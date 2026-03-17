@@ -1,0 +1,16 @@
+[Unit]
+Description=spela media controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fredrik
+ExecStart=/home/fredrik/.local/bin/spela server
+Restart=on-failure
+RestartSec=5
+Environment=TMDB_API_KEY=
+WorkingDirectory=/home/fredrik
+
+[Install]
+WantedBy=multi-user.target

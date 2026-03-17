@@ -1,0 +1,509 @@
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use axum::extract::{Query, State};
+use axum::http::Method;
+use axum::response::Json;
+use axum::routing::{get, post};
+use axum::Router;
+use chrono::Utc;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tower_http::cors::{Any, CorsLayer};
+
+use crate::cast::CastController;
+use crate::config::Config;
+use crate::disk;
+use crate::search::SearchEngine;
+use crate::state::{AppState, CurrentStream};
+use crate::subtitles;
+use crate::torrent;
+use crate::transcode;
+
+pub struct ServerState {
+    pub config: Config,
+    pub search_engine: SearchEngine,
+    pub cast: Mutex<CastController>,
+    pub state_dir: PathBuf,
+    pub media_dir: PathBuf,
+}
+
+type SharedState = Arc<ServerState>;
+
+pub async fn run_server(config: Config) -> anyhow::Result<()> {
+    let state_dir = Config::state_dir();
+    let media_dir = config.media_dir();
+    std::fs::create_dir_all(&state_dir)?;
+    std::fs::create_dir_all(&media_dir)?;
+
+    let search_engine = SearchEngine::new(config.tmdb_api_key.clone());
+    let cast = Mutex::new(CastController::new(&state_dir));
+    let port = config.port;
+
+    let state = Arc::new(ServerState {
+        config,
+        search_engine,
+        cast,
+        state_dir,
+        media_dir,
+    });
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any);
+
+    let app = Router::new()
+        .route("/search", get(handle_search))
+        .route("/play", post(handle_play))
+        .route("/stop", post(handle_stop))
+        .route("/status", get(handle_status))
+        .route("/pause", post(handle_pause))
+        .route("/resume", post(handle_resume))
+        .route("/seek", post(handle_seek))
+        .route("/volume", post(handle_volume))
+        .route("/next", post(handle_next))
+        .route("/prev", post(handle_prev))
+        .route("/targets", get(handle_targets))
+        .route("/history", get(handle_history))
+        .route("/config", get(handle_get_config).post(handle_set_config))
+        .route("/cast-info", post(handle_cast_info))
+        .layer(cors)
+        .with_state(state);
+
+    let addr = format!("0.0.0.0:{}", port);
+    tracing::info!("spela server listening on http://{}", addr);
+    tracing::info!("Endpoints: /search /play /stop /status /pause /resume /seek /volume /next /prev /targets /history /config");
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+// --- Request types ---
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+    movie: Option<String>,
+    season: Option<u32>,
+    episode: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct PlayRequest {
+    pub magnet: Option<String>,
+    pub target: Option<String>,
+    pub cast_name: Option<String>,
+    pub title: Option<String>,
+    pub file_index: Option<u32>,
+    pub no_subs: Option<bool>,
+    pub subtitle_lang: Option<String>,
+    pub imdb_id: Option<String>,
+    pub show: Option<String>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub seek_to: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct SeekRequest {
+    t: Option<f64>,
+    seconds: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct VolumeRequest {
+    level: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct CastInfoRequest {
+    device: Option<String>,
+}
+
+// --- Handlers ---
+
+async fn handle_search(
+    State(state): State<SharedState>,
+    Query(params): Query<SearchParams>,
+) -> Json<Value> {
+    let q = match params.q {
+        Some(q) if !q.is_empty() => q,
+        _ => return Json(json!({"error": "Missing q parameter"})),
+    };
+    let movie = params.movie.is_some();
+    match state.search_engine.search(&q, movie, params.season, params.episode).await {
+        Ok(result) => Json(serde_json::to_value(result).unwrap_or(json!({"error": "serialize failed"}))),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn handle_play(
+    State(state): State<SharedState>,
+    Json(req): Json<PlayRequest>,
+) -> Json<Value> {
+    let magnet = match &req.magnet {
+        Some(m) if !m.is_empty() => m.clone(),
+        _ => return Json(json!({"error": "Missing magnet"})),
+    };
+
+    // Disk check
+    if let Ok(Some(err)) = disk::check_space(&state.media_dir) {
+        return Json(json!({"error": err}));
+    }
+    disk::cleanup_old_files(&state.media_dir);
+
+    // Stop existing stream
+    let pid_path = state.state_dir.join("webtorrent.pid");
+    torrent::stop_by_pid_file(&pid_path);
+
+    let mut app_state = AppState::load(&state.state_dir);
+    app_state.stop_current();
+
+    let target = req.target.as_deref().unwrap_or(&app_state.preferences.default_target).to_string();
+    let cast_name = req.cast_name.clone()
+        .or_else(|| app_state.preferences.chromecast_name.clone())
+        .unwrap_or_else(|| state.config.default_device.clone());
+    let no_subs = req.no_subs.unwrap_or(false);
+    let sub_lang = req.subtitle_lang.clone().unwrap_or_else(|| "eng".into());
+
+    // Start webtorrent
+    let log_path = state.state_dir.join("webtorrent.log");
+    let (pid, server_url) = match torrent::start_webtorrent(
+        &magnet, req.file_index, &state.media_dir, &state.config.lan_ip, &log_path
+    ).await {
+        Ok(r) => r,
+        Err(e) => return Json(json!({"error": e.to_string()})),
+    };
+
+    let _ = torrent::save_pid(&state.state_dir.join("webtorrent.pid"), pid);
+
+    // Audio codec detection + transcode
+    let mut final_url = server_url.clone();
+    match transcode::detect_audio_codec(&server_url).await {
+        Ok(Some(codec)) if transcode::needs_transcode(&codec) => {
+            tracing::info!("Audio codec {} needs transcode -> AAC", codec);
+            match transcode::transcode_audio(&server_url, &state.media_dir).await {
+                Ok((_path, _child)) => {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    let media_str = state.media_dir.to_string_lossy().to_string();
+                    let _ = tokio::process::Command::new("python3")
+                        .args(["-m", "http.server", "8889", "--directory", &media_str])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    final_url = format!("http://{}:8889/transcoded_aac.mp4", state.config.lan_ip);
+                }
+                Err(e) => tracing::warn!("Transcode failed (casting anyway): {}", e),
+            }
+        }
+        _ => {}
+    }
+
+    // Fetch subtitles
+    let mut has_subtitles = false;
+    if !no_subs {
+        if let Some(imdb_id) = &req.imdb_id {
+            let client = reqwest::Client::new();
+            match subtitles::fetch_subtitles(&client, imdb_id, req.season, req.episode, &sub_lang, &state.media_dir).await {
+                Ok(Some(_)) => {
+                    has_subtitles = true;
+                    tracing::info!("Subtitles fetched ({})", sub_lang);
+                }
+                Ok(None) => tracing::info!("No subtitles found for {}", sub_lang),
+                Err(e) => tracing::warn!("Subtitle fetch failed: {}", e),
+            }
+        }
+    }
+
+    // Cast to Chromecast
+    if target == "chromecast" {
+        let state_clone = state.clone();
+        let cast_name_clone = cast_name.clone();
+        let url_clone = final_url.clone();
+        let cast_result = tokio::task::spawn_blocking(move || {
+            let mut cast = state_clone.cast.lock().unwrap();
+            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4")
+        }).await;
+
+        match cast_result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return Json(json!({
+                    "error": format!("Cast failed: {}", e),
+                    "url": final_url,
+                    "recovery_suggestion": "Try 'spela targets' to discover devices, or check if TV is on"
+                }));
+            }
+            Err(e) => return Json(json!({"error": format!("Cast task failed: {}", e)})),
+        }
+
+        // Seek to saved position if resuming
+        if let Some(seek_to) = req.seek_to {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            let state_clone = state.clone();
+            let cast_name_clone = cast_name.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut cast = state_clone.cast.lock().unwrap();
+                cast.seek(&cast_name_clone, seek_to)
+            }).await;
+        }
+    }
+
+    // Save state
+    let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
+    app_state.current = Some(CurrentStream {
+        magnet: magnet.chars().take(300).collect(),
+        title: title.clone(),
+        show: req.show.clone(),
+        season: req.season,
+        episode: req.episode,
+        imdb_id: req.imdb_id.clone(),
+        target: format!("{}:{}", target, cast_name),
+        url: final_url.clone(),
+        started_at: Utc::now(),
+        pid,
+        has_subtitles,
+        subtitle_lang: if has_subtitles { Some(sub_lang) } else { None },
+    });
+    let _ = app_state.save(&state.state_dir);
+
+    Json(json!({
+        "status": "streaming",
+        "pid": pid,
+        "target": format!("{}:{}", target, cast_name),
+        "title": title,
+        "subtitles": has_subtitles,
+        "url": final_url
+    }))
+}
+
+async fn handle_stop(State(state): State<SharedState>) -> Json<Value> {
+    let pid_path = state.state_dir.join("webtorrent.pid");
+    torrent::stop_by_pid_file(&pid_path);
+
+    let mut app_state = AppState::load(&state.state_dir);
+    app_state.stop_current();
+    let _ = app_state.save(&state.state_dir);
+
+    Json(json!({"status": "stopped"}))
+}
+
+async fn handle_status(State(state): State<SharedState>) -> Json<Value> {
+    let app_state = AppState::load(&state.state_dir);
+    match &app_state.current {
+        None => Json(json!({"status": "idle"})),
+        Some(current) => {
+            let running = is_process_running(current.pid);
+            Json(json!({
+                "status": if running { "streaming" } else { "process_dead" },
+                "current": current,
+                "running": running
+            }))
+        }
+    }
+}
+
+async fn handle_pause(State(state): State<SharedState>) -> Json<Value> {
+    let device = get_current_device(&state);
+    let state_clone = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut cast = state_clone.cast.lock().unwrap();
+        cast.pause(&device)
+    }).await;
+    cast_result_to_json(result)
+}
+
+async fn handle_resume(State(state): State<SharedState>) -> Json<Value> {
+    let device = get_current_device(&state);
+    let state_clone = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut cast = state_clone.cast.lock().unwrap();
+        cast.resume(&device)
+    }).await;
+    cast_result_to_json(result)
+}
+
+async fn handle_seek(
+    State(state): State<SharedState>,
+    Json(req): Json<SeekRequest>,
+) -> Json<Value> {
+    let seconds = match req.t.or(req.seconds) {
+        Some(s) => s,
+        None => return Json(json!({"error": "Missing t (seconds) parameter"})),
+    };
+    let device = get_current_device(&state);
+    let state_clone = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut cast = state_clone.cast.lock().unwrap();
+        cast.seek(&device, seconds)
+    }).await;
+    cast_result_to_json(result)
+}
+
+async fn handle_volume(
+    State(state): State<SharedState>,
+    Json(req): Json<VolumeRequest>,
+) -> Json<Value> {
+    let level = match req.level {
+        Some(l) => l,
+        None => return Json(json!({"error": "Missing level (0-100) parameter"})),
+    };
+    let device = get_current_device(&state);
+    let state_clone = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut cast = state_clone.cast.lock().unwrap();
+        cast.set_volume(&device, level)
+    }).await;
+    cast_result_to_json(result)
+}
+
+async fn handle_next(State(state): State<SharedState>) -> Json<Value> {
+    navigate_episode(&state, 1).await
+}
+
+async fn handle_prev(State(state): State<SharedState>) -> Json<Value> {
+    navigate_episode(&state, -1).await
+}
+
+async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
+    let app_state = AppState::load(&state.state_dir);
+    let current = match &app_state.current {
+        Some(c) if c.show.is_some() && c.season.is_some() && c.episode.is_some() => c,
+        _ => return Json(json!({"error": "No show/episode context -- play a TV episode first"})),
+    };
+
+    let show = current.show.clone().unwrap();
+    let cur_ep = current.episode.unwrap();
+    let mut season = current.season.unwrap();
+    let episode = if direction > 0 {
+        cur_ep + 1
+    } else if cur_ep > 1 {
+        cur_ep - 1
+    } else {
+        if season > 1 {
+            season -= 1;
+            99 // Will be clamped by results
+        } else {
+            return Json(json!({"error": "Already at first episode"}));
+        }
+    };
+
+    let result = match state.search_engine.search(&show, false, Some(season), Some(episode)).await {
+        Ok(r) => r,
+        Err(e) => return Json(json!({"error": e.to_string()})),
+    };
+
+    if !result.torrent_available || result.results.is_empty() {
+        return Json(json!({
+            "error": format!("No torrent found for S{:02}E{:02}", season, episode),
+            "searched": result
+        }));
+    }
+
+    let best = &result.results[0];
+    let target_parts: Vec<&str> = current.target.splitn(2, ':').collect();
+
+    let play_req = PlayRequest {
+        magnet: Some(best.magnet.clone()),
+        target: target_parts.first().map(|s| s.to_string()),
+        cast_name: target_parts.get(1).map(|s| s.to_string()),
+        title: Some(format!("{} S{:02}E{:02}", show, season, episode)),
+        file_index: best.file_index,
+        no_subs: None,
+        subtitle_lang: None,
+        imdb_id: result.show.as_ref().and_then(|s| s.imdb_id.clone()),
+        show: Some(show),
+        season: Some(season),
+        episode: Some(episode),
+        seek_to: None,
+    };
+
+    handle_play(State(state.clone()), Json(play_req)).await
+}
+
+async fn handle_targets(State(state): State<SharedState>) -> Json<Value> {
+    let state_clone = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut cast = state_clone.cast.lock().unwrap();
+        cast.discover()
+    }).await;
+    match result {
+        Ok(Ok(devices)) => Json(json!({"targets": devices})),
+        Ok(Err(e)) => Json(json!({"error": e.to_string(), "targets": []})),
+        Err(e) => Json(json!({"error": e.to_string(), "targets": []})),
+    }
+}
+
+async fn handle_history(State(state): State<SharedState>) -> Json<Value> {
+    let app_state = AppState::load(&state.state_dir);
+    Json(json!({"history": app_state.history.iter().take(20).collect::<Vec<_>>()}))
+}
+
+async fn handle_get_config(State(state): State<SharedState>) -> Json<Value> {
+    let app_state = AppState::load(&state.state_dir);
+    Json(json!({"preferences": app_state.preferences}))
+}
+
+async fn handle_set_config(
+    State(state): State<SharedState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let mut app_state = AppState::load(&state.state_dir);
+    if let Some(obj) = body.as_object() {
+        if let Some(v) = obj.get("default_target").and_then(|v| v.as_str()) {
+            app_state.preferences.default_target = v.into();
+        }
+        if let Some(v) = obj.get("chromecast_name").and_then(|v| v.as_str()) {
+            app_state.preferences.chromecast_name = Some(v.into());
+        }
+        if let Some(v) = obj.get("preferred_quality").and_then(|v| v.as_str()) {
+            app_state.preferences.preferred_quality = v.into();
+        }
+    }
+    let _ = app_state.save(&state.state_dir);
+    Json(json!({"preferences": app_state.preferences}))
+}
+
+async fn handle_cast_info(
+    State(state): State<SharedState>,
+    Json(req): Json<CastInfoRequest>,
+) -> Json<Value> {
+    let device = req.device.unwrap_or_else(|| get_current_device(&state));
+    let state_clone = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut cast = state_clone.cast.lock().unwrap();
+        cast.get_info(&device)
+    }).await;
+    match result {
+        Ok(Ok(info)) => Json(serde_json::to_value(info).unwrap_or(json!({"error": "serialize"}))),
+        Ok(Err(e)) => Json(json!({"error": e.to_string()})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+// --- Helpers ---
+
+fn get_current_device(state: &ServerState) -> String {
+    let app_state = AppState::load(&state.state_dir);
+    app_state.current
+        .and_then(|c| c.target.splitn(2, ':').nth(1).map(String::from))
+        .or(app_state.preferences.chromecast_name)
+        .unwrap_or_else(|| state.config.default_device.clone())
+}
+
+fn is_process_running(pid: u32) -> bool {
+    unsafe { torrent::kill_check(pid) }
+}
+
+fn cast_result_to_json(
+    result: Result<anyhow::Result<crate::cast::CastResult>, tokio::task::JoinError>
+) -> Json<Value> {
+    match result {
+        Ok(Ok(r)) => Json(serde_json::to_value(r).unwrap_or(json!({"error": "serialize"}))),
+        Ok(Err(e)) => Json(json!({"error": e.to_string()})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
