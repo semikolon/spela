@@ -60,11 +60,13 @@ rsync -av --exclude target ~/Projects/spela/src/ darwin:~/spela/src/
 
 - **webtorrent `-s` FIXED** (our PR #3011, fixes #331) — piece verification bug in `_markUnverified` re-selected ALL pieces, downloading entire torrent despite `-s`. Fix: `Selections.contains()` guard prevents re-selecting deselected pieces. Patched in-place on Darwin at `~/.local/share/mise/installs/node/24.14.0/lib/node_modules/webtorrent-cli/node_modules/webtorrent/lib/`. Verified: 27-file season pack → only target file + 1.7MB boundary pieces downloaded (sparse files, no actual disk waste). Smart ranking still prefers single-file torrents as belt-and-suspenders
 - **localhost doesn't work for Chromecast** — always use `192.168.4.1`, Chromecast fetches URL itself
-- **EAC3/AC3/DTS silent** — auto-detect with ffprobe, progressive transcode to AAC stereo
+- **EAC3/AC3/DTS → AAC transcode** — ffprobe auto-detect, ffmpeg with `-re` flag (real-time pacing, never outruns download) + `-reconnect_at_eof` (handles stalls). Fragmented MP4 output (`frag_keyframe+empty_moov`) playable from first byte. Previous approach (wait for full download OR read from HTTP without -re) caused truncated episodes
+- **Subtitles burned into video** — when transcoding is needed, SRT subtitles are hardcoded via `-vf subtitles=` with NVENC GPU encoding (`h264_nvenc`). Works around rust_cast's lack of Cast protocol track support. Subtitles fetched from Stremio OpenSubtitles v3 (zero auth)
+- **Self-healing: dead seeds** — if 0% download progress after 12s, auto-tries next search result (up to 3 retries)
 - **catt mDNS ~40% flaky** — V2 uses rust_cast native + IP cache, no Python deps
 - **webtorrent --chromecast broken** — serve via HTTP (:8888) + cast URL via rust_cast
-- **Subtitle tracks** — rust_cast doesn't support Cast protocol tracks yet. VTT conversion ready, track injection TODO
 - **systemd PATH** — needs explicit PATH env for mise shims (webtorrent not in default PATH)
+- **GPU coexistence** — NVENC transcode (163MB), llama.cpp embeddings (2.8GB), Chrome kiosk (103MB) all fit in 4GB VRAM simultaneously
 
 ## Chromecast Devices
 
