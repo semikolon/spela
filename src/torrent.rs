@@ -71,6 +71,39 @@ pub async fn start_webtorrent(
     }
 }
 
+/// Check if webtorrent is making download progress by parsing the log.
+/// Returns true if any data has been downloaded (> 0%).
+pub async fn check_progress(log_path: &Path, timeout_secs: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while tokio::time::Instant::now() < deadline {
+        sleep(Duration::from_secs(2)).await;
+        if let Ok(log) = std::fs::read_to_string(log_path) {
+            // webtorrent logs progress like "12% ... 1.2 MB/s"
+            // Any percentage > 0 or any non-zero speed means we're downloading
+            for line in log.lines().rev().take(10) {
+                // Check for percentage progress
+                if let Some(pct_pos) = line.find('%') {
+                    if pct_pos > 0 {
+                        let before = &line[..pct_pos];
+                        let num_str: String = before.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<String>().chars().rev().collect();
+                        if let Ok(pct) = num_str.parse::<u32>() {
+                            if pct > 0 { return true; }
+                        }
+                    }
+                }
+                // Check for non-zero download speed
+                if line.contains("MB/s") || line.contains("KB/s") {
+                    let has_speed = line.split_whitespace().any(|w| {
+                        w.parse::<f64>().map(|v| v > 0.0).unwrap_or(false)
+                    });
+                    if has_speed { return true; }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Kill a process by PID (SIGTERM).
 pub fn kill_pid(pid: u32) {
     unsafe {

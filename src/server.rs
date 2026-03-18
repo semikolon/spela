@@ -149,6 +149,37 @@ async fn handle_play(
     State(state): State<SharedState>,
     Json(mut req): Json<PlayRequest>,
 ) -> Json<Value> {
+    // Auto-retry loop: tries up to 3 results on torrent failure
+    let max_retries = 3u32;
+    for retry in 0..max_retries {
+        let result = do_play(&state, &mut req).await;
+        match &result {
+            Json(v) if v.get("error").is_some() && retry < max_retries - 1 => {
+                // Check if we can auto-fallback to next result
+                if let Some(rid) = req.result_id {
+                    if let Some(search) = AppState::load_last_search(&state.state_dir) {
+                        let next_rid = rid + 1;
+                        if next_rid <= search.results.len() {
+                            tracing::warn!("Play failed ({}), auto-trying result #{}", v["error"], next_rid);
+                            req.result_id = Some(next_rid);
+                            req.magnet = None;
+                            req.file_index = None;
+                            continue;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        return result;
+    }
+    Json(json!({"error": "All retry attempts failed"}))
+}
+
+async fn do_play(
+    state: &SharedState,
+    req: &mut PlayRequest,
+) -> Json<Value> {
     // Resolve result_id from last search — fills magnet, file_index, and metadata automatically
     if let Some(rid) = req.result_id {
         match AppState::load_last_search(&state.state_dir) {
@@ -224,12 +255,37 @@ async fn handle_play(
 
     let _ = torrent::save_pid(&state.state_dir.join("webtorrent.pid"), pid);
 
+    // Self-healing: check download progress — if 0% after 12s, torrent has dead seeds
+    if !torrent::check_progress(&log_path, 12).await {
+        tracing::warn!("Torrent has no download progress after 12s — dead seeds");
+        torrent::kill_pid(pid);
+        torrent::kill_all_webtorrent();
+        disk::cleanup_old_files(&state.media_dir);
+        return Json(json!({"error": "Torrent has no active seeds (0% after 12s)"}));
+    }
+
     // Audio codec detection + transcode
     let mut final_url = server_url.clone();
     match transcode::detect_audio_codec(&server_url).await {
         Ok(Some(codec)) if transcode::needs_transcode(&codec) => {
             tracing::info!("Audio codec {} needs transcode -> AAC", codec);
-            match transcode::transcode_audio(&server_url, &state.media_dir).await {
+
+            // Wait for local file to finish downloading before transcoding
+            // This prevents ffmpeg EOF truncation when it outruns the download
+            tracing::info!("Waiting for local video file to finish downloading...");
+            let local_file = transcode::find_local_video(&state.media_dir, 120).await;
+            let transcode_input = match &local_file {
+                Some(path) => {
+                    tracing::info!("Transcoding from local file: {}", path.display());
+                    path.to_string_lossy().to_string()
+                }
+                None => {
+                    tracing::warn!("No local file found, falling back to HTTP URL");
+                    server_url.clone()
+                }
+            };
+
+            match transcode::transcode_audio(&transcode_input, &state.media_dir).await {
                 Ok((_path, _child)) => {
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     let media_str = state.media_dir.to_string_lossy().to_string();
