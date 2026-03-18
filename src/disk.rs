@@ -2,10 +2,10 @@ use anyhow::Result;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-const MAX_MEDIA_MB: u64 = 5000;
+const MAX_MEDIA_MB: u64 = 10000;
 const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Check if media dir exceeds 5GB cap.
+/// Check if media dir exceeds 10GB cap.
 pub fn check_space(media_dir: &Path) -> Result<Option<String>> {
     if !media_dir.exists() {
         return Ok(None);
