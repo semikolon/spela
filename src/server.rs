@@ -93,6 +93,8 @@ struct SearchParams {
 #[derive(Deserialize)]
 pub struct PlayRequest {
     pub magnet: Option<String>,
+    /// Play search result by ID (1-8) from last search — auto-fills magnet, file_index, metadata
+    pub result_id: Option<usize>,
     pub target: Option<String>,
     pub cast_name: Option<String>,
     pub title: Option<String>,
@@ -134,18 +136,61 @@ async fn handle_search(
     };
     let movie = params.movie.is_some();
     match state.search_engine.search(&q, movie, params.season, params.episode).await {
-        Ok(result) => Json(serde_json::to_value(result).unwrap_or(json!({"error": "serialize failed"}))),
+        Ok(result) => {
+            // Save results so `play <N>` can reference them
+            AppState::save_last_search(&state.state_dir, &result);
+            Json(serde_json::to_value(result).unwrap_or(json!({"error": "serialize failed"})))
+        }
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
 
 async fn handle_play(
     State(state): State<SharedState>,
-    Json(req): Json<PlayRequest>,
+    Json(mut req): Json<PlayRequest>,
 ) -> Json<Value> {
+    // Resolve result_id from last search — fills magnet, file_index, and metadata automatically
+    if let Some(rid) = req.result_id {
+        match AppState::load_last_search(&state.state_dir) {
+            Some(search) => {
+                let result = search.results.iter().find(|r| r.id == rid);
+                match result {
+                    Some(r) => {
+                        req.magnet = Some(r.magnet.clone());
+                        req.file_index = req.file_index.or(r.file_index);
+                        // Auto-fill metadata from the search context
+                        if req.title.is_none() {
+                            let ep = search.searching.as_ref();
+                            req.title = Some(match (&search.show, ep) {
+                                (Some(show), Some(ep)) => format!("{} S{:02}E{:02}", show.title, ep.season, ep.episode),
+                                (Some(show), None) => show.title.clone(),
+                                _ => r.title.clone(),
+                            });
+                        }
+                        if req.imdb_id.is_none() {
+                            req.imdb_id = search.show.as_ref().and_then(|s| s.imdb_id.clone());
+                        }
+                        if req.show.is_none() {
+                            req.show = search.show.as_ref().map(|s| s.title.clone());
+                        }
+                        if req.season.is_none() {
+                            req.season = search.searching.as_ref().map(|e| e.season);
+                        }
+                        if req.episode.is_none() {
+                            req.episode = search.searching.as_ref().map(|e| e.episode);
+                        }
+                        tracing::info!("Playing result #{}: {} (file_index: {:?})", rid, req.title.as_deref().unwrap_or("?"), req.file_index);
+                    }
+                    None => return Json(json!({"error": format!("Result #{} not found in last search (have {})", rid, search.results.len())})),
+                }
+            }
+            None => return Json(json!({"error": "No previous search results. Run 'spela search' first."})),
+        }
+    }
+
     let magnet = match &req.magnet {
         Some(m) if !m.is_empty() => m.clone(),
-        _ => return Json(json!({"error": "Missing magnet"})),
+        _ => return Json(json!({"error": "Missing magnet. Use 'spela play <N>' with a result number, or pass a magnet link."})),
     };
 
     // Disk check
@@ -408,6 +453,7 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
 
     let play_req = PlayRequest {
         magnet: Some(best.magnet.clone()),
+        result_id: None,
         target: target_parts.first().map(|s| s.to_string()),
         cast_name: target_parts.get(1).map(|s| s.to_string()),
         title: Some(format!("{} S{:02}E{:02}", show, season, episode)),

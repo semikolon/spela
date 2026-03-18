@@ -1,7 +1,9 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::search::SearchResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
@@ -97,6 +99,20 @@ impl AppState {
         let path = state_dir.join("state.json");
         std::fs::write(path, serde_json::to_string_pretty(self)?)?;
         Ok(())
+    }
+
+    /// Save last search results to a separate file for play-by-id.
+    pub fn save_last_search(state_dir: &Path, result: &SearchResult) {
+        let path = state_dir.join("last_search.json");
+        let _ = serde_json::to_string_pretty(result)
+            .map(|s| std::fs::write(path, s));
+    }
+
+    /// Load last search results.
+    pub fn load_last_search(state_dir: &Path) -> Option<SearchResult> {
+        let path = state_dir.join("last_search.json");
+        std::fs::read_to_string(path).ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
     }
 
     pub fn stop_current(&mut self) {

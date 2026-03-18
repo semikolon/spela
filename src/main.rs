@@ -48,10 +48,10 @@ enum Commands {
         #[arg(long)]
         episode: Option<u32>,
     },
-    /// Stream a magnet link to Chromecast or VLC
+    /// Play a search result (1-8) or magnet link. Example: spela play 1
     Play {
-        /// Magnet link
-        magnet: String,
+        /// Result number (1-8) from last search, OR a magnet link
+        source: String,
         /// Stream to VLC instead of Chromecast
         #[arg(long)]
         vlc: bool,
@@ -61,7 +61,7 @@ enum Commands {
         /// Title for state tracking
         #[arg(long)]
         title: Option<String>,
-        /// File index for multi-file torrents
+        /// File index override (auto-filled from search results)
         #[arg(long)]
         file_index: Option<u32>,
         /// Disable subtitles
@@ -159,9 +159,12 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             if let Some(e) = episode { url.push_str(&format!("&episode={}", e)); }
             Ok(client.get(&url).send().await?.json().await?)
         }
-        Commands::Play { magnet, vlc, cast, title, file_index, no_subs } => {
+        Commands::Play { source, vlc, cast, title, file_index, no_subs } => {
+            // Smart source detection: number = result ID, magnet: = magnet link
+            let is_result_id = source.parse::<usize>().ok().filter(|&n| n >= 1 && n <= 20);
             let body = serde_json::json!({
-                "magnet": magnet,
+                "result_id": is_result_id,
+                "magnet": if is_result_id.is_none() { Some(&source) } else { None },
                 "target": if vlc { "vlc" } else { "chromecast" },
                 "cast_name": cast,
                 "title": title,

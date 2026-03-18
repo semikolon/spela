@@ -251,7 +251,7 @@ impl SearchEngine {
             .await?;
 
         let streams = resp["streams"].as_array().cloned().unwrap_or_default();
-        let results: Vec<TorrentResult> = streams.iter().enumerate().map(|(i, s)| {
+        let mut results: Vec<TorrentResult> = streams.iter().map(|s| {
             let title_text = s["title"].as_str().unwrap_or("");
             let meta = parse_torrentio_title(title_text);
             let quality = s["name"].as_str().unwrap_or("")
@@ -263,17 +263,35 @@ impl SearchEngine {
                 .to_string();
 
             TorrentResult {
-                id: i + 1,
+                id: 0, // assigned after sorting
                 quality,
                 title: filename,
                 seeds: meta.0,
                 size: meta.1,
                 source: meta.2,
-                magnet: build_magnet(&info_hash, &s["behaviorHints"]["filename"].as_str().unwrap_or("")),
+                magnet: build_magnet(&info_hash, s["behaviorHints"]["filename"].as_str().unwrap_or("")),
                 info_hash,
                 file_index: s["fileIdx"].as_u64().map(|n| n as u32),
             }
         }).collect();
+
+        // Smart ranking: single-file torrents first, then by seeds
+        // file_index=0 or None = likely single file (best — no wasted disk space)
+        // file_index>=1 = multi-file pack (webtorrent -s is unreliable, downloads neighbors)
+        results.sort_by(|a, b| {
+            let a_single = a.file_index.map_or(true, |i| i == 0);
+            let b_single = b.file_index.map_or(true, |i| i == 0);
+            match (a_single, b_single) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => b.seeds.cmp(&a.seeds), // within same tier, prefer more seeds
+            }
+        });
+
+        // Assign IDs after sorting
+        for (i, r) in results.iter_mut().enumerate() {
+            r.id = i + 1;
+        }
 
         Ok(results.into_iter().take(8).collect())
     }
