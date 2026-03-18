@@ -38,7 +38,7 @@ pub async fn transcode_audio(
             "-c:a", "aac",
             "-ac", "2",
             "-b:a", "192k",
-            "-movflags", "+faststart",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "-y",
             output_path.to_str().unwrap_or("transcoded_aac.mp4"),
         ])
