@@ -1,0 +1,12 @@
+{
+  "name": "spela",
+  "version": "0.1.0",
+  "description": "AI-agent-ready media controller for Sarpetorp",
+  "type": "module",
+  "bin": { "spela": "./cli.js" },
+  "dependencies": {
+    "webtorrent": "^2.8.5",
+    "castv2-client": "^1.2.0",
+    "mdns-js": "^1.0.3"
+  }
+}
