@@ -23,73 +23,60 @@ pub fn needs_transcode(codec: &str) -> bool {
     matches!(codec, "ac3" | "eac3" | "dts" | "truehd" | "dca")
 }
 
-/// Find the largest video file in the media directory (the downloaded torrent file).
-/// Waits up to `wait_secs` for the file to stabilize (stop growing = fully downloaded).
-pub async fn find_local_video(media_dir: &Path, wait_secs: u64) -> Option<PathBuf> {
-    let mut best: Option<(PathBuf, u64)> = None;
-
-    fn scan_dir(dir: &Path, best: &mut Option<(PathBuf, u64)>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    scan_dir(&path, best);
-                } else if path.is_file() {
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if matches!(ext, "mp4" | "mkv" | "avi" | "webm") {
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            if best.as_ref().map_or(true, |(_, s)| meta.len() > *s) {
-                                *best = Some((path, meta.len()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Wait for file to finish downloading (size stabilizes)
-    for _ in 0..wait_secs {
-        best = None;
-        scan_dir(media_dir, &mut best);
-        if let Some((ref path, size)) = best {
-            if size > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                // Check if size changed
-                if let Ok(meta) = std::fs::metadata(path) {
-                    if meta.len() == size {
-                        // Size stable — file is complete
-                        return Some(path.clone());
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    }
-
-    // Return whatever we found even if still growing
-    best.map(|(p, _)| p)
-}
-
-/// Transcode audio to AAC, copy video. Uses local file path, not HTTP URL.
-/// This avoids EOF truncation when ffmpeg outruns the download.
+/// Transcode audio to AAC from an HTTP URL (progressive/streaming input).
+/// Uses -re (real-time read) so ffmpeg never outruns the download.
+/// Uses reconnect flags so temporary download stalls don't cause EOF.
+/// Optionally burns in subtitles if subtitle_path is provided.
 pub async fn transcode_audio(
-    input: &str,
+    input_url: &str,
     media_dir: &Path,
+    subtitle_path: Option<&Path>,
 ) -> Result<(PathBuf, tokio::process::Child)> {
     let output_path = media_dir.join("transcoded_aac.mp4");
 
+    let mut args: Vec<String> = vec![
+        // Input: read at real-time speed so we never outrun the download
+        "-re".into(),
+        // Reconnect on stalls/drops — keeps the stream alive during slow periods
+        "-reconnect".into(), "1".into(),
+        "-reconnect_at_eof".into(), "1".into(),
+        "-reconnect_streamed".into(), "1".into(),
+        "-reconnect_delay_max".into(), "30".into(),
+        // HTTP read timeout: 60 seconds of silence before giving up (microseconds)
+        "-rw_timeout".into(), "60000000".into(),
+        "-i".into(), input_url.into(),
+    ];
+
+    // Subtitle burn-in: if we have an SRT file, hardcode it into the video
+    // This requires video re-encoding (NVENC on Darwin's GTX 1650)
+    if let Some(srt_path) = subtitle_path {
+        if srt_path.exists() {
+            let srt_str = srt_path.to_string_lossy().to_string()
+                .replace(':', "\\:"); // ffmpeg subtitle filter needs escaped colons
+            args.extend([
+                "-vf".into(), format!("subtitles='{}'", srt_str),
+                "-c:v".into(), "h264_nvenc".into(),
+                "-preset".into(), "p4".into(), // balanced speed/quality
+                "-cq".into(), "23".into(),     // constant quality
+            ]);
+        } else {
+            args.extend(["-c:v".into(), "copy".into()]);
+        }
+    } else {
+        args.extend(["-c:v".into(), "copy".into()]);
+    }
+
+    args.extend([
+        "-c:a".into(), "aac".into(),
+        "-ac".into(), "2".into(),
+        "-b:a".into(), "192k".into(),
+        "-movflags".into(), "frag_keyframe+empty_moov+default_base_moof".into(),
+        "-y".into(),
+        output_path.to_str().unwrap_or("transcoded_aac.mp4").into(),
+    ]);
+
     let child = Command::new("ffmpeg")
-        .args([
-            "-i", input,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-ac", "2",
-            "-b:a", "192k",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-            "-y",
-            output_path.to_str().unwrap_or("transcoded_aac.mp4"),
-        ])
+        .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;

@@ -264,59 +264,53 @@ async fn do_play(
         return Json(json!({"error": "Torrent has no active seeds (0% after 12s)"}));
     }
 
-    // Audio codec detection + transcode
-    let mut final_url = server_url.clone();
-    match transcode::detect_audio_codec(&server_url).await {
-        Ok(Some(codec)) if transcode::needs_transcode(&codec) => {
-            tracing::info!("Audio codec {} needs transcode -> AAC", codec);
-
-            // Wait for local file to finish downloading before transcoding
-            // This prevents ffmpeg EOF truncation when it outruns the download
-            tracing::info!("Waiting for local video file to finish downloading...");
-            let local_file = transcode::find_local_video(&state.media_dir, 120).await;
-            let transcode_input = match &local_file {
-                Some(path) => {
-                    tracing::info!("Transcoding from local file: {}", path.display());
-                    path.to_string_lossy().to_string()
-                }
-                None => {
-                    tracing::warn!("No local file found, falling back to HTTP URL");
-                    server_url.clone()
-                }
-            };
-
-            match transcode::transcode_audio(&transcode_input, &state.media_dir).await {
-                Ok((_path, _child)) => {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    let media_str = state.media_dir.to_string_lossy().to_string();
-                    let _ = tokio::process::Command::new("python3")
-                        .args(["-m", "http.server", "8889", "--directory", &media_str])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    final_url = format!("http://{}:8889/transcoded_aac.mp4", state.config.lan_ip);
-                }
-                Err(e) => tracing::warn!("Transcode failed (casting anyway): {}", e),
-            }
-        }
-        _ => {}
-    }
-
-    // Fetch subtitles
+    // Fetch subtitles FIRST (needed for burn-in during transcode)
     let mut has_subtitles = false;
+    let mut subtitle_srt_path: Option<PathBuf> = None;
     if !no_subs {
         if let Some(imdb_id) = &req.imdb_id {
             let client = reqwest::Client::new();
             match subtitles::fetch_subtitles(&client, imdb_id, req.season, req.episode, &sub_lang, &state.media_dir).await {
-                Ok(Some(_)) => {
+                Ok(Some(vtt_path)) => {
                     has_subtitles = true;
+                    // Use the SRT version for ffmpeg burn-in (ffmpeg handles SRT natively)
+                    subtitle_srt_path = Some(state.media_dir.join(format!("subtitle_{}.srt", sub_lang)));
                     tracing::info!("Subtitles fetched ({})", sub_lang);
                 }
                 Ok(None) => tracing::info!("No subtitles found for {}", sub_lang),
                 Err(e) => tracing::warn!("Subtitle fetch failed: {}", e),
             }
         }
+    }
+
+    // Audio codec detection + transcode (reads from HTTP with -re, never outruns download)
+    let mut final_url = server_url.clone();
+    match transcode::detect_audio_codec(&server_url).await {
+        Ok(Some(codec)) if transcode::needs_transcode(&codec) => {
+            tracing::info!("Audio codec {} needs transcode -> AAC{}", codec,
+                if subtitle_srt_path.is_some() { " + subtitle burn-in (NVENC)" } else { "" });
+
+            let sub_path = subtitle_srt_path.as_deref();
+            match transcode::transcode_audio(&server_url, &state.media_dir, sub_path).await {
+                Ok((_path, _child)) => {
+                    // Start python HTTP server for transcoded file
+                    let media_str = state.media_dir.to_string_lossy().to_string();
+                    let _ = tokio::process::Command::new("python3")
+                        .args(["-m", "http.server", "8889", "--directory", &media_str])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    // Wait for initial buffer (fMP4 is playable from first fragment)
+                    tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
+                    final_url = format!("http://{}:8889/transcoded_aac.mp4", state.config.lan_ip);
+                    if sub_path.is_some() {
+                        tracing::info!("Subtitles burned into video stream via NVENC");
+                    }
+                }
+                Err(e) => tracing::warn!("Transcode failed (casting original): {}", e),
+            }
+        }
+        _ => {}
     }
 
     // Cast to Chromecast
