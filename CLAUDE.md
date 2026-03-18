@@ -58,7 +58,7 @@ rsync -av --exclude target ~/Projects/spela/src/ darwin:~/spela/src/
 
 ## Hard-Won Lessons
 
-- **webtorrent `-s` BROKEN for packs** (GitHub #331, unmerged PR #2981) — piece verification bug marks ALL pieces as unverified → downloads entire torrent despite `-s`. Not piece-boundary overlap — full regression since v5.1.3. **Fix**: smart ranking puts single-file torrents (file_index=0) first. Torrentio `fileIdx` IS 0-based and maps directly to webtorrent's `-s` index. If only packs available, `-s` still gives the selected file streaming priority (plays first) but everything downloads in background
+- **webtorrent `-s` FIXED** (our PR #3011, fixes #331) — piece verification bug in `_markUnverified` re-selected ALL pieces, downloading entire torrent despite `-s`. Fix: `Selections.contains()` guard prevents re-selecting deselected pieces. Patched in-place on Darwin at `~/.local/share/mise/installs/node/24.14.0/lib/node_modules/webtorrent-cli/node_modules/webtorrent/lib/`. Verified: 27-file season pack → only target file + 1.7MB boundary pieces downloaded (sparse files, no actual disk waste). Smart ranking still prefers single-file torrents as belt-and-suspenders
 - **localhost doesn't work for Chromecast** — always use `192.168.4.1`, Chromecast fetches URL itself
 - **EAC3/AC3/DTS silent** — auto-detect with ffprobe, progressive transcode to AAC stereo
 - **catt mDNS ~40% flaky** — V2 uses rust_cast native + IP cache, no Python deps
