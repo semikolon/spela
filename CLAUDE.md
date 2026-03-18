@@ -51,14 +51,14 @@ rsync -av --exclude target ~/Projects/spela/src/ darwin:~/spela/src/
 - **Service**: `/etc/systemd/system/spela.service` (auto-start, restart on crash)
 - **Config**: `~/.config/spela/config.toml` (TMDB key, default device, LAN IP)
 - **State**: `~/.spela/` (state.json, last_search.json, devices.json, webtorrent.log)
-- **Media**: `~/media/` (temporary, 5GB cap, 24h auto-cleanup)
+- **Media**: `~/media/` (temporary, 10GB cap, 24h auto-cleanup)
 - **Deps**: webtorrent-cli (mise/npm), ffmpeg (apt)
 - **Firewall**: ports 8888 (webtorrent HTTP) + 7890 (spela API) open to LAN in nftables
 - **PATH**: systemd service needs mise shims path for webtorrent
 
 ## Hard-Won Lessons
 
-- **webtorrent `-s` unreliable for packs** — deselects files but still downloads neighbors (100s of MB waste on 20GB packs). Fix: rank single-file torrents first in search results
+- **webtorrent `-s` BROKEN for packs** (GitHub #331, unmerged PR #2981) — piece verification bug marks ALL pieces as unverified → downloads entire torrent despite `-s`. Not piece-boundary overlap — full regression since v5.1.3. **Fix**: smart ranking puts single-file torrents (file_index=0) first. Torrentio `fileIdx` IS 0-based and maps directly to webtorrent's `-s` index. If only packs available, `-s` still gives the selected file streaming priority (plays first) but everything downloads in background
 - **localhost doesn't work for Chromecast** — always use `192.168.4.1`, Chromecast fetches URL itself
 - **EAC3/AC3/DTS silent** — auto-detect with ffprobe, progressive transcode to AAC stereo
 - **catt mDNS ~40% flaky** — V2 uses rust_cast native + IP cache, no Python deps
