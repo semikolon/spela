@@ -165,6 +165,14 @@ async fn handle_play(
                         let next_rid = rid + 1;
                         if next_rid <= search.results.len() {
                             tracing::warn!("Play failed ({}), auto-trying result #{}", v["error"], next_rid);
+                            // Clean up partial files from failed attempt
+                            let transcoded = state.media_dir.join("transcoded_aac.mp4");
+                            if transcoded.exists() {
+                                let _ = std::fs::remove_file(&transcoded);
+                            }
+                            if let Some(pid) = state.ffmpeg_pid.lock().unwrap().take() {
+                                torrent::kill_pid(pid);
+                            }
                             req.result_id = Some(next_rid);
                             req.magnet = None;
                             req.file_index = None;

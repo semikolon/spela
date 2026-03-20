@@ -96,9 +96,44 @@ impl SearchEngine {
 
         if movie {
             self.search_movie(query).await
-        } else {
+        } else if season.is_some() || episode.is_some() {
+            // Explicit season/episode = definitely TV
             self.search_tv(query, season, episode).await
+        } else {
+            // Auto-detect: use TMDB multi-search to determine if it's a movie or TV show
+            match self.tmdb_auto_detect(query).await {
+                Ok(media_type) if media_type == "movie" => {
+                    tracing::info!("Auto-detected '{}' as movie (TMDB multi-search)", query);
+                    self.search_movie(query).await
+                }
+                _ => {
+                    // Default to TV, or if auto-detect found "tv"
+                    self.search_tv(query, season, episode).await
+                }
+            }
         }
+    }
+
+    /// Use TMDB's /search/multi endpoint to detect whether a query is a movie or TV show.
+    async fn tmdb_auto_detect(&self, query: &str) -> Result<String> {
+        let url = format!(
+            "https://api.themoviedb.org/3/search/multi?query={}&api_key={}",
+            urlencoded(query),
+            self.tmdb_key
+        );
+        let resp: Value = self.client.get(&url).send().await?.json().await?;
+        let results = resp["results"].as_array()
+            .ok_or_else(|| anyhow!("No multi-search results"))?;
+
+        // Find the first movie or tv result (skip "person" results)
+        for result in results {
+            if let Some(media_type) = result["media_type"].as_str() {
+                if media_type == "movie" || media_type == "tv" {
+                    return Ok(media_type.to_string());
+                }
+            }
+        }
+        Err(anyhow!("No movie or TV result found"))
     }
 
     async fn search_tv(&self, query: &str, season: Option<u32>, episode: Option<u32>) -> Result<SearchResult> {
