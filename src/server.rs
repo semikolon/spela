@@ -104,6 +104,7 @@ pub struct PlayRequest {
     pub title: Option<String>,
     pub file_index: Option<u32>,
     pub no_subs: Option<bool>,
+    pub no_intro: Option<bool>,
     pub subtitle_lang: Option<String>,
     pub imdb_id: Option<String>,
     pub show: Option<String>,
@@ -298,13 +299,17 @@ async fn do_play(
     // Audio codec detection + transcode (reads from HTTP with -re, never outruns download)
     let mut final_url = server_url.clone();
     let mut is_transcoded = false;
+    let no_intro = req.no_intro.unwrap_or(false);
+    let intro_path = if no_intro { None } else { transcode::find_intro() };
     match transcode::detect_audio_codec(&server_url).await {
         Ok(Some(codec)) if transcode::needs_transcode(&codec) => {
-            tracing::info!("Audio codec {} needs transcode -> AAC{}", codec,
-                if subtitle_srt_path.is_some() { " + subtitle burn-in (NVENC)" } else { "" });
+            tracing::info!("Audio codec {} needs transcode -> AAC{}{}",
+                codec,
+                if subtitle_srt_path.is_some() { " + subtitle burn-in (NVENC)" } else { "" },
+                if intro_path.is_some() { " + intro clip" } else { "" });
 
             let sub_path = subtitle_srt_path.as_deref();
-            match transcode::transcode_audio(&server_url, &state.media_dir, sub_path).await {
+            match transcode::transcode_audio(&server_url, &state.media_dir, sub_path, intro_path.as_deref()).await {
                 Ok((output_path, ffmpeg_pid)) => {
                     // Track ffmpeg PID for the streaming endpoint and cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
@@ -557,6 +562,7 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         title: Some(format!("{} S{:02}E{:02}", show, season, episode)),
         file_index: best.file_index,
         no_subs: None,
+        no_intro: None,
         subtitle_lang: None,
         imdb_id: result.show.as_ref().and_then(|s| s.imdb_id.clone()),
         show: Some(show),

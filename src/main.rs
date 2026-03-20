@@ -67,6 +67,9 @@ enum Commands {
         /// Disable subtitles
         #[arg(long)]
         no_subs: bool,
+        /// Disable intro clip
+        #[arg(long)]
+        no_intro: bool,
     },
     /// Stop current stream
     Stop,
@@ -159,7 +162,7 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             if let Some(e) = episode { url.push_str(&format!("&episode={}", e)); }
             Ok(client.get(&url).send().await?.json().await?)
         }
-        Commands::Play { source, vlc, cast, title, file_index, no_subs } => {
+        Commands::Play { source, vlc, cast, title, file_index, no_subs, no_intro } => {
             // Smart source detection: number = result ID, magnet: = magnet link
             let is_result_id = source.parse::<usize>().ok().filter(|&n| n >= 1 && n <= 20);
             let body = serde_json::json!({
@@ -170,6 +173,7 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
                 "title": title,
                 "file_index": file_index,
                 "no_subs": no_subs,
+                "no_intro": no_intro,
             });
             Ok(client.post(format!("{}/play", base)).json(&body).send().await?.json().await?)
         }
