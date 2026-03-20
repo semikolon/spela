@@ -315,14 +315,16 @@ async fn do_play(
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
 
                     // Wait for sufficient buffer before casting.
-                    // 5MB proves sustained torrent download + transcode pipeline health,
-                    // not just an initial burst. At ~350KB/s real-time rate, takes ~14s.
+                    // 5MB proves sustained torrent download + transcode pipeline health.
+                    // Intro concat + NVENC re-encoding needs more time (~30s) than
+                    // simple audio transcode with video copy (~14s).
                     let prebuffer_min: u64 = 5 * 1024 * 1024; // 5MB
+                    let timeout_secs = if intro_path.is_some() { 45 } else { 25 };
                     let prebuffer_deadline = tokio::time::Instant::now()
-                        + tokio::time::Duration::from_secs(20);
+                        + tokio::time::Duration::from_secs(timeout_secs);
                     loop {
                         if tokio::time::Instant::now() > prebuffer_deadline {
-                            tracing::warn!("Pre-buffer timeout (20s) — casting with available data");
+                            tracing::warn!("Pre-buffer timeout ({}s) — casting with available data", timeout_secs);
                             break;
                         }
                         if let Ok(meta) = std::fs::metadata(&output_path) {
