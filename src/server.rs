@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::{Query, State};
 use axum::http::Method;
-use axum::response::Json;
+use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
 use chrono::Utc;
@@ -26,6 +26,8 @@ pub struct ServerState {
     pub cast: Mutex<CastController>,
     pub state_dir: PathBuf,
     pub media_dir: PathBuf,
+    /// PID of the running ffmpeg transcode process (if any)
+    pub ffmpeg_pid: Mutex<Option<u32>>,
 }
 
 type SharedState = Arc<ServerState>;
@@ -46,6 +48,7 @@ pub async fn run_server(config: Config) -> anyhow::Result<()> {
         cast,
         state_dir,
         media_dir,
+        ffmpeg_pid: Mutex::new(None),
     });
 
     let cors = CorsLayer::new()
@@ -68,6 +71,7 @@ pub async fn run_server(config: Config) -> anyhow::Result<()> {
         .route("/history", get(handle_history))
         .route("/config", get(handle_get_config).post(handle_set_config))
         .route("/cast-info", post(handle_cast_info))
+        .route("/stream/transcode", get(handle_transcode_stream))
         .layer(cors)
         .with_state(state);
 
@@ -285,6 +289,7 @@ async fn do_play(
 
     // Audio codec detection + transcode (reads from HTTP with -re, never outruns download)
     let mut final_url = server_url.clone();
+    let mut is_transcoded = false;
     match transcode::detect_audio_codec(&server_url).await {
         Ok(Some(codec)) if transcode::needs_transcode(&codec) => {
             tracing::info!("Audio codec {} needs transcode -> AAC{}", codec,
@@ -292,17 +297,35 @@ async fn do_play(
 
             let sub_path = subtitle_srt_path.as_deref();
             match transcode::transcode_audio(&server_url, &state.media_dir, sub_path).await {
-                Ok((_path, _child)) => {
-                    // Start python HTTP server for transcoded file
-                    let media_str = state.media_dir.to_string_lossy().to_string();
-                    let _ = tokio::process::Command::new("python3")
-                        .args(["-m", "http.server", "8889", "--directory", &media_str])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
-                    // Wait for initial buffer (fMP4 is playable from first fragment)
-                    tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
-                    final_url = format!("http://{}:8889/transcoded_aac.mp4", state.config.lan_ip);
+                Ok((output_path, ffmpeg_pid)) => {
+                    // Track ffmpeg PID for the streaming endpoint and cleanup
+                    *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
+
+                    // Wait for sufficient buffer before casting
+                    // fMP4 with empty_moov is playable from first fragment, but we need
+                    // enough data for the Chromecast to begin buffering (~2MB minimum)
+                    let prebuffer_min: u64 = 2 * 1024 * 1024; // 2MB
+                    let prebuffer_deadline = tokio::time::Instant::now()
+                        + tokio::time::Duration::from_secs(20);
+                    loop {
+                        if tokio::time::Instant::now() > prebuffer_deadline {
+                            tracing::warn!("Pre-buffer timeout (20s) — casting with available data");
+                            break;
+                        }
+                        if let Ok(meta) = std::fs::metadata(&output_path) {
+                            if meta.len() >= prebuffer_min {
+                                tracing::info!("Pre-buffer ready: {}KB", meta.len() / 1024);
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    }
+
+                    // Serve via axum's streaming endpoint (chunked transfer, no Content-Length)
+                    // This replaces the python http.server which sent Content-Length for a growing file
+                    final_url = format!("http://{}:{}/stream/transcode", state.config.lan_ip, state.config.port);
+                    is_transcoded = true;
+
                     if sub_path.is_some() {
                         tracing::info!("Subtitles burned into video stream via NVENC");
                     }
@@ -318,9 +341,10 @@ async fn do_play(
         let state_clone = state.clone();
         let cast_name_clone = cast_name.clone();
         let url_clone = final_url.clone();
+        let live = is_transcoded;
         let cast_result = tokio::task::spawn_blocking(move || {
             let mut cast = state_clone.cast.lock().unwrap();
-            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4")
+            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4", live)
         }).await;
 
         match cast_result {
@@ -378,6 +402,22 @@ async fn do_play(
 async fn handle_stop(State(state): State<SharedState>) -> Json<Value> {
     let pid_path = state.state_dir.join("webtorrent.pid");
     torrent::stop_by_pid_file(&pid_path);
+
+    // Kill ffmpeg transcode process if running
+    if let Some(pid) = state.ffmpeg_pid.lock().unwrap().take() {
+        torrent::kill_pid(pid);
+        tracing::info!("Killed ffmpeg transcode (PID {})", pid);
+    }
+    // Kill any lingering python http servers (legacy cleanup)
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "python3 -m http.server 8889"])
+        .output();
+
+    // Clean up transcoded file
+    let transcoded = state.media_dir.join("transcoded_aac.mp4");
+    if transcoded.exists() {
+        let _ = std::fs::remove_file(&transcoded);
+    }
 
     let mut app_state = AppState::load(&state.state_dir);
     app_state.stop_current();
@@ -578,6 +618,87 @@ async fn handle_cast_info(
         Ok(Err(e)) => Json(json!({"error": e.to_string()})),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
+}
+
+/// Stream the transcoded file with chunked transfer encoding (no Content-Length).
+/// This replaces python http.server which sent Content-Length based on file size at request time,
+/// causing Chromecast to stop after reading the initial Content-Length bytes of a growing file.
+async fn handle_transcode_stream(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    let path = state.media_dir.join("transcoded_aac.mp4");
+    let ffmpeg_pid = *state.ffmpeg_pid.lock().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+
+        // Wait for file to exist (ffmpeg may not have written it yet)
+        for _ in 0..30 {
+            if path.exists() { break; }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("Failed to open transcoded file: {}", e);
+                return;
+            }
+        };
+
+        let mut buf = vec![0u8; 64 * 1024]; // 64KB read buffer
+        let mut stall_count = 0u32;
+
+        loop {
+            match file.read(&mut buf).await {
+                Ok(0) => {
+                    // At EOF — check if ffmpeg is still running
+                    let ffmpeg_alive = ffmpeg_pid
+                        .map(|pid| unsafe { crate::torrent::kill_check(pid) })
+                        .unwrap_or(false);
+
+                    if !ffmpeg_alive {
+                        // ffmpeg is done, send any remaining data and close
+                        break;
+                    }
+
+                    // ffmpeg still running — file will grow, wait and retry
+                    stall_count += 1;
+                    if stall_count > 600 { // 5 minutes of stall = give up
+                        tracing::warn!("Transcode stream stalled for 5 minutes, closing");
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                Ok(n) => {
+                    stall_count = 0;
+                    let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        // Client disconnected
+                        tracing::info!("Transcode stream client disconnected");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Transcode stream read error: {}", e);
+                    let _ = tx.send(Err(e)).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = axum::body::Body::from_stream(stream);
+
+    axum::response::Response::builder()
+        .header("Content-Type", "video/mp4")
+        .header("Cache-Control", "no-cache, no-store")
+        .header("Connection", "keep-alive")
+        .body(body)
+        .unwrap()
 }
 
 // --- Helpers ---

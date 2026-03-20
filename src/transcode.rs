@@ -27,11 +27,12 @@ pub fn needs_transcode(codec: &str) -> bool {
 /// Uses -re (real-time read) so ffmpeg never outruns the download.
 /// Uses reconnect flags so temporary download stalls don't cause EOF.
 /// Optionally burns in subtitles if subtitle_path is provided.
+/// Returns (output_path, ffmpeg_pid).
 pub async fn transcode_audio(
     input_url: &str,
     media_dir: &Path,
     subtitle_path: Option<&Path>,
-) -> Result<(PathBuf, tokio::process::Child)> {
+) -> Result<(PathBuf, u32)> {
     let output_path = media_dir.join("transcoded_aac.mp4");
 
     let mut args: Vec<String> = vec![
@@ -81,5 +82,10 @@ pub async fn transcode_audio(
         .stderr(std::process::Stdio::null())
         .spawn()?;
 
-    Ok((output_path, child))
+    let pid = child.id().unwrap_or(0);
+
+    // Detach — we track by PID, not by Child handle
+    std::mem::forget(child);
+
+    Ok((output_path, pid))
 }

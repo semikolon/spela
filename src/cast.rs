@@ -131,7 +131,9 @@ impl CastController {
     }
 
     /// Cast a URL to a named Chromecast device.
-    pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str) -> Result<CastResult> {
+    /// Set `live` to true for real-time transcoded streams (uses StreamType::Live,
+    /// which tells the Chromecast not to expect a fixed Content-Length).
+    pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, live: bool) -> Result<CastResult> {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, session_id) = Self::get_or_launch_app(&device)?;
@@ -139,7 +141,7 @@ impl CastController {
         let media = Media {
             content_id: url.to_string(),
             content_type: content_type.to_string(),
-            stream_type: StreamType::Buffered,
+            stream_type: if live { StreamType::Live } else { StreamType::Buffered },
             duration: None,
             metadata: None,
         };
