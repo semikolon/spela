@@ -309,10 +309,10 @@ async fn do_play(
                     // Track ffmpeg PID for the streaming endpoint and cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
 
-                    // Wait for sufficient buffer before casting
-                    // fMP4 with empty_moov is playable from first fragment, but we need
-                    // enough data for the Chromecast to begin buffering (~2MB minimum)
-                    let prebuffer_min: u64 = 2 * 1024 * 1024; // 2MB
+                    // Wait for sufficient buffer before casting.
+                    // 5MB proves sustained torrent download + transcode pipeline health,
+                    // not just an initial burst. At ~350KB/s real-time rate, takes ~14s.
+                    let prebuffer_min: u64 = 5 * 1024 * 1024; // 5MB
                     let prebuffer_deadline = tokio::time::Instant::now()
                         + tokio::time::Duration::from_secs(20);
                     loop {
