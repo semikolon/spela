@@ -125,6 +125,8 @@ pub async fn transcode_audio(
         "-c:a".into(), "aac".into(),
         "-ac".into(), "2".into(),
         "-b:a".into(), "192k".into(),
+        "-dn".into(),                // Strip data streams (bin_data) — Chromecast rejects them
+        "-map_metadata".into(), "-1".into(), // Strip metadata tracks
         "-movflags".into(), "frag_keyframe+empty_moov+default_base_moof".into(),
         "-y".into(),
         output_path.to_str().unwrap_or("transcoded_aac.mp4").into(),
