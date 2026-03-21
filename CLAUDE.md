@@ -15,6 +15,7 @@ spela search "Good Luck Have Fun Dont Die"       # Auto-detects movie vs TV
 spela search "legion" --season 1 --episode 5   # Search + rank results
 spela play 1                                     # Play result #1 (auto: magnet, file_index, metadata)
 spela play 1 --cast "Vardagsrum"                 # Play to living room TV
+spela play 1 --no-intro                          # Skip intro bumper
 spela next                                       # Next episode
 spela pause / resume / stop                      # Playback control
 spela status / history / targets                 # Info
@@ -29,7 +30,7 @@ spela status / history / targets                 # Info
 - `src/search.rs` — TMDB + Torrentio. **Auto-detect movie vs TV** via TMDB multi-search. Smart ranking: single-file torrents above season packs, then by seeds
 - `src/cast.rs` — Native Chromecast via rust_cast + mdns-sd. 3x retry + IP cache + known device fallback
 - `src/torrent.rs` — webtorrent-cli subprocess management with `-s <fileIdx>` for file selection
-- `src/transcode.rs` — ffprobe codec detection + ffmpeg EAC3/DTS/AC3→AAC transcode
+- `src/transcode.rs` — ffprobe codec detection + ffmpeg EAC3/DTS/AC3→AAC transcode + intro concat
 - `src/subtitles.rs` — Stremio OpenSubtitles v3 (zero auth), SRT→WebVTT
 - `src/disk.rs` — 5GB cap, 24h file cleanup
 - `src/state.rs` — state.json + last_search.json (play-by-id)
@@ -50,6 +51,7 @@ ssh darwin 'sudo systemctl stop spela && cp ~/Projects/spela/target/release/spel
 - **Service**: `/etc/systemd/system/spela.service` (auto-start, restart on crash)
 - **Config**: `~/.config/spela/config.toml` (TMDB key, default device, LAN IP)
 - **State**: `~/.spela/` (state.json, last_search.json, devices.json, webtorrent.log)
+- **Intro**: `~/.config/spela/intro.mp4` (5s Kling AI-generated bumper, 1080p H.264+AAC)
 - **Media**: `~/media/` (temporary, 10GB cap, 24h auto-cleanup). Transcoded files cleaned on stop
 - **Deps**: webtorrent-cli (mise/npm), ffmpeg (apt)
 - **Firewall**: ports 8888 (webtorrent HTTP) + 7890 (spela API) open to LAN in nftables
@@ -66,6 +68,8 @@ ssh darwin 'sudo systemctl stop spela && cp ~/Projects/spela/target/release/spel
 - **catt mDNS ~40% flaky** — V2 uses rust_cast native + IP cache, no Python deps
 - **webtorrent --chromecast broken** — serve via HTTP (:8888) + cast URL via rust_cast
 - **systemd PATH** — needs explicit PATH env for mise shims (webtorrent not in default PATH)
+- **Intro clip** (Mar 21, 2026) — `~/.config/spela/intro.mp4` prepended via ffmpeg concat filter when transcoding is active. Both streams scaled to 1080p, NVENC re-encodes the combined output. 45s pre-buffer (vs 25s without intro) due to heavier pipeline. `--no-intro` to disable. Only activates when audio transcode is already needed; direct-cast skips intro. **Gotcha**: strip `-dn -map_metadata -1` required — concat produces `bin_data` streams that Chromecast rejects
+- **Chromecast progress bar during intro** — Default Media Receiver (CC1AD845) always shows overlay for ~5s on media load. Custom Receiver App ($5 Google Cast SDK registration, ~50-line HTML) would give full UI control. Not yet implemented
 - **GPU coexistence** — NVENC transcode (163MB), llama.cpp embeddings (2.8GB), Chrome kiosk (103MB) all fit in 4GB VRAM simultaneously
 
 ## Chromecast Devices
