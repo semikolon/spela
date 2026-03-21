@@ -404,6 +404,62 @@ async fn do_play(
     });
     let _ = app_state.save(&state.state_dir);
 
+    // Spawn post-playback reaper: monitors pipeline, auto-cleans when movie ends.
+    // Frees webtorrent's ~1.5GB RAM and cleans up media files.
+    {
+        let state = state.clone();
+        let webtorrent_pid = pid;
+        let title_for_log = title.clone();
+        tokio::spawn(async move {
+            // Wait for playback to establish before monitoring
+            tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+
+                // Check if this stream is still the current one (user may have started another)
+                let app_state = AppState::load(&state.state_dir);
+                match &app_state.current {
+                    Some(c) if c.pid == webtorrent_pid => {} // Still our stream
+                    _ => {
+                        tracing::debug!("Reaper: stream replaced or stopped, exiting");
+                        break;
+                    }
+                }
+
+                let wt_alive = unsafe { torrent::kill_check(webtorrent_pid) };
+                let ffmpeg_alive = state.ffmpeg_pid.lock().unwrap()
+                    .map(|p| unsafe { torrent::kill_check(p) })
+                    .unwrap_or(false);
+
+                if !ffmpeg_alive && !wt_alive {
+                    // Both dead — playback fully finished
+                    tracing::info!("Reaper: all processes exited for '{}', cleaning up", title_for_log);
+                    do_cleanup(&state);
+                    break;
+                }
+
+                if !ffmpeg_alive && wt_alive {
+                    // ffmpeg done (movie finished transcoding), webtorrent still seeding.
+                    // Grace period: let Chromecast play remaining buffer
+                    tracing::info!("Reaper: ffmpeg finished for '{}', grace period before cleanup...", title_for_log);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(180)).await;
+
+                    // Re-check we're still the active stream
+                    let app_state = AppState::load(&state.state_dir);
+                    match &app_state.current {
+                        Some(c) if c.pid == webtorrent_pid => {
+                            tracing::info!("Reaper: cleaning up webtorrent + media for '{}'", title_for_log);
+                            do_cleanup(&state);
+                        }
+                        _ => tracing::debug!("Reaper: stream changed during grace period"),
+                    }
+                    break;
+                }
+            }
+        });
+    }
+
     Json(json!({
         "status": "streaming",
         "pid": pid,
@@ -414,21 +470,19 @@ async fn do_play(
     }))
 }
 
-async fn handle_stop(State(state): State<SharedState>) -> Json<Value> {
+/// Shared cleanup logic: kill webtorrent + ffmpeg, delete transcoded file, update state.
+fn do_cleanup(state: &SharedState) {
     let pid_path = state.state_dir.join("webtorrent.pid");
     torrent::stop_by_pid_file(&pid_path);
 
-    // Kill ffmpeg transcode process if running
     if let Some(pid) = state.ffmpeg_pid.lock().unwrap().take() {
         torrent::kill_pid(pid);
-        tracing::info!("Killed ffmpeg transcode (PID {})", pid);
     }
-    // Kill any lingering python http servers (legacy cleanup)
+    // Kill any lingering python http servers (legacy)
     let _ = std::process::Command::new("pkill")
         .args(["-f", "python3 -m http.server 8889"])
         .output();
 
-    // Clean up transcoded file
     let transcoded = state.media_dir.join("transcoded_aac.mp4");
     if transcoded.exists() {
         let _ = std::fs::remove_file(&transcoded);
@@ -437,7 +491,10 @@ async fn handle_stop(State(state): State<SharedState>) -> Json<Value> {
     let mut app_state = AppState::load(&state.state_dir);
     app_state.stop_current();
     let _ = app_state.save(&state.state_dir);
+}
 
+async fn handle_stop(State(state): State<SharedState>) -> Json<Value> {
+    do_cleanup(&state);
     Json(json!({"status": "stopped"}))
 }
 
