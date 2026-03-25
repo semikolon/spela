@@ -310,17 +310,24 @@ impl SearchEngine {
             }
         }).collect();
 
-        // Smart ranking: single-file torrents first, then by seeds
-        // file_index=0 or None = likely single file (best — no wasted disk space)
-        // file_index>=1 = multi-file pack (webtorrent -s is unreliable, downloads neighbors)
+        // Smart ranking (3 tiers):
+        // 1. Single-file > season pack (webtorrent -s is unreliable for packs)
+        // 2. H.264 > HEVC/x265 (Chromecast-native vs NVENC re-encode needed)
+        // 3. More seeds > fewer seeds
         results.sort_by(|a, b| {
             let a_single = a.file_index.map_or(true, |i| i == 0);
             let b_single = b.file_index.map_or(true, |i| i == 0);
-            match (a_single, b_single) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => b.seeds.cmp(&a.seeds), // within same tier, prefer more seeds
+            if a_single != b_single {
+                return if a_single { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
             }
+
+            let a_hevc = is_hevc_from_title(&a.title);
+            let b_hevc = is_hevc_from_title(&b.title);
+            if a_hevc != b_hevc {
+                return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+            }
+
+            b.seeds.cmp(&a.seeds)
         });
 
         // Assign IDs after sorting
@@ -330,6 +337,13 @@ impl SearchEngine {
 
         Ok(results.into_iter().take(8).collect())
     }
+}
+
+/// Detect HEVC/x265 from torrent filename — these need NVENC re-encoding for Chromecast.
+fn is_hevc_from_title(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    lower.contains("x265") || lower.contains("h265") || lower.contains("h.265")
+        || lower.contains("hevc") || lower.contains("10bit") || lower.contains("10-bit")
 }
 
 fn extract_episode(val: &Value) -> Option<EpisodeRef> {
