@@ -2,10 +2,11 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-/// Detect audio codec of a media URL/file using ffprobe.
-pub async fn detect_audio_codec(url: &str) -> Result<Option<String>> {
+/// Detect audio and video codecs of a media URL/file using ffprobe.
+/// Returns (video_codec, audio_codec).
+pub async fn detect_codecs(url: &str) -> Result<(Option<String>, Option<String>)> {
     let output = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", url])
+        .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name", url])
         .output()
         .await?;
 
@@ -13,14 +14,35 @@ pub async fn detect_audio_codec(url: &str) -> Result<Option<String>> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}{}", stdout, stderr);
 
-    Ok(combined.lines()
-        .find_map(|line| line.strip_prefix("codec_name="))
-        .map(|s| s.trim().to_string()))
+    let mut video_codec = None;
+    let mut audio_codec = None;
+    let mut current_type = None;
+
+    for line in combined.lines() {
+        if let Some(ct) = line.strip_prefix("codec_type=") {
+            current_type = Some(ct.trim().to_string());
+        }
+        if let Some(cn) = line.strip_prefix("codec_name=") {
+            match current_type.as_deref() {
+                Some("video") if video_codec.is_none() => video_codec = Some(cn.trim().to_string()),
+                Some("audio") if audio_codec.is_none() => audio_codec = Some(cn.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    Ok((video_codec, audio_codec))
 }
 
-/// Returns true if the codec needs transcoding for Chromecast.
-pub fn needs_transcode(codec: &str) -> bool {
+/// Returns true if the audio codec needs transcoding for Chromecast.
+pub fn audio_needs_transcode(codec: &str) -> bool {
     matches!(codec, "ac3" | "eac3" | "dts" | "truehd" | "dca")
+}
+
+/// Returns true if the video codec needs transcoding for Chromecast.
+/// Basic Chromecasts only support H.264. HEVC/VP9/AV1 need re-encoding.
+pub fn video_needs_transcode(codec: &str) -> bool {
+    matches!(codec, "hevc" | "h265" | "vp9" | "av1")
 }
 
 /// Resolve intro clip path from config directory.
@@ -33,16 +55,17 @@ pub fn find_intro() -> Option<PathBuf> {
     }
 }
 
-/// Transcode audio to AAC from an HTTP URL (progressive/streaming input).
+/// Transcode media from an HTTP URL (progressive/streaming input).
 /// Uses -re (real-time read) so ffmpeg never outruns the download.
 /// Uses reconnect flags so temporary download stalls don't cause EOF.
-/// Optionally burns in subtitles and/or prepends an intro clip.
+/// Optionally re-encodes video (HEVC→H.264), burns in subtitles, and/or prepends intro clip.
 /// Returns (output_path, ffmpeg_pid).
-pub async fn transcode_audio(
+pub async fn transcode(
     input_url: &str,
     media_dir: &Path,
     subtitle_path: Option<&Path>,
     intro_path: Option<&Path>,
+    video_reencode: bool,
 ) -> Result<(PathBuf, u32)> {
     let output_path = media_dir.join("transcoded_aac.mp4");
     let has_intro = intro_path.is_some();
@@ -116,8 +139,15 @@ pub async fn transcode_audio(
             "-preset".into(), "p4".into(),
             "-cq".into(), "23".into(),
         ]);
+    } else if video_reencode {
+        // No intro, no subs, but video needs re-encoding (HEVC→H.264)
+        args.extend([
+            "-c:v".into(), "h264_nvenc".into(),
+            "-preset".into(), "p4".into(),
+            "-cq".into(), "23".into(),
+        ]);
     } else {
-        // No intro, no subs — video copy (cheapest path)
+        // No intro, no subs, compatible video — video copy (cheapest path)
         args.extend(["-c:v".into(), "copy".into()]);
     }
 

@@ -296,20 +296,29 @@ async fn do_play(
         }
     }
 
-    // Audio codec detection + transcode (reads from HTTP with -re, never outruns download)
+    // Codec detection + transcode decision
     let mut final_url = server_url.clone();
     let mut is_transcoded = false;
     let no_intro = req.no_intro.unwrap_or(false);
     let intro_path = if no_intro { None } else { transcode::find_intro() };
-    match transcode::detect_audio_codec(&server_url).await {
-        Ok(Some(codec)) if transcode::needs_transcode(&codec) => {
-            tracing::info!("Audio codec {} needs transcode -> AAC{}{}",
-                codec,
-                if subtitle_srt_path.is_some() { " + subtitle burn-in (NVENC)" } else { "" },
-                if intro_path.is_some() { " + intro clip" } else { "" });
 
-            let sub_path = subtitle_srt_path.as_deref();
-            match transcode::transcode_audio(&server_url, &state.media_dir, sub_path, intro_path.as_deref()).await {
+    let (video_codec, audio_codec) = transcode::detect_codecs(&server_url).await
+        .unwrap_or((None, None));
+
+    let need_audio_tc = audio_codec.as_deref().map_or(false, transcode::audio_needs_transcode);
+    let need_video_tc = video_codec.as_deref().map_or(false, transcode::video_needs_transcode);
+    let need_transcode = need_audio_tc || need_video_tc || intro_path.is_some() || subtitle_srt_path.is_some();
+
+    if need_transcode {
+        let mut reasons = Vec::new();
+        if need_audio_tc { reasons.push(format!("{} -> AAC", audio_codec.as_deref().unwrap_or("?"))); }
+        if need_video_tc { reasons.push(format!("{} -> H.264 (NVENC)", video_codec.as_deref().unwrap_or("?"))); }
+        if subtitle_srt_path.is_some() { reasons.push("subtitle burn-in".into()); }
+        if intro_path.is_some() { reasons.push("intro clip".into()); }
+        tracing::info!("Transcode needed: {}", reasons.join(" + "));
+
+        let sub_path = subtitle_srt_path.as_deref();
+        match transcode::transcode(&server_url, &state.media_dir, sub_path, intro_path.as_deref(), need_video_tc).await {
                 Ok((output_path, ffmpeg_pid)) => {
                     // Track ffmpeg PID for the streaming endpoint and cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
@@ -347,8 +356,6 @@ async fn do_play(
                 }
                 Err(e) => tracing::warn!("Transcode failed (casting original): {}", e),
             }
-        }
-        _ => {}
     }
 
     // Cast to Chromecast

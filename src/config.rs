@@ -22,7 +22,7 @@ pub struct Config {
     pub port: u16,
 }
 
-fn default_server() -> String { "darwin:7890".into() }
+fn default_server() -> String { "darwin.home:7890".into() }
 fn default_device() -> String { "Fredriks TV".into() }
 fn default_subtitles() -> String { "en".into() }
 fn default_quality() -> String { "1080p".into() }
