@@ -312,8 +312,10 @@ impl SearchEngine {
 
         // Smart ranking (3 tiers):
         // 1. Single-file > season pack (webtorrent -s is unreliable for packs)
-        // 2. H.264 > HEVC/x265 (Chromecast-native vs NVENC re-encode needed)
+        // 2. H.264 > HEVC/x265, BUT only if H.264 has enough seeds (≥5).
+        //    A well-seeded HEVC beats a dead H.264 — NVENC handles the transcode.
         // 3. More seeds > fewer seeds
+        const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
         results.sort_by(|a, b| {
             let a_single = a.file_index.map_or(true, |i| i == 0);
             let b_single = b.file_index.map_or(true, |i| i == 0);
@@ -323,8 +325,12 @@ impl SearchEngine {
 
             let a_hevc = is_hevc_from_title(&a.title);
             let b_hevc = is_hevc_from_title(&b.title);
+            // Only apply codec preference when the preferred result has viable seeds
             if a_hevc != b_hevc {
-                return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+                let preferred = if a_hevc { b } else { a }; // the H.264 one
+                if preferred.seeds >= MIN_SEEDS_FOR_CODEC_PREF {
+                    return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+                }
             }
 
             b.seeds.cmp(&a.seeds)
