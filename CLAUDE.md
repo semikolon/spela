@@ -45,7 +45,13 @@ ssh darwin 'cd ~/Projects/spela && git pull && cargo build --release'
 ssh darwin 'sudo systemctl stop spela && cp ~/Projects/spela/target/release/spela ~/.local/bin/ && sudo systemctl start spela'
 ```
 
-## Darwin Setup
+## Mac Mini (Client)
+
+- **Symlink**: `~/.local/bin/spela` → `~/Projects/spela/target/release/spela` (rebuilds auto-update the symlink target)
+- **Default server**: `darwin.home:7890` (hardcoded in `src/config.rs`, overridable via `~/.config/spela/config.toml` or `~/Library/Application Support/spela/config.toml`)
+- **Ruby voice assistant**: Can control spela via `run_spela` tool (Gemini function declaration in `conversation_engine.py`). Example: "Hey Ruby, play Legion season one episode two"
+
+## Darwin (Server)
 
 - **Binary**: `~/.local/bin/spela`
 - **Service**: `/etc/systemd/system/spela.service` (auto-start, restart on crash)
