@@ -4,7 +4,7 @@
 
 Rust CLI + HTTP API server for torrent-to-Chromecast streaming. Single 6.9MB binary, zero runtime deps on target (except webtorrent-cli and ffmpeg).
 
-**Status**: v2.0.0 deployed on Darwin as systemd service. Chromecast casting stable (Mar 20 streaming fix).
+**Status**: v2.0.0 deployed on Darwin. Casting stable, pause/resume works, intro clip, HEVC transcode. Seeking blocked on Custom Receiver App (next step).
 
 **Architecture**: `spela server` on Darwin (`darwin.home:7890`). `spela <command>` thin HTTP client from any LAN machine. Voice assistants call HTTP API directly.
 
@@ -27,10 +27,10 @@ spela status / history / targets                 # Info
 
 - `src/main.rs` — CLI (clap) + server startup. Detects `play 1` (result ID) vs `play magnet:...`
 - `src/server.rs` — axum HTTP API, 14 endpoints. Orchestrates search→play→cast pipeline
-- `src/search.rs` — TMDB + Torrentio. **Auto-detect movie vs TV** via TMDB multi-search. Smart ranking: single-file torrents above season packs, then by seeds
+- `src/search.rs` — TMDB + Torrentio. **Auto-detect movie vs TV** via TMDB multi-search. **3-tier ranking**: single-file > H.264 > HEVC (≥5 seed threshold), then by seeds
 - `src/cast.rs` — Native Chromecast via rust_cast + mdns-sd. 3x retry + IP cache + known device fallback
 - `src/torrent.rs` — webtorrent-cli subprocess management with `-s <fileIdx>` for file selection
-- `src/transcode.rs` — ffprobe codec detection + ffmpeg EAC3/DTS/AC3→AAC transcode + intro concat
+- `src/transcode.rs` — ffprobe codec+duration detection, ffmpeg audio transcode (EAC3/DTS/AC3→AAC) + video transcode (HEVC→H.264 via NVENC) + intro concat
 - `src/subtitles.rs` — Stremio OpenSubtitles v3 (zero auth), SRT→WebVTT
 - `src/disk.rs` — 5GB cap, 24h file cleanup
 - `src/state.rs` — state.json + last_search.json (play-by-id)
@@ -74,9 +74,14 @@ ssh darwin 'sudo systemctl stop spela && cp ~/Projects/spela/target/release/spel
 - **catt mDNS ~40% flaky** — V2 uses rust_cast native + IP cache, no Python deps
 - **webtorrent --chromecast broken** — serve via HTTP (:8888) + cast URL via rust_cast
 - **systemd PATH** — needs explicit PATH env for mise shims (webtorrent not in default PATH)
-- **Intro clip** (Mar 21, 2026) — `~/.config/spela/intro.mp4` prepended via ffmpeg concat filter when transcoding is active. Both streams scaled to 1080p, NVENC re-encodes the combined output. 45s pre-buffer (vs 25s without intro) due to heavier pipeline. `--no-intro` to disable. Only activates when audio transcode is already needed; direct-cast skips intro. **Gotcha**: strip `-dn -map_metadata -1` required — concat produces `bin_data` streams that Chromecast rejects
-- **Chromecast progress bar during intro** — Default Media Receiver (CC1AD845) always shows overlay for ~5s on media load. Custom Receiver App ($5 Google Cast SDK registration, ~50-line HTML) would give full UI control. Not yet implemented
+- **HEVC/VP9/AV1 auto-transcode** (Mar 26) — `detect_codecs()` returns video+audio+duration. HEVC torrents auto-transcoded to H.264 via NVENC. Search ranking deprioritizes HEVC (but well-seeded HEVC beats dead H.264, threshold ≥5 seeds)
+- **Intro clip** (Mar 21) — `~/.config/spela/intro.mp4` prepended via ffmpeg concat filter. Always plays when present (triggers NVENC pipeline). Both streams scaled to 1080p. 45s pre-buffer (vs 25s without intro). `--no-intro` to disable. **Gotcha**: `-dn -map_metadata -1` required — concat produces `bin_data` streams Chromecast rejects
+- **Pause/resume works** (Mar 26) — no stall timeout (removed). Tested up to 10-minute pauses. ffmpeg exit is the only stream termination signal
+- **Silent Range requests** (Mar 26) — `/stream/transcode` honors `Range: bytes=N-` by seeking the file, but ALWAYS returns 200 (never 206/Accept-Ranges). Chromecast switches to VOD mode if it sees range headers → disconnects on growing files. Silent approach: seek works, Chromecast stays in live mode
+- **Seeking does NOT work** with Default Media Receiver — fMP4 has no byte-offset index, Chromecast can't map timestamps to file positions. Both `StreamType::Live` and `StreamType::Buffered` (with known duration from ffprobe) tested — seek always resets to start. Jellyfin solves this with Custom Receiver + Shaka Player + server-side seek-restart. **Next step**: $5 Google Cast SDK → Custom Receiver App
+- **Post-playback reaper** (Mar 21) — background task monitors ffmpeg PID. When movie ends (ffmpeg exits), waits 3 min grace, kills webtorrent (~1.5GB freed), cleans files. Detects stream replacement and exits cleanly
 - **GPU coexistence** — NVENC transcode (163MB), llama.cpp embeddings (2.8GB), Chrome kiosk (103MB) all fit in 4GB VRAM simultaneously
+- **Jellyfin evaluated, rejected** (Mar 26) — library-centric (no "stream torrent NOW" flow), C#/.NET plugins, mixed Chromecast reliability. spela Custom Receiver is cleaner path for seeking
 
 ## Chromecast Devices
 
