@@ -131,26 +131,20 @@ impl CastController {
     }
 
     /// Cast a URL to a named Chromecast device.
-    /// Cast a URL to a named Chromecast device.
-    /// When `duration` is provided, uses StreamType::Buffered (enables seeking).
-    /// When `duration` is None, uses StreamType::Live (growing file, no seeking).
-    /// Jellyfin's approach: BUFFERED + known duration from source metadata, HTTP stream
-    /// can still be chunked (no Content-Length needed in the HTTP response).
+    /// Uses StreamType::Live for transcoded streams (chunked, growing file).
+    /// Duration passed for display purposes but seeking requires Custom Receiver —
+    /// Default Media Receiver can't seek in fMP4 without byte-offset index.
+    /// Jellyfin solves this with custom receiver + Shaka Player + server-side seek-restart.
     pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, duration: Option<f64>) -> Result<CastResult> {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, session_id) = Self::get_or_launch_app(&device)?;
 
-        let (stream_type, media_duration) = match duration {
-            Some(d) => (StreamType::Buffered, Some(d as f32)),
-            None => (StreamType::Live, None),
-        };
-
         let media = Media {
             content_id: url.to_string(),
             content_type: content_type.to_string(),
-            stream_type,
-            duration: media_duration,
+            stream_type: StreamType::Live,
+            duration: duration.map(|d| d as f32),
             metadata: None,
         };
 
