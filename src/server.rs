@@ -302,8 +302,11 @@ async fn do_play(
     let no_intro = req.no_intro.unwrap_or(false);
     let intro_path = if no_intro { None } else { transcode::find_intro() };
 
-    let (video_codec, audio_codec) = transcode::detect_codecs(&server_url).await
-        .unwrap_or((None, None));
+    let (video_codec, audio_codec, source_duration) = transcode::detect_codecs(&server_url).await
+        .unwrap_or((None, None, None));
+    if let Some(dur) = source_duration {
+        tracing::info!("Source duration: {:.0}s ({:.0} min)", dur, dur / 60.0);
+    }
 
     let need_audio_tc = audio_codec.as_deref().map_or(false, transcode::audio_needs_transcode);
     let need_video_tc = video_codec.as_deref().map_or(false, transcode::video_needs_transcode);
@@ -363,10 +366,15 @@ async fn do_play(
         let state_clone = state.clone();
         let cast_name_clone = cast_name.clone();
         let url_clone = final_url.clone();
-        let live = is_transcoded;
+        // When duration is known, use Buffered (enables seeking). Otherwise Live.
+        // Intro adds ~5s to total duration.
+        let cast_duration = source_duration.map(|d| {
+            let intro_secs = if intro_path.is_some() { 5.0 } else { 0.0 };
+            d + intro_secs
+        });
         let cast_result = tokio::task::spawn_blocking(move || {
             let mut cast = state_clone.cast.lock().unwrap();
-            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4", live)
+            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4", cast_duration)
         }).await;
 
         match cast_result {

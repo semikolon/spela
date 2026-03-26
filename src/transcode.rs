@@ -2,11 +2,11 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-/// Detect audio and video codecs of a media URL/file using ffprobe.
-/// Returns (video_codec, audio_codec).
-pub async fn detect_codecs(url: &str) -> Result<(Option<String>, Option<String>)> {
+/// Detect audio/video codecs and duration of a media URL/file using ffprobe.
+/// Returns (video_codec, audio_codec, duration_secs).
+pub async fn detect_codecs(url: &str) -> Result<(Option<String>, Option<String>, Option<f64>)> {
     let output = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name", url])
+        .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name", "-show_entries", "format=duration", url])
         .output()
         .await?;
 
@@ -16,6 +16,7 @@ pub async fn detect_codecs(url: &str) -> Result<(Option<String>, Option<String>)
 
     let mut video_codec = None;
     let mut audio_codec = None;
+    let mut duration = None;
     let mut current_type = None;
 
     for line in combined.lines() {
@@ -29,9 +30,14 @@ pub async fn detect_codecs(url: &str) -> Result<(Option<String>, Option<String>)
                 _ => {}
             }
         }
+        if let Some(dur) = line.strip_prefix("duration=") {
+            if let Ok(d) = dur.trim().parse::<f64>() {
+                duration = Some(d);
+            }
+        }
     }
 
-    Ok((video_codec, audio_codec))
+    Ok((video_codec, audio_codec, duration))
 }
 
 /// Returns true if the audio codec needs transcoding for Chromecast.

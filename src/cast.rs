@@ -131,18 +131,26 @@ impl CastController {
     }
 
     /// Cast a URL to a named Chromecast device.
-    /// Set `live` to true for real-time transcoded streams (uses StreamType::Live,
-    /// which tells the Chromecast not to expect a fixed Content-Length).
-    pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, live: bool) -> Result<CastResult> {
+    /// Cast a URL to a named Chromecast device.
+    /// When `duration` is provided, uses StreamType::Buffered (enables seeking).
+    /// When `duration` is None, uses StreamType::Live (growing file, no seeking).
+    /// Jellyfin's approach: BUFFERED + known duration from source metadata, HTTP stream
+    /// can still be chunked (no Content-Length needed in the HTTP response).
+    pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, duration: Option<f64>) -> Result<CastResult> {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, session_id) = Self::get_or_launch_app(&device)?;
 
+        let (stream_type, media_duration) = match duration {
+            Some(d) => (StreamType::Buffered, Some(d as f32)),
+            None => (StreamType::Live, None),
+        };
+
         let media = Media {
             content_id: url.to_string(),
             content_type: content_type.to_string(),
-            stream_type: if live { StreamType::Live } else { StreamType::Buffered },
-            duration: None,
+            stream_type,
+            duration: media_duration,
             metadata: None,
         };
 
