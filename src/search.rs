@@ -2,6 +2,9 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Torrentio API — aggregates 24 torrent sites (TPB, 1337x, YTS, RARBG, TorrentGalaxy, etc.)
+/// Default providers already return 76+ results per movie. All-providers URL doesn't add more.
+/// Other Stremio addons (MediaFusion, Knightcrawler, Comet) require encrypted config URLs.
 const TORRENTIO_BASE: &str = "https://torrentio.strem.fun/sort=seeders";
 
 const PUBLIC_TRACKERS: &[&str] = &[
