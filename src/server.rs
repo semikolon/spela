@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Query, State};
-use axum::http::Method;
+use axum::http::{HeaderMap, Method};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
@@ -703,16 +703,48 @@ async fn handle_cast_info(
 /// Stream the transcoded file with chunked transfer encoding (no Content-Length).
 /// Tails the growing file as ffmpeg writes to it. No stall timeout — ffmpeg dying
 /// is the only termination signal, supporting indefinite pauses.
+///
+/// Range request support (for reconnection):
+/// - Honors `Range: bytes=N-` by seeking to offset N before streaming
+/// - NEVER advertises `Accept-Ranges` or sends 206 — Chromecast interprets those
+///   as "this is a seekable VOD file", which conflicts with StreamType::Live and
+///   causes it to probe for Content-Length, fail, and go idle
+/// - Always responds 200 with chunked transfer, even for Range requests
+/// - This allows non-Chromecast clients to reconnect at an offset while keeping
+///   Chromecast in live streaming mode
 async fn handle_transcode_stream(
     State(state): State<SharedState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let path = state.media_dir.join("transcoded_aac.mp4");
     let ffmpeg_pid = *state.ffmpeg_pid.lock().unwrap();
 
+    // Parse Range header for reconnection support: "bytes=N-" -> seek to N
+    // Only open-ended ranges are supported (no end byte) since file is growing
+    let start_offset: u64 = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|range_str| {
+            let range_str = range_str.strip_prefix("bytes=")?;
+            let dash_pos = range_str.find('-')?;
+            let start_str = &range_str[..dash_pos];
+            // Only honor open-ended ranges (bytes=N-), not bounded (bytes=N-M)
+            let after_dash = &range_str[dash_pos + 1..];
+            if !after_dash.is_empty() {
+                return None; // Bounded range — ignore for growing file
+            }
+            start_str.parse::<u64>().ok()
+        })
+        .unwrap_or(0);
+
+    if start_offset > 0 {
+        tracing::info!("Transcode stream: Range request, seeking to byte {}", start_offset);
+    }
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
 
     tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
         // Wait for file to exist (ffmpeg may not have written it yet)
         for _ in 0..30 {
@@ -727,6 +759,24 @@ async fn handle_transcode_stream(
                 return;
             }
         };
+
+        // Seek to requested offset for reconnection
+        if start_offset > 0 {
+            // Verify the file has enough data to seek to
+            if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                if start_offset <= metadata.len() {
+                    if let Err(e) = file.seek(std::io::SeekFrom::Start(start_offset)).await {
+                        tracing::warn!("Transcode stream: seek to {} failed: {}", start_offset, e);
+                        // Fall through — stream from beginning
+                    }
+                } else {
+                    tracing::warn!(
+                        "Transcode stream: requested offset {} beyond file size {}, streaming from start",
+                        start_offset, metadata.len()
+                    );
+                }
+            }
+        }
 
         let mut buf = vec![0u8; 64 * 1024]; // 64KB read buffer
 
@@ -767,6 +817,10 @@ async fn handle_transcode_stream(
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = axum::body::Body::from_stream(stream);
 
+    // CRITICAL: Never send Accept-Ranges or 206 status — Chromecast Default Media
+    // Receiver interprets those as "seekable VOD content", overriding StreamType::Live.
+    // It then probes for Content-Length, fails (growing file), and abandons playback.
+    // Always respond 200 with chunked transfer to keep Chromecast in live mode.
     axum::response::Response::builder()
         .header("Content-Type", "video/mp4")
         .header("Cache-Control", "no-cache, no-store")
