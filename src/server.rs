@@ -700,21 +700,33 @@ async fn handle_cast_info(
     }
 }
 
-/// Stream the transcoded file with chunked transfer encoding (no Content-Length).
-/// This replaces python http.server which sent Content-Length based on file size at request time,
-/// causing Chromecast to stop after reading the initial Content-Length bytes of a growing file.
+/// Stream the transcoded file with Range request support.
+/// Supports pause/resume/seek — Chromecast can reconnect at any byte offset.
+/// When no Range header: streams from beginning with chunked transfer (live mode).
+/// When Range header present: serves the requested byte range from the file on disk.
 async fn handle_transcode_stream(
     State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let path = state.media_dir.join("transcoded_aac.mp4");
     let ffmpeg_pid = *state.ffmpeg_pid.lock().unwrap();
 
+    // Parse Range header if present (e.g., "bytes=12345-")
+    let range_start = headers.get("range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("bytes="))
+        .and_then(|s| s.split('-').next())
+        .and_then(|s| s.parse::<u64>().ok());
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
 
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
+    let is_range = range_start.is_some();
+    let start_offset = range_start.unwrap_or(0);
 
-        // Wait for file to exist (ffmpeg may not have written it yet)
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        // Wait for file to exist
         for _ in 0..30 {
             if path.exists() { break; }
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -728,8 +740,16 @@ async fn handle_transcode_stream(
             }
         };
 
+        // Seek to requested offset for Range requests
+        if start_offset > 0 {
+            if let Err(e) = file.seek(std::io::SeekFrom::Start(start_offset)).await {
+                tracing::error!("Failed to seek to byte {}: {}", start_offset, e);
+                return;
+            }
+            tracing::info!("Range request: serving from byte {}", start_offset);
+        }
+
         let mut buf = vec![0u8; 64 * 1024]; // 64KB read buffer
-        let mut stall_count = 0u32;
 
         loop {
             match file.read(&mut buf).await {
@@ -740,23 +760,18 @@ async fn handle_transcode_stream(
                         .unwrap_or(false);
 
                     if !ffmpeg_alive {
-                        // ffmpeg is done, send any remaining data and close
-                        break;
+                        break; // ffmpeg done, all data sent
                     }
 
-                    // ffmpeg still running — file will grow, wait and retry
-                    stall_count += 1;
-                    if stall_count > 600 { // 5 minutes of stall = give up
-                        tracing::warn!("Transcode stream stalled for 5 minutes, closing");
-                        break;
-                    }
+                    // ffmpeg still running — file will grow, wait and retry.
+                    // No stall timeout: ffmpeg dying is the only termination signal.
+                    // This supports indefinite pauses (Chromecast holds TCP connection
+                    // open, backpressure stalls tx.send, we wait here at EOF).
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
                 Ok(n) => {
-                    stall_count = 0;
                     let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
                     if tx.send(Ok(chunk)).await.is_err() {
-                        // Client disconnected
                         tracing::info!("Transcode stream client disconnected");
                         break;
                     }
@@ -773,12 +788,20 @@ async fn handle_transcode_stream(
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = axum::body::Body::from_stream(stream);
 
-    axum::response::Response::builder()
+    let mut response = axum::response::Response::builder()
         .header("Content-Type", "video/mp4")
+        .header("Accept-Ranges", "bytes")
         .header("Cache-Control", "no-cache, no-store")
-        .header("Connection", "keep-alive")
-        .body(body)
-        .unwrap()
+        .header("Connection", "keep-alive");
+
+    if is_range {
+        // 206 Partial Content for Range requests
+        response = response
+            .status(206)
+            .header("Content-Range", format!("bytes {}-", start_offset));
+    }
+
+    response.body(body).unwrap()
 }
 
 // --- Helpers ---
