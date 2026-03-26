@@ -45,7 +45,7 @@ ffmpeg (transcode if needed: HEVC→H.264, AC3→AAC, subtitle burn-in, intro co
 Chromecast (rust_cast, StreamType::Live, mDNS discovery)
 ```
 
-The CLI is a thin HTTP client. The server does everything. This means any device on your LAN can control playback -- phones, voice assistants, scripts, cron jobs.
+The CLI is a thin HTTP client. The server does everything. Run both on the same machine (laptop, desktop) or split them across your LAN. No dedicated server required -- `spela server` in one terminal tab, `spela play` in another.
 
 ## Install
 
@@ -53,7 +53,7 @@ The CLI is a thin HTTP client. The server does everything. This means any device
 
 - **Rust** (for building spela)
 - **webtorrent-cli** (`npm install -g webtorrent-cli`)
-- **ffmpeg** with NVENC support (for GPU transcoding) or CPU fallback
+- **ffmpeg** (NVENC GPU transcoding if available, CPU fallback works fine — just slower startup)
 - A **TMDB API key** (free at [themoviedb.org](https://www.themoviedb.org/settings/api))
 - A **Chromecast** on the same network
 
@@ -168,7 +168,7 @@ Most torrents are H.264 + AC3/DTS audio. Chromecast only speaks H.264 + AAC. spe
 6. Output: fragmented MP4, streamed via chunked HTTP as it's being written
 7. 5MB pre-buffer before casting (proves the torrent is healthy)
 
-All transcoding uses NVENC (GPU) when available. CPU fallback works but is slower.
+Transcoding uses NVENC (GPU) when available. Without a GPU, ffmpeg falls back to CPU encoding (`libx264`) -- works fine, just takes ~30-60s to buffer instead of ~10s. Most torrents are H.264 + AC3 which only needs audio transcoding (instant, CPU-only).
 
 ## Known Limitations
 
