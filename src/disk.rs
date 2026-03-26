@@ -65,3 +65,61 @@ fn dir_size(path: &Path) -> Result<u64> {
     }
     Ok(total)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_check_space_nonexistent_dir() {
+        let result = check_space(Path::new("/tmp/spela_test_nonexistent_dir_12345"));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_check_space_empty_dir() {
+        let dir = tempdir("check_space_empty");
+        let result = check_space(&dir);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none()); // 0 bytes < 10GB
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_dir_size_with_files() {
+        let dir = tempdir("dir_size_files");
+        fs::write(dir.join("a.txt"), "hello").unwrap(); // 5 bytes
+        fs::write(dir.join("b.txt"), "world!").unwrap(); // 6 bytes
+        assert_eq!(dir_size(&dir).unwrap(), 11);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_dir_size_recursive() {
+        let dir = tempdir("dir_size_recursive");
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(dir.join("root.txt"), "abc").unwrap(); // 3
+        fs::write(sub.join("child.txt"), "defgh").unwrap(); // 5
+        assert_eq!(dir_size(&dir).unwrap(), 8);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_cleanup_old_files_preserves_new() {
+        let dir = tempdir("cleanup_preserves");
+        fs::write(dir.join("new.txt"), "keep me").unwrap();
+        cleanup_old_files(&dir);
+        assert!(dir.join("new.txt").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn tempdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("spela_test_{}_{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir); // clean any stale dir
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+}

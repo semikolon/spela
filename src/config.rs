@@ -106,3 +106,71 @@ impl Config {
             .join(".spela")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_needs_setup() {
+        let config = Config::default();
+        assert!(config.needs_setup()); // default_device is empty
+    }
+
+    #[test]
+    fn test_config_with_device_doesnt_need_setup() {
+        let mut config = Config::default();
+        config.default_device = "My TV".into();
+        assert!(!config.needs_setup());
+    }
+
+    #[test]
+    fn test_config_roundtrip_toml() {
+        let mut config = Config::default();
+        config.default_device = "Living Room".into();
+        config.tmdb_api_key = "test-key".into();
+        config.lan_ip = "10.0.0.1".into();
+        config.known_devices.insert("TV".into(), "10.0.0.50".into());
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(parsed.default_device, "Living Room");
+        assert_eq!(parsed.tmdb_api_key, "test-key");
+        assert_eq!(parsed.lan_ip, "10.0.0.1");
+        assert_eq!(parsed.known_devices.get("TV").unwrap(), "10.0.0.50");
+    }
+
+    #[test]
+    fn test_config_from_minimal_toml() {
+        // A config with just a TMDB key — everything else defaults
+        let toml_str = r#"tmdb_api_key = "abc123""#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.tmdb_api_key, "abc123");
+        assert_eq!(config.port, 7890);
+        assert!(config.default_device.is_empty());
+        assert!(config.known_devices.is_empty());
+    }
+
+    #[test]
+    fn test_config_known_devices_toml() {
+        let toml_str = r#"
+default_device = "Vardagsrum"
+
+[known_devices]
+"Vardagsrum" = "192.168.4.58"
+"Bedroom TV" = "192.168.4.126"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.known_devices.len(), 2);
+        assert_eq!(config.known_devices.get("Vardagsrum").unwrap(), "192.168.4.58");
+    }
+
+    #[test]
+    fn test_media_dir_tilde_expansion() {
+        let config = Config { media_dir: "~/media".into(), ..Config::default() };
+        let expanded = config.media_dir();
+        assert!(!expanded.to_string_lossy().contains('~'));
+        assert!(expanded.to_string_lossy().contains("media"));
+    }
+}

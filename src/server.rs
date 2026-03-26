@@ -727,23 +727,7 @@ async fn handle_transcode_stream(
     let path = state.media_dir.join("transcoded_aac.mp4");
     let ffmpeg_pid = *state.ffmpeg_pid.lock().unwrap();
 
-    // Parse Range header for reconnection support: "bytes=N-" -> seek to N
-    // Only open-ended ranges are supported (no end byte) since file is growing
-    let start_offset: u64 = headers
-        .get("range")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|range_str| {
-            let range_str = range_str.strip_prefix("bytes=")?;
-            let dash_pos = range_str.find('-')?;
-            let start_str = &range_str[..dash_pos];
-            // Only honor open-ended ranges (bytes=N-), not bounded (bytes=N-M)
-            let after_dash = &range_str[dash_pos + 1..];
-            if !after_dash.is_empty() {
-                return None; // Bounded range — ignore for growing file
-            }
-            start_str.parse::<u64>().ok()
-        })
-        .unwrap_or(0);
+    let start_offset = parse_range_start(headers.get("range").and_then(|v| v.to_str().ok()));
 
     if start_offset > 0 {
         tracing::info!("Transcode stream: Range request, seeking to byte {}", start_offset);
@@ -837,6 +821,24 @@ async fn handle_transcode_stream(
         .unwrap()
 }
 
+/// Parse a Range header value into an open-ended start offset.
+/// Only supports "bytes=N-" (open-ended). Bounded ranges ("bytes=N-M") return None
+/// because our file is growing and we can't honor a fixed end byte.
+fn parse_range_start(range_header: Option<&str>) -> u64 {
+    range_header
+        .and_then(|range_str| {
+            let range_str = range_str.strip_prefix("bytes=")?;
+            let dash_pos = range_str.find('-')?;
+            let start_str = &range_str[..dash_pos];
+            let after_dash = &range_str[dash_pos + 1..];
+            if !after_dash.is_empty() {
+                return None; // Bounded range — ignore
+            }
+            start_str.parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+}
+
 // --- Helpers ---
 
 fn get_current_device(state: &ServerState) -> String {
@@ -858,5 +860,57 @@ fn cast_result_to_json(
         Ok(Ok(r)) => Json(serde_json::to_value(r).unwrap_or(json!({"error": "serialize"}))),
         Ok(Err(e)) => Json(json!({"error": e.to_string()})),
         Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Range header parsing (the silent Range feature) ---
+    // Edge cases from Mar 26: Accept-Ranges/206 broke Chromecast,
+    // so we parse Range but always respond 200
+
+    #[test]
+    fn test_parse_range_open_ended() {
+        assert_eq!(parse_range_start(Some("bytes=12345-")), 12345);
+    }
+
+    #[test]
+    fn test_parse_range_zero() {
+        assert_eq!(parse_range_start(Some("bytes=0-")), 0);
+    }
+
+    #[test]
+    fn test_parse_range_bounded_ignored() {
+        // Bounded ranges must be ignored — file is growing, can't honor end byte
+        assert_eq!(parse_range_start(Some("bytes=100-500")), 0);
+    }
+
+    #[test]
+    fn test_parse_range_no_header() {
+        assert_eq!(parse_range_start(None), 0);
+    }
+
+    #[test]
+    fn test_parse_range_garbage() {
+        assert_eq!(parse_range_start(Some("not-a-range")), 0);
+    }
+
+    #[test]
+    fn test_parse_range_missing_prefix() {
+        assert_eq!(parse_range_start(Some("12345-")), 0);
+    }
+
+    #[test]
+    fn test_parse_range_large_offset() {
+        // 100GB offset — should handle u64 range
+        assert_eq!(parse_range_start(Some("bytes=107374182400-")), 107374182400);
+    }
+
+    #[test]
+    fn test_parse_range_multipart_ignored() {
+        // Multi-range not supported
+        assert_eq!(parse_range_start(Some("bytes=0-100, 200-300")), 0);
     }
 }
