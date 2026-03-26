@@ -790,14 +790,17 @@ async fn handle_transcode_stream(
 
     let mut response = axum::response::Response::builder()
         .header("Content-Type", "video/mp4")
-        .header("Accept-Ranges", "bytes")
         .header("Cache-Control", "no-cache, no-store")
         .header("Connection", "keep-alive");
 
     if is_range {
-        // 206 Partial Content for Range requests
+        // 206 Partial Content for Range requests.
+        // Only advertise Accept-Ranges when actually handling a Range request,
+        // not on initial load — Chromecast may probe content-length and fail
+        // on a growing file if it sees Accept-Ranges on the first request.
         response = response
             .status(206)
+            .header("Accept-Ranges", "bytes")
             .header("Content-Range", format!("bytes {}-", start_offset));
     }
 
