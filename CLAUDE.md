@@ -1,5 +1,8 @@
 # spela — AI-Agent-Ready Media Controller
 
+## NO PERSONAL DATA (MANDATORY)
+**Public repo.** Never commit real names, IPs, API keys, device names, or household details to code/docs. Use placeholders. Runtime config (`config.toml`, `state.json`) is user-local and gitignored.
+
 ## Overview
 
 Rust CLI + HTTP API server for torrent-to-Chromecast streaming. Single 6.9MB binary, zero runtime deps on target (except webtorrent-cli and ffmpeg).
