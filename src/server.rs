@@ -39,7 +39,7 @@ pub async fn run_server(config: Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(&media_dir)?;
 
     let search_engine = SearchEngine::new(config.tmdb_api_key.clone());
-    let cast = Mutex::new(CastController::new(&state_dir));
+    let cast = Mutex::new(CastController::new(&state_dir, config.known_devices.clone()));
     let port = config.port;
 
     let state = Arc::new(ServerState {

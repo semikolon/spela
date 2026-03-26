@@ -15,11 +15,6 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
-/// Known device IPs — fallback when mDNS fails.
-const KNOWN_DEVICES: &[(&str, &str)] = &[
-    ("Fredriks TV", "192.168.4.126"),
-    ("Vardagsrum", "192.168.4.58"),
-];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -55,13 +50,15 @@ pub struct CastResult {
 pub struct CastController {
     device_cache: HashMap<String, DeviceInfo>,
     cache_path: PathBuf,
+    /// Fallback IPs from config — used when mDNS and cache both miss.
+    known_devices: HashMap<String, String>,
 }
 
 impl CastController {
-    pub fn new(state_dir: &Path) -> Self {
+    pub fn new(state_dir: &Path, known_devices: HashMap<String, String>) -> Self {
         let cache_path = state_dir.join("devices.json");
         let device_cache = Self::load_cache(&cache_path);
-        Self { device_cache, cache_path }
+        Self { device_cache, cache_path, known_devices }
     }
 
     fn load_cache(path: &Path) -> HashMap<String, DeviceInfo> {
@@ -112,7 +109,7 @@ impl CastController {
         Ok(devices)
     }
 
-    /// Resolve device name to IP, using cache then mDNS then hardcoded fallback.
+    /// Resolve device name to IP, using cache → mDNS → config fallback.
     fn resolve_device(&mut self, name: &str) -> Result<(String, u16)> {
         if let Some(dev) = self.device_cache.get(name) {
             return Ok((dev.ip.clone(), dev.port));
@@ -122,12 +119,10 @@ impl CastController {
                 return Ok((dev.ip.clone(), dev.port));
             }
         }
-        for (known_name, known_ip) in KNOWN_DEVICES {
-            if *known_name == name {
-                return Ok((known_ip.to_string(), CAST_PORT));
-            }
+        if let Some(ip) = self.known_devices.get(name) {
+            return Ok((ip.clone(), CAST_PORT));
         }
-        Err(anyhow!("Device '{}' not found. Run 'spela targets' to discover devices.", name))
+        Err(anyhow!("Device '{}' not found. Run 'spela targets' to discover devices, then 'spela config default_device \"Name\"' to set default.", name))
     }
 
     /// Cast a URL to a named Chromecast device.

@@ -97,6 +97,8 @@ enum Commands {
     Targets,
     /// Show watch history
     History,
+    /// First-run setup: discover Chromecasts, pick default, save config
+    Setup,
     /// Get or set preferences
     Config {
         /// Config key
@@ -119,6 +121,10 @@ async fn main() {
                 eprintln!("Server error: {}", e);
                 std::process::exit(1);
             }
+        }
+        Commands::Setup => {
+            run_setup().await;
+            return;
         }
         _ => {
             let config = config::Config::load().unwrap_or_default();
@@ -146,6 +152,109 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+async fn run_setup() {
+    use std::io::{self, Write, BufRead};
+    use std::collections::HashMap;
+
+    println!("🎬 spela setup\n");
+
+    let mut config = config::Config::load().unwrap_or_default();
+
+    // TMDB API key
+    if config.tmdb_api_key.is_empty() {
+        println!("You need a TMDB API key for search (free at https://themoviedb.org).");
+        print!("TMDB API key (or press Enter to skip): ");
+        io::stdout().flush().unwrap();
+        let mut key = String::new();
+        io::stdin().lock().read_line(&mut key).unwrap();
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            config.tmdb_api_key = key;
+        }
+    }
+
+    // LAN IP
+    if config.lan_ip.is_empty() {
+        print!("Server LAN IP (Chromecast fetches from this): ");
+        io::stdout().flush().unwrap();
+        let mut ip = String::new();
+        io::stdin().lock().read_line(&mut ip).unwrap();
+        let ip = ip.trim().to_string();
+        if !ip.is_empty() {
+            config.lan_ip = ip;
+        }
+    }
+
+    // Discover Chromecasts
+    println!("\nScanning for Chromecast devices (5 seconds)...");
+    let cast = cast::CastController::new(&config::Config::state_dir(), HashMap::new());
+    // Discovery needs a mutable ref, so shadow
+    let mut cast = cast;
+    match cast.discover() {
+        Ok(devices) if !devices.is_empty() => {
+            println!("\nFound {} device(s):\n", devices.len());
+            let unique: Vec<_> = {
+                let mut seen = std::collections::HashSet::new();
+                devices.into_iter().filter(|d| seen.insert(d.name.clone())).collect()
+            };
+            for (i, dev) in unique.iter().enumerate() {
+                println!("  {}. {} ({}) — {}", i + 1, dev.name, dev.ip, dev.model);
+            }
+            print!("\nDefault device [1-{}]: ", unique.len());
+            io::stdout().flush().unwrap();
+            let mut choice = String::new();
+            io::stdin().lock().read_line(&mut choice).unwrap();
+            if let Ok(idx) = choice.trim().parse::<usize>() {
+                if idx >= 1 && idx <= unique.len() {
+                    let dev = &unique[idx - 1];
+                    config.default_device = dev.name.clone();
+                    config.known_devices.insert(dev.name.clone(), dev.ip.clone());
+                    println!("Default: {}", dev.name);
+                }
+            }
+
+            // Save all discovered devices as known fallbacks
+            for dev in &unique {
+                config.known_devices.entry(dev.name.clone()).or_insert(dev.ip.clone());
+            }
+        }
+        _ => {
+            println!("No devices found. Make sure Chromecasts are on and on the same network.");
+            print!("Default device name (manual entry): ");
+            io::stdout().flush().unwrap();
+            let mut name = String::new();
+            io::stdin().lock().read_line(&mut name).unwrap();
+            let name = name.trim().to_string();
+            if !name.is_empty() {
+                config.default_device = name;
+            }
+        }
+    }
+
+    // Server address
+    if config.server == "localhost:7890" {
+        print!("\nServer address [localhost:7890]: ");
+        io::stdout().flush().unwrap();
+        let mut addr = String::new();
+        io::stdin().lock().read_line(&mut addr).unwrap();
+        let addr = addr.trim().to_string();
+        if !addr.is_empty() {
+            config.server = addr;
+        }
+    }
+
+    match config.save() {
+        Ok(_) => {
+            println!("\n✅ Config saved to {}", config::Config::config_path().display());
+            println!("\nNext steps:");
+            println!("  1. Start the server:  spela server");
+            println!("  2. Search:            spela search \"movie name\"");
+            println!("  3. Play:              spela play 1");
+        }
+        Err(e) => eprintln!("Failed to save config: {}", e),
     }
 }
 
@@ -201,7 +310,7 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
                 _ => Ok(client.get(format!("{}/config", base)).send().await?.json().await?),
             }
         }
-        Commands::Server { .. } => unreachable!(),
+        Commands::Server { .. } | Commands::Setup => unreachable!(),
     }
 }
 

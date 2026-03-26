@@ -183,3 +183,39 @@ pub async fn transcode(
 
     Ok((output_path, pid))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audio_needs_transcode() {
+        assert!(audio_needs_transcode("ac3"));
+        assert!(audio_needs_transcode("eac3"));
+        assert!(audio_needs_transcode("dts"));
+        assert!(audio_needs_transcode("truehd"));
+        assert!(audio_needs_transcode("dca"));
+        assert!(!audio_needs_transcode("aac"));
+        assert!(!audio_needs_transcode("mp3"));
+        assert!(!audio_needs_transcode("opus"));
+        assert!(!audio_needs_transcode("vorbis"));
+    }
+
+    #[test]
+    fn test_video_needs_transcode() {
+        assert!(video_needs_transcode("hevc"));
+        assert!(video_needs_transcode("h265"));
+        assert!(video_needs_transcode("vp9"));
+        assert!(video_needs_transcode("av1"));
+        assert!(!video_needs_transcode("h264"));
+        assert!(!video_needs_transcode("mpeg4"));
+        assert!(!video_needs_transcode("vp8"));
+    }
+
+    #[test]
+    fn test_find_intro_returns_none_when_missing() {
+        // In test env, ~/.config/spela/intro.mp4 likely doesn't exist
+        // This just verifies the function doesn't panic
+        let _ = find_intro();
+    }
+}

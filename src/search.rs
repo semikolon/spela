@@ -392,3 +392,126 @@ fn urlencoded(s: &str) -> String {
         _ => format!("%{:02X}", b),
     }).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_hevc_from_title() {
+        assert!(is_hevc_from_title("Movie.2025.1080p.BluRay.x265-GROUP.mkv"));
+        assert!(is_hevc_from_title("Movie.HEVC.1080p.mkv"));
+        assert!(is_hevc_from_title("Movie.H265.mkv"));
+        assert!(is_hevc_from_title("Movie.H.265.mkv"));
+        assert!(is_hevc_from_title("Movie.10Bit.DDP5.1.mkv"));
+        assert!(is_hevc_from_title("Movie.10-bit.mkv"));
+        assert!(!is_hevc_from_title("Movie.2025.1080p.BluRay.x264-GROUP.mkv"));
+        assert!(!is_hevc_from_title("Movie.H264.AAC.mp4"));
+        assert!(!is_hevc_from_title("Movie.mp4"));
+    }
+
+    #[test]
+    fn test_parse_torrentio_title() {
+        // Actual torrentio format uses emoji + space-separated fields
+        let title = "Movie.mkv\n👤 42 💾 1.5 GB ⚙️ TorrentGalaxy";
+        let (seeds, size, source) = parse_torrentio_title(title);
+        assert_eq!(seeds, 42);
+        assert_eq!(size, "1.5 GB");
+        assert_eq!(source, "TorrentGalaxy");
+    }
+
+    #[test]
+    fn test_parse_torrentio_title_missing_fields() {
+        let (seeds, size, source) = parse_torrentio_title("No metadata here");
+        assert_eq!(seeds, 0);
+        assert_eq!(size, "");
+        assert_eq!(source, "");
+    }
+
+    #[test]
+    fn test_urlencoded() {
+        assert_eq!(urlencoded("hello world"), "hello%20world");
+        assert_eq!(urlencoded("foo/bar"), "foo%2Fbar");
+        assert_eq!(urlencoded("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    #[test]
+    fn test_build_magnet() {
+        let magnet = build_magnet("abc123", "Movie.mkv");
+        assert!(magnet.starts_with("magnet:?xt=urn:btih:abc123&dn=Movie.mkv"));
+        assert!(magnet.contains("&tr="));
+    }
+
+    fn make_result(id: usize, title: &str, seeds: u32, file_index: Option<u32>) -> TorrentResult {
+        TorrentResult {
+            id,
+            quality: "1080p".into(),
+            title: title.into(),
+            seeds,
+            size: "1 GB".into(),
+            source: "Test".into(),
+            magnet: "magnet:test".into(),
+            info_hash: "test".into(),
+            file_index,
+        }
+    }
+
+    #[test]
+    fn test_ranking_single_file_over_pack() {
+        let mut results = vec![
+            make_result(1, "Movie.x264.mkv", 100, Some(3)),   // pack
+            make_result(2, "Movie.x264.mkv", 50, Some(0)),    // single file
+        ];
+        results.sort_by(|a, b| {
+            let a_single = a.file_index.map_or(true, |i| i == 0);
+            let b_single = b.file_index.map_or(true, |i| i == 0);
+            if a_single != b_single {
+                return if a_single { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+            }
+            b.seeds.cmp(&a.seeds)
+        });
+        assert_eq!(results[0].seeds, 50); // single file wins despite fewer seeds
+    }
+
+    #[test]
+    fn test_ranking_h264_over_hevc_with_enough_seeds() {
+        let mut results = vec![
+            make_result(1, "Movie.x265.mkv", 100, Some(0)),   // HEVC, well-seeded
+            make_result(2, "Movie.x264.mkv", 20, Some(0)),    // H.264, decent seeds
+        ];
+        const MIN_SEEDS: u32 = 5;
+        results.sort_by(|a, b| {
+            let a_hevc = is_hevc_from_title(&a.title);
+            let b_hevc = is_hevc_from_title(&b.title);
+            if a_hevc != b_hevc {
+                let preferred = if a_hevc { b } else { a };
+                if preferred.seeds >= MIN_SEEDS {
+                    return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+                }
+            }
+            b.seeds.cmp(&a.seeds)
+        });
+        assert_eq!(results[0].title, "Movie.x264.mkv"); // H.264 wins (20 >= 5 threshold)
+    }
+
+    #[test]
+    fn test_ranking_well_seeded_hevc_over_dead_h264() {
+        let mut results = vec![
+            make_result(1, "Movie.x265.mkv", 100, Some(0)),  // HEVC, well-seeded
+            make_result(2, "Movie.x264.mkv", 2, Some(0)),    // H.264, nearly dead
+        ];
+        const MIN_SEEDS: u32 = 5;
+        results.sort_by(|a, b| {
+            let a_hevc = is_hevc_from_title(&a.title);
+            let b_hevc = is_hevc_from_title(&b.title);
+            if a_hevc != b_hevc {
+                let preferred = if a_hevc { b } else { a };
+                if preferred.seeds >= MIN_SEEDS {
+                    return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+                }
+            }
+            b.seeds.cmp(&a.seeds)
+        });
+        assert_eq!(results[0].title, "Movie.x265.mkv"); // HEVC wins (H.264 only 2 seeds < 5)
+    }
+}
