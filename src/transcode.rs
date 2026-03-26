@@ -170,7 +170,7 @@ pub async fn transcode(
 
     tracing::debug!("ffmpeg args: {:?}", args);
 
-    let child = Command::new("ffmpeg")
+    let mut child = Command::new("ffmpeg")
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -178,8 +178,13 @@ pub async fn transcode(
 
     let pid = child.id().unwrap_or(0);
 
-    // Detach — we track by PID, not by Child handle
-    std::mem::forget(child);
+    // Spawn a background task to reap the child when it exits.
+    // Without this, killed ffmpeg processes become zombies because
+    // nobody calls waitpid() on them. The task just awaits completion
+    // and discards the result — we track liveness by PID elsewhere.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
 
     Ok((output_path, pid))
 }
