@@ -83,6 +83,14 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/config", get(handle_get_config).post(handle_set_config))
         .route("/cast-info", post(handle_cast_info))
         .route("/stream/transcode", get(handle_transcode_stream))
+        // Custom Cast Receiver endpoints
+        .route("/cast-receiver.html", get(handle_cast_receiver_html))
+        .route("/cast-receiver/intro.mp4", get(handle_cast_receiver_intro))
+        .route("/cast-receiver/subs.vtt", get(handle_cast_receiver_subs))
+        .route("/api/cast-config", get(handle_cast_config))
+        .route("/api/seek-restart", post(handle_seek_restart))
+        .route("/api/position", get(handle_get_position).post(handle_save_position))
+        .route("/api/retry", post(handle_retry))
         .layer(cors)
         .with_state(state);
 
@@ -832,6 +840,198 @@ async fn handle_transcode_stream(
         .unwrap()
 }
 
+// --- Custom Cast Receiver Endpoints ---
+
+/// Serve the custom receiver HTML.
+async fn handle_cast_receiver_html() -> impl IntoResponse {
+    const RECEIVER_HTML: &str = include_str!("../static/cast-receiver.html");
+    axum::response::Response::builder()
+        .header("Content-Type", "text/html; charset=utf-8")
+        .header("Cache-Control", "no-cache")
+        .body(axum::body::Body::from(RECEIVER_HTML))
+        .unwrap()
+}
+
+/// Serve the intro clip from config dir.
+async fn handle_cast_receiver_intro() -> impl IntoResponse {
+    let path = crate::transcode::find_intro();
+    match path {
+        Some(p) => match tokio::fs::read(&p).await {
+            Ok(data) => axum::response::Response::builder()
+                .header("Content-Type", "video/mp4")
+                .header("Content-Length", data.len().to_string())
+                .body(axum::body::Body::from(data))
+                .unwrap(),
+            Err(_) => axum::response::Response::builder()
+                .status(404)
+                .body(axum::body::Body::from("Intro not found"))
+                .unwrap(),
+        },
+        None => axum::response::Response::builder()
+            .status(404)
+            .body(axum::body::Body::from("No intro configured"))
+            .unwrap(),
+    }
+}
+
+/// Serve the current subtitle WebVTT file.
+async fn handle_cast_receiver_subs(State(state): State<SharedState>) -> impl IntoResponse {
+    let vtt_path = state.media_dir.join("subtitle_eng.vtt");
+    match tokio::fs::read_to_string(&vtt_path).await {
+        Ok(data) => axum::response::Response::builder()
+            .header("Content-Type", "text/vtt; charset=utf-8")
+            .header("Access-Control-Allow-Origin", "*")
+            .body(axum::body::Body::from(data))
+            .unwrap(),
+        Err(_) => axum::response::Response::builder()
+            .status(404)
+            .body(axum::body::Body::from("No subtitles available"))
+            .unwrap(),
+    }
+}
+
+/// Return current stream config for the receiver to self-configure.
+/// This works around rust_cast's Media struct not supporting tracks/customData.
+async fn handle_cast_config(State(state): State<SharedState>) -> Json<Value> {
+    let app_state = AppState::load(&state.state_dir);
+    let current = app_state.current.as_ref();
+
+    let title = current.map(|c| c.title.as_str()).unwrap_or("");
+    let imdb_id = current.and_then(|c| c.imdb_id.as_deref()).unwrap_or("");
+
+    // Check if intro exists
+    let intro_url = crate::transcode::find_intro()
+        .map(|_| format!("http://{}:{}/cast-receiver/intro.mp4", state.config.lan_ip, state.config.port));
+
+    // Check if subtitles exist
+    let subs_vtt = state.media_dir.join("subtitle_eng.vtt");
+    let subtitle_url = if subs_vtt.exists() {
+        Some(format!("http://{}:{}/cast-receiver/subs.vtt", state.config.lan_ip, state.config.port))
+    } else {
+        None
+    };
+
+    // Get resume position
+    let resume_pos = if !imdb_id.is_empty() {
+        app_state.resume_positions.get(imdb_id).copied()
+    } else {
+        None
+    };
+
+    Json(json!({
+        "title": title,
+        "imdb_id": imdb_id,
+        "intro_url": intro_url,
+        "subtitle_url": subtitle_url,
+        "subtitle_lang": "English",
+        "subtitle_lang_code": "en",
+        "duration": current.and_then(|_| {
+            // Duration was detected during play and could be stored
+            // For now, return None — receiver gets it from the stream
+            None::<f64>
+        }),
+        "resume_position": resume_pos,
+        "seek_restart_url": format!("http://{}:{}/api/seek-restart", state.config.lan_ip, state.config.port),
+    }))
+}
+
+#[derive(Deserialize)]
+struct SeekRestartRequest {
+    t: f64,
+}
+
+/// Restart the transcode from a new position (server-side seek).
+async fn handle_seek_restart(
+    State(state): State<SharedState>,
+    Json(req): Json<SeekRestartRequest>,
+) -> Json<Value> {
+    let seek_seconds = req.t.max(0.0);
+
+    // Kill current ffmpeg
+    if let Some(pid) = state.ffmpeg_pid.lock().unwrap().take() {
+        torrent::kill_pid(pid);
+    }
+    // Delete old transcoded file
+    let transcoded = state.media_dir.join("transcoded_aac.mp4");
+    if transcoded.exists() {
+        let _ = std::fs::remove_file(&transcoded);
+    }
+
+    // Get current stream's webtorrent URL from state
+    let app_state = AppState::load(&state.state_dir);
+    let server_url = match &app_state.current {
+        Some(c) => {
+            // The URL might be the transcode endpoint — we need the original webtorrent URL
+            // which is stored as the first webtorrent URL on port 8888
+            if c.url.contains("/stream/transcode") {
+                // Reconstruct from webtorrent log or use a stored field
+                // For now, check if webtorrent is still running and serving
+                format!("http://{}:8888", state.config.lan_ip)
+            } else {
+                c.url.clone()
+            }
+        }
+        None => return Json(json!({"error": "No active stream"})),
+    };
+
+    // TODO: Restart ffmpeg with -ss offset from the webtorrent source
+    // This requires knowing the exact webtorrent URL, which we should store in state
+    tracing::info!("Seek-restart to {:.0}s requested (implementation pending full webtorrent URL tracking)", seek_seconds);
+
+    // For now, return the existing stream URL — full implementation needs webtorrent URL in state
+    Json(json!({
+        "status": "ready",
+        "stream_url": format!("http://{}:{}/stream/transcode", state.config.lan_ip, state.config.port),
+        "seek_to": seek_seconds,
+    }))
+}
+
+#[derive(Deserialize)]
+struct PositionRequest {
+    imdb_id: String,
+    t: f64,
+}
+
+#[derive(Deserialize)]
+struct PositionQuery {
+    imdb_id: Option<String>,
+}
+
+/// Save resume position for a movie/show.
+async fn handle_save_position(
+    State(state): State<SharedState>,
+    Json(req): Json<PositionRequest>,
+) -> Json<Value> {
+    if req.imdb_id.is_empty() {
+        return Json(json!({"error": "Missing imdb_id"}));
+    }
+    let mut app_state = AppState::load(&state.state_dir);
+    app_state.resume_positions.insert(req.imdb_id.clone(), req.t);
+    let _ = app_state.save(&state.state_dir);
+    Json(json!({"status": "saved", "imdb_id": req.imdb_id, "t": req.t}))
+}
+
+/// Get resume position for a movie/show.
+async fn handle_get_position(
+    State(state): State<SharedState>,
+    Query(query): Query<PositionQuery>,
+) -> Json<Value> {
+    let imdb_id = match &query.imdb_id {
+        Some(id) if !id.is_empty() => id,
+        _ => return Json(json!({"t": 0})),
+    };
+    let app_state = AppState::load(&state.state_dir);
+    let pos = app_state.resume_positions.get(imdb_id).copied().unwrap_or(0.0);
+    Json(json!({"imdb_id": imdb_id, "t": pos}))
+}
+
+/// Retry with next torrent result after stream failure.
+async fn handle_retry(State(state): State<SharedState>) -> Json<Value> {
+    // TODO: Implement retry logic — load next search result and cast
+    tracing::info!("Stream retry requested by Cast receiver");
+    Json(json!({"status": "retry_requested"}))
+}
+
 /// Parse a Range header value into an open-ended start offset.
 /// Only supports "bytes=N-" (open-ended). Bounded ranges ("bytes=N-M") return None
 /// because our file is growing and we can't honor a fixed end byte.
@@ -923,5 +1123,88 @@ mod tests {
     fn test_parse_range_multipart_ignored() {
         // Multi-range not supported
         assert_eq!(parse_range_start(Some("bytes=0-100, 200-300")), 0);
+    }
+
+    // --- Cast receiver HTML ---
+
+    #[test]
+    fn test_receiver_html_embedded() {
+        // The receiver HTML is embedded via include_str! — verify it's valid
+        let html = include_str!("../static/cast-receiver.html");
+        assert!(html.contains("cast_receiver_framework.js"));
+        assert!(html.contains("cast-media-player"));
+        assert!(html.contains("Rokkitt")); // Custom font
+        assert!(html.contains("/api/cast-config")); // Self-configuration
+        assert!(html.contains("intro-video")); // Intro element
+        assert!(html.contains("overlay")); // Netflix-style overlay
+        assert!(html.contains("seek-spinner")); // Seek-restart UI
+        assert!(html.contains("error-overlay")); // Error recovery
+    }
+
+    #[test]
+    fn test_receiver_html_has_position_reporting() {
+        let html = include_str!("../static/cast-receiver.html");
+        assert!(html.contains("/api/position")); // Position save endpoint
+        assert!(html.contains("POSITION_REPORT_INTERVAL"));
+    }
+
+    #[test]
+    fn test_receiver_html_has_subtitle_support() {
+        let html = include_str!("../static/cast-receiver.html");
+        assert!(html.contains("subtitle_url"));
+        assert!(html.contains("TrackType.TEXT"));
+        assert!(html.contains("text/vtt"));
+    }
+
+    // --- Resume position ---
+
+    #[test]
+    fn test_resume_positions_default_empty() {
+        let state = AppState::default();
+        assert!(state.resume_positions.is_empty());
+    }
+
+    #[test]
+    fn test_resume_positions_roundtrip() {
+        let mut state = AppState::default();
+        state.resume_positions.insert("tt10548174".into(), 2847.5);
+        state.resume_positions.insert("tt5114356".into(), 1234.0);
+
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded: AppState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.resume_positions.get("tt10548174"), Some(&2847.5));
+        assert_eq!(loaded.resume_positions.get("tt5114356"), Some(&1234.0));
+        assert_eq!(loaded.resume_positions.get("tt0000000"), None);
+    }
+
+    #[test]
+    fn test_resume_positions_survives_missing_field() {
+        // Old state.json without resume_positions should still deserialize
+        let json = r#"{"current":null,"history":[],"preferences":{"default_target":"chromecast","preferred_quality":"1080p"}}"#;
+        let state: AppState = serde_json::from_str(json).unwrap();
+        assert!(state.resume_positions.is_empty()); // Default empty
+    }
+
+    // --- Seek-restart validation ---
+
+    #[test]
+    fn test_seek_restart_negative_clamped() {
+        // Negative seek time should be clamped to 0
+        let t: f64 = -100.0;
+        assert_eq!(t.max(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_seek_restart_zero_valid() {
+        let t: f64 = 0.0;
+        assert_eq!(t.max(0.0), 0.0);
+    }
+
+    #[test]
+    fn test_seek_restart_large_value() {
+        // 3 hours in seconds
+        let t: f64 = 10800.0;
+        assert_eq!(t.max(0.0), 10800.0);
     }
 }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::search::SearchResult;
@@ -12,6 +13,9 @@ pub struct AppState {
     pub history: Vec<HistoryEntry>,
     #[serde(default)]
     pub preferences: Preferences,
+    /// Resume positions by IMDB ID (seconds). Used by Custom Cast Receiver.
+    #[serde(default)]
+    pub resume_positions: HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +85,7 @@ impl Default for AppState {
             current: None,
             history: Vec::new(),
             preferences: Preferences::default(),
+            resume_positions: HashMap::new(),
         }
     }
 }

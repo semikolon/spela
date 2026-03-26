@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>spela</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Rokkitt:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; width: 100vw; height: 100vh; }
+
+    /* --- Intro --- */
+    #intro-video {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      object-fit: cover; z-index: 100;
+      transition: opacity 2s ease-out;
+    }
+    #intro-video.fade-out { opacity: 0; }
+    #intro-video.hidden { display: none; }
+
+    /* --- Main player --- */
+    #main-player {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      object-fit: contain; z-index: 1;
+    }
+
+    /* --- Netflix-style overlay --- */
+    #overlay {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      z-index: 50; pointer-events: none;
+      opacity: 0; transition: opacity 0.4s ease;
+    }
+    #overlay.visible { opacity: 1; }
+
+    #overlay-top {
+      position: absolute; top: 0; left: 0; right: 0; height: 20%;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.7) 0%, transparent 100%);
+      display: flex; align-items: flex-start; padding: 3vh 4vw;
+    }
+    #overlay-title {
+      font-family: 'Rokkitt', serif;
+      color: rgba(255,255,255,0.9); font-size: 3.5vh; font-weight: 600;
+    }
+
+    #overlay-bottom {
+      position: absolute; bottom: 0; left: 0; right: 0; height: 20%;
+      background: linear-gradient(to top, rgba(0,0,0,0.7) 0%, transparent 100%);
+      display: flex; flex-direction: column; justify-content: flex-end;
+      padding: 2vh 4vw 3vh;
+    }
+
+    /* --- Seek bar --- */
+    #seek-bar-container {
+      width: 100%; height: 0.5vh; background: rgba(255,255,255,0.2);
+      border-radius: 0.25vh; position: relative; margin-bottom: 1vh;
+    }
+    #seek-bar-fill {
+      height: 100%; background: rgba(255,255,255,0.85); border-radius: 0.25vh;
+      transition: width 0.3s linear;
+    }
+    #seek-bar-buffered {
+      position: absolute; top: 0; left: 0; height: 100%;
+      background: rgba(255,255,255,0.15); border-radius: 0.25vh;
+    }
+    #seek-time {
+      font-family: 'Rokkitt', serif;
+      color: rgba(255,255,255,0.7); font-size: 1.8vh;
+      display: flex; justify-content: space-between;
+    }
+
+    /* --- Seek-restart spinner --- */
+    #seek-spinner {
+      display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      z-index: 60; background: rgba(0,0,0,0.5);
+      justify-content: center; align-items: center;
+    }
+    #seek-spinner.active {
+      display: flex;
+    }
+    #seek-spinner .spinner {
+      width: 5vh; height: 5vh;
+      border: 0.4vh solid rgba(255,255,255,0.3);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* --- Error overlay --- */
+    #error-overlay {
+      display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      z-index: 70; background: rgba(0,0,0,0.8);
+      justify-content: center; align-items: center;
+      font-family: 'Rokkitt', serif; color: rgba(255,255,255,0.9); font-size: 2.5vh;
+    }
+    #error-overlay.active { display: flex; }
+
+    /* --- Subtitles (styled by Cast SDK, but we set defaults) --- */
+    ::cue {
+      font-family: 'Rokkitt', serif;
+      font-size: 3vh;
+      color: rgba(255,255,255,0.7);
+      text-shadow: 1px 1px 2px rgba(0,0,0,0.6), -1px -1px 2px rgba(0,0,0,0.6);
+      background: transparent;
+    }
+  </style>
+</head>
+<body>
+  <video id="intro-video" class="hidden" muted></video>
+  <cast-media-player id="main-player"></cast-media-player>
+
+  <div id="overlay">
+    <div id="overlay-top">
+      <div id="overlay-title"></div>
+    </div>
+    <div id="overlay-bottom">
+      <div id="seek-bar-container">
+        <div id="seek-bar-buffered"></div>
+        <div id="seek-bar-fill"></div>
+      </div>
+      <div id="seek-time">
+        <span id="time-elapsed">0:00</span>
+        <span id="time-total">0:00</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="seek-spinner"><div class="spinner"></div></div>
+  <div id="error-overlay" id="error-text"></div>
+
+  <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <script>
+    'use strict';
+
+    const POSITION_REPORT_INTERVAL = 30000; // 30 seconds
+    const OVERLAY_HIDE_DELAY = 5000; // 5 seconds
+    const ERROR_RETRY_DELAY = 10000; // 10 seconds
+    const INTRO_FADE_DURATION = 2000; // 2 seconds
+
+    // --- State ---
+    let spelaBaseUrl = '';
+    let castConfig = null;
+    let introPlaying = false;
+    let overlayTimer = null;
+    let positionTimer = null;
+    let seekRestarting = false;
+
+    // --- Cast framework setup ---
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const playerManager = context.getPlayerManager();
+
+    // --- Intercept LOAD to handle intro + config ---
+    playerManager.setMessageInterceptor(
+      cast.framework.messages.MessageType.LOAD,
+      async (loadRequestData) => {
+        const mediaUrl = loadRequestData.media.contentId;
+
+        // Derive spela server base URL from the media URL
+        try {
+          const url = new URL(mediaUrl);
+          spelaBaseUrl = url.origin;
+        } catch (e) {
+          spelaBaseUrl = '';
+        }
+
+        // Fetch config from spela server (tracks, intro, metadata)
+        if (spelaBaseUrl) {
+          try {
+            const resp = await fetch(`${spelaBaseUrl}/api/cast-config`);
+            castConfig = await resp.json();
+
+            // Set title
+            if (castConfig.title) {
+              document.getElementById('overlay-title').textContent = castConfig.title;
+              if (!loadRequestData.media.metadata) {
+                loadRequestData.media.metadata = new cast.framework.messages.GenericMediaMetadata();
+              }
+              loadRequestData.media.metadata.title = castConfig.title;
+            }
+
+            // Add subtitle tracks
+            if (castConfig.subtitle_url) {
+              const track = new cast.framework.messages.Track(1, cast.framework.messages.TrackType.TEXT);
+              track.trackContentId = castConfig.subtitle_url;
+              track.trackContentType = 'text/vtt';
+              track.subtype = cast.framework.messages.TextTrackType.SUBTITLES;
+              track.name = castConfig.subtitle_lang || 'English';
+              track.language = castConfig.subtitle_lang_code || 'en';
+              loadRequestData.media.tracks = [track];
+              loadRequestData.activeTrackIds = [1];
+            }
+
+            // Set duration from source metadata
+            if (castConfig.duration && castConfig.duration > 0) {
+              loadRequestData.media.duration = castConfig.duration;
+            }
+
+            // Play intro if available
+            if (castConfig.intro_url) {
+              await playIntro(castConfig.intro_url, mediaUrl);
+            }
+
+            // Resume from saved position
+            if (castConfig.resume_position && castConfig.resume_position > 30) {
+              loadRequestData.currentTime = castConfig.resume_position;
+            }
+
+          } catch (e) {
+            console.warn('Failed to fetch cast-config:', e);
+          }
+        }
+
+        // Start position reporting
+        startPositionReporting();
+
+        return loadRequestData;
+      }
+    );
+
+    // --- Intercept SEEK for server-side restart ---
+    playerManager.setMessageInterceptor(
+      cast.framework.messages.MessageType.SEEK,
+      async (seekRequestData) => {
+        if (seekRestarting) return null; // Debounce
+
+        const seekTime = seekRequestData.currentTime;
+        const bufferedEnd = getBufferedEnd();
+
+        // Client-side seek if within buffered range
+        if (seekTime <= bufferedEnd) {
+          return seekRequestData;
+        }
+
+        // Server-side seek-restart for beyond buffer
+        if (spelaBaseUrl) {
+          seekRestarting = true;
+          showSeekSpinner();
+
+          try {
+            const resp = await fetch(`${spelaBaseUrl}/api/seek-restart`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ t: seekTime })
+            });
+            const result = await resp.json();
+
+            if (result.status === 'ready' && result.stream_url) {
+              // Load the new stream from the seek position
+              const mediaInfo = playerManager.getMediaInformation();
+              mediaInfo.contentId = result.stream_url;
+              playerManager.load(mediaInfo);
+            }
+          } catch (e) {
+            console.error('Seek-restart failed:', e);
+          } finally {
+            seekRestarting = false;
+            hideSeekSpinner();
+          }
+
+          return null; // Cancel the original seek
+        }
+
+        return seekRequestData;
+      }
+    );
+
+    // --- Playback event handlers ---
+    playerManager.addEventListener(
+      cast.framework.events.EventType.PLAYING,
+      () => {
+        showOverlay();
+        hideOverlayAfterDelay();
+      }
+    );
+
+    playerManager.addEventListener(
+      cast.framework.events.EventType.PAUSE,
+      () => showOverlay()
+    );
+
+    playerManager.addEventListener(
+      cast.framework.events.EventType.SEEKED,
+      () => {
+        showOverlay();
+        hideOverlayAfterDelay();
+      }
+    );
+
+    playerManager.addEventListener(
+      cast.framework.events.EventType.TIME_UPDATE,
+      () => updateSeekBar()
+    );
+
+    playerManager.addEventListener(
+      cast.framework.events.EventType.ERROR,
+      (event) => handlePlaybackError(event)
+    );
+
+    // --- Intro playback ---
+    async function playIntro(introUrl, mainMediaUrl) {
+      return new Promise((resolve) => {
+        const intro = document.getElementById('intro-video');
+        intro.src = introUrl;
+        intro.classList.remove('hidden');
+        introPlaying = true;
+
+        intro.oncanplay = () => intro.play();
+
+        intro.ontimeupdate = () => {
+          // Start fade 2 seconds before end
+          if (intro.duration && intro.currentTime >= intro.duration - (INTRO_FADE_DURATION / 1000)) {
+            intro.classList.add('fade-out');
+          }
+        };
+
+        intro.onended = () => {
+          introPlaying = false;
+          intro.classList.add('hidden');
+          resolve();
+        };
+
+        // Fallback: if intro fails to load, skip it
+        intro.onerror = () => {
+          introPlaying = false;
+          intro.classList.add('hidden');
+          resolve();
+        };
+
+        // Safety timeout: skip intro after 10 seconds no matter what
+        setTimeout(() => {
+          if (introPlaying) {
+            introPlaying = false;
+            intro.classList.add('hidden');
+            resolve();
+          }
+        }, 10000);
+      });
+    }
+
+    // --- Overlay management ---
+    function showOverlay() {
+      if (introPlaying) return;
+      document.getElementById('overlay').classList.add('visible');
+      clearTimeout(overlayTimer);
+    }
+
+    function hideOverlayAfterDelay() {
+      clearTimeout(overlayTimer);
+      overlayTimer = setTimeout(() => {
+        if (playerManager.getPlayerState() === cast.framework.messages.PlayerState.PLAYING) {
+          document.getElementById('overlay').classList.remove('visible');
+        }
+      }, OVERLAY_HIDE_DELAY);
+    }
+
+    function updateSeekBar() {
+      if (introPlaying) return;
+      const currentTime = playerManager.getCurrentTimeSec();
+      const duration = playerManager.getDurationSec();
+      if (!duration || duration <= 0) return;
+
+      const pct = (currentTime / duration) * 100;
+      document.getElementById('seek-bar-fill').style.width = pct + '%';
+      document.getElementById('time-elapsed').textContent = formatTime(currentTime);
+      document.getElementById('time-total').textContent = formatTime(duration);
+    }
+
+    // --- Seek spinner ---
+    function showSeekSpinner() {
+      document.getElementById('seek-spinner').classList.add('active');
+    }
+    function hideSeekSpinner() {
+      document.getElementById('seek-spinner').classList.remove('active');
+    }
+
+    // --- Error handling ---
+    function handlePlaybackError(event) {
+      console.error('Playback error:', event);
+      const overlay = document.getElementById('error-overlay');
+      let countdown = ERROR_RETRY_DELAY / 1000;
+      overlay.textContent = `Stream interrupted, retrying in ${countdown}s...`;
+      overlay.classList.add('active');
+
+      const interval = setInterval(() => {
+        countdown--;
+        overlay.textContent = `Stream interrupted, retrying in ${countdown}s...`;
+        if (countdown <= 0) {
+          clearInterval(interval);
+          overlay.classList.remove('active');
+          retryStream();
+        }
+      }, 1000);
+    }
+
+    async function retryStream() {
+      if (!spelaBaseUrl) return;
+      try {
+        const resp = await fetch(`${spelaBaseUrl}/api/retry`, { method: 'POST' });
+        const result = await resp.json();
+        // Server handles retry logic — will cast a new stream
+      } catch (e) {
+        console.error('Retry failed:', e);
+      }
+    }
+
+    // --- Position reporting ---
+    function startPositionReporting() {
+      clearInterval(positionTimer);
+      positionTimer = setInterval(() => {
+        if (!spelaBaseUrl || !castConfig?.imdb_id) return;
+        const currentTime = playerManager.getCurrentTimeSec();
+        if (currentTime > 0) {
+          fetch(`${spelaBaseUrl}/api/position`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              imdb_id: castConfig.imdb_id,
+              t: currentTime
+            })
+          }).catch(() => {}); // Fire and forget
+        }
+      }, POSITION_REPORT_INTERVAL);
+    }
+
+    // --- Helpers ---
+    function formatTime(seconds) {
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = Math.floor(seconds % 60);
+      if (h > 0) return `${h}:${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
+      return `${m}:${s.toString().padStart(2,'0')}`;
+    }
+
+    function getBufferedEnd() {
+      try {
+        const player = document.getElementById('main-player');
+        const video = player?.querySelector('video');
+        if (video?.buffered?.length > 0) {
+          return video.buffered.end(video.buffered.length - 1);
+        }
+      } catch (e) {}
+      return playerManager.getCurrentTimeSec() + 30; // Estimate
+    }
+
+    // --- Start receiver ---
+    const options = new cast.framework.CastReceiverOptions();
+    options.disableIdleTimeout = true;
+    context.start(options);
+  </script>
+</body>
+</html>
