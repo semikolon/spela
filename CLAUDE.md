@@ -82,6 +82,9 @@ ssh darwin 'sudo systemctl stop spela && cp ~/Projects/spela/target/release/spel
 - **Post-playback reaper** (Mar 21) — background task monitors ffmpeg PID. When movie ends (ffmpeg exits), waits 3 min grace, kills webtorrent (~1.5GB freed), cleans files. Detects stream replacement and exits cleanly
 - **GPU coexistence** — NVENC transcode (163MB), llama.cpp embeddings (2.8GB), Chrome kiosk (103MB) all fit in 4GB VRAM simultaneously
 - **Jellyfin evaluated, rejected** (Mar 26) — library-centric (no "stream torrent NOW" flow), C#/.NET plugins, mixed Chromecast reliability. spela Custom Receiver is cleaner path for seeking
+- **Custom Cast Receiver built** (Mar 26) — `static/cast-receiver.html` (Shaka Player + CAF v3). Self-configures via `/api/cast-config` because **rust_cast's Media struct only has 5 fields** (contentId, streamType, contentType, metadata, duration) — no tracks, customData, or textTrackStyle. Server endpoints: `/cast-receiver.html`, `/cast-receiver/intro.mp4`, `/cast-receiver/subs.vtt`, `/api/cast-config`, `/api/seek-restart`, `/api/position`, `/api/retry`. Blocked on $5 Cast SDK registration. Spec at `.claude/specs/custom-cast-receiver/`
+- **Cast SDK terms** (Mar 26) — reviewed, no restrictions on content type or personal/commercial use. ToS governs SDK usage (user-initiated casting, no persistent receiver storage), not content. Safe for distribution
+- **AdGuard blocks payments** (Mar 26) — `ogads-pa.clients6.google.com` and similar payment domains caught by ad filters. Added 35 whitelist rules for Google Payments, 3DS (Visa/Mastercard/Cardinal Commerce), Swedish banks (Swedbank, Lunar, BankID, Klarna, Swish). Rules in `/opt/AdGuardHome/AdGuardHome.yaml` under `user_rules`
 
 ## Chromecast Devices
 
