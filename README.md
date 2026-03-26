@@ -26,7 +26,7 @@ Because "I want to watch a movie" shouldn't require Sonarr + Radarr + Prowlarr +
 - **Intro clip** -- your own Netflix-style bumper before every stream (drop an `intro.mp4` in config)
 - **Pause/resume** -- tested up to 10-minute pauses. No timeouts, no dropped connections
 - **Post-playback cleanup** -- kills webtorrent and cleans temp files after the movie ends
-- **Voice-ready** -- HTTP API on every endpoint, perfect for voice assistants
+- **Voice-ready** -- works with voice assistants via CLI or HTTP API. Our assistant Ruby (Gemini + MCP) uses `spela search` and `spela play` directly
 - **Self-healing** -- dead torrents auto-retry the next result. Failed casts retry 3x with backoff
 
 ## Architecture
