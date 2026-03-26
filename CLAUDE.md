@@ -29,14 +29,15 @@ spela status / history / targets                 # Info
 ## Key Files
 
 - `src/main.rs` — CLI (clap) + server startup. Detects `play 1` (result ID) vs `play magnet:...`
-- `src/server.rs` — axum HTTP API, 14 endpoints. Orchestrates search→play→cast pipeline
+- `src/server.rs` — axum HTTP API, 21 endpoints (including Custom Receiver: cast-config, seek-restart, position, retry). Orchestrates search→play→cast pipeline
 - `src/search.rs` — TMDB + Torrentio. **Auto-detect movie vs TV** via TMDB multi-search. **3-tier ranking**: single-file > H.264 > HEVC (≥5 seed threshold), then by seeds
 - `src/cast.rs` — Native Chromecast via rust_cast + mdns-sd. 3x retry + IP cache + known device fallback
 - `src/torrent.rs` — webtorrent-cli subprocess management with `-s <fileIdx>` for file selection
 - `src/transcode.rs` — ffprobe codec+duration detection, ffmpeg audio transcode (EAC3/DTS/AC3→AAC) + video transcode (HEVC→H.264 via NVENC) + intro concat
 - `src/subtitles.rs` — Stremio OpenSubtitles v3 (zero auth), SRT→WebVTT
 - `src/disk.rs` — 5GB cap, 24h file cleanup
-- `src/state.rs` — state.json + last_search.json (play-by-id)
+- `src/state.rs` — state.json + last_search.json (play-by-id) + resume_positions (IMDB→seconds)
+- `static/cast-receiver.html` — Custom Cast Receiver (Shaka Player + CAF v3, ~200 lines)
 - `src/config.rs` — ~/.config/spela/config.toml
 
 ## Build & Deploy
@@ -87,7 +88,9 @@ ssh darwin 'sudo systemctl stop spela && cp ~/Projects/spela/target/release/spel
 - **Jellyfin evaluated, rejected** (Mar 26) — library-centric (no "stream torrent NOW" flow), C#/.NET plugins, mixed Chromecast reliability. spela Custom Receiver is cleaner path for seeking
 - **Custom Cast Receiver built** (Mar 26) — `static/cast-receiver.html` (Shaka Player + CAF v3). Self-configures via `/api/cast-config` because **rust_cast's Media struct only has 5 fields** (contentId, streamType, contentType, metadata, duration) — no tracks, customData, or textTrackStyle. Server endpoints: `/cast-receiver.html`, `/cast-receiver/intro.mp4`, `/cast-receiver/subs.vtt`, `/api/cast-config`, `/api/seek-restart`, `/api/position`, `/api/retry`. Blocked on $5 Cast SDK registration. Spec at `.claude/specs/custom-cast-receiver/`
 - **Cast SDK terms** (Mar 26) — reviewed, no restrictions on content type or personal/commercial use. ToS governs SDK usage (user-initiated casting, no persistent receiver storage), not content. Safe for distribution
-- **AdGuard blocks payments** (Mar 26) — `ogads-pa.clients6.google.com` and similar payment domains caught by ad filters. Added 35 whitelist rules for Google Payments, 3DS (Visa/Mastercard/Cardinal Commerce), Swedish banks (Swedbank, Lunar, BankID, Klarna, Swish). Rules in `/opt/AdGuardHome/AdGuardHome.yaml` under `user_rules`
+- **ffmpeg zombie fix** (Mar 26) — `std::mem::forget(child)` prevented `waitpid()`, creating zombie processes. Fix: `tokio::spawn(child.wait())` reaps immediately on exit
+- **Torrentio sources** — aggregates 24 torrent sites (TPB, 1337x, YTS, RARBG, TorrentGalaxy, Rutracker, etc). Configurable via URL params. Default covers major English sources
+- **AdGuard blocks payments** (Mar 26) — `ogads-pa.clients6.google.com` caught by ad filters. 35 whitelist rules added for Google Payments, 3DS, Swedish banks
 
 ## Chromecast Devices
 
