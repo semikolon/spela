@@ -176,15 +176,20 @@ async fn run_setup() {
         }
     }
 
-    // LAN IP
+    // LAN IP — auto-detect
     if config.lan_ip.is_empty() {
-        print!("Server LAN IP (Chromecast fetches from this): ");
-        io::stdout().flush().unwrap();
-        let mut ip = String::new();
-        io::stdin().lock().read_line(&mut ip).unwrap();
-        let ip = ip.trim().to_string();
-        if !ip.is_empty() {
+        if let Some(ip) = config::Config::detect_lan_ip() {
+            println!("Detected LAN IP: {}", ip);
             config.lan_ip = ip;
+        } else {
+            print!("Could not auto-detect LAN IP. Enter manually: ");
+            io::stdout().flush().unwrap();
+            let mut ip = String::new();
+            io::stdin().lock().read_line(&mut ip).unwrap();
+            let ip = ip.trim().to_string();
+            if !ip.is_empty() {
+                config.lan_ip = ip;
+            }
         }
     }
 

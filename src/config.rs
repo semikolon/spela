@@ -105,6 +105,14 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(".spela")
     }
+
+    /// Auto-detect the machine's LAN IP by creating a UDP socket.
+    /// Doesn't send any data — just checks which local address the OS would use.
+    pub fn detect_lan_ip() -> Option<String> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("8.8.8.8:80").ok()?;
+        Some(socket.local_addr().ok()?.ip().to_string())
+    }
 }
 
 #[cfg(test)]
@@ -167,10 +175,41 @@ default_device = "Vardagsrum"
     }
 
     #[test]
+    fn test_detect_lan_ip() {
+        // Should return a non-loopback IP on any machine with network
+        let ip = Config::detect_lan_ip();
+        if let Some(ip) = ip {
+            assert!(!ip.is_empty());
+            assert!(!ip.starts_with("127.")); // not loopback
+        }
+        // On CI without network, None is acceptable
+    }
+
+    #[test]
     fn test_media_dir_tilde_expansion() {
         let config = Config { media_dir: "~/media".into(), ..Config::default() };
         let expanded = config.media_dir();
         assert!(!expanded.to_string_lossy().contains('~'));
         assert!(expanded.to_string_lossy().contains("media"));
+    }
+
+    #[test]
+    fn test_media_dir_absolute_path() {
+        let config = Config { media_dir: "/tmp/spela-media".into(), ..Config::default() };
+        assert_eq!(config.media_dir().to_string_lossy(), "/tmp/spela-media");
+    }
+
+    #[test]
+    fn test_config_empty_toml() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.default_device.is_empty());
+        assert_eq!(config.port, 7890);
+        assert_eq!(config.server, "localhost:7890");
+    }
+
+    #[test]
+    fn test_config_cast_app_id_default_empty() {
+        let config = Config::default();
+        assert!(config.cast_app_id.is_empty()); // uses Default Media Receiver when empty
     }
 }

@@ -32,7 +32,18 @@ pub struct ServerState {
 
 type SharedState = Arc<ServerState>;
 
-pub async fn run_server(config: Config) -> anyhow::Result<()> {
+pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
+    // Auto-detect LAN IP if not set in config
+    if config.lan_ip.is_empty() {
+        if let Some(ip) = Config::detect_lan_ip() {
+            tracing::info!("Auto-detected LAN IP: {}", ip);
+            config.lan_ip = ip;
+        } else {
+            tracing::warn!("Could not auto-detect LAN IP. Set lan_ip in config.toml");
+            config.lan_ip = "127.0.0.1".into();
+        }
+    }
+
     let state_dir = Config::state_dir();
     let media_dir = config.media_dir();
     std::fs::create_dir_all(&state_dir)?;

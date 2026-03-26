@@ -495,6 +495,65 @@ mod tests {
     }
 
     #[test]
+    fn test_ranking_h264_at_exact_threshold() {
+        // Exactly 5 seeds = threshold met, H.264 should win
+        let mut results = vec![
+            make_result(1, "Movie.x265.mkv", 100, Some(0)),
+            make_result(2, "Movie.x264.mkv", 5, Some(0)),  // exactly at threshold
+        ];
+        const MIN_SEEDS: u32 = 5;
+        results.sort_by(|a, b| {
+            let a_hevc = is_hevc_from_title(&a.title);
+            let b_hevc = is_hevc_from_title(&b.title);
+            if a_hevc != b_hevc {
+                let preferred = if a_hevc { b } else { a };
+                if preferred.seeds >= MIN_SEEDS {
+                    return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+                }
+            }
+            b.seeds.cmp(&a.seeds)
+        });
+        assert_eq!(results[0].title, "Movie.x264.mkv");
+    }
+
+    #[test]
+    fn test_ranking_both_h264_sorts_by_seeds() {
+        let mut results = vec![
+            make_result(1, "Movie.x264.FLEET.mkv", 10, Some(0)),
+            make_result(2, "Movie.x264.YTS.mp4", 50, Some(0)),
+        ];
+        results.sort_by(|a, b| {
+            let a_hevc = is_hevc_from_title(&a.title);
+            let b_hevc = is_hevc_from_title(&b.title);
+            if a_hevc != b_hevc {
+                let preferred = if a_hevc { b } else { a };
+                if preferred.seeds >= 5 {
+                    return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+                }
+            }
+            b.seeds.cmp(&a.seeds)
+        });
+        assert_eq!(results[0].seeds, 50); // more seeds wins within same codec tier
+    }
+
+    #[test]
+    fn test_ranking_both_hevc_sorts_by_seeds() {
+        let mut results = vec![
+            make_result(1, "Movie.x265.10Bit.mkv", 200, Some(0)),
+            make_result(2, "Movie.HEVC.mkv", 50, Some(0)),
+        ];
+        results.sort_by(|a, b| b.seeds.cmp(&a.seeds));
+        assert_eq!(results[0].seeds, 200);
+    }
+
+    #[test]
+    fn test_is_hevc_case_insensitive() {
+        assert!(is_hevc_from_title("Movie.X265.mkv"));
+        assert!(is_hevc_from_title("Movie.HEVC.mkv"));
+        assert!(is_hevc_from_title("Movie.H.265.MKV"));
+    }
+
+    #[test]
     fn test_ranking_well_seeded_hevc_over_dead_h264() {
         let mut results = vec![
             make_result(1, "Movie.x265.mkv", 100, Some(0)),  // HEVC, well-seeded
