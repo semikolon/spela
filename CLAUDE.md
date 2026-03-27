@@ -89,7 +89,8 @@ ssh darwin 'sudo systemctl stop spela && cp ~/Projects/spela/target/release/spel
 - **Custom Cast Receiver built** (Mar 26) — `static/cast-receiver.html` (Shaka Player + CAF v3). Self-configures via `/api/cast-config` because **rust_cast's Media struct only has 5 fields** (contentId, streamType, contentType, metadata, duration) — no tracks, customData, or textTrackStyle. Server endpoints: `/cast-receiver.html`, `/cast-receiver/intro.mp4`, `/cast-receiver/subs.vtt`, `/api/cast-config`, `/api/seek-restart`, `/api/position`, `/api/retry`. Blocked on $5 Cast SDK registration. Spec at `.claude/specs/custom-cast-receiver/`
 - **Cast SDK terms** (Mar 26) — reviewed, no restrictions on content type or personal/commercial use. ToS governs SDK usage (user-initiated casting, no persistent receiver storage), not content. Safe for distribution
 - **ffmpeg zombie fix** (Mar 26) — `std::mem::forget(child)` prevented `waitpid()`, creating zombie processes. Fix: `tokio::spawn(child.wait())` reaps immediately on exit
-- **Torrentio sources** — aggregates 24 torrent sites (TPB, 1337x, YTS, RARBG, TorrentGalaxy, Rutracker, etc). Configurable via URL params. Default covers major English sources
+- **Torrentio sources** — aggregates 24 torrent sites, returns 76+ results per movie. Default providers = ALL providers (tested, same results). Other Stremio addons (MediaFusion, Knightcrawler, Comet) require encrypted config URLs or debrid service — not usable without self-hosting. Future: self-hosted Jackett on Darwin for private trackers
+- **Movie disambiguation** — TMDB returns sequel over original for franchise names ("28 Years Later" → The Bone Temple). TODO: add `--year` flag to filter by release year
 - **AdGuard blocks payments** (Mar 26) — `ogads-pa.clients6.google.com` caught by ad filters. 35 whitelist rules added for Google Payments, 3DS, Swedish banks
 
 ## Chromecast Devices
