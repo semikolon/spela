@@ -33,6 +33,9 @@ enum Commands {
         /// Listen port
         #[arg(long, default_value_t = 7890)]
         port: u16,
+        /// Listen host/IP address
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
     },
     /// Search for TV shows or movies
     Search {
@@ -113,10 +116,11 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Server { port } => {
+        Commands::Server { port, host } => {
             tracing_subscriber::fmt::init();
             let mut config = config::Config::load().unwrap_or_default();
             config.port = port;
+            config.host = host;
             if let Err(e) = server::run_server(config).await {
                 eprintln!("Server error: {}", e);
                 std::process::exit(1);
@@ -316,6 +320,7 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             }
         }
         Commands::Server { .. } | Commands::Setup => unreachable!(),
+
     }
 }
 

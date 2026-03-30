@@ -21,6 +21,8 @@ pub struct Config {
     pub media_dir: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_host")]
+    pub host: String,
     /// Fallback IPs for Chromecast devices when mDNS discovery fails.
     /// Format: { "Device Name" = "192.168.x.x" }
     #[serde(default)]
@@ -35,6 +37,7 @@ fn default_subtitles() -> String { "en".into() }
 fn default_quality() -> String { "1080p".into() }
 fn default_media_dir() -> String { "~/media".into() }
 fn default_port() -> u16 { 7890 }
+fn default_host() -> String { "0.0.0.0".into() }
 
 impl Default for Config {
     fn default() -> Self {
@@ -47,6 +50,7 @@ impl Default for Config {
             lan_ip: String::new(),
             media_dir: default_media_dir(),
             port: default_port(),
+            host: default_host(),
             known_devices: HashMap::new(),
             cast_app_id: String::new(),
         }

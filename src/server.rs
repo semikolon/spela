@@ -52,6 +52,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     let search_engine = SearchEngine::new(config.tmdb_api_key.clone());
     let cast = Mutex::new(CastController::new(&state_dir, config.known_devices.clone()));
     let port = config.port;
+    let host = config.host.clone();
 
     let state = Arc::new(ServerState {
         config,
@@ -94,7 +95,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .layer(cors)
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("{}:{}", host, port);
     tracing::info!("spela server listening on http://{}", addr);
     tracing::info!("Endpoints: /search /play /stop /status /pause /resume /seek /volume /next /prev /targets /history /config");
 
