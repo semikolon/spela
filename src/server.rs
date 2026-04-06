@@ -214,6 +214,14 @@ async fn do_play(
     state: &SharedState,
     req: &mut PlayRequest,
 ) -> Json<Value> {
+    let mut media_dir = state.media_dir.clone();
+    if media_dir.to_string_lossy().starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
+        }
+    }
+    let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
+
     // Resolve result_id from last search — fills magnet, file_index, and metadata automatically
     if let Some(rid) = req.result_id {
         match AppState::load_last_search(&state.state_dir) {
@@ -259,10 +267,41 @@ async fn do_play(
     };
 
     // Disk check
-    if let Ok(Some(err)) = disk::check_space(&state.media_dir) {
+    if let Ok(Some(err)) = disk::check_space(&media_dir) {
         return Json(json!({"error": err}));
     }
-    disk::cleanup_old_files(&state.media_dir);
+    disk::cleanup_old_files(&media_dir);
+
+    // Local Bypass System: Check if the movie already exists on disk
+    let mut server_url = String::new();
+    let mut pid: u32 = 0;
+    let mut is_local = false;
+
+    if let Some(title) = &req.title {
+        // Search for the file in media_dir (YTS format: "Movie Title (Year) [Quality] ...")
+        if let Ok(entries) = std::fs::read_dir(&media_dir) {
+            for entry in entries.flatten() {
+                if let Ok(file_type) = entry.file_type() {
+                    if file_type.is_dir() && entry.file_name().to_string_lossy().contains(title) {
+                        // Found a matching directory, look for mp4/mkv inside
+                        if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
+                            for sub_entry in sub_entries.flatten() {
+                                let path = sub_entry.path();
+                                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                                if ext == "mp4" || ext == "mkv" {
+                                    tracing::info!("Local Bypass: Found already downloaded file: {:?}", path);
+                                    server_url = format!("file://{}", path.to_string_lossy());
+                                    is_local = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if is_local { break; }
+            }
+        }
+    }
 
     // Stop existing stream
     let pid_path = state.state_dir.join("webtorrent.pid");
@@ -271,31 +310,27 @@ async fn do_play(
     let mut app_state = AppState::load(&state.state_dir);
     app_state.stop_current();
 
-    let target = req.target.as_deref().unwrap_or(&app_state.preferences.default_target).to_string();
-    let cast_name = req.cast_name.clone()
-        .or_else(|| app_state.preferences.chromecast_name.clone())
-        .unwrap_or_else(|| state.config.default_device.clone());
-    let no_subs = req.no_subs.unwrap_or(false);
-    let sub_lang = req.subtitle_lang.clone().unwrap_or_else(|| "eng".into());
+    // Start webtorrent if NOT local
+    if !is_local {
+        let log_path = state.state_dir.join("webtorrent.log");
+        let result = match torrent::start_webtorrent(
+            &magnet, req.file_index, &media_dir, &state.config.lan_ip, &log_path
+        ).await {
+            Ok(r) => r,
+            Err(e) => return Json(json!({"error": e.to_string()})),
+        };
+        pid = result.0;
+        server_url = result.1;
+        let _ = torrent::save_pid(&state.state_dir.join("webtorrent.pid"), pid);
 
-    // Start webtorrent
-    let log_path = state.state_dir.join("webtorrent.log");
-    let (pid, server_url) = match torrent::start_webtorrent(
-        &magnet, req.file_index, &state.media_dir, &state.config.lan_ip, &log_path
-    ).await {
-        Ok(r) => r,
-        Err(e) => return Json(json!({"error": e.to_string()})),
-    };
-
-    let _ = torrent::save_pid(&state.state_dir.join("webtorrent.pid"), pid);
-
-    // Self-healing: check download progress — if 0% after 12s, torrent has dead seeds
-    if !torrent::check_progress(&log_path, 12).await {
-        tracing::warn!("Torrent has no download progress after 12s — dead seeds");
-        torrent::kill_pid(pid);
-        torrent::kill_all_webtorrent();
-        disk::cleanup_old_files(&state.media_dir);
-        return Json(json!({"error": "Torrent has no active seeds (0% after 12s)"}));
+        // Self-healing: check download progress
+        if !torrent::check_progress(&log_path, 12).await {
+            tracing::warn!("Torrent has no download progress after 12s — dead seeds");
+            torrent::kill_pid(pid);
+            torrent::kill_all_webtorrent();
+            disk::cleanup_old_files(&media_dir);
+            return Json(json!({"error": "Torrent has no active seeds (0% after 12s)"}));
+        }
     }
 
     // Fetch subtitles FIRST (needed for burn-in during transcode)
@@ -358,7 +393,7 @@ async fn do_play(
         tracing::info!("Transcode needed: {}", reasons.join(" + "));
 
         let sub_path = subtitle_srt_path.as_deref();
-        match transcode::transcode(&server_url, &state.media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to).await {
+        match transcode::transcode(&server_url, &media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to).await {
                 Ok((output_path, ffmpeg_pid)) => {
                     // Track ffmpeg PID for the streaming endpoint and cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
@@ -769,7 +804,14 @@ async fn handle_transcode_stream(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let path = state.media_dir.join("transcoded_aac.mp4");
+    let mut media_dir = state.media_dir.clone();
+    if media_dir.to_string_lossy().starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
+        }
+    }
+    let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
+    let path = media_dir.join("transcoded_aac.mp4");
     let ffmpeg_pid = *state.ffmpeg_pid.lock().unwrap();
 
     let start_offset = parse_range_start(headers.get("range").and_then(|v| v.to_str().ok()));
@@ -902,7 +944,14 @@ async fn handle_cast_receiver_intro() -> impl IntoResponse {
 
 /// Serve the current subtitle WebVTT file.
 async fn handle_cast_receiver_subs(State(state): State<SharedState>) -> impl IntoResponse {
-    let vtt_path = state.media_dir.join("subtitle_eng.vtt");
+    let mut media_dir = state.media_dir.clone();
+    if media_dir.to_string_lossy().starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
+        }
+    }
+    let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
+    let vtt_path = media_dir.join("subtitle_eng.vtt");
     match tokio::fs::read_to_string(&vtt_path).await {
         Ok(data) => axum::response::Response::builder()
             .header("Content-Type", "text/vtt; charset=utf-8")
@@ -930,7 +979,14 @@ async fn handle_cast_config(State(state): State<SharedState>) -> Json<Value> {
         .map(|_| format!("http://{}:{}/cast-receiver/intro.mp4", state.config.lan_ip, state.config.port));
 
     // Check if subtitles exist
-    let subs_vtt = state.media_dir.join("subtitle_eng.vtt");
+    let mut media_dir = state.media_dir.clone();
+    if media_dir.to_string_lossy().starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
+        }
+    }
+    let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
+    let subs_vtt = media_dir.join("subtitle_eng.vtt");
     let subtitle_url = if subs_vtt.exists() {
         Some(format!("http://{}:{}/cast-receiver/subs.vtt", state.config.lan_ip, state.config.port))
     } else {
