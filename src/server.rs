@@ -287,8 +287,10 @@ async fn do_play(
                         if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
                             for sub_entry in sub_entries.flatten() {
                                 let path = sub_entry.path();
+                                let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                                 let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                                if ext == "mp4" || ext == "mkv" {
+                                // Only match actual movie files, not transcode artifacts
+                                if (ext == "mp4" || ext == "mkv") && !fname.starts_with("transcoded") {
                                     tracing::info!("Local Bypass: Found already downloaded file: {:?}", path);
                                     server_url = format!("file://{}", path.to_string_lossy());
                                     is_local = true;
@@ -580,12 +582,20 @@ fn do_cleanup(state: &SharedState) {
     if let Some(pid) = state.ffmpeg_pid.lock().unwrap().take() {
         torrent::kill_pid(pid);
     }
-    // Kill any lingering python http servers (legacy)
+    // Kill any lingering ffmpeg or python http servers
     let _ = std::process::Command::new("pkill")
         .args(["-f", "python3 -m http.server 8889"])
         .output();
 
-    let transcoded = state.media_dir.join("transcoded_aac.mp4");
+    // Expand media_dir path (same logic as do_play) before trying to delete
+    let mut media_dir = state.media_dir.clone();
+    if media_dir.to_string_lossy().starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
+        }
+    }
+    let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
+    let transcoded = media_dir.join("transcoded_aac.mp4");
     if transcoded.exists() {
         let _ = std::fs::remove_file(&transcoded);
     }

@@ -85,20 +85,30 @@ pub async fn transcode(
         args.extend(["-i".into(), intro.to_string_lossy().to_string()]);
     }
 
-    // Input 1 (or 0 if no intro): main stream with real-time pacing
+    // Input 1 (or 0 if no intro): main stream
     if let Some(seek) = seek_to {
         if seek > 0.0 {
             args.extend(["-ss".into(), seek.to_string()]);
         }
     }
-    args.extend([
-        "-reconnect".into(), "1".into(),
-        "-reconnect_at_eof".into(), "1".into(),
-        "-reconnect_streamed".into(), "1".into(),
-        "-reconnect_delay_max".into(), "30".into(),
-        "-rw_timeout".into(), "60000000".into(),
-        "-i".into(), input_url.into(),
-    ]);
+    // Reconnect flags are HTTP-only — they cause FFmpeg to error on file:// URLs
+    let is_local_file = input_url.starts_with("file://") || input_url.starts_with("/");
+    if !is_local_file {
+        args.extend([
+            "-reconnect".into(), "1".into(),
+            "-reconnect_at_eof".into(), "1".into(),
+            "-reconnect_streamed".into(), "1".into(),
+            "-reconnect_delay_max".into(), "30".into(),
+            "-rw_timeout".into(), "60000000".into(),
+        ]);
+    }
+    // Strip file:// prefix for FFmpeg (it expects bare paths for local files)
+    let ffmpeg_input = if let Some(path) = input_url.strip_prefix("file://") {
+        path.to_string()
+    } else {
+        input_url.to_string()
+    };
+    args.extend(["-i".into(), ffmpeg_input]);
 
     // Build filter chain based on what's needed
     let main_idx = if has_intro { 1 } else { 0 };
@@ -173,12 +183,21 @@ pub async fn transcode(
         output_path.to_str().unwrap_or("transcoded_aac.mp4").into(),
     ]);
 
-    tracing::debug!("ffmpeg args: {:?}", args);
+    tracing::info!("ffmpeg args: {:?}", args);
+
+    // Log FFmpeg stderr to a file for debugging (was /dev/null — invisible failures)
+    let ffmpeg_log_path = media_dir.parent()
+        .and_then(|_| dirs::home_dir())
+        .map(|h| h.join(".spela").join("ffmpeg.log"))
+        .unwrap_or_else(|| media_dir.join("ffmpeg.log"));
+    let stderr_file = std::fs::File::create(&ffmpeg_log_path)
+        .unwrap_or_else(|_| std::fs::File::create("/tmp/spela-ffmpeg.log").expect("Cannot create any log file"));
+    tracing::info!("FFmpeg stderr → {:?}", ffmpeg_log_path);
 
     let mut child = Command::new("ffmpeg")
         .args(&args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()?;
 
     let pid = child.id().unwrap_or(0);
