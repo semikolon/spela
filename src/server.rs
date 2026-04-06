@@ -336,7 +336,8 @@ async fn do_play(
     // Codec detection + transcode decision
     let mut final_url = server_url.clone();
     let mut is_transcoded = false;
-    let no_intro = req.no_intro.unwrap_or(false);
+    // Skip intro when seeking — avoids complex concat logic and improves UX on resume
+    let no_intro = req.no_intro.unwrap_or(false) || seek_to.is_some();
     let intro_path = if no_intro { None } else { transcode::find_intro() };
 
     let (video_codec, audio_codec, source_duration) = transcode::detect_codecs(&server_url).await
