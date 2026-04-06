@@ -493,7 +493,7 @@ async fn do_play(
             started_at: chrono::Utc::now(),
             pid: webtorrent_pid,
             has_subtitles,
-            subtitle_lang: sub_lang,
+            subtitle_lang: Some(sub_lang),
         });
         let _ = app_state.save(&state.state_dir);
     }
