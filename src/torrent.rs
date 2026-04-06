@@ -24,6 +24,7 @@ pub async fn start_webtorrent(
         media_dir.to_string_lossy().to_string(),
         "-p".to_string(),
         "8888".to_string(),
+        "--keep-seeding".to_string(),
     ];
     if let Some(idx) = file_index {
         args.push("-s".to_string());
