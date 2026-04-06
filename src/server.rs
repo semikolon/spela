@@ -350,7 +350,7 @@ async fn do_play(
         if let Some(imdb_id) = &req.imdb_id {
             let client = reqwest::Client::new();
             match subtitles::fetch_subtitles(&client, imdb_id, req.season, req.episode, &sub_lang, &state.media_dir).await {
-                Ok(Some(vtt_path)) => {
+                Ok(Some(_vtt_path)) => {
                     has_subtitles = true;
                     // Use the SRT version for ffmpeg burn-in (ffmpeg handles SRT natively)
                     subtitle_srt_path = Some(state.media_dir.join(format!("subtitle_{}.srt", sub_lang)));
@@ -468,7 +468,6 @@ async fn do_play(
                     "recovery_suggestion": "Try 'spela targets' to discover devices, or check if TV is on"
                 }));
             }
-            Ok(_) => {} // should not happen with Result
             Err(e) => return Json(json!({"error": format!("Cast task failed: {}", e)})),
         }
 
@@ -1069,7 +1068,7 @@ async fn handle_seek_restart(
 
     // Get current stream's webtorrent URL from state
     let app_state = AppState::load(&state.state_dir);
-    let server_url = match &app_state.current {
+    let _server_url = match &app_state.current {
         Some(c) => {
             // The URL might be the transcode endpoint — we need the original webtorrent URL
             // which is stored as the first webtorrent URL on port 8888
@@ -1151,8 +1150,8 @@ async fn handle_reset_position(
     Json(json!({"status": "reset", "key": key}))
 }
 
-/// Retry with next torrent result after stream failure.
-async fn handle_retry(State(state): State<SharedState>) -> Json<Value> {
+/// Force a retry of the current stream.
+async fn handle_retry(State(_state): State<SharedState>) -> Json<Value> {
     // TODO: Implement retry logic — load next search result and cast
     tracing::info!("Stream retry requested by Cast receiver");
     Json(json!({"status": "retry_requested"}))

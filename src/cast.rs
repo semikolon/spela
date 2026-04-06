@@ -130,7 +130,7 @@ impl CastController {
     /// Duration passed for display purposes but seeking requires Custom Receiver —
     /// Default Media Receiver can't seek in fMP4 without byte-offset index.
     /// Jellyfin solves this with custom receiver + Shaka Player + server-side seek-restart.
-    pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, duration: Option<f64>, current_time: Option<f64>) -> Result<CastResult> {
+    pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, duration: Option<f64>, _current_time: Option<f64>) -> Result<CastResult> {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, session_id) = Self::get_or_launch_app(&device)?;
@@ -203,6 +203,7 @@ impl CastController {
     }
 
     /// Stop playback on a device.
+    #[allow(dead_code)]
     pub fn stop_cast(&mut self, device_name: &str) -> Result<CastResult> {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;

@@ -88,6 +88,7 @@ impl Config {
     }
 
     /// True if this looks like a first run (no config file or no default device).
+    #[allow(dead_code)]
     pub fn needs_setup(&self) -> bool {
         self.default_device.is_empty()
     }
