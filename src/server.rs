@@ -531,7 +531,6 @@ async fn do_play(
         "subtitles": has_subtitles,
     }))
 }
-}
 
 /// Shared cleanup logic: kill webtorrent + ffmpeg, delete transcoded file, update state.
 fn do_cleanup(state: &SharedState) {
