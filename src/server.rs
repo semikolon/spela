@@ -483,15 +483,17 @@ async fn do_play(
         let mut app_state = AppState::load(&state.state_dir);
         app_state.current = Some(crate::state::CurrentStream {
             title: title.clone(),
-            show: req.show.clone().unwrap_or_else(|| title.clone()),
-            imdb_id: req.imdb_id.clone().unwrap_or_else(|| "".into()),
+            show: Some(req.show.clone().unwrap_or_else(|| title.clone())),
+            imdb_id: Some(req.imdb_id.clone().unwrap_or_else(|| "".into())),
+            season: req.season,
+            episode: req.episode,
             magnet: magnet.clone(),
             target: format!("{}:{}", target, cast_name),
             url: final_url.clone(),
             started_at: chrono::Utc::now(),
             pid: webtorrent_pid,
             has_subtitles,
-            subtitle_lang: Some(sub_lang),
+            subtitle_lang: sub_lang,
         });
         let _ = app_state.save(&state.state_dir);
     }
