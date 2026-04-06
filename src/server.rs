@@ -465,9 +465,6 @@ async fn do_play(
         // --- Seek Logic ---
         // If we are NOT transcoding, we must tell the Chromecast to seek 
         // to the correct position after the media loads.
-        // If we ARE transcoding, the stream itself already starts at the right 
-        // point (Fake Live seek), so calling an absolute seek(2843) on a 3-second 
-        // stream would cause a hang.
         if !is_transcoded {
             if let Some(pos) = seek_to {
                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -477,8 +474,10 @@ async fn do_play(
                     let mut cast = state_clone.cast.lock().unwrap();
                     cast.seek(&cast_name_clone, pos)
                 }).await;
-    // Save state
-    let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
+            }
+        }
+    }
+
     // Update global current state
     {
         let mut app_state = AppState::load(&state.state_dir);
@@ -497,6 +496,32 @@ async fn do_play(
         let _ = app_state.save(&state.state_dir);
     }
 
+    // Spawn post-playback reaper: monitors pipeline, auto-cleans when movie ends.
+    {
+        let state = state.clone();
+        let wt_pid = webtorrent_pid;
+        let title_for_log = title.clone();
+        tokio::spawn(async move {
+            // Wait for playback to establish before monitoring
+            tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                let app_state = AppState::load(&state.state_dir);
+                match &app_state.current {
+                    Some(c) if c.pid == wt_pid => {} 
+                    _ => break,
+                }
+                let wt_alive = if wt_pid > 0 { unsafe { torrent::kill_check(wt_pid) } } else { false };
+                let ffmpeg_alive = state.ffmpeg_pid.lock().unwrap().map(|p| unsafe { torrent::kill_check(p) }).unwrap_or(false);
+                if !ffmpeg_alive && !wt_alive {
+                    tracing::info!("Reaper: cleaning up for '{}'", title_for_log);
+                    do_cleanup(&state);
+                    break;
+                }
+            }
+        });
+    }
+
     Json(json!({
         "pid": webtorrent_pid,
         "status": "streaming",
@@ -506,71 +531,6 @@ async fn do_play(
         "subtitles": has_subtitles,
     }))
 }
-
-// Spawn post-playback reaper: monitors pipeline, auto-cleans when movie ends.
-    // Frees webtorrent's ~1.5GB RAM and cleans up media files.
-    {
-        let state = state.clone();
-        let webtorrent_pid = pid;
-        let title_for_log = title.clone();
-        tokio::spawn(async move {
-            // Wait for playback to establish before monitoring
-            tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
-
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-
-                // Check if this stream is still the current one (user may have started another)
-                let app_state = AppState::load(&state.state_dir);
-                match &app_state.current {
-                    Some(c) if c.pid == webtorrent_pid => {} // Still our stream
-                    _ => {
-                        tracing::debug!("Reaper: stream replaced or stopped, exiting");
-                        break;
-                    }
-                }
-
-                let wt_alive = unsafe { torrent::kill_check(webtorrent_pid) };
-                let ffmpeg_alive = state.ffmpeg_pid.lock().unwrap()
-                    .map(|p| unsafe { torrent::kill_check(p) })
-                    .unwrap_or(false);
-
-                if !ffmpeg_alive && !wt_alive {
-                    // Both dead — playback fully finished
-                    tracing::info!("Reaper: all processes exited for '{}', cleaning up", title_for_log);
-                    do_cleanup(&state);
-                    break;
-                }
-
-                if !ffmpeg_alive && wt_alive {
-                    // ffmpeg done (movie finished transcoding), webtorrent still seeding.
-                    // Grace period: let Chromecast play remaining buffer
-                    tracing::info!("Reaper: ffmpeg finished for '{}', grace period before cleanup...", title_for_log);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(180)).await;
-
-                    // Re-check we're still the active stream
-                    let app_state = AppState::load(&state.state_dir);
-                    match &app_state.current {
-                        Some(c) if c.pid == webtorrent_pid => {
-                            tracing::info!("Reaper: cleaning up webtorrent + media for '{}'", title_for_log);
-                            do_cleanup(&state);
-                        }
-                        _ => tracing::debug!("Reaper: stream changed during grace period"),
-                    }
-                    break;
-                }
-            }
-        });
-    }
-
-    Json(json!({
-        "status": "streaming",
-        "pid": pid,
-        "target": format!("{}:{}", target, cast_name),
-        "title": title,
-        "subtitles": has_subtitles,
-        "url": final_url
-    }))
 }
 
 /// Shared cleanup logic: kill webtorrent + ffmpeg, delete transcoded file, update state.
