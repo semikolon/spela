@@ -310,7 +310,8 @@ async fn do_play(
     torrent::stop_by_pid_file(&pid_path);
 
     let mut app_state = AppState::load(&state.state_dir);
-    app_state.stop_current();
+    app_state.current = None;
+    let _ = app_state.save(&state.state_dir);
 
     let target = req.target.as_deref().unwrap_or(&app_state.preferences.default_target).to_string();
     let cast_name = req.cast_name.clone()
@@ -492,6 +493,15 @@ async fn do_play(
 
     // Save state
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
+    // If seeking, save the baseline position immediately to state.json
+    if let Some(pos) = seek_to {
+        let (key, saved) = app_state.save_position_smart(req.imdb_id.clone(), req.title.clone(), pos);
+        if saved {
+            let _ = app_state.save(&state.state_dir);
+            tracing::info!("Auto-resume: saved baseline position for '{}' at {}s", key, pos);
+        }
+    }
+
     app_state.current = Some(CurrentStream {
         magnet: magnet.chars().take(300).collect(),
         title: title.clone(),
@@ -545,9 +555,10 @@ async fn do_play(
 
                 if !ffmpeg_alive && wt_alive {
                     // ffmpeg done (movie finished transcoding), webtorrent still seeding.
-                    // Grace period: let Chromecast play remaining buffer
-                    tracing::info!("Reaper: ffmpeg finished for '{}', grace period before cleanup...", title_for_log);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(180)).await;
+                    // Grace period: let Chromecast play remaining buffer. 
+                    // 45 minutes account for high-speed HW encoding (12x+).
+                    tracing::info!("Reaper: ffmpeg finished for '{}', waiting 45m grace period...", title_for_log);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2700)).await;
 
                     // Re-check we're still the active stream
                     let app_state = AppState::load(&state.state_dir);
