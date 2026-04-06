@@ -344,10 +344,9 @@ async fn do_play(
         if let Some(imdb_id) = &req.imdb_id {
             let client = reqwest::Client::new();
             match subtitles::fetch_subtitles(&client, imdb_id, req.season, req.episode, &sub_lang, &media_dir).await {
-                Ok(Some(_vtt_path)) => {
+                Ok(Some(vtt_path)) => {
                     has_subtitles = true;
-                    // Use the SRT version for ffmpeg burn-in (ffmpeg handles SRT natively)
-                    subtitle_srt_path = Some(media_dir.join(format!("subtitle_{}.srt", sub_lang)));
+                    subtitle_srt_path = Some(vtt_path);
                     tracing::info!("Subtitles fetched ({})", sub_lang);
                 }
                 Ok(None) => tracing::info!("No subtitles found for {}", sub_lang),
