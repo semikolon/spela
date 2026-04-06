@@ -214,6 +214,13 @@ async fn do_play(
     state: &SharedState,
     req: &mut PlayRequest,
 ) -> Json<Value> {
+    let mut media_dir = state.media_dir.clone();
+    if media_dir.to_string_lossy().starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
+        }
+    }
+
     // Resolve result_id from last search — fills magnet, file_index, and metadata automatically
     if let Some(rid) = req.result_id {
         match AppState::load_last_search(&state.state_dir) {
@@ -318,12 +325,6 @@ async fn do_play(
     }
 
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
-    let mut media_dir = state.media_dir.clone();
-    if media_dir.to_string_lossy().starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
-        }
-    }
 
     // Auto-resume from saved position if no explicit seek requested
     let mut seek_to = req.seek_to;
