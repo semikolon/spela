@@ -324,12 +324,12 @@ async fn do_play(
         };
         webtorrent_pid = pid;
         final_source_url = Some(server_url);
-        let _ = torrent::save_pid(&state.state_dir.join("webtorrent.pid"), pid);
+        let _ = torrent::save_pid(&state.state_dir.join("webtorrent.pid"), webtorrent_pid);
 
         // Self-healing: check progress
         if !torrent::check_progress(&log_path, 12).await {
             tracing::warn!("Torrent dead after 12s");
-            torrent::kill_pid(pid);
+            torrent::kill_pid(webtorrent_pid);
             torrent::kill_all_webtorrent();
             return Json(json!({"error": "Torrent has no active seeds"}));
         }
@@ -344,7 +344,7 @@ async fn do_play(
         if let Some(imdb_id) = &req.imdb_id {
             let client = reqwest::Client::new();
             match subtitles::fetch_subtitles(&client, imdb_id, req.season, req.episode, &sub_lang, &media_dir).await {
-                Ok(Some(vtt_path)) => {
+                Ok(Some(_vtt_path)) => {
                     has_subtitles = true;
                     // Use the SRT version for ffmpeg burn-in (ffmpeg handles SRT natively)
                     subtitle_srt_path = Some(media_dir.join(format!("subtitle_{}.srt", sub_lang)));
@@ -402,11 +402,6 @@ async fn do_play(
                 Ok((output_path, ffmpeg_pid)) => {
                     // Track ffmpeg PID for the streaming endpoint and cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
-
-                    // Wait for sufficient buffer before casting.
-                    // 5MB proves sustained torrent download + transcode pipeline health.
-                    // Intro concat + NVENC re-encoding needs more time (~30s) than
-                    // simple audio transcode with video copy (~14s).
                     let prebuffer_min: u64 = 5 * 1024 * 1024; // 5MB
                     let timeout_secs = if intro_path.is_some() { 45 } else { 25 };
                     let prebuffer_deadline = tokio::time::Instant::now()
