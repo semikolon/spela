@@ -214,16 +214,6 @@ async fn do_play(
     state: &SharedState,
     req: &mut PlayRequest,
 ) -> Json<Value> {
-    let mut media_dir = state.media_dir.clone();
-    if media_dir.to_string_lossy().starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
-        }
-    }
-    // Force absolute path for stability
-    let media_dir_abs = std::fs::canonicalize(&media_dir).unwrap_or(media_dir.clone());
-    let media_dir = media_dir_abs; 
-
     // Resolve result_id from last search — fills magnet, file_index, and metadata automatically
     if let Some(rid) = req.result_id {
         match AppState::load_last_search(&state.state_dir) {
@@ -269,10 +259,10 @@ async fn do_play(
     };
 
     // Disk check
-    if let Ok(Some(err)) = disk::check_space(&media_dir) {
+    if let Ok(Some(err)) = disk::check_space(&state.media_dir) {
         return Json(json!({"error": err}));
     }
-    disk::cleanup_old_files(&media_dir);
+    disk::cleanup_old_files(&state.media_dir);
 
     // Stop existing stream
     let pid_path = state.state_dir.join("webtorrent.pid");
@@ -288,57 +278,25 @@ async fn do_play(
     let no_subs = req.no_subs.unwrap_or(false);
     let sub_lang = req.subtitle_lang.clone().unwrap_or_else(|| "eng".into());
 
-    // Check if the file is already downloaded (Local Bypass)
-    let mut final_source_url = None;
-    let mut webtorrent_pid = 0;
+    // Start webtorrent
+    let log_path = state.state_dir.join("webtorrent.log");
+    let (pid, server_url) = match torrent::start_webtorrent(
+        &magnet, req.file_index, &state.media_dir, &state.config.lan_ip, &log_path
+    ).await {
+        Ok(r) => r,
+        Err(e) => return Json(json!({"error": e.to_string()})),
+    };
 
-    // Search for the movie file in the media directory
-    if let Ok(entries) = std::fs::read_dir(&media_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && (path.to_string_lossy().contains(".mp4") || path.to_string_lossy().contains(".mkv")) {
-                tracing::info!("Local Bypass: Found already downloaded file: {:?}", path);
-                final_source_url = Some(path.to_string_lossy().to_string());
-                break;
-            } else if path.is_dir() {
-                if let Ok(subs) = std::fs::read_dir(&path) {
-                    for sub in subs.flatten() {
-                        let sub_path = sub.path();
-                        if sub_path.is_file() && (sub_path.to_string_lossy().contains(".mp4") || sub_path.to_string_lossy().contains(".mkv")) {
-                            tracing::info!("Local Bypass: Found in subdirectory: {:?}", sub_path);
-                            final_source_url = Some(sub_path.to_string_lossy().to_string());
-                            break;
-                        }
-                    }
-                }
-            }
-            if final_source_url.is_some() { break; }
-        }
+    let _ = torrent::save_pid(&state.state_dir.join("webtorrent.pid"), pid);
+
+    // Self-healing: check download progress — if 0% after 12s, torrent has dead seeds
+    if !torrent::check_progress(&log_path, 12).await {
+        tracing::warn!("Torrent has no download progress after 12s — dead seeds");
+        torrent::kill_pid(pid);
+        torrent::kill_all_webtorrent();
+        disk::cleanup_old_files(&state.media_dir);
+        return Json(json!({"error": "Torrent has no active seeds (0% after 12s)"}));
     }
-
-    if final_source_url.is_none() {
-        // Start webtorrent
-        let log_path = state.state_dir.join("webtorrent.log");
-        let (pid, server_url) = match torrent::start_webtorrent(
-            &magnet, req.file_index, &media_dir, &state.config.lan_ip, &log_path
-        ).await {
-            Ok(r) => r,
-            Err(e) => return Json(json!({"error": e.to_string()})),
-        };
-        webtorrent_pid = pid;
-        final_source_url = Some(server_url);
-        let _ = torrent::save_pid(&state.state_dir.join("webtorrent.pid"), webtorrent_pid);
-
-        // Self-healing: check progress
-        if !torrent::check_progress(&log_path, 12).await {
-            tracing::warn!("Torrent dead after 12s");
-            torrent::kill_pid(webtorrent_pid);
-            torrent::kill_all_webtorrent();
-            return Json(json!({"error": "Torrent has no active seeds"}));
-        }
-    }
-
-    let server_url = final_source_url.unwrap();
 
     // Fetch subtitles FIRST (needed for burn-in during transcode)
     let mut has_subtitles = false;
@@ -346,10 +304,11 @@ async fn do_play(
     if !no_subs {
         if let Some(imdb_id) = &req.imdb_id {
             let client = reqwest::Client::new();
-            match subtitles::fetch_subtitles(&client, imdb_id, req.season, req.episode, &sub_lang, &media_dir).await {
+            match subtitles::fetch_subtitles(&client, imdb_id, req.season, req.episode, &sub_lang, &state.media_dir).await {
                 Ok(Some(vtt_path)) => {
                     has_subtitles = true;
-                    subtitle_srt_path = Some(vtt_path);
+                    // Use the SRT version for ffmpeg burn-in (ffmpeg handles SRT natively)
+                    subtitle_srt_path = Some(state.media_dir.join(format!("subtitle_{}.srt", sub_lang)));
                     tracing::info!("Subtitles fetched ({})", sub_lang);
                 }
                 Ok(None) => tracing::info!("No subtitles found for {}", sub_lang),
@@ -377,8 +336,7 @@ async fn do_play(
     // Codec detection + transcode decision
     let mut final_url = server_url.clone();
     let mut is_transcoded = false;
-    // Skip intro when seeking — avoids complex concat logic and improves UX on resume
-    let no_intro = req.no_intro.unwrap_or(false) || seek_to.is_some();
+    let no_intro = req.no_intro.unwrap_or(false);
     let intro_path = if no_intro { None } else { transcode::find_intro() };
 
     let (video_codec, audio_codec, source_duration) = transcode::detect_codecs(&server_url).await
@@ -400,24 +358,44 @@ async fn do_play(
         tracing::info!("Transcode needed: {}", reasons.join(" + "));
 
         let sub_path = subtitle_srt_path.as_deref();
-        match transcode::transcode(&server_url, &media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to).await {
+        match transcode::transcode(&server_url, &state.media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to).await {
                 Ok((output_path, ffmpeg_pid)) => {
                     // Track ffmpeg PID for the streaming endpoint and cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
-                    is_transcoded = true;
-                    final_url = format!("http://{}:{}/stream/transcode", state.config.lan_ip, state.config.port);
-                    
-                    // Wait for transcoded file to exist and grow a bit
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    if !output_path.exists() {
-                        tracing::warn!("Pre-buffer: transcoded file not produced after 5s");
+
+                    // Wait for sufficient buffer before casting.
+                    // 5MB proves sustained torrent download + transcode pipeline health.
+                    // Intro concat + NVENC re-encoding needs more time (~30s) than
+                    // simple audio transcode with video copy (~14s).
+                    let prebuffer_min: u64 = 5 * 1024 * 1024; // 5MB
+                    let timeout_secs = if intro_path.is_some() { 45 } else { 25 };
+                    let prebuffer_deadline = tokio::time::Instant::now()
+                        + tokio::time::Duration::from_secs(timeout_secs);
+                    loop {
+                        if tokio::time::Instant::now() > prebuffer_deadline {
+                            tracing::warn!("Pre-buffer timeout ({}s) — casting with available data", timeout_secs);
+                            break;
+                        }
+                        if let Ok(meta) = std::fs::metadata(&output_path) {
+                            if meta.len() >= prebuffer_min {
+                                tracing::info!("Pre-buffer ready: {}KB", meta.len() / 1024);
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     }
-                    if let Some(_path) = sub_path {
+
+                    // Serve via axum's streaming endpoint (chunked transfer, no Content-Length)
+                    // This replaces the python http.server which sent Content-Length for a growing file
+                    final_url = format!("http://{}:{}/stream/transcode", state.config.lan_ip, state.config.port);
+                    is_transcoded = true;
+
+                    if sub_path.is_some() {
                         tracing::info!("Subtitles burned into video stream via NVENC");
                     }
                 }
-                Err(e) => return Json(json!({"error": format!("Transcode failed: {}", e)})),
-        }
+                Err(e) => tracing::warn!("Transcode failed (casting original): {}", e),
+            }
     }
 
     // Cast to Chromecast
@@ -425,15 +403,36 @@ async fn do_play(
         let state_clone = state.clone();
         let cast_name_clone = cast_name.clone();
         let url_clone = final_url.clone();
+        // When duration is known, use Buffered (enables seeking). Otherwise Live.
+        // Intro adds ~5s to total duration.
         let cast_duration = source_duration.map(|d| {
             let intro_secs = if intro_path.is_some() { 5.0 } else { 0.0 };
             d + intro_secs
         });
-        let _cast_res = tokio::task::spawn_blocking(move || {
+        let cast_result = tokio::task::spawn_blocking(move || {
             let mut cast = state_clone.cast.lock().unwrap();
-            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4", cast_duration, if is_transcoded { None } else { seek_to })
+            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4", cast_duration, seek_to)
         }).await;
 
+        match cast_result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return Json(json!({
+                    "error": format!("Cast failed: {}", e),
+                    "url": final_url,
+                    "recovery_suggestion": "Try 'spela targets' to discover devices, or check if TV is on"
+                }));
+            }
+            Ok(_) => {} // should not happen with Result
+            Err(e) => return Json(json!({"error": format!("Cast task failed: {}", e)})),
+        }
+
+        // --- Seek Logic ---
+        // If we are NOT transcoding, we must tell the Chromecast to seek 
+        // to the correct position after the media loads.
+        // If we ARE transcoding, the stream itself already starts at the right 
+        // point (Fake Live seek), so calling an absolute seek(2843) on a 3-second 
+        // stream would cause a hang.
         if !is_transcoded {
             if let Some(pos) = seek_to {
                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -447,45 +446,74 @@ async fn do_play(
         }
     }
 
-    // Update global current state
-    {
-        let mut app_state = AppState::load(&state.state_dir);
-        app_state.current = Some(crate::state::CurrentStream {
-            title: title.clone(),
-            show: Some(req.show.clone().unwrap_or_else(|| title.clone())),
-            imdb_id: Some(req.imdb_id.clone().unwrap_or_else(|| "".into())),
-            season: req.season,
-            episode: req.episode,
-            magnet: magnet.clone(),
-            target: format!("{}:{}", target, cast_name),
-            url: final_url.clone(),
-            started_at: chrono::Utc::now(),
-            pid: webtorrent_pid,
-            has_subtitles,
-            subtitle_lang: Some(sub_lang),
-        });
-        let _ = app_state.save(&state.state_dir);
-    }
+    // Save state
+    let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
+    app_state.current = Some(CurrentStream {
+        magnet: magnet.chars().take(300).collect(),
+        title: title.clone(),
+        show: req.show.clone(),
+        season: req.season,
+        episode: req.episode,
+        imdb_id: req.imdb_id.clone(),
+        target: format!("{}:{}", target, cast_name),
+        url: final_url.clone(),
+        started_at: Utc::now(),
+        pid,
+        has_subtitles,
+        subtitle_lang: if has_subtitles { Some(sub_lang) } else { None },
+    });
+    let _ = app_state.save(&state.state_dir);
 
-    // Spawn post-playback reaper
+    // Spawn post-playback reaper: monitors pipeline, auto-cleans when movie ends.
+    // Frees webtorrent's ~1.5GB RAM and cleans up media files.
     {
         let state = state.clone();
-        let wt_pid = webtorrent_pid;
+        let webtorrent_pid = pid;
         let title_for_log = title.clone();
         tokio::spawn(async move {
+            // Wait for playback to establish before monitoring
             tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+
+                // Check if this stream is still the current one (user may have started another)
                 let app_state = AppState::load(&state.state_dir);
                 match &app_state.current {
-                    Some(c) if c.pid == wt_pid => {} 
-                    _ => break,
+                    Some(c) if c.pid == webtorrent_pid => {} // Still our stream
+                    _ => {
+                        tracing::debug!("Reaper: stream replaced or stopped, exiting");
+                        break;
+                    }
                 }
-                let wt_alive = if wt_pid > 0 { unsafe { torrent::kill_check(wt_pid) } } else { false };
-                let ffmpeg_alive = state.ffmpeg_pid.lock().unwrap().map(|p| unsafe { torrent::kill_check(p) }).unwrap_or(false);
+
+                let wt_alive = unsafe { torrent::kill_check(webtorrent_pid) };
+                let ffmpeg_alive = state.ffmpeg_pid.lock().unwrap()
+                    .map(|p| unsafe { torrent::kill_check(p) })
+                    .unwrap_or(false);
+
                 if !ffmpeg_alive && !wt_alive {
-                    tracing::info!("Reaper: cleaning up for '{}'", title_for_log);
+                    // Both dead — playback fully finished
+                    tracing::info!("Reaper: all processes exited for '{}', cleaning up", title_for_log);
                     do_cleanup(&state);
+                    break;
+                }
+
+                if !ffmpeg_alive && wt_alive {
+                    // ffmpeg done (movie finished transcoding), webtorrent still seeding.
+                    // Grace period: let Chromecast play remaining buffer
+                    tracing::info!("Reaper: ffmpeg finished for '{}', grace period before cleanup...", title_for_log);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(180)).await;
+
+                    // Re-check we're still the active stream
+                    let app_state = AppState::load(&state.state_dir);
+                    match &app_state.current {
+                        Some(c) if c.pid == webtorrent_pid => {
+                            tracing::info!("Reaper: cleaning up webtorrent + media for '{}'", title_for_log);
+                            do_cleanup(&state);
+                        }
+                        _ => tracing::debug!("Reaper: stream changed during grace period"),
+                    }
                     break;
                 }
             }
@@ -493,37 +521,29 @@ async fn do_play(
     }
 
     Json(json!({
-        "pid": webtorrent_pid,
         "status": "streaming",
+        "pid": pid,
         "target": format!("{}:{}", target, cast_name),
         "title": title,
-        "url": final_url,
         "subtitles": has_subtitles,
+        "url": final_url
     }))
 }
 
 /// Shared cleanup logic: kill webtorrent + ffmpeg, delete transcoded file, update state.
 fn do_cleanup(state: &SharedState) {
-    let mut media_dir = state.media_dir.clone();
-    if media_dir.to_string_lossy().starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
-        }
-    }
-    // Force absolute path for stability
-    let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
-
     let pid_path = state.state_dir.join("webtorrent.pid");
     torrent::stop_by_pid_file(&pid_path);
 
     if let Some(pid) = state.ffmpeg_pid.lock().unwrap().take() {
         torrent::kill_pid(pid);
     }
-    // KILL MANUAL TESTS: Clear any lingering FFmpeg or Webtorrent processes
-    let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg"]).output();
-    let _ = std::process::Command::new("pkill").args(["-f", "webtorrent"]).output();
+    // Kill any lingering python http servers (legacy)
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "python3 -m http.server 8889"])
+        .output();
 
-    let transcoded = media_dir.join("transcoded_aac.mp4");
+    let transcoded = state.media_dir.join("transcoded_aac.mp4");
     if transcoded.exists() {
         let _ = std::fs::remove_file(&transcoded);
     }
