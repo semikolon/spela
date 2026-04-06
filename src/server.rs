@@ -404,35 +404,20 @@ async fn do_play(
                 Ok((output_path, ffmpeg_pid)) => {
                     // Track ffmpeg PID for the streaming endpoint and cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
-                    let prebuffer_min: u64 = 5 * 1024 * 1024; // 5MB
-                    let timeout_secs = if intro_path.is_some() { 45 } else { 25 };
-                    let prebuffer_deadline = tokio::time::Instant::now()
-                        + tokio::time::Duration::from_secs(timeout_secs);
-                    loop {
-                        if tokio::time::Instant::now() > prebuffer_deadline {
-                            tracing::warn!("Pre-buffer timeout ({}s) — casting with available data", timeout_secs);
-                            break;
-                        }
-                        if let Ok(meta) = std::fs::metadata(&output_path) {
-                            if meta.len() >= prebuffer_min {
-                                tracing::info!("Pre-buffer ready: {}KB", meta.len() / 1024);
-                                break;
-                            }
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    }
-
-                    // Serve via axum's streaming endpoint (chunked transfer, no Content-Length)
-                    // This replaces the python http.server which sent Content-Length for a growing file
-                    final_url = format!("http://{}:{}/stream/transcode", state.config.lan_ip, state.config.port);
                     is_transcoded = true;
-
-                    if sub_path.is_some() {
+                    final_url = format!("http://{}:{}/stream/transcode", state.config.lan_ip, state.config.port);
+                    
+                    // Wait for transcoded file to exist and grow a bit
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    if !output_path.exists() {
+                        tracing::warn!("Pre-buffer: transcoded file not produced after 5s");
+                    }
+                    if let Some(_path) = sub_path {
                         tracing::info!("Subtitles burned into video stream via NVENC");
                     }
                 }
-                Err(e) => tracing::warn!("Transcode failed (casting original): {}", e),
-            }
+                Err(e) => return Json(json!({"error": format!("Transcode failed: {}", e)})),
+        }
     }
 
     // Cast to Chromecast
@@ -440,33 +425,15 @@ async fn do_play(
         let state_clone = state.clone();
         let cast_name_clone = cast_name.clone();
         let url_clone = final_url.clone();
-        // When duration is known, use Buffered (enables seeking). Otherwise Live.
-        // Intro adds ~5s to total duration.
         let cast_duration = source_duration.map(|d| {
             let intro_secs = if intro_path.is_some() { 5.0 } else { 0.0 };
             d + intro_secs
         });
-        let cast_result = tokio::task::spawn_blocking(move || {
+        let _cast_res = tokio::task::spawn_blocking(move || {
             let mut cast = state_clone.cast.lock().unwrap();
-            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4", cast_duration, seek_to)
+            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4", cast_duration, if is_transcoded { None } else { seek_to })
         }).await;
 
-        match cast_result {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                return Json(json!({
-                    "error": format!("Cast failed: {}", e),
-                    "url": final_url,
-                    "recovery_suggestion": "Try 'spela targets' to discover devices, or check if TV is on"
-                }));
-            }
-            Ok(_) => {} // should not happen with Result
-            Err(e) => return Json(json!({"error": format!("Cast task failed: {}", e)})),
-        }
-
-        // --- Seek Logic ---
-        // If we are NOT transcoding, we must tell the Chromecast to seek 
-        // to the correct position after the media loads.
         if !is_transcoded {
             if let Some(pos) = seek_to {
                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -500,13 +467,12 @@ async fn do_play(
         let _ = app_state.save(&state.state_dir);
     }
 
-    // Spawn post-playback reaper: monitors pipeline, auto-cleans when movie ends.
+    // Spawn post-playback reaper
     {
         let state = state.clone();
         let wt_pid = webtorrent_pid;
         let title_for_log = title.clone();
         tokio::spawn(async move {
-            // Wait for playback to establish before monitoring
             tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
