@@ -477,29 +477,37 @@ async fn do_play(
                     let mut cast = state_clone.cast.lock().unwrap();
                     cast.seek(&cast_name_clone, pos)
                 }).await;
-            }
-        }
-    }
-
     // Save state
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
-    app_state.current = Some(CurrentStream {
-        magnet: magnet.chars().take(300).collect(),
-        title: title.clone(),
-        show: req.show.clone(),
-        season: req.season,
-        episode: req.episode,
-        imdb_id: req.imdb_id.clone(),
-        target: format!("{}:{}", target, cast_name),
-        url: final_url.clone(),
-        started_at: Utc::now(),
-        pid,
-        has_subtitles,
-        subtitle_lang: if has_subtitles { Some(sub_lang) } else { None },
-    });
-    let _ = app_state.save(&state.state_dir);
+    // Update global current state
+    {
+        let mut app_state = AppState::load(&state.state_dir);
+        app_state.current = Some(crate::state::CurrentStream {
+            title: title.clone(),
+            show: req.show.clone().unwrap_or_else(|| title.clone()),
+            imdb_id: req.imdb_id.clone().unwrap_or_else(|| "".into()),
+            magnet: magnet.clone(),
+            target: format!("{}:{}", target, cast_name),
+            url: final_url.clone(),
+            started_at: chrono::Utc::now(),
+            pid: webtorrent_pid,
+            has_subtitles,
+            subtitle_lang: Some(sub_lang),
+        });
+        let _ = app_state.save(&state.state_dir);
+    }
 
-    // Spawn post-playback reaper: monitors pipeline, auto-cleans when movie ends.
+    Json(json!({
+        "pid": webtorrent_pid,
+        "status": "streaming",
+        "target": format!("{}:{}", target, cast_name),
+        "title": title,
+        "url": final_url,
+        "subtitles": has_subtitles,
+    }))
+}
+
+// Spawn post-playback reaper: monitors pipeline, auto-cleans when movie ends.
     // Frees webtorrent's ~1.5GB RAM and cleans up media files.
     {
         let state = state.clone();
