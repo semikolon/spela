@@ -391,7 +391,7 @@ async fn do_play(
 
     let need_audio_tc = audio_codec.as_deref().map_or(false, transcode::audio_needs_transcode);
     let need_video_tc = video_codec.as_deref().map_or(false, transcode::video_needs_transcode);
-    let need_transcode = need_audio_tc || need_video_tc || intro_path.is_some() || subtitle_srt_path.is_some();
+    let need_transcode = need_audio_tc || need_video_tc || intro_path.is_some() || subtitle_srt_path.is_some() || is_local;
 
     if need_transcode {
         let mut reasons = Vec::new();
