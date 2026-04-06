@@ -92,7 +92,6 @@ pub async fn transcode(
         }
     }
     args.extend([
-        "-re".into(),
         "-reconnect".into(), "1".into(),
         "-reconnect_at_eof".into(), "1".into(),
         "-reconnect_streamed".into(), "1".into(),
