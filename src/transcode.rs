@@ -72,6 +72,7 @@ pub async fn transcode(
     subtitle_path: Option<&Path>,
     intro_path: Option<&Path>,
     video_reencode: bool,
+    seek_to: Option<f64>,
 ) -> Result<(PathBuf, u32)> {
     let output_path = media_dir.join("transcoded_aac.mp4");
     let has_intro = intro_path.is_some();
@@ -85,6 +86,11 @@ pub async fn transcode(
     }
 
     // Input 1 (or 0 if no intro): main stream with real-time pacing
+    if let Some(seek) = seek_to {
+        if seek > 0.0 {
+            args.extend(["-ss".into(), seek.to_string()]);
+        }
+    }
     args.extend([
         "-re".into(),
         "-reconnect".into(), "1".into(),

@@ -73,6 +73,9 @@ enum Commands {
         /// Disable intro clip
         #[arg(long)]
         no_intro: bool,
+        /// Seek to position (e.g., 47:23 or 2100)
+        #[arg(long)]
+        seek: Option<String>,
     },
     /// Stop current stream
     Stop,
@@ -292,9 +295,11 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             if let Some(e) = episode { url.push_str(&format!("&episode={}", e)); }
             Ok(client.get(&url).send().await?.json().await?)
         }
-        Commands::Play { source, vlc, cast, title, file_index, no_subs, no_intro } => {
+        Commands::Play { source, vlc, cast, title, file_index, no_subs, no_intro, seek } => {
             // Smart source detection: number = result ID, magnet: = magnet link
             let is_result_id = source.parse::<usize>().ok().filter(|&n| n >= 1 && n <= 20);
+            let seek_to = if let Some(s) = seek { Some(parse_position_string(&s)?) } else { None };
+
             let body = serde_json::json!({
                 "result_id": is_result_id,
                 "magnet": if is_result_id.is_none() { Some(&source) } else { None },
@@ -304,6 +309,7 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
                 "file_index": file_index,
                 "no_subs": no_subs,
                 "no_intro": no_intro,
+                "seek_to": seek_to,
             });
             Ok(client.post(format!("{}/play", base)).json(&body).send().await?.json().await?)
         }

@@ -130,7 +130,7 @@ impl CastController {
     /// Duration passed for display purposes but seeking requires Custom Receiver —
     /// Default Media Receiver can't seek in fMP4 without byte-offset index.
     /// Jellyfin solves this with custom receiver + Shaka Player + server-side seek-restart.
-    pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, duration: Option<f64>) -> Result<CastResult> {
+    pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, duration: Option<f64>, current_time: Option<f64>) -> Result<CastResult> {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, session_id) = Self::get_or_launch_app(&device)?;
@@ -143,6 +143,8 @@ impl CastController {
             metadata: None,
         };
 
+        // Note: rust_cast's Load message currently doesn't expose currentTime in its high-level API.
+        // For now, we rely on the post-load seek in server.rs or the Custom Receiver's LOAD interceptor.
         let status = device.media.load(
             transport_id.as_str(),
             session_id.as_str(),

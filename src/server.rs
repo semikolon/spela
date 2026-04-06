@@ -317,6 +317,22 @@ async fn do_play(
         }
     }
 
+    let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
+
+    // Auto-resume from saved position if no explicit seek requested
+    let mut seek_to = req.seek_to;
+    if seek_to.is_none() {
+        let app_state = AppState::load(&state.state_dir);
+        let pos = app_state.get_position(req.imdb_id.clone(), req.title.clone());
+        if pos > 30.0 { // Don't bother resuming if less than 30s in
+            tracing::info!("Auto-resume: found saved position for '{}' at {:.0}s", title, pos);
+            seek_to = Some(pos);
+        }
+    }
+
+    // Stop current stream if any
+    do_cleanup(&state);
+
     // Codec detection + transcode decision
     let mut final_url = server_url.clone();
     let mut is_transcoded = false;
@@ -342,7 +358,7 @@ async fn do_play(
         tracing::info!("Transcode needed: {}", reasons.join(" + "));
 
         let sub_path = subtitle_srt_path.as_deref();
-        match transcode::transcode(&server_url, &state.media_dir, sub_path, intro_path.as_deref(), need_video_tc).await {
+        match transcode::transcode(&server_url, &state.media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to).await {
                 Ok((output_path, ffmpeg_pid)) => {
                     // Track ffmpeg PID for the streaming endpoint and cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
@@ -395,7 +411,7 @@ async fn do_play(
         });
         let cast_result = tokio::task::spawn_blocking(move || {
             let mut cast = state_clone.cast.lock().unwrap();
-            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4", cast_duration)
+            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4", cast_duration, seek_to)
         }).await;
 
         match cast_result {
@@ -407,18 +423,26 @@ async fn do_play(
                     "recovery_suggestion": "Try 'spela targets' to discover devices, or check if TV is on"
                 }));
             }
+            Ok(_) => {} // should not happen with Result
             Err(e) => return Json(json!({"error": format!("Cast task failed: {}", e)})),
         }
 
-        // Seek to saved position if resuming
-        if let Some(seek_to) = req.seek_to {
-            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-            let state_clone = state.clone();
-            let cast_name_clone = cast_name.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let mut cast = state_clone.cast.lock().unwrap();
-                cast.seek(&cast_name_clone, seek_to)
-            }).await;
+        // --- Seek Logic ---
+        // If we are NOT transcoding, we must tell the Chromecast to seek 
+        // to the correct position after the media loads.
+        // If we ARE transcoding, the stream itself already starts at the right 
+        // point (Fake Live seek), so calling an absolute seek(2843) on a 3-second 
+        // stream would cause a hang.
+        if !is_transcoded {
+            if let Some(pos) = seek_to {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                let state_clone = state.clone();
+                let cast_name_clone = cast_name.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut cast = state_clone.cast.lock().unwrap();
+                    cast.seek(&cast_name_clone, pos)
+                }).await;
+            }
         }
     }
 
