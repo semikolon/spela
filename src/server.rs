@@ -285,25 +285,57 @@ async fn do_play(
     let no_subs = req.no_subs.unwrap_or(false);
     let sub_lang = req.subtitle_lang.clone().unwrap_or_else(|| "eng".into());
 
-    // Start webtorrent
-    let log_path = state.state_dir.join("webtorrent.log");
-    let (pid, server_url) = match torrent::start_webtorrent(
-        &magnet, req.file_index, &media_dir, &state.config.lan_ip, &log_path
-    ).await {
-        Ok(r) => r,
-        Err(e) => return Json(json!({"error": e.to_string()})),
-    };
+    // Check if the file is already downloaded (Local Bypass)
+    let mut final_source_url = None;
+    let mut webtorrent_pid = 0;
 
-    let _ = torrent::save_pid(&state.state_dir.join("webtorrent.pid"), pid);
-
-    // Self-healing: check download progress — if 0% after 12s, torrent has dead seeds
-    if !torrent::check_progress(&log_path, 12).await {
-        tracing::warn!("Torrent has no download progress after 12s — dead seeds");
-        torrent::kill_pid(pid);
-        torrent::kill_all_webtorrent();
-        disk::cleanup_old_files(&state.media_dir);
-        return Json(json!({"error": "Torrent has no active seeds (0% after 12s)"}));
+    // Search for the movie file in the media directory
+    if let Ok(entries) = std::fs::read_dir(&media_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && (path.to_string_lossy().contains(".mp4") || path.to_string_lossy().contains(".mkv")) {
+                tracing::info!("Local Bypass: Found already downloaded file: {:?}", path);
+                final_source_url = Some(path.to_string_lossy().to_string());
+                break;
+            } else if path.is_dir() {
+                if let Ok(subs) = std::fs::read_dir(&path) {
+                    for sub in subs.flatten() {
+                        let sub_path = sub.path();
+                        if sub_path.is_file() && (sub_path.to_string_lossy().contains(".mp4") || sub_path.to_string_lossy().contains(".mkv")) {
+                            tracing::info!("Local Bypass: Found in subdirectory: {:?}", sub_path);
+                            final_source_url = Some(sub_path.to_string_lossy().to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            if final_source_url.is_some() { break; }
+        }
     }
+
+    if final_source_url.is_none() {
+        // Start webtorrent
+        let log_path = state.state_dir.join("webtorrent.log");
+        let (pid, server_url) = match torrent::start_webtorrent(
+            &magnet, req.file_index, &media_dir, &state.config.lan_ip, &log_path
+        ).await {
+            Ok(r) => r,
+            Err(e) => return Json(json!({"error": e.to_string()})),
+        };
+        webtorrent_pid = pid;
+        final_source_url = Some(server_url);
+        let _ = torrent::save_pid(&state.state_dir.join("webtorrent.pid"), pid);
+
+        // Self-healing: check progress
+        if !torrent::check_progress(&log_path, 12).await {
+            tracing::warn!("Torrent dead after 12s");
+            torrent::kill_pid(pid);
+            torrent::kill_all_webtorrent();
+            return Json(json!({"error": "Torrent has no active seeds"}));
+        }
+    }
+
+    let server_url = final_source_url.unwrap();
 
     // Fetch subtitles FIRST (needed for burn-in during transcode)
     let mut has_subtitles = false;
