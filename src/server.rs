@@ -310,6 +310,13 @@ async fn do_play(
     let mut app_state = AppState::load(&state.state_dir);
     app_state.stop_current();
 
+    let target = req.target.as_deref().unwrap_or(&app_state.preferences.default_target).to_string();
+    let cast_name = req.cast_name.clone()
+        .or_else(|| app_state.preferences.chromecast_name.clone())
+        .unwrap_or_else(|| state.config.default_device.clone());
+    let no_subs = req.no_subs.unwrap_or(false);
+    let sub_lang = req.subtitle_lang.clone().unwrap_or_else(|| "eng".into());
+
     // Start webtorrent if NOT local
     if !is_local {
         let log_path = state.state_dir.join("webtorrent.log");
