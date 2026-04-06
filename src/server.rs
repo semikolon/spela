@@ -220,6 +220,9 @@ async fn do_play(
             media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
         }
     }
+    // Force absolute path for stability
+    let media_dir_abs = std::fs::canonicalize(&media_dir).unwrap_or(media_dir.clone());
+    let media_dir = media_dir_abs; 
 
     // Resolve result_id from last search — fills magnet, file_index, and metadata automatically
     if let Some(rid) = req.result_id {
@@ -535,18 +538,26 @@ async fn do_play(
 
 /// Shared cleanup logic: kill webtorrent + ffmpeg, delete transcoded file, update state.
 fn do_cleanup(state: &SharedState) {
+    let mut media_dir = state.media_dir.clone();
+    if media_dir.to_string_lossy().starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
+        }
+    }
+    // Force absolute path for stability
+    let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
+
     let pid_path = state.state_dir.join("webtorrent.pid");
     torrent::stop_by_pid_file(&pid_path);
 
     if let Some(pid) = state.ffmpeg_pid.lock().unwrap().take() {
         torrent::kill_pid(pid);
     }
-    // Kill any lingering python http servers (legacy)
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "python3 -m http.server 8889"])
-        .output();
+    // KILL MANUAL TESTS: Clear any lingering FFmpeg or Webtorrent processes
+    let _ = std::process::Command::new("pkill").args(["-f", "ffmpeg"]).output();
+    let _ = std::process::Command::new("pkill").args(["-f", "webtorrent"]).output();
 
-    let transcoded = state.media_dir.join("transcoded_aac.mp4");
+    let transcoded = media_dir.join("transcoded_aac.mp4");
     if transcoded.exists() {
         let _ = std::fs::remove_file(&transcoded);
     }
