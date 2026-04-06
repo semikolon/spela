@@ -298,7 +298,7 @@ async function startStream(magnet, opts = {}) {
       const log = readFileSync(logFile, 'utf8')
       const match = log.match(/Server running at: (http:\/\/localhost:\d+\/[^\n]+)/)
       if (match) {
-        serverUrl = match[1].replace('localhost', '192.168.4.1').trim()
+        serverUrl = match[1].replace('localhost', 'darwin.home').trim()
         break
       }
     } catch {}
@@ -326,7 +326,7 @@ async function startStream(magnet, opts = {}) {
       // Serve transcoded file via python HTTP server
       const httpProc = spawn('python3', ['-m', 'http.server', '8889', '--directory', MEDIA_DIR], { detached: true, stdio: 'ignore' })
       httpProc.unref()
-      finalUrl = `http://192.168.4.1:8889/transcoded_aac.mp4`
+      finalUrl = `http://darwin.home:8889/transcoded_aac.mp4`
       await new Promise(r => setTimeout(r, 2000))
     }
   } catch (err) {

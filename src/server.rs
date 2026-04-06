@@ -91,6 +91,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/api/cast-config", get(handle_cast_config))
         .route("/api/seek-restart", post(handle_seek_restart))
         .route("/api/position", get(handle_get_position).post(handle_save_position))
+        .route("/api/position/reset", post(handle_reset_position))
         .route("/api/retry", post(handle_retry))
         .layer(cors)
         .with_state(state);
@@ -913,11 +914,11 @@ async fn handle_cast_config(State(state): State<SharedState>) -> Json<Value> {
     };
 
     // Get resume position
-    let resume_pos = if !imdb_id.is_empty() {
-        app_state.resume_positions.get(imdb_id).copied()
-    } else {
-        None
-    };
+    let resume_pos = app_state.get_position(
+        if imdb_id.is_empty() { None } else { Some(imdb_id.to_string()) },
+        if title.is_empty() { None } else { Some(title.to_string()) }
+    );
+    let resume_pos = if resume_pos > 0.0 { Some(resume_pos) } else { None };
 
     Json(json!({
         "title": title,
@@ -989,13 +990,17 @@ async fn handle_seek_restart(
 
 #[derive(Deserialize)]
 struct PositionRequest {
-    imdb_id: String,
+    #[serde(default)]
+    imdb_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
     t: f64,
 }
 
 #[derive(Deserialize)]
 struct PositionQuery {
     imdb_id: Option<String>,
+    title: Option<String>,
 }
 
 /// Save resume position for a movie/show.
@@ -1003,13 +1008,15 @@ async fn handle_save_position(
     State(state): State<SharedState>,
     Json(req): Json<PositionRequest>,
 ) -> Json<Value> {
-    if req.imdb_id.is_empty() {
-        return Json(json!({"error": "Missing imdb_id"}));
+    if req.imdb_id.is_none() && req.title.is_none() {
+        return Json(json!({"error": "Missing imdb_id and title"}));
     }
     let mut app_state = AppState::load(&state.state_dir);
-    app_state.resume_positions.insert(req.imdb_id.clone(), req.t);
-    let _ = app_state.save(&state.state_dir);
-    Json(json!({"status": "saved", "imdb_id": req.imdb_id, "t": req.t}))
+    let (key, saved) = app_state.save_position_smart(req.imdb_id.clone(), req.title.clone(), req.t);
+    if saved {
+        let _ = app_state.save(&state.state_dir);
+    }
+    Json(json!({"status": if saved { "saved" } else { "ignored" }, "key": key, "t": req.t}))
 }
 
 /// Get resume position for a movie/show.
@@ -1017,13 +1024,23 @@ async fn handle_get_position(
     State(state): State<SharedState>,
     Query(query): Query<PositionQuery>,
 ) -> Json<Value> {
-    let imdb_id = match &query.imdb_id {
-        Some(id) if !id.is_empty() => id,
-        _ => return Json(json!({"t": 0})),
-    };
     let app_state = AppState::load(&state.state_dir);
-    let pos = app_state.resume_positions.get(imdb_id).copied().unwrap_or(0.0);
-    Json(json!({"imdb_id": imdb_id, "t": pos}))
+    let pos = app_state.get_position(query.imdb_id.clone(), query.title);
+    Json(json!({"imdb_id": query.imdb_id, "t": pos}))
+}
+
+/// Reset resume position for a movie/show.
+async fn handle_reset_position(
+    State(state): State<SharedState>,
+    Json(req): Json<PositionQuery>, // Reuse PositionQuery but it's a JSON body in POST
+) -> Json<Value> {
+    if req.imdb_id.is_none() && req.title.is_none() {
+        return Json(json!({"error": "Missing imdb_id and title"}));
+    }
+    let mut app_state = AppState::load(&state.state_dir);
+    let key = app_state.reset_position(req.imdb_id, req.title);
+    let _ = app_state.save(&state.state_dir);
+    Json(json!({"status": "reset", "key": key}))
 }
 
 /// Retry with next torrent result after stream failure.

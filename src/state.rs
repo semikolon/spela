@@ -134,4 +134,66 @@ impl AppState {
             self.history.truncate(50);
         }
     }
+
+    /// Update resume position for a movie/show using High-Water Mark logic.
+    pub fn save_position_smart(&mut self, imdb_id: Option<String>, title: Option<String>, t: f64) -> (String, bool) {
+        let key = if let Some(id) = imdb_id.filter(|s| !s.is_empty()) {
+            id
+        } else if let Some(t) = title.filter(|s| !s.is_empty()) {
+            slugify(&t)
+        } else {
+            return ("unknown".into(), false);
+        };
+
+        let current = self.resume_positions.get(&key).copied().unwrap_or(0.0);
+        
+        // --- High-Water Mark Logic ---
+        // Only update if we've moved further than before.
+        if t > current {
+            self.resume_positions.insert(key.clone(), t);
+            (key, true)
+        } else {
+            (key, false)
+        }
+    }
+
+    /// Load resume position by IMDb ID or Title.
+    pub fn get_position(&self, imdb_id: Option<String>, title: Option<String>) -> f64 {
+        if let Some(id) = imdb_id.filter(|s| !s.is_empty()) {
+            if let Some(pos) = self.resume_positions.get(&id) {
+                return *pos;
+            }
+        }
+        if let Some(t) = title.filter(|s| !s.is_empty()) {
+            let key = slugify(&t);
+            return self.resume_positions.get(&key).copied().unwrap_or(0.0);
+        }
+        0.0
+    }
+
+    /// Force reset a resume position (bypasses High-Water Mark).
+    pub fn reset_position(&mut self, imdb_id: Option<String>, title: Option<String>) -> String {
+        let key = if let Some(id) = imdb_id.filter(|s| !s.is_empty()) {
+            id
+        } else if let Some(t) = title.filter(|s| !s.is_empty()) {
+            slugify(&t)
+        } else {
+            return "unknown".into();
+        };
+
+        self.resume_positions.remove(&key);
+        key
+    }
+}
+
+/// Simple slugify for title-based keys.
+fn slugify(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }

@@ -109,6 +109,18 @@ enum Commands {
         /// Config value
         value: Option<String>,
     },
+    /// Recover a lost resume position
+    Recover {
+        /// IMDb ID or Title
+        target: String,
+        /// Position (e.g., 2843 or 47:23)
+        position: String,
+    },
+    /// Clear a resume position
+    Clear {
+        /// IMDb ID or Title
+        target: String,
+    },
 }
 
 #[tokio::main]
@@ -319,8 +331,26 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
                 _ => Ok(client.get(format!("{}/config", base)).send().await?.json().await?),
             }
         }
+        Commands::Recover { target, position } => {
+            let t = parse_position_string(&position)?;
+            let is_imdb = target.starts_with("tt") && target.len() > 5;
+            let body = if is_imdb {
+                serde_json::json!({"imdb_id": target, "t": t})
+            } else {
+                serde_json::json!({"title": target, "t": t})
+            };
+            Ok(client.post(format!("{}/api/position", base)).json(&body).send().await?.json().await?)
+        }
+        Commands::Clear { target } => {
+            let is_imdb = target.starts_with("tt") && target.len() > 5;
+            let body = if is_imdb {
+                serde_json::json!({"imdb_id": target})
+            } else {
+                serde_json::json!({"title": target})
+            };
+            Ok(client.post(format!("{}/api/position/reset", base)).json(&body).send().await?.json().await?)
+        }
         Commands::Server { .. } | Commands::Setup => unreachable!(),
-
     }
 }
 
@@ -405,6 +435,24 @@ fn print_human(val: &Value) {
         let target = val.get("target").and_then(|v| v.as_str()).unwrap_or("");
         println!("  {} → {} (PID: {})", title, target, pid);
     }
+}
+
+fn parse_position_string(s: &str) -> anyhow::Result<f64> {
+    if let Ok(secs) = s.parse::<f64>() {
+        return Ok(secs);
+    }
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() == 2 {
+        let m = parts[0].parse::<f64>()?;
+        let s = parts[1].parse::<f64>()?;
+        return Ok(m * 60.0 + s);
+    } else if parts.len() == 3 {
+        let h = parts[0].parse::<f64>()?;
+        let m = parts[1].parse::<f64>()?;
+        let s = parts[2].parse::<f64>()?;
+        return Ok(h * 3600.0 + m * 60.0 + s);
+    }
+    anyhow::bail!("Invalid position format: use seconds (123) or MM:SS (47:23)")
 }
 
 fn urlencoded(s: &str) -> String {

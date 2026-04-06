@@ -70,7 +70,7 @@ ssh darwin 'sudo systemctl stop spela && cp ~/Projects/spela/target/release/spel
 ## Hard-Won Lessons
 
 - **webtorrent `-s` FIXED** (our PR #3011, fixes #331) — piece verification bug in `_markUnverified` re-selected ALL pieces, downloading entire torrent despite `-s`. Fix: `Selections.contains()` guard prevents re-selecting deselected pieces. Patched in-place on Darwin at `~/.local/share/mise/installs/node/24.14.0/lib/node_modules/webtorrent-cli/node_modules/webtorrent/lib/`. Verified: 27-file season pack → only target file + 1.7MB boundary pieces downloaded (sparse files, no actual disk waste). Smart ranking still prefers single-file torrents as belt-and-suspenders
-- **localhost doesn't work for Chromecast** — always use `192.168.4.1`, Chromecast fetches URL itself
+- **localhost doesn't work for Chromecast** — always use `darwin.home`, Chromecast fetches URL itself
 - **Transcoded streaming via axum endpoint** (Mar 20, 2026) — `python3 -m http.server` sent `Content-Length` for a growing fMP4 file → Chromecast read that many bytes, thought stream complete, stopped after ~10s. Fix: `/stream/transcode` axum endpoint with chunked transfer (no Content-Length) + `StreamType::Live` (tells Chromecast not to expect fixed length). **5MB pre-buffer** proves sustained torrent+transcode health before casting. ffmpeg PID tracked for stream tailing + cleanup
 - **EAC3/AC3/DTS → AAC transcode** — ffprobe auto-detect, ffmpeg with `-re` flag (real-time pacing, never outruns download) + `-reconnect_at_eof` (handles stalls). Fragmented MP4 output (`frag_keyframe+empty_moov`) playable from first byte
 - **Subtitles burned into video** — when transcoding is needed, SRT subtitles are hardcoded via `-vf subtitles=` with NVENC GPU encoding (`h264_nvenc`). Works around rust_cast's lack of Cast protocol track support. Subtitles fetched from Stremio OpenSubtitles v3 (zero auth)
@@ -99,4 +99,4 @@ Hardcoded fallback IPs in `src/cast.rs`:
 - Fredriks TV: 192.168.4.126
 - Vardagsrum: 192.168.4.58
 
-DNS: `darwin.home` → 192.168.4.1 (AdGuard Home rewrite, configured Mar 18)
+DNS: `darwin.home` → darwin.home (AdGuard Home rewrite, configured Mar 18)
