@@ -259,10 +259,10 @@ async fn do_play(
     };
 
     // Disk check
-    if let Ok(Some(err)) = disk::check_space(&state.media_dir) {
+    if let Ok(Some(err)) = disk::check_space(&media_dir) {
         return Json(json!({"error": err}));
     }
-    disk::cleanup_old_files(&state.media_dir);
+    disk::cleanup_old_files(&media_dir);
 
     // Stop existing stream
     let pid_path = state.state_dir.join("webtorrent.pid");
@@ -281,7 +281,7 @@ async fn do_play(
     // Start webtorrent
     let log_path = state.state_dir.join("webtorrent.log");
     let (pid, server_url) = match torrent::start_webtorrent(
-        &magnet, req.file_index, &state.media_dir, &state.config.lan_ip, &log_path
+        &magnet, req.file_index, &media_dir, &state.config.lan_ip, &log_path
     ).await {
         Ok(r) => r,
         Err(e) => return Json(json!({"error": e.to_string()})),
@@ -304,11 +304,11 @@ async fn do_play(
     if !no_subs {
         if let Some(imdb_id) = &req.imdb_id {
             let client = reqwest::Client::new();
-            match subtitles::fetch_subtitles(&client, imdb_id, req.season, req.episode, &sub_lang, &state.media_dir).await {
+            match subtitles::fetch_subtitles(&client, imdb_id, req.season, req.episode, &sub_lang, &media_dir).await {
                 Ok(Some(vtt_path)) => {
                     has_subtitles = true;
                     // Use the SRT version for ffmpeg burn-in (ffmpeg handles SRT natively)
-                    subtitle_srt_path = Some(state.media_dir.join(format!("subtitle_{}.srt", sub_lang)));
+                    subtitle_srt_path = Some(media_dir.join(format!("subtitle_{}.srt", sub_lang)));
                     tracing::info!("Subtitles fetched ({})", sub_lang);
                 }
                 Ok(None) => tracing::info!("No subtitles found for {}", sub_lang),
@@ -318,6 +318,12 @@ async fn do_play(
     }
 
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
+    let mut media_dir = state.media_dir.clone();
+    if media_dir.to_string_lossy().starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
+        }
+    }
 
     // Auto-resume from saved position if no explicit seek requested
     let mut seek_to = req.seek_to;
@@ -359,7 +365,7 @@ async fn do_play(
         tracing::info!("Transcode needed: {}", reasons.join(" + "));
 
         let sub_path = subtitle_srt_path.as_deref();
-        match transcode::transcode(&server_url, &state.media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to).await {
+        match transcode::transcode(&server_url, &media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to).await {
                 Ok((output_path, ffmpeg_pid)) => {
                     // Track ffmpeg PID for the streaming endpoint and cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
