@@ -287,6 +287,18 @@ async fn do_play(
         if let Ok(entries) = std::fs::read_dir(&media_dir) {
             for entry in entries.flatten() {
                 if let Ok(file_type) = entry.file_type() {
+                    let folder_name = entry.file_name().to_string_lossy().to_string();
+                    let matches_title = folder_name.contains(title);
+                    
+                    // CRITICAL: Check Year-Awareness to prevent 2025 vs 2026 mismatches
+                    let matches_year = if title.contains("2026") {
+                        folder_name.contains("2026")
+                    } else if title.contains("2025") {
+                        folder_name.contains("2025")
+                    } else {
+                        true // No year in query, trust title match
+                    };
+
                     // CRITICAL: Check Quality-Awareness to prevent downgrades (e.g., 4k vs 1080p)
                     let matches_quality = if let Some(q) = &req.quality {
                         let q_lower = q.to_lowercase();
@@ -782,6 +794,7 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         episode: Some(episode),
         seek_to: None,
         duration: None,
+        quality: None,
     };
 
     handle_play(State(state.clone()), Json(play_req)).await
