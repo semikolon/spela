@@ -283,7 +283,19 @@ async fn do_play(
         if let Ok(entries) = std::fs::read_dir(&media_dir) {
             for entry in entries.flatten() {
                 if let Ok(file_type) = entry.file_type() {
-                    if file_type.is_dir() && entry.file_name().to_string_lossy().contains(title) {
+                    let folder_name = entry.file_name().to_string_lossy().to_string();
+                    let matches_title = folder_name.contains(title);
+                    
+                    // CRITICAL: Check Year-Awareness to prevent 2025 vs 2026 mismatches
+                    let matches_year = if title.contains("2026") {
+                        folder_name.contains("2026")
+                    } else if title.contains("2025") {
+                        folder_name.contains("2025")
+                    } else {
+                        true // No year in query, trust title match
+                    };
+
+                    if file_type.is_dir() && matches_title && matches_year {
                         // Found a matching directory, look for mp4/mkv inside
                         if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
                             for sub_entry in sub_entries.flatten() {
@@ -306,9 +318,18 @@ async fn do_play(
         }
     }
 
-    // Stop existing stream
+    // Stop existing stream (webtorrent and ffmpeg)
     let pid_path = state.state_dir.join("webtorrent.pid");
     torrent::stop_by_pid_file(&pid_path);
+    if let Some(old_fb_pid) = state.ffmpeg_pid.lock().unwrap().take() {
+        tracing::info!("do_play: killing existing ffmpeg zombie (PID {})", old_fb_pid);
+        torrent::kill_pid(old_fb_pid);
+    }
+    // Aggressive cleanup: delete the transcode file to break any lingering connections
+    let ffmpeg_log = state.media_dir.join("transcoded_aac.mp4");
+    if ffmpeg_log.exists() {
+        let _ = std::fs::remove_file(&ffmpeg_log);
+    }
 
     let mut app_state = AppState::load(&state.state_dir);
     app_state.current = None;
