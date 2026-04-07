@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-const MAX_MEDIA_MB: u64 = 10000;
+const MAX_MEDIA_MB: u64 = 50000;
 const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Check if media dir exceeds 10GB cap.
