@@ -38,6 +38,8 @@ pub struct CurrentStream {
     pub has_subtitles: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle_lang: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
