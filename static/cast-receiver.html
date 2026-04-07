@@ -410,12 +410,14 @@
         if (!spelaBaseUrl || !castConfig?.imdb_id) return;
         const currentTime = playerManager.getCurrentTimeSec();
         if (currentTime > 0) {
+          const duration = playerManager.getDurationSec();
           fetch(`${spelaBaseUrl}/api/position`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               imdb_id: castConfig.imdb_id,
-              t: currentTime
+              t: currentTime,
+              duration: duration > 0 ? duration : null
             })
           }).catch(() => {}); // Fire and forget
         }

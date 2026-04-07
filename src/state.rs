@@ -136,7 +136,9 @@ impl AppState {
     }
 
     /// Update resume position for a movie/show using High-Water Mark logic.
-    pub fn save_position_smart(&mut self, imdb_id: Option<String>, title: Option<String>, t: f64) -> (String, bool) {
+    /// Returns (key, reset_or_saved).
+    /// If duration is provided and t is near the end (>92% or within 300s), resets/clears the position.
+    pub fn save_position_smart(&mut self, imdb_id: Option<String>, title: Option<String>, t: f64, duration: Option<f64>) -> (String, bool) {
         let key = if let Some(id) = imdb_id.filter(|s| !s.is_empty()) {
             id
         } else if let Some(t) = title.filter(|s| !s.is_empty()) {
@@ -144,6 +146,16 @@ impl AppState {
         } else {
             return ("unknown".into(), false);
         };
+
+        // --- Completion Logic ---
+        // If we are within the last 5 minutes or past 92% of the film, clear the position.
+        if let Some(dur) = duration {
+            if dur > 0.0 && (t >= dur * 0.92 || t >= (dur - 300.0)) {
+                tracing::info!("Playback completion detected for '{}' at {}s (of {}s) — clearing resume point", key, t, dur);
+                self.reset_position(imdb_id, title);
+                return (key, true);
+            }
+        }
 
         let current = self.resume_positions.get(&key).copied().unwrap_or(0.0);
         
@@ -196,4 +208,39 @@ fn slugify(s: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_save_position_smart_completion_threshold() {
+        let mut state = AppState::default();
+        let imdb_id = Some("tt10548174".to_string());
+        let title = Some("28 Years Later".to_string());
+        
+        // 1. Regular save (50 mins in)
+        let (key, saved) = state.save_position_smart(imdb_id.clone(), title.clone(), 3000.0, Some(6907.0));
+        assert!(saved);
+        assert_eq!(state.resume_positions.get(&key), Some(&3000.0));
+
+        // 2. Completion reset (1:49:00 out of 1:55:00)
+        // 6540s / 6907s = 0.946 ( > 0.92 )
+        let (key2, saved2) = state.save_position_smart(imdb_id.clone(), title.clone(), 6600.0, Some(6907.0));
+        assert!(saved2);
+        assert_eq!(state.resume_positions.get(&key2), None); // Should be cleared!
+    }
+
+    #[test]
+    fn test_save_position_smart_completion_last_5_mins() {
+        let mut state = AppState::default();
+        let title = Some("Short Film".to_string());
+        let duration = 600.0; // 10 mins
+
+        // 8 mins in (80% but within 5 mins of end)
+        let (key, saved) = state.save_position_smart(None, title.clone(), 480.0, Some(duration));
+        assert!(saved);
+        assert_eq!(state.resume_positions.get(&key), None); // Should be cleared!
+    }
 }

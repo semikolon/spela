@@ -492,9 +492,11 @@ async fn do_play(
 
     // Save state
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
+    let duration = source_duration;
+
     // If seeking, save the baseline position immediately to state.json
     if let Some(pos) = seek_to {
-        let (key, saved) = app_state.save_position_smart(req.imdb_id.clone(), req.title.clone(), pos);
+        let (key, saved) = app_state.save_position_smart(req.imdb_id.clone(), req.title.clone(), pos, duration);
         if saved {
             let _ = app_state.save(&state.state_dir);
             tracing::info!("Auto-resume: saved baseline position for '{}' at {}s", key, pos);
@@ -514,6 +516,7 @@ async fn do_play(
         pid,
         has_subtitles,
         subtitle_lang: if has_subtitles { Some(sub_lang) } else { None },
+        duration,
     });
     let _ = app_state.save(&state.state_dir);
 
@@ -750,6 +753,7 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         season: Some(season),
         episode: Some(episode),
         seek_to: None,
+        duration: None,
     };
 
     handle_play(State(state.clone()), Json(play_req)).await
@@ -1034,11 +1038,7 @@ async fn handle_cast_config(State(state): State<SharedState>) -> Json<Value> {
         "subtitle_url": subtitle_url,
         "subtitle_lang": "English",
         "subtitle_lang_code": "en",
-        "duration": current.and_then(|_| {
-            // Duration was detected during play and could be stored
-            // For now, return None — receiver gets it from the stream
-            None::<f64>
-        }),
+        "duration": current.and_then(|c| c.duration),
         "resume_position": resume_pos,
         "seek_restart_url": format!("http://{}:{}/api/seek-restart", state.config.lan_ip, state.config.port),
     }))
@@ -1102,6 +1102,7 @@ struct PositionRequest {
     #[serde(default)]
     title: Option<String>,
     t: f64,
+    duration: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1119,7 +1120,7 @@ async fn handle_save_position(
         return Json(json!({"error": "Missing imdb_id and title"}));
     }
     let mut app_state = AppState::load(&state.state_dir);
-    let (key, saved) = app_state.save_position_smart(req.imdb_id.clone(), req.title.clone(), req.t);
+    let (key, saved) = app_state.save_position_smart(req.imdb_id.clone(), req.title.clone(), req.t, req.duration);
     if saved {
         let _ = app_state.save(&state.state_dir);
     }
