@@ -139,9 +139,9 @@ impl AppState {
     /// Returns (key, reset_or_saved).
     /// If duration is provided and t is near the end (>92% or within 300s), resets/clears the position.
     pub fn save_position_smart(&mut self, imdb_id: Option<String>, title: Option<String>, t: f64, duration: Option<f64>) -> (String, bool) {
-        let key = if let Some(id) = imdb_id.filter(|s| !s.is_empty()) {
-            id
-        } else if let Some(t) = title.filter(|s| !s.is_empty()) {
+        let key = if let Some(id) = imdb_id.as_ref().filter(|s| !s.is_empty()) {
+            id.to_string()
+        } else if let Some(t) = title.as_ref().filter(|s| !s.is_empty()) {
             slugify(&t)
         } else {
             return ("unknown".into(), false);

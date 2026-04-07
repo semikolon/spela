@@ -132,6 +132,7 @@ pub struct PlayRequest {
     pub season: Option<u32>,
     pub episode: Option<u32>,
     pub seek_to: Option<f64>,
+    pub duration: Option<f64>,
 }
 
 #[derive(Deserialize)]
