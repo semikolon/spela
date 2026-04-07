@@ -3,7 +3,6 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 const MAX_MEDIA_MB: u64 = 10000;
-const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Check if media dir exceeds 10GB cap.
 pub fn check_space(media_dir: &Path) -> Result<Option<String>> {
@@ -19,48 +18,51 @@ pub fn check_space(media_dir: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Delete files older than 24h in media dir.
-pub fn cleanup_old_files(media_dir: &Path) {
+/// Smart Disk Hygiene: Prune folders based on age and completion status.
+/// - Active movie: NEVER touched.
+/// - Partial downloads: Deletes after 24h of inactivity.
+/// - Completed (.spela_done): Deletes after 7 days to allow re-watching.
+pub fn prune_disk(media_dir: &Path, active_title: &str) {
     if !media_dir.exists() { return; }
     let now = SystemTime::now();
+
     if let Ok(entries) = std::fs::read_dir(media_dir) {
         for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            // SKIP the active movie to prevent stream termination
+            if name.contains(active_title) { continue; }
+
             if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    if let Ok(modified) = meta.modified() {
-                        if let Ok(age) = now.duration_since(modified) {
-                            if age > MAX_AGE {
-                                let _ = std::fs::remove_file(entry.path());
-                            }
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(age) = now.duration_since(modified) {
+                        let is_done = path.join(".spela_done").exists();
+                        let max_age = if is_done {
+                            Duration::from_secs(7 * 24 * 3600) // 7 days grace for completed
+                        } else {
+                            Duration::from_secs(24 * 3600) // 24 hours for partial/stale
+                        };
+
+                        if age > max_age {
+                            tracing::info!("Smart Disk Hygiene: Pruning '{}' (Age: {}h, Done: {})", name, age.as_secs() / 3600, is_done);
+                            let _ = std::fs::remove_dir_all(&path);
                         }
                     }
                 }
             }
         }
     }
-    // Remove empty subdirectories
-    if let Ok(entries) = std::fs::read_dir(media_dir) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_dir() {
-                    let _ = std::fs::remove_dir(entry.path()); // only removes if empty
-                }
-            }
-        }
-    }
 }
 
-fn dir_size(path: &Path) -> Result<u64> {
+pub fn dir_size(path: &Path) -> Result<u64> {
     let mut total = 0u64;
-    if path.is_dir() {
+    if path.is_file() {
+        total += path.metadata()?.len();
+    } else if path.is_dir() {
         for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let meta = entry.metadata()?;
-            if meta.is_file() {
-                total += meta.len();
-            } else if meta.is_dir() {
-                total += dir_size(&entry.path())?;
-            }
+            total += dir_size(&entry?.path())?;
         }
     }
     Ok(total)

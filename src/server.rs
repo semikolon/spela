@@ -1,3 +1,4 @@
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -134,6 +135,7 @@ pub struct PlayRequest {
     pub seek_to: Option<f64>,
     pub duration: Option<f64>,
     pub quality: Option<String>,
+    pub size: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +202,9 @@ async fn handle_play(
                             req.result_id = Some(next_rid);
                             req.magnet = None;
                             req.file_index = None;
+                            req.duration = None;
+                            req.quality = None;
+                            req.size = None;
                             continue;
                         }
                     }
@@ -257,6 +262,9 @@ async fn do_play(
                         if req.quality.is_none() {
                             req.quality = Some(r.quality.clone());
                         }
+                        if req.size.is_none() {
+                            req.size = Some(r.size.clone());
+                        }
                         tracing::info!("Playing result #{}: {} (file_index: {:?})", rid, req.title.as_deref().unwrap_or("?"), req.file_index);
                     }
                     None => return Json(json!({"error": format!("Result #{} not found in last search (have {})", rid, search.results.len())})),
@@ -271,11 +279,11 @@ async fn do_play(
         _ => return Json(json!({"error": "Missing magnet. Use 'spela play <N>' with a result number, or pass a magnet link."})),
     };
 
-    // Disk check
-    if let Ok(Some(err)) = disk::check_space(&media_dir) {
-        return Json(json!({"error": err}));
-    }
-    disk::cleanup_old_files(&media_dir);
+    let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
+
+    // --- SMART DISK HYGIENE ---
+    // Proactively prune stale media.
+    disk::prune_disk(&media_dir, &title);
 
     // Local Bypass System: Check if the movie already exists on disk
     let mut server_url = String::new();
@@ -288,9 +296,20 @@ async fn do_play(
             for entry in entries.flatten() {
                 if let Ok(file_type) = entry.file_type() {
                     let folder_name = entry.file_name().to_string_lossy().to_string();
-                    let matches_title = folder_name.contains(title);
+                    let s_folder = sanitize_title(&folder_name);
+                    let s_title = sanitize_title(title);
                     
-                    // CRITICAL: Check Year-Awareness to prevent 2025 vs 2026 mismatches
+                    // Token-based matching: Check if all words from title are in folder_name
+                    let title_tokens: Vec<&str> = s_title.split_whitespace().collect();
+                    let matches_title = if title_tokens.is_empty() {
+                        false
+                    } else {
+                        title_tokens.iter().all(|&t| s_folder.contains(t))
+                    };
+                    
+                    if !matches_title {
+                        tracing::debug!("Bypass Mismatch: '{}' vs '{}'", s_title, s_folder);
+                    }
                     let matches_year = if title.contains("2026") {
                         folder_name.contains("2026")
                     } else if title.contains("2025") {
@@ -313,6 +332,9 @@ async fn do_play(
                         true // No quality specified
                     };
 
+                    let expected_bytes = req.size.as_deref().and_then(parse_size_to_bytes).unwrap_or(0);
+                    let has_done_marker = entry.path().join(".spela_done").exists();
+
                     if file_type.is_dir() && matches_title && matches_year && matches_quality {
                         // Found a matching directory, look for mp4/mkv inside
                         if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
@@ -322,10 +344,15 @@ async fn do_play(
                                 let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
                                 // Only match actual movie files, not transcode artifacts
                                 if (ext == "mp4" || ext == "mkv") && !fname.starts_with("transcoded") {
-                                    tracing::info!("Local Bypass: Found already downloaded file: {:?}", path);
-                                    server_url = format!("file://{}", path.to_string_lossy());
-                                    is_local = true;
-                                    break;
+                                    // Triple-Lock Verification: Marker OR Physical Size Match
+                                    if has_done_marker || is_physically_full(&path, expected_bytes) {
+                                        tracing::info!("Local Bypass: Found healthy file (done_marker: {}, physical_match: true): {:?}", has_done_marker, path);
+                                        server_url = format!("file://{}", path.to_string_lossy());
+                                        is_local = true;
+                                        break;
+                                    } else {
+                                        tracing::info!("Local Bypass: Found file but failed health check (size: {}B, expected: {}B). Delegating to Torrent Engine.", path.metadata().map_or(0, |m| m.len()), expected_bytes);
+                                    }
                                 }
                             }
                         }
@@ -362,6 +389,11 @@ async fn do_play(
 
     // Start webtorrent if NOT local
     if !is_local {
+        // Disk check: Only required if we are going to start a NEW download
+        if let Ok(Some(err)) = disk::check_space(&media_dir) {
+            return Json(json!({"error": err}));
+        }
+
         let log_path = state.state_dir.join("webtorrent.log");
         let result = match torrent::start_webtorrent(
             &magnet, req.file_index, &media_dir, &state.config.lan_ip, &log_path
@@ -378,7 +410,7 @@ async fn do_play(
             tracing::warn!("Torrent has no download progress after 12s — dead seeds");
             torrent::kill_pid(pid);
             torrent::kill_all_webtorrent();
-            disk::cleanup_old_files(&media_dir);
+            disk::prune_disk(&media_dir, ""); // Clean up any dead attempt
             return Json(json!({"error": "Torrent has no active seeds (0% after 12s)"}));
         }
     }
@@ -617,6 +649,15 @@ async fn do_play(
         });
     }
 
+    // --- STATIC IP HANDSHAKE ---
+    // Use the LAN IP (192.168.1.1) instead of darwin.home hostname 
+    // to prevent DNS resolution hangs on the Chromecast.
+    let final_url = if final_url.contains("darwin.home") {
+        final_url.replace("darwin.home", &state.config.lan_ip)
+    } else {
+        final_url
+    };
+
     Json(json!({
         "status": "streaming",
         "pid": pid,
@@ -639,6 +680,45 @@ fn do_cleanup(state: &SharedState) {
     let _ = std::process::Command::new("pkill")
         .args(["-f", "python3 -m http.server 8889"])
         .output();
+
+    // --- AUTO-VERIFICATION MARKER ---
+    // If the movie is physically full on disk, mark it as .spela_done
+    // to enable instant Local Bypass for future requests.
+    let app_state = crate::state::AppState::load(&state.state_dir);
+    if let Some(current) = &app_state.current {
+        let mut target_dir = state.media_dir.clone();
+        if target_dir.to_string_lossy().starts_with("~/") {
+            if let Some(home) = dirs::home_dir() {
+                target_dir = home.join(target_dir.strip_prefix("~/").unwrap());
+            }
+        }
+        let target_dir = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
+        
+        // Find the movie folder by title
+        if let Ok(entries) = std::fs::read_dir(&target_dir) {
+            for entry in entries.flatten() {
+                let folder_name = entry.file_name().to_string_lossy().to_string();
+                if folder_name.contains(&current.title) {
+                    // Check for mp4/mkv files and verify physical completeness
+                    if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
+                        for sub_entry in sub_entries.flatten() {
+                            let path = sub_entry.path();
+                            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                            if ext == "mp4" || ext == "mkv" {
+                                if is_physically_full(&path, current.duration.unwrap_or(0.0) as u64) {
+                                    let marker_path = entry.path().join(".spela_done");
+                                    if !marker_path.exists() {
+                                        let _ = std::fs::File::create(&marker_path);
+                                        tracing::info!("Auto-Verification: Marked '{}' as .spela_done (Physically Full)", current.title);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Expand media_dir path (same logic as do_play) before trying to delete
     let mut media_dir = state.media_dir.clone();
@@ -794,10 +874,49 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         episode: Some(episode),
         seek_to: None,
         duration: None,
-        quality: None,
+        quality: Some(best.quality.clone()),
+        size: Some(best.size.clone()),
     };
 
     handle_play(State(state.clone()), Json(play_req)).await
+}
+
+// --- Helpers ---
+
+fn parse_size_to_bytes(size_str: &str) -> Option<u64> {
+    let lower = size_str.to_lowercase();
+    let parts: Vec<&str> = lower.split_whitespace().collect();
+    if parts.len() < 2 { return None; }
+    let val: f64 = parts[0].parse().ok()?;
+    let unit = parts[1];
+    let factor = match unit {
+        "gb" | "gib" => 1024 * 1024 * 1024,
+        "mb" | "mib" => 1024 * 1024,
+        "kb" | "kib" => 1024,
+        _ => 1,
+    };
+    Some((val * factor as f64) as u64)
+}
+
+fn is_physically_full(path: &std::path::Path, expected_bytes: u64) -> bool {
+    if let Ok(meta) = std::fs::metadata(path) {
+        let logical_size = meta.len();
+        // Logical size must be at least 99% of expected size
+        if expected_bytes > 0 && logical_size < (expected_bytes as f64 * 0.99) as u64 {
+            return false;
+        }
+        // Physical blocks check (Unix only): blocks() are 512-byte units.
+        // Sparse files have blocks() * 512 < logical_size.
+        // We allow a small margin for filesystem overhead/compression.
+        let physical_size = meta.blocks() * 512;
+        if physical_size < (logical_size as f64 * 0.95) as u64 {
+            tracing::warn!("Local Bypass: File is sparse (physical {} < logical {}). Rejecting.", physical_size, logical_size);
+            return false;
+        }
+        true
+    } else {
+        false
+    }
 }
 
 async fn handle_targets(State(state): State<SharedState>) -> Json<Value> {
@@ -1374,4 +1493,15 @@ mod tests {
         let t: f64 = 10800.0;
         assert_eq!(t.max(0.0), 10800.0);
     }
+}
+
+/// Sanitize title for fuzzy matching (lowercase, no symbols, KEEP SPACES)
+fn sanitize_title(title: &str) -> String {
+    title.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
