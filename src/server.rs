@@ -133,6 +133,7 @@ pub struct PlayRequest {
     pub episode: Option<u32>,
     pub seek_to: Option<f64>,
     pub duration: Option<f64>,
+    pub quality: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +254,9 @@ async fn do_play(
                         if req.episode.is_none() {
                             req.episode = search.searching.as_ref().map(|e| e.episode);
                         }
+                        if req.quality.is_none() {
+                            req.quality = Some(r.quality.clone());
+                        }
                         tracing::info!("Playing result #{}: {} (file_index: {:?})", rid, req.title.as_deref().unwrap_or("?"), req.file_index);
                     }
                     None => return Json(json!({"error": format!("Result #{} not found in last search (have {})", rid, search.results.len())})),
@@ -283,19 +287,21 @@ async fn do_play(
         if let Ok(entries) = std::fs::read_dir(&media_dir) {
             for entry in entries.flatten() {
                 if let Ok(file_type) = entry.file_type() {
-                    let folder_name = entry.file_name().to_string_lossy().to_string();
-                    let matches_title = folder_name.contains(title);
-                    
-                    // CRITICAL: Check Year-Awareness to prevent 2025 vs 2026 mismatches
-                    let matches_year = if title.contains("2026") {
-                        folder_name.contains("2026")
-                    } else if title.contains("2025") {
-                        folder_name.contains("2025")
+                    // CRITICAL: Check Quality-Awareness to prevent downgrades (e.g., 4k vs 1080p)
+                    let matches_quality = if let Some(q) = &req.quality {
+                        let q_lower = q.to_lowercase();
+                        if q_lower.contains("2160p") || q_lower.contains("4k") {
+                            folder_name.contains("2160p") || folder_name.contains("4k") || folder_name.contains("2160")
+                        } else if q_lower.contains("1080p") {
+                            folder_name.contains("1080p") || folder_name.contains("1080")
+                        } else {
+                            true // Generic match
+                        }
                     } else {
-                        true // No year in query, trust title match
+                        true // No quality specified
                     };
 
-                    if file_type.is_dir() && matches_title && matches_year {
+                    if file_type.is_dir() && matches_title && matches_year && matches_quality {
                         // Found a matching directory, look for mp4/mkv inside
                         if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
                             for sub_entry in sub_entries.flatten() {
