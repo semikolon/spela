@@ -14,7 +14,7 @@ pub async fn start_webtorrent(
     magnet: &str,
     file_index: Option<u32>,
     media_dir: &Path,
-    lan_ip: &str,
+    stream_host: &str,
     log_path: &Path,
 ) -> Result<(u32, String)> {
     std::fs::create_dir_all(media_dir)?;
@@ -69,7 +69,7 @@ pub async fn start_webtorrent(
             if let Some(cap) = log.lines().find(|l| l.contains("Server running at:")) {
                 if let Some(url_start) = cap.find("http://") {
                     let url = cap[url_start..].trim().to_string();
-                    server_url = Some(url.replace("localhost", lan_ip));
+                    server_url = Some(url.replace("localhost", stream_host));
                     break;
                 }
             }

@@ -212,19 +212,19 @@ async fn run_setup() {
         }
     }
 
-    // LAN IP — auto-detect
-    if config.lan_ip.is_empty() {
-        if let Some(ip) = config::Config::detect_lan_ip() {
-            println!("Detected LAN IP: {}", ip);
-            config.lan_ip = ip;
+    // Stream host — prefer a DNS hostname when available, fall back to a routable IP.
+    if config.stream_host.is_empty() {
+        if let Some(host) = config::Config::detect_stream_host_fallback() {
+            println!("Detected stream host fallback: {}", host);
+            config.stream_host = host;
         } else {
-            print!("Could not auto-detect LAN IP. Enter manually: ");
+            print!("Could not auto-detect a stream host fallback. Enter hostname or IP manually: ");
             io::stdout().flush().unwrap();
-            let mut ip = String::new();
-            io::stdin().lock().read_line(&mut ip).unwrap();
-            let ip = ip.trim().to_string();
-            if !ip.is_empty() {
-                config.lan_ip = ip;
+            let mut host = String::new();
+            io::stdin().lock().read_line(&mut host).unwrap();
+            let host = host.trim().to_string();
+            if !host.is_empty() {
+                config.stream_host = host;
             }
         }
     }

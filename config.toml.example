@@ -1,10 +1,10 @@
 # spela configuration — ~/.config/spela/config.toml
 
 # Server address (for CLI client mode)
-server = "darwin:7890"
+server = "media.local:7890"
 
 # Default Chromecast device name
-default_device = "Fredriks TV"
+default_device = "Living Room TV"
 
 # Subtitle language ("en", "sv", "off")
 subtitles = "en"
@@ -15,8 +15,8 @@ quality = "1080p"
 # TMDB API key (free at themoviedb.org)
 tmdb_api_key = ""
 
-# Darwin LAN IP (for Chromecast URLs — never localhost)
-lan_ip = "192.168.4.1"
+# Hostname or IP that Cast clients can fetch from (never localhost)
+stream_host = "media.local"
 
 # Media directory (temporary downloads, 5GB cap)
 media_dir = "~/media"

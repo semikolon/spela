@@ -34,14 +34,14 @@ pub struct ServerState {
 type SharedState = Arc<ServerState>;
 
 pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
-    // Auto-detect LAN IP if not set in config
-    if config.lan_ip.is_empty() {
-        if let Some(ip) = Config::detect_lan_ip() {
-            tracing::info!("Auto-detected LAN IP: {}", ip);
-            config.lan_ip = ip;
+    // Auto-detect a routable stream host fallback if not set in config.
+    if config.stream_host.is_empty() {
+        if let Some(host) = Config::detect_stream_host_fallback() {
+            tracing::info!("Auto-detected stream host fallback: {}", host);
+            config.stream_host = host;
         } else {
-            tracing::warn!("Could not auto-detect LAN IP. Set lan_ip in config.toml");
-            config.lan_ip = "127.0.0.1".into();
+            tracing::warn!("Could not auto-detect a stream host fallback. Set stream_host in config.toml");
+            config.stream_host = "127.0.0.1".into();
         }
     }
 
@@ -416,7 +416,7 @@ async fn do_play(
 
         let log_path = state.state_dir.join("webtorrent.log");
         let result = match torrent::start_webtorrent(
-            &magnet, req.file_index, &media_dir, &state.config.lan_ip, &log_path
+            &magnet, req.file_index, &media_dir, &state.config.stream_host, &log_path
         ).await {
             Ok(r) => r,
             Err(e) => return Json(json!({"error": e.to_string()})),
@@ -524,7 +524,7 @@ async fn do_play(
 
                     // Serve via axum's streaming endpoint (chunked transfer, no Content-Length)
                     // This replaces the python http.server which sent Content-Length for a growing file
-                    final_url = format!("http://{}:{}/stream/transcode", state.config.lan_ip, state.config.port);
+                    final_url = format!("http://{}:{}/stream/transcode", state.config.stream_host, state.config.port);
                     is_transcoded = true;
 
                     if sub_path.is_some() {
@@ -1194,7 +1194,7 @@ async fn handle_cast_config(State(state): State<SharedState>) -> Json<Value> {
 
     // Check if intro exists
     let intro_url = crate::transcode::find_intro()
-        .map(|_| format!("http://{}:{}/cast-receiver/intro.mp4", state.config.lan_ip, state.config.port));
+        .map(|_| format!("http://{}:{}/cast-receiver/intro.mp4", state.config.stream_host, state.config.port));
 
     // Check if subtitles exist
     let mut media_dir = state.media_dir.clone();
@@ -1206,7 +1206,7 @@ async fn handle_cast_config(State(state): State<SharedState>) -> Json<Value> {
     let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
     let subs_vtt = media_dir.join("subtitle_eng.vtt");
     let subtitle_url = if subs_vtt.exists() {
-        Some(format!("http://{}:{}/cast-receiver/subs.vtt", state.config.lan_ip, state.config.port))
+        Some(format!("http://{}:{}/cast-receiver/subs.vtt", state.config.stream_host, state.config.port))
     } else {
         None
     };
@@ -1227,7 +1227,7 @@ async fn handle_cast_config(State(state): State<SharedState>) -> Json<Value> {
         "subtitle_lang_code": "en",
         "duration": current.and_then(|c| c.duration),
         "resume_position": resume_pos,
-        "seek_restart_url": format!("http://{}:{}/api/seek-restart", state.config.lan_ip, state.config.port),
+        "seek_restart_url": format!("http://{}:{}/api/seek-restart", state.config.stream_host, state.config.port),
     }))
 }
 
@@ -1262,7 +1262,7 @@ async fn handle_seek_restart(
             if c.url.contains("/stream/transcode") {
                 // Reconstruct from webtorrent log or use a stored field
                 // For now, check if webtorrent is still running and serving
-                format!("http://{}:8888", state.config.lan_ip)
+                format!("http://{}:8888", state.config.stream_host)
             } else {
                 c.url.clone()
             }
@@ -1277,7 +1277,7 @@ async fn handle_seek_restart(
     // For now, return the existing stream URL — full implementation needs webtorrent URL in state
     Json(json!({
         "status": "ready",
-        "stream_url": format!("http://{}:{}/stream/transcode", state.config.lan_ip, state.config.port),
+        "stream_url": format!("http://{}:{}/stream/transcode", state.config.stream_host, state.config.port),
         "seek_to": seek_seconds,
     }))
 }

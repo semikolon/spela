@@ -16,7 +16,7 @@ pub struct Config {
     #[serde(default)]
     pub tmdb_api_key: String,
     #[serde(default)]
-    pub lan_ip: String,
+    pub stream_host: String,
     #[serde(default = "default_media_dir")]
     pub media_dir: String,
     #[serde(default = "default_port")]
@@ -47,7 +47,7 @@ impl Default for Config {
             subtitles: default_subtitles(),
             quality: default_quality(),
             tmdb_api_key: String::new(),
-            lan_ip: String::new(),
+            stream_host: String::new(),
             media_dir: default_media_dir(),
             port: default_port(),
             host: default_host(),
@@ -111,9 +111,9 @@ impl Config {
             .join(".spela")
     }
 
-    /// Auto-detect the machine's LAN IP by creating a UDP socket.
+    /// Auto-detect a routable local IP fallback for `stream_host`.
     /// Doesn't send any data — just checks which local address the OS would use.
-    pub fn detect_lan_ip() -> Option<String> {
+    pub fn detect_stream_host_fallback() -> Option<String> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
         socket.connect("8.8.8.8:80").ok()?;
         Some(socket.local_addr().ok()?.ip().to_string())
@@ -142,7 +142,7 @@ mod tests {
         let mut config = Config::default();
         config.default_device = "Living Room".into();
         config.tmdb_api_key = "test-key".into();
-        config.lan_ip = "10.0.0.1".into();
+        config.stream_host = "media.local".into();
         config.known_devices.insert("TV".into(), "10.0.0.50".into());
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -150,7 +150,7 @@ mod tests {
 
         assert_eq!(parsed.default_device, "Living Room");
         assert_eq!(parsed.tmdb_api_key, "test-key");
-        assert_eq!(parsed.lan_ip, "10.0.0.1");
+        assert_eq!(parsed.stream_host, "media.local");
         assert_eq!(parsed.known_devices.get("TV").unwrap(), "10.0.0.50");
     }
 
@@ -168,21 +168,21 @@ mod tests {
     #[test]
     fn test_config_known_devices_toml() {
         let toml_str = r#"
-default_device = "Vardagsrum"
+default_device = "Living Room TV"
 
 [known_devices]
-"Vardagsrum" = "192.168.4.58"
-"Bedroom TV" = "192.168.4.126"
+"Living Room TV" = "192.168.1.50"
+"Bedroom TV" = "192.168.1.51"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.known_devices.len(), 2);
-        assert_eq!(config.known_devices.get("Vardagsrum").unwrap(), "192.168.4.58");
+        assert_eq!(config.known_devices.get("Living Room TV").unwrap(), "192.168.1.50");
     }
 
     #[test]
-    fn test_detect_lan_ip() {
+    fn test_detect_stream_host_fallback() {
         // Should return a non-loopback IP on any machine with network
-        let ip = Config::detect_lan_ip();
+        let ip = Config::detect_stream_host_fallback();
         if let Some(ip) = ip {
             assert!(!ip.is_empty());
             assert!(!ip.starts_with("127.")); // not loopback

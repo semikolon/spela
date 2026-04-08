@@ -130,12 +130,12 @@ spela config default_device "My TV"      # set default Chromecast
 Config lives at `~/.config/spela/config.toml`:
 
 ```toml
-server = "localhost:7890"
+server = "media.local:7890"
 default_device = "Living Room TV"
 subtitles = "en"
 quality = "1080p"
 tmdb_api_key = "your-key-here"
-lan_ip = "192.168.1.100"        # host/IP Chromecast can fetch from; a DNS name is fine if Cast resolves it
+stream_host = "media.local"     # hostname or IP Chromecast can fetch from; never localhost
 media_dir = "~/media"
 port = 7890
 
