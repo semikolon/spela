@@ -45,7 +45,9 @@ the entire userspace was under severe resource pressure.
 3. Service containment:
    Run WebTorrent/ffmpeg in a bounded cgroup or transient systemd scope. Node's
    `--max-old-space-size` is useful but not enough by itself because multiple
-   workers can still exhaust the host.
+   workers can still exhaust the host. Implemented first slice:
+   `systemd/spela-resource-limits.conf` is a host-safe drop-in with
+   `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `TasksMax`, and `CPUQuota`.
 
 4. Watchdog:
    Add an external host watchdog that checks memory pressure, swap pressure, and
@@ -63,6 +65,21 @@ the entire userspace was under severe resource pressure.
    Keep regression tests around worker-only cleanup and stale PID handling.
    Keep this operations note linked from `README.md`, `CLAUDE.md`, and
    `TODO.md`.
+
+## Systemd Drop-In
+
+Use the tracked drop-in rather than overwriting the host's full service file:
+
+```bash
+sudo mkdir -p /etc/systemd/system/spela.service.d
+sudo install -m 0644 systemd/spela-resource-limits.conf \
+  /etc/systemd/system/spela.service.d/resource-limits.conf
+sudo systemctl daemon-reload
+sudo systemctl restart spela.service
+```
+
+This preserves host-specific environment and `ExecStart` configuration while
+bounding the worker cgroup.
 
 ## Emergency Checklist
 

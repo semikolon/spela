@@ -169,6 +169,11 @@ Environment=TMDB_API_KEY=your-key-here
 WantedBy=multi-user.target
 ```
 
+Install `systemd/spela-resource-limits.conf` as a drop-in at
+`/etc/systemd/system/spela.service.d/resource-limits.conf` on production hosts.
+That keeps media worker memory, swap, task count, and CPU use bounded without
+putting host-specific secrets in the tracked unit file.
+
 ## How Transcoding Works
 
 Most torrents are H.264 + AC3/DTS audio. Chromecast only speaks H.264 + AAC. spela handles this transparently:
