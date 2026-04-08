@@ -19,6 +19,8 @@ the entire userspace was under severe resource pressure.
   must not delete media, mark files verified, or rewrite playback history.
 - User-facing playback cleanup may delete temporary transcode files, but that
   must stay explicit and separate from worker-only cleanup.
+- `.spela_done` completion markers require a known expected byte size and a
+  physical byte check. Never derive completion from playback duration alone.
 - Every WebTorrent worker should be traceable to current playback state.
 - At server startup, stale workers that are not owned by active playback should
   be reconciled and terminated with `SIGTERM`.
@@ -65,6 +67,13 @@ the entire userspace was under severe resource pressure.
    Keep regression tests around worker-only cleanup and stale PID handling.
    Keep this operations note linked from `README.md`, `CLAUDE.md`, and
    `TODO.md`.
+
+7. Local-bypass verification:
+   Local bypass is useful, but it must not turn sparse or partial files into
+   trusted media. Search-result size metadata should travel into playback state
+   so cleanup can write `.spela_done` only after physical bytes match the
+   expected size. If size metadata is absent, an existing marker can help, but a
+   known expected size always wins over the marker.
 
 ## Systemd Drop-In
 

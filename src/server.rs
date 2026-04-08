@@ -325,19 +325,10 @@ async fn do_play(
             for entry in entries.flatten() {
                 if let Ok(file_type) = entry.file_type() {
                     let folder_name = entry.file_name().to_string_lossy().to_string();
-                    let s_folder = sanitize_title(&folder_name);
-                    let s_title = sanitize_title(title);
-                    
-                    // Token-based matching: Check if all words from title are in folder_name
-                    let title_tokens: Vec<&str> = s_title.split_whitespace().collect();
-                    let matches_title = if title_tokens.is_empty() {
-                        false
-                    } else {
-                        title_tokens.iter().all(|&t| s_folder.contains(t))
-                    };
-                    
+                    let matches_title = title_tokens_match(&folder_name, title);
+
                     if !matches_title {
-                        tracing::debug!("Bypass Mismatch: '{}' vs '{}'", s_title, s_folder);
+                        tracing::debug!("Bypass Mismatch: '{}' vs '{}'", sanitize_title(title), sanitize_title(&folder_name));
                     }
                     let matches_year = if title.contains("2026") {
                         folder_name.contains("2026")
@@ -373,8 +364,8 @@ async fn do_play(
                                 let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
                                 // Only match actual movie files, not transcode artifacts
                                 if (ext == "mp4" || ext == "mkv") && !fname.starts_with("transcoded") {
-                                    // Triple-Lock Verification: Marker OR Physical Size Match
-                                    if has_done_marker || is_physically_full(&path, expected_bytes) {
+                                    // Known expected size wins over any completion marker.
+                                    if local_bypass_file_is_healthy(&path, has_done_marker, expected_bytes) {
                                         tracing::info!("Local Bypass: Found healthy file (done_marker: {}, physical_match: true): {:?}", has_done_marker, path);
                                         server_url = format!("file://{}", path.to_string_lossy());
                                         is_local = true;
@@ -618,6 +609,8 @@ async fn do_play(
         has_subtitles,
         subtitle_lang: if has_subtitles { Some(sub_lang) } else { None },
         duration,
+        quality: req.quality.clone(),
+        size: req.size.clone(),
     });
     let _ = app_state.save(&state.state_dir);
 
@@ -678,15 +671,6 @@ async fn do_play(
         });
     }
 
-    // --- STATIC IP HANDSHAKE ---
-    // Use the LAN IP (192.168.1.1) instead of darwin.home hostname 
-    // to prevent DNS resolution hangs on the Chromecast.
-    let final_url = if final_url.contains("darwin.home") {
-        final_url.replace("darwin.home", &state.config.lan_ip)
-    } else {
-        final_url
-    };
-
     Json(json!({
         "status": "streaming",
         "pid": pid,
@@ -715,6 +699,13 @@ fn do_cleanup(state: &SharedState) {
     // to enable instant Local Bypass for future requests.
     let app_state = crate::state::AppState::load(&state.state_dir);
     if let Some(current) = &app_state.current {
+        let expected_bytes = current.size.as_deref().and_then(parse_size_to_bytes).unwrap_or(0);
+        if expected_bytes == 0 {
+            tracing::debug!(
+                "Auto-Verification: skipping .spela_done for '{}' because expected byte size is unknown",
+                current.title
+            );
+        }
         let mut target_dir = state.media_dir.clone();
         if target_dir.to_string_lossy().starts_with("~/") {
             if let Some(home) = dirs::home_dir() {
@@ -727,14 +718,14 @@ fn do_cleanup(state: &SharedState) {
         if let Ok(entries) = std::fs::read_dir(&target_dir) {
             for entry in entries.flatten() {
                 let folder_name = entry.file_name().to_string_lossy().to_string();
-                if folder_name.contains(&current.title) {
+                if expected_bytes > 0 && title_tokens_match(&folder_name, &current.title) {
                     // Check for mp4/mkv files and verify physical completeness
                     if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
                         for sub_entry in sub_entries.flatten() {
                             let path = sub_entry.path();
                             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
                             if ext == "mp4" || ext == "mkv" {
-                                if is_physically_full(&path, current.duration.unwrap_or(0.0) as u64) {
+                                if is_physically_full(&path, expected_bytes) {
                                     let marker_path = entry.path().join(".spela_done");
                                     if !marker_path.exists() {
                                         let _ = std::fs::File::create(&marker_path);
@@ -925,6 +916,13 @@ fn parse_size_to_bytes(size_str: &str) -> Option<u64> {
         _ => 1,
     };
     Some((val * factor as f64) as u64)
+}
+
+fn local_bypass_file_is_healthy(path: &std::path::Path, has_done_marker: bool, expected_bytes: u64) -> bool {
+    if expected_bytes > 0 {
+        return is_physically_full(path, expected_bytes);
+    }
+    has_done_marker && is_physically_full(path, 0)
 }
 
 fn is_physically_full(path: &std::path::Path, expected_bytes: u64) -> bool {
@@ -1522,6 +1520,40 @@ mod tests {
         let t: f64 = 10800.0;
         assert_eq!(t.max(0.0), 10800.0);
     }
+
+    #[test]
+    fn test_parse_size_to_bytes_units() {
+        assert_eq!(parse_size_to_bytes("1 GB"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size_to_bytes("1.5 GB"), Some(1610612736));
+        assert_eq!(parse_size_to_bytes("700 MB"), Some(700 * 1024 * 1024));
+        assert_eq!(parse_size_to_bytes("nonsense"), None);
+    }
+
+    #[test]
+    fn test_title_tokens_match_sanitized_folder_names() {
+        assert!(title_tokens_match("Some.Movie.Title.2026.1080p.WEB-DL", "Some Movie Title"));
+        assert!(!title_tokens_match("Some Other Movie 2026 1080p", "Some Movie Title"));
+    }
+
+    #[test]
+    fn test_local_bypass_does_not_trust_marker_when_expected_size_disagrees() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "spela-local-bypass-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::write(&path, [0u8; 4096]).unwrap();
+
+        assert!(!local_bypass_file_is_healthy(&path, true, 1024 * 1024 * 1024));
+        assert!(local_bypass_file_is_healthy(&path, true, 0));
+        assert!(!local_bypass_file_is_healthy(&path, false, 0));
+
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Sanitize title for fuzzy matching (lowercase, no symbols, KEEP SPACES)
@@ -1533,4 +1565,11 @@ fn sanitize_title(title: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn title_tokens_match(candidate: &str, title: &str) -> bool {
+    let s_candidate = sanitize_title(candidate);
+    let s_title = sanitize_title(title);
+    let title_tokens: Vec<&str> = s_title.split_whitespace().collect();
+    !title_tokens.is_empty() && title_tokens.iter().all(|&token| s_candidate.contains(token))
 }

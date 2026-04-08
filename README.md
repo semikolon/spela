@@ -135,7 +135,7 @@ default_device = "Living Room TV"
 subtitles = "en"
 quality = "1080p"
 tmdb_api_key = "your-key-here"
-lan_ip = "192.168.1.100"        # your server's LAN IP (Chromecast fetches from this)
+lan_ip = "192.168.1.100"        # host/IP Chromecast can fetch from; a DNS name is fine if Cast resolves it
 media_dir = "~/media"
 port = 7890
 
@@ -173,6 +173,11 @@ Install `systemd/spela-resource-limits.conf` as a drop-in at
 `/etc/systemd/system/spela.service.d/resource-limits.conf` on production hosts.
 That keeps media worker memory, swap, task count, and CPU use bounded without
 putting host-specific secrets in the tracked unit file.
+
+Completion markers (`.spela_done`) are only written after the downloaded file's
+physical bytes match the expected torrent result size. Do not mark files complete
+from playback duration alone; that can make partial files eligible for local
+bypass.
 
 ## How Transcoding Works
 

@@ -40,6 +40,10 @@ pub struct CurrentStream {
     pub subtitle_lang: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

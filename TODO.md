@@ -10,4 +10,5 @@
 - [x] Add a worker-only cleanup command/path that terminates WebTorrent/ffmpeg without deleting media or rewriting playback history. Implemented as local `spela kill-workers`.
 - [x] Reconcile stale WebTorrent workers on server startup before accepting new playback.
 - [x] Add systemd/cgroup containment for media workers (`MemoryHigh`, `MemoryMax`, task limits, and CPU quota/weight where practical). Implemented as `systemd/spela-resource-limits.conf`.
+- [x] Tighten local-bypass completion markers so `.spela_done` is written only when expected torrent byte size and physical file bytes agree.
 - [ ] Add an external watchdog/alert that reports orphan WebTorrent workers and resource pressure before the host becomes unhealthy.
