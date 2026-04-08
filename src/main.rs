@@ -9,7 +9,7 @@ mod torrent;
 mod transcode;
 
 use clap::{Parser, Subcommand};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[derive(Parser)]
 #[command(name = "spela", version, about = "AI-agent-ready media controller — search, stream, cast")]
@@ -79,6 +79,8 @@ enum Commands {
     },
     /// Stop current stream
     Stop,
+    /// Terminate local WebTorrent/Spela ffmpeg workers without deleting media
+    KillWorkers,
     /// Show playback status
     Status,
     /// Pause playback
@@ -143,6 +145,21 @@ async fn main() {
         }
         Commands::Setup => {
             run_setup().await;
+            return;
+        }
+        Commands::KillWorkers => {
+            let (webtorrent_pids, ffmpeg_pids) = torrent::kill_all_workers();
+            let val = json!({
+                "status": "workers_terminated",
+                "webtorrent_pids": webtorrent_pids,
+                "ffmpeg_pids": ffmpeg_pids,
+                "media_deleted": false,
+            });
+            if cli.human {
+                print_human(&val);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+            }
             return;
         }
         _ => {
@@ -356,7 +373,7 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             };
             Ok(client.post(format!("{}/api/position/reset", base)).json(&body).send().await?.json().await?)
         }
-        Commands::Server { .. } | Commands::Setup => unreachable!(),
+        Commands::Server { .. } | Commands::Setup | Commands::KillWorkers => unreachable!(),
     }
 }
 
@@ -404,6 +421,24 @@ fn print_human(val: &Value) {
     // Status
     if let Some(status) = val.get("status").and_then(|v| v.as_str()) {
         println!("Status: {}", status);
+        if status == "workers_terminated" {
+            let webtorrent = val
+                .get("webtorrent_pids")
+                .and_then(|v| v.as_array())
+                .map(|pids| pids.len())
+                .unwrap_or(0);
+            let ffmpeg = val
+                .get("ffmpeg_pids")
+                .and_then(|v| v.as_array())
+                .map(|pids| pids.len())
+                .unwrap_or(0);
+            println!(
+                "  Sent SIGTERM to {} WebTorrent worker(s) and {} ffmpeg worker(s).",
+                webtorrent, ffmpeg
+            );
+            println!("  Media deleted: false");
+            return;
+        }
         if let Some(current) = val.get("current") {
             let title = current.get("title").and_then(|v| v.as_str()).unwrap_or("?");
             let target = current.get("target").and_then(|v| v.as_str()).unwrap_or("");

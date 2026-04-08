@@ -1,7 +1,12 @@
 use anyhow::{anyhow, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
+
+const WEBTORRENT_PROCESS_PATTERN: &str = "WebTorrent|webtorrent";
+const SPELA_FFMPEG_PROCESS_PATTERN: &str = "ffmpeg.*transcoded_aac\\.mp4|transcoded_aac\\.mp4";
+const SIGTERM: i32 = 15;
 
 /// Start webtorrent-cli as an HTTP file server.
 /// Returns (PID, HTTP URL for the served file).
@@ -31,19 +36,36 @@ pub async fn start_webtorrent(
         args.push(idx.to_string());
     }
 
-    let child = Command::new("webtorrent")
+    let mut child = Command::new("webtorrent")
         .args(&args)
+        .env("NODE_OPTIONS", "--max-old-space-size=4096")
         .stdout(log_file)
         .stderr(log_err)
         .spawn()?;
 
     let pid = child.id().ok_or_else(|| anyhow!("Failed to get webtorrent PID"))?;
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) => tracing::debug!("webtorrent process {} exited with {}", pid, status),
+            Err(err) => tracing::warn!("failed to reap webtorrent process {}: {}", pid, err),
+        }
+    });
 
     // Wait for HTTP server to be ready (parse log for URL)
     let mut server_url = None;
-    for _ in 0..30 {
+    for i in 0..300 {
         sleep(Duration::from_secs(1)).await;
+
+        // Check if process is still alive
+        if unsafe { !kill_check(pid) } {
+            let log_content = std::fs::read_to_string(log_path).unwrap_or_default();
+            return Err(anyhow!("Webtorrent process (PID {}) died during startup. Log: {}", pid, log_content));
+        }
+
         if let Ok(log) = std::fs::read_to_string(log_path) {
+            if i % 10 == 0 && log.contains("verifying existing torrent data") {
+                tracing::info!("Webtorrent: verifying existing data (hashing)...");
+            }
             if let Some(cap) = log.lines().find(|l| l.contains("Server running at:")) {
                 if let Some(url_start) = cap.find("http://") {
                     let url = cap[url_start..].trim().to_string();
@@ -108,7 +130,7 @@ pub async fn check_progress(log_path: &Path, timeout_secs: u64) -> bool {
 /// Kill a process by PID (SIGTERM).
 pub fn kill_pid(pid: u32) {
     unsafe {
-        libc::kill(pid as i32, 15); // SIGTERM
+        libc::kill(pid as i32, SIGTERM);
     }
 }
 
@@ -117,30 +139,94 @@ pub unsafe fn kill_check(pid: u32) -> bool {
     libc::kill(pid as i32, 0) == 0
 }
 
-/// Kill all webtorrent processes.
-pub fn kill_all_webtorrent() {
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "webtorrent"])
-        .output();
+/// Kill all WebTorrent workers except explicitly allowed PIDs.
+pub fn kill_webtorrent_except(allowed_pids: &[u32]) -> Vec<u32> {
+    kill_matching(WEBTORRENT_PROCESS_PATTERN, allowed_pids)
+}
+
+/// Kill all WebTorrent workers.
+pub fn kill_all_webtorrent() -> Vec<u32> {
+    kill_webtorrent_except(&[])
+}
+
+/// Kill Spela-owned ffmpeg workers that write the transient transcode artifact.
+pub fn kill_spela_ffmpeg_workers() -> Vec<u32> {
+    kill_matching(SPELA_FFMPEG_PROCESS_PATTERN, &[])
+}
+
+/// Emergency worker-only cleanup. Sends SIGTERM and does not delete media or
+/// mutate playback state.
+pub fn kill_all_workers() -> (Vec<u32>, Vec<u32>) {
+    (kill_all_webtorrent(), kill_spela_ffmpeg_workers())
 }
 
 /// Stop stream by PID file.
-pub fn stop_by_pid_file(pid_path: &Path) {
+pub fn stop_by_pid_file(pid_path: &Path) -> Vec<u32> {
+    let mut killed = Vec::new();
     if let Ok(text) = std::fs::read_to_string(pid_path) {
         if let Ok(pid) = text.trim().parse::<u32>() {
             if pid > 0 {
                 kill_pid(pid);
+                killed.push(pid);
             }
         }
     }
     let _ = std::fs::write(pid_path, "");
-    kill_all_webtorrent();
+    for pid in kill_all_webtorrent() {
+        if !killed.contains(&pid) {
+            killed.push(pid);
+        }
+    }
+    killed
 }
 
 /// Write PID to file.
 pub fn save_pid(pid_path: &PathBuf, pid: u32) -> Result<()> {
     std::fs::write(pid_path, pid.to_string())?;
     Ok(())
+}
+
+fn pids_matching(pattern: &str) -> Vec<u32> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-f", pattern])
+        .output();
+    match output {
+        Ok(output) => parse_pgrep_pids(&String::from_utf8_lossy(&output.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn kill_matching(pattern: &str, allowed_pids: &[u32]) -> Vec<u32> {
+    let allowed: HashSet<u32> = allowed_pids.iter().copied().filter(|pid| *pid > 0).collect();
+    let self_pid = std::process::id();
+    let mut killed = Vec::new();
+    for pid in pids_matching(pattern) {
+        if pid == self_pid || allowed.contains(&pid) || unsafe { !kill_check(pid) } {
+            continue;
+        }
+        kill_pid(pid);
+        killed.push(pid);
+    }
+    killed
+}
+
+fn parse_pgrep_pids(output: &str) -> Vec<u32> {
+    output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter_map(|pid| pid.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pgrep_pids_ignores_non_pid_lines() {
+        assert_eq!(parse_pgrep_pids("123\nnot-a-pid\n456 webtorrent\n0\n"), vec![123, 456]);
+    }
 }
 
 // Minimal libc bindings for kill()

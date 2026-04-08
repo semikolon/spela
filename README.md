@@ -47,6 +47,19 @@ Chromecast (rust_cast, StreamType::Live, mDNS discovery)
 
 The CLI is a thin HTTP client. The server does everything. Run both on the same machine (laptop, desktop) or split them across your LAN. No dedicated server required -- `spela server` in one terminal tab, `spela play` in another.
 
+## Worker Safety
+
+spela's most important operational rule is that WebTorrent and ffmpeg are owned workers, not disposable background noise. Worker cleanup and media cleanup must stay separate:
+
+- emergency cleanup should terminate WebTorrent/ffmpeg workers only;
+- playback cleanup may remove temporary transcode files, but only through explicit playback paths;
+- startup should reconcile stale workers from previous sessions;
+- production deployments should add systemd/cgroup limits so a media worker cannot exhaust the host.
+
+Run `spela kill-workers` on the media host for emergency worker-only cleanup. It sends `SIGTERM` to local WebTorrent workers and Spela-owned ffmpeg transcode workers; it does not remove media files or update playback history.
+
+See [OPERATIONS.md](OPERATIONS.md) for the defense-in-depth plan and emergency checklist.
+
 ## Install
 
 ### Prerequisites

@@ -49,6 +49,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     let media_dir = config.media_dir();
     std::fs::create_dir_all(&state_dir)?;
     std::fs::create_dir_all(&media_dir)?;
+    reconcile_webtorrent_workers_on_startup(&state_dir);
 
     let search_engine = SearchEngine::new(config.tmdb_api_key.clone());
     let cast = Mutex::new(CastController::new(&state_dir, config.known_devices.clone()));
@@ -104,6 +105,34 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn reconcile_webtorrent_workers_on_startup(state_dir: &PathBuf) {
+    let mut app_state = AppState::load(state_dir);
+    let active_pid = app_state
+        .current
+        .as_ref()
+        .map(|current| current.pid)
+        .filter(|pid| *pid > 0 && unsafe { torrent::kill_check(*pid) });
+
+    if app_state.current.is_some() && active_pid.is_none() {
+        tracing::warn!("Clearing stale current stream on startup: recorded WebTorrent PID is not running");
+        app_state.current = None;
+        let _ = app_state.save(state_dir);
+    }
+
+    let allowed: Vec<u32> = active_pid.into_iter().collect();
+    let killed = torrent::kill_webtorrent_except(&allowed);
+    if !killed.is_empty() {
+        tracing::warn!("Terminated stale WebTorrent workers on startup: {:?}", killed);
+    }
+
+    let pid_path = state_dir.join("webtorrent.pid");
+    if let Some(pid) = allowed.first() {
+        let _ = torrent::save_pid(&pid_path, *pid);
+    } else {
+        let _ = std::fs::write(pid_path, "");
+    }
 }
 
 // --- Request types ---

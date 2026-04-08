@@ -56,6 +56,13 @@ pub fn prune_disk(media_dir: &Path, active_title: &str) {
     }
 }
 
+/// Backward-compatible wrapper for the older cleanup test. New production code
+/// should use `prune_disk` so the active title can be protected explicitly.
+#[cfg(test)]
+fn cleanup_old_files(media_dir: &Path) {
+    prune_disk(media_dir, "");
+}
+
 pub fn dir_size(path: &Path) -> Result<u64> {
     let mut total = 0u64;
     if path.is_file() {

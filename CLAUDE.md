@@ -39,6 +39,7 @@ spela status / history / targets                 # Info
 - `src/state.rs` — state.json + last_search.json (play-by-id) + resume_positions (IMDB→seconds)
 - `static/cast-receiver.html` — Custom Cast Receiver (Shaka Player + CAF v3, ~200 lines)
 - `src/config.rs` — ~/.config/spela/config.toml
+- `OPERATIONS.md` — worker safety plan, stale WebTorrent prevention, emergency cleanup rules
 
 ## Build & Deploy
 
@@ -69,6 +70,7 @@ ssh darwin 'sudo systemctl stop spela && cp ~/Projects/spela/target/release/spel
 
 ## Hard-Won Lessons
 
+- **Worker cleanup must not imply media cleanup** — WebTorrent/ffmpeg are owned workers with their own failure domain. Emergency cleanup should terminate stale workers only; it must not delete media or rewrite playback history. Keep this rule linked to `OPERATIONS.md`. This was added after a private production incident where abandoned WebTorrent workers exhausted host RAM/swap and made unrelated services appear wedged.
 - **webtorrent `-s` FIXED** (our PR #3011, fixes #331) — piece verification bug in `_markUnverified` re-selected ALL pieces, downloading entire torrent despite `-s`. Fix: `Selections.contains()` guard prevents re-selecting deselected pieces. Patched in-place on Darwin at `~/.local/share/mise/installs/node/24.14.0/lib/node_modules/webtorrent-cli/node_modules/webtorrent/lib/`. Verified: 27-file season pack → only target file + 1.7MB boundary pieces downloaded (sparse files, no actual disk waste). Smart ranking still prefers single-file torrents as belt-and-suspenders
 - **localhost doesn't work for Chromecast** — always use `darwin.home`, Chromecast fetches URL itself
 - **Transcoded streaming via axum endpoint** (Mar 20, 2026) — `python3 -m http.server` sent `Content-Length` for a growing fMP4 file → Chromecast read that many bytes, thought stream complete, stopped after ~10s. Fix: `/stream/transcode` axum endpoint with chunked transfer (no Content-Length) + `StreamType::Live` (tells Chromecast not to expect fixed length). **5MB pre-buffer** proves sustained torrent+transcode health before casting. ffmpeg PID tracked for stream tailing + cleanup
