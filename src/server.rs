@@ -389,16 +389,25 @@ async fn do_play(
                         let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
                         if (ext == "mp4" || ext == "mkv") && !fname.starts_with("transcoded") {
-                            // For top-level files, a `<filename>.spela_done` sibling
-                            // is the equivalent of the dir-level marker.
-                            let marker_path = path.with_extension(format!("{}.spela_done", ext));
-                            let file_has_done_marker = marker_path.exists();
-                            if local_bypass_file_is_healthy(&path, file_has_done_marker, expected_bytes) {
-                                tracing::info!("Local Bypass: Found healthy top-level file (done_marker: {}): {:?}", file_has_done_marker, path);
+                            // Trust the title/year/quality match for content identity
+                            // and only sanity-check the file via top_level_file_is_healthy
+                            // (≥100 MB, non-sparse). See the function's doc for why we
+                            // don't enforce strict size matching against the search
+                            // result's expected_bytes here.
+                            if top_level_file_is_healthy(&path) {
+                                tracing::info!(
+                                    "Local Bypass: Found healthy top-level file (logical {}B, expected {}B, title-trust): {:?}",
+                                    path.metadata().map_or(0, |m| m.len()),
+                                    expected_bytes,
+                                    path
+                                );
                                 server_url = format!("file://{}", path.to_string_lossy());
                                 is_local = true;
                             } else {
-                                tracing::info!("Local Bypass: Top-level file failed health check (size: {}B, expected: {}B). Delegating to Torrent Engine.", path.metadata().map_or(0, |m| m.len()), expected_bytes);
+                                tracing::info!(
+                                    "Local Bypass: Top-level file failed sanity check (size: {}B, sparse-or-tiny). Delegating to Torrent Engine.",
+                                    path.metadata().map_or(0, |m| m.len())
+                                );
                             }
                         }
                     }
@@ -978,6 +987,45 @@ fn is_physically_full(path: &std::path::Path, expected_bytes: u64) -> bool {
         let physical_size = meta.blocks() * 512;
         if physical_size < (logical_size as f64 * 0.95) as u64 {
             tracing::warn!("Local Bypass: File is sparse (physical {} < logical {}). Rejecting.", physical_size, logical_size);
+            return false;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Top-level file health check (Apr 15, 2026): trust the filename for content
+/// identity and only sanity-check that the file is large enough to be a movie
+/// and is not sparse.
+///
+/// Why this exists: `is_physically_full` enforces a strict ±1% logical-size
+/// match against the search result's expected size, but for top-level
+/// single-file releases the user often already has SOME release of the same
+/// content on disk (different group, different remux, different audio mix)
+/// whose logical size differs by a few hundred MB. The directory-bypass path
+/// is correct to be strict because it has to disambiguate multiple files in a
+/// season pack; the top-level path doesn't — `matches_title` + `matches_year`
+/// + `matches_quality` already prove it's the right show / season / episode /
+/// resolution. Forcing a fresh torrent download on every play "because the
+/// FLUX remux is 311 MB smaller than the DUAL.5.1 remux" is the bug that
+/// made The.Boys.S05E01...FLUX.mkv invisible to Bypass on Apr 15, 2026.
+///
+/// Sanity floor: 100 MB. Anything smaller than that is a partial download or
+/// a stub file, not a real movie file.
+fn top_level_file_is_healthy(path: &std::path::Path) -> bool {
+    const MIN_MOVIE_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let logical_size = meta.len();
+        if logical_size < MIN_MOVIE_SIZE_BYTES {
+            return false;
+        }
+        let physical_size = meta.blocks() * 512;
+        if physical_size < (logical_size as f64 * 0.95) as u64 {
+            tracing::warn!(
+                "Local Bypass: Top-level file is sparse (physical {} < logical {}). Rejecting.",
+                physical_size, logical_size
+            );
             return false;
         }
         true
