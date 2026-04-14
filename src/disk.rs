@@ -3,9 +3,19 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-const MAX_MEDIA_MB: u64 = 10000;
+const MAX_MEDIA_MB: u64 = 10_000;
 
-/// Check if media dir exceeds 10GB cap.
+/// Minimum free space (MB) on the host filesystem below which spela refuses
+/// to start new downloads, regardless of whether its own `~/media/` cap is
+/// satisfied. This is a second, independent safety floor that protects
+/// Darwin's system-critical services — kamal-proxy, Docker builds, FalkorDB,
+/// Graphiti, AdGuard, journald, etc. — from being starved by a runaway
+/// torrent on a machine where spela is a low-priority tenant.
+const MIN_FS_FREE_MB: u64 = 20 * 1024;
+
+/// Check if new downloads are safe: media dir must be under its own cap,
+/// AND the host filesystem must have enough free space that spela can't
+/// put pressure on higher-priority services.
 pub fn check_space(media_dir: &Path) -> Result<Option<String>> {
     if !media_dir.exists() {
         return Ok(None);
@@ -13,10 +23,50 @@ pub fn check_space(media_dir: &Path) -> Result<Option<String>> {
     let size_bytes = dir_size(media_dir)?;
     let size_mb = size_bytes / (1024 * 1024);
     if size_mb > MAX_MEDIA_MB {
-        Ok(Some(format!("~/media/ is {}MB (>{}MB cap). Clean up first.", size_mb, MAX_MEDIA_MB)))
-    } else {
-        Ok(None)
+        return Ok(Some(format!(
+            "~/media/ is {}MB (>{}MB cap). Clean up first.",
+            size_mb, MAX_MEDIA_MB
+        )));
     }
+
+    // Host-filesystem safety floor. `df` is present on every Unix spela
+    // runs on (Ubuntu, macOS); if it's missing or its output is unparseable
+    // we treat the check as unenforceable rather than refusing the play,
+    // otherwise spela becomes unusable on the slightest parser regression.
+    if let Some(free_mb) = fs_free_mb(media_dir) {
+        if free_mb < MIN_FS_FREE_MB {
+            return Ok(Some(format!(
+                "Host filesystem has only {}MB free (<{}MB safety floor); spela is backing off to keep Darwin's critical services unaffected.",
+                free_mb, MIN_FS_FREE_MB
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Query the host filesystem free space (MB) via `df -Pk <path>`. Returns
+/// `None` on any failure (missing binary, non-zero exit, parse error, etc.)
+/// so callers can treat the safety floor as best-effort.
+fn fs_free_mb(path: &Path) -> Option<u64> {
+    let output = std::process::Command::new("df")
+        .args(["-Pk"]) // POSIX output (no line wrapping), 1K blocks
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&output.stdout).ok()?;
+    // Header is line 0; data line is line 1 in POSIX mode (no wrap).
+    let data = text.lines().nth(1)?;
+    // Columns: Filesystem, 1K-blocks, Used, Available, Capacity, Mounted-on
+    let cols: Vec<&str> = data.split_whitespace().collect();
+    if cols.len() < 4 {
+        return None;
+    }
+    let available_kb: u64 = cols[3].parse().ok()?;
+    Some(available_kb / 1024)
 }
 
 /// Smart Disk Hygiene: Prune folders based on age and completion status.
