@@ -5,7 +5,13 @@ use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
 const WEBTORRENT_PROCESS_PATTERN: &str = "WebTorrent|webtorrent";
-const SPELA_FFMPEG_PROCESS_PATTERN: &str = "ffmpeg.*transcoded_aac\\.mp4|transcoded_aac\\.mp4";
+// Match BOTH the legacy fragmented-MP4 path (transcoded_aac.mp4, retained
+// for the Custom Cast Receiver flow) AND the Apr 15, 2026 HLS path
+// (transcoded_hls/ directory containing playlist.m3u8 + segments). Either
+// signature should be enough to fingerprint a spela-owned ffmpeg child
+// without sweeping unrelated ffmpeg processes on the host.
+const SPELA_FFMPEG_PROCESS_PATTERN: &str =
+    "ffmpeg.*transcoded_aac\\.mp4|transcoded_aac\\.mp4|ffmpeg.*transcoded_hls|transcoded_hls/playlist\\.m3u8";
 const SIGTERM: i32 = 15;
 
 /// Start webtorrent-cli as an HTTP file server.

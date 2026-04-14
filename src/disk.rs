@@ -155,7 +155,19 @@ mod tests {
         let dir = tempdir("check_space_empty");
         let result = check_space(&dir);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_none()); // 0 bytes < 10GB
+        // The 10 GB media cap will never fire on an empty dir — but the
+        // 20 GB host-filesystem safety floor is environment-dependent and
+        // CAN fire on a tight test host (e.g. Mac Mini at 20 GiB free).
+        // Accept either None (host has plenty of free space) or a floor
+        // warning, but reject any other surprise warning text.
+        let warning = result.unwrap();
+        if let Some(w) = warning {
+            assert!(
+                w.contains("Host filesystem") && w.contains("safety floor"),
+                "unexpected check_space warning: {}",
+                w
+            );
+        }
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -86,6 +86,10 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/config", get(handle_get_config).post(handle_set_config))
         .route("/cast-info", post(handle_cast_info))
         .route("/stream/transcode", get(handle_transcode_stream))
+        // HLS streaming endpoints (Apr 15, 2026 rework — proper Chromecast support)
+        .route("/hls/playlist.m3u8", get(handle_hls_playlist))
+        .route("/hls/init.mp4", get(handle_hls_init))
+        .route("/hls/segment/{segment}", get(handle_hls_segment))
         // Custom Cast Receiver endpoints
         .route("/cast-receiver.html", get(handle_cast_receiver_html))
         .route("/cast-receiver/intro.mp4", get(handle_cast_receiver_intro))
@@ -532,43 +536,67 @@ async fn do_play(
         tracing::info!("Transcode needed: {}", reasons.join(" + "));
 
         let sub_path = subtitle_srt_path.as_deref();
-        match transcode::transcode(&server_url, &media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to).await {
-                Ok((output_path, ffmpeg_pid)) => {
-                    // Track ffmpeg PID for the streaming endpoint and cleanup
+        // Apr 15, 2026: switched from `transcode::transcode` (fragmented MP4
+        // served via chunked-transfer at /stream/transcode, which Chromecast
+        // Default Media Receiver rejects with player_state=IDLE) to
+        // `transcode::transcode_hls` (HLS event playlist + fmp4 segments
+        // served via /hls/playlist.m3u8 with proper Content-Length + Range).
+        // See ~/Projects/spela/TODO.md § "Cast Pipeline Rework" for the full
+        // trade-off analysis.
+        match transcode::transcode_hls(&server_url, &media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to).await {
+                Ok((manifest_path, ffmpeg_pid)) => {
+                    // Track ffmpeg PID for the post-playback reaper + cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
 
-                    // Wait for sufficient buffer before casting.
-                    // 5MB proves sustained torrent download + transcode pipeline health.
-                    // Intro concat + NVENC re-encoding needs more time (~30s) than
-                    // simple audio transcode with video copy (~14s).
-                    let prebuffer_min: u64 = 5 * 1024 * 1024; // 5MB
-                    let timeout_secs = if intro_path.is_some() { 45 } else { 25 };
+                    // HLS pre-buffer: wait for the manifest file + the fmp4
+                    // init segment + at least one segment to exist on disk.
+                    // ffmpeg writes the manifest atomically (temp_file flag)
+                    // when adding segments, so when we see seg_00001.m4s it
+                    // is guaranteed to be playable. The ~12 seconds of
+                    // encoded content (2 segments at 6s each) we wait for is
+                    // ~2 seconds of wall time at NVENC's 6x realtime — well
+                    // inside the cast handshake budget.
+                    let hls_dir = manifest_path.parent().map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| media_dir.join("transcoded_hls"));
+                    let init_path = hls_dir.join("init.mp4");
+                    let first_segment = hls_dir.join("seg_00001.m4s");
+                    let prebuffer_timeout_secs: u64 = if intro_path.is_some() { 60 } else { 40 };
                     let prebuffer_deadline = tokio::time::Instant::now()
-                        + tokio::time::Duration::from_secs(timeout_secs);
+                        + tokio::time::Duration::from_secs(prebuffer_timeout_secs);
                     loop {
                         if tokio::time::Instant::now() > prebuffer_deadline {
-                            tracing::warn!("Pre-buffer timeout ({}s) — casting with available data", timeout_secs);
+                            tracing::warn!(
+                                "HLS pre-buffer timeout ({}s) — casting with available data",
+                                prebuffer_timeout_secs
+                            );
                             break;
                         }
-                        if let Ok(meta) = std::fs::metadata(&output_path) {
-                            if meta.len() >= prebuffer_min {
-                                tracing::info!("Pre-buffer ready: {}KB", meta.len() / 1024);
-                                break;
-                            }
+                        if manifest_path.exists() && init_path.exists() && first_segment.exists() {
+                            tracing::info!(
+                                "HLS pre-buffer ready: manifest + init + seg_00001 exist at {:?}",
+                                hls_dir
+                            );
+                            break;
                         }
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     }
 
-                    // Serve via axum's streaming endpoint (chunked transfer, no Content-Length)
-                    // This replaces the python http.server which sent Content-Length for a growing file
-                    final_url = format!("http://{}:{}/stream/transcode", state.config.stream_host, state.config.port);
+                    // Cast URL is the HLS manifest. Chromecast Default Media
+                    // Receiver sees the .m3u8 + content_type
+                    // application/vnd.apple.mpegurl and routes through Shaka
+                    // Player's HLS adapter, which handles segment fetching,
+                    // 206 Range requests, and growing manifests natively.
+                    final_url = format!(
+                        "http://{}:{}/hls/playlist.m3u8",
+                        state.config.stream_host, state.config.port
+                    );
                     is_transcoded = true;
 
                     if sub_path.is_some() {
                         tracing::info!("Subtitles burned into video stream via NVENC");
                     }
                 }
-                Err(e) => tracing::warn!("Transcode failed (casting original): {}", e),
+                Err(e) => tracing::warn!("HLS transcode failed (casting original): {}", e),
             }
     }
 
@@ -583,9 +611,20 @@ async fn do_play(
             let intro_secs = if intro_path.is_some() { 5.0 } else { 0.0 };
             d + intro_secs
         });
+        // Pick the cast content_type from the URL: HLS manifests get the
+        // official IANA media type which routes Default Media Receiver
+        // through Shaka Player's HLS adapter; everything else (raw MP4,
+        // direct file URLs) gets video/mp4.
+        let cast_content_type: &str = if url_clone.ends_with(".m3u8")
+            || url_clone.contains("/hls/playlist.m3u8")
+        {
+            "application/vnd.apple.mpegurl"
+        } else {
+            "video/mp4"
+        };
         let cast_result = tokio::task::spawn_blocking(move || {
             let mut cast = state_clone.cast.lock().unwrap();
-            cast.cast_url(&cast_name_clone, &url_clone, "video/mp4", cast_duration, seek_to)
+            cast.cast_url(&cast_name_clone, &url_clone, cast_content_type, cast_duration, seek_to)
         }).await;
 
         match cast_result {
@@ -824,6 +863,16 @@ fn do_cleanup(state: &SharedState) {
     let transcoded = media_dir.join("transcoded_aac.mp4");
     if transcoded.exists() {
         let _ = std::fs::remove_file(&transcoded);
+    }
+    // Apr 15, 2026: also wipe the HLS output dir written by transcode_hls.
+    // Each play creates fresh segments under transcoded_hls/; leaving stale
+    // segments around would let the next play accidentally serve mismatched
+    // content if the manifest from the previous run survives.
+    let hls_dir = media_dir.join("transcoded_hls");
+    if hls_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&hls_dir) {
+            tracing::warn!("do_cleanup: failed to remove HLS dir {:?}: {}", hls_dir, e);
+        }
     }
 
     let mut app_state = AppState::load(&state.state_dir);
@@ -1406,6 +1455,234 @@ async fn handle_cast_receiver_intro() -> impl IntoResponse {
             .body(axum::body::Body::from("No intro configured"))
             .unwrap(),
     }
+}
+
+// --- HLS Streaming Endpoints (Apr 15, 2026 rework) ---
+//
+// The original `/stream/transcode` endpoint serves a growing fragmented MP4
+// with chunked transfer encoding and always returns HTTP 200 (never 206).
+// Chromecast Default Media Receiver's MP4 parser refuses that combination
+// and silently drops to player_state=IDLE — the "blue cast icon" failure
+// mode `cast_health_monitor` exists to detect. The HLS endpoints below
+// replace that path with a proper segment-based streaming format that the
+// receiver supports natively (Shaka Player handles HLS out of the box).
+//
+// Layout under <media_dir>/transcoded_hls/:
+//   - playlist.m3u8 (event-type, appendable, ENDLIST written when ffmpeg closes)
+//   - init.mp4      (fmp4 init segment with moov box)
+//   - seg_NNNNN.m4s (6-second fmp4 segments)
+//
+// All three handlers go through `serve_static_with_range`, which honors HTTP
+// Range requests with proper 206 / Content-Range / Accept-Ranges headers and
+// always sets a real Content-Length. That's exactly what Default Media
+// Receiver wants — and exactly what `/stream/transcode` doesn't provide.
+
+/// Resolve the spela media dir to an absolute, canonicalized path. Mirrors
+/// the inline logic the cast-receiver handlers had been duplicating.
+fn resolve_media_dir(state: &SharedState) -> PathBuf {
+    let mut media_dir = state.media_dir.clone();
+    if media_dir.to_string_lossy().starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            media_dir = home.join(media_dir.strip_prefix("~/").unwrap());
+        }
+    }
+    std::fs::canonicalize(&media_dir).unwrap_or(media_dir)
+}
+
+/// Parse an HTTP `Range: bytes=N-M` header into `(start, end)` inclusive
+/// byte offsets, clamped to the file's actual size. Falls back to
+/// `(0, total_size - 1)` for missing or malformed headers.
+fn parse_http_range_header(header: Option<&str>, total_size: u64) -> (u64, u64) {
+    if total_size == 0 {
+        return (0, 0);
+    }
+    let last_byte = total_size - 1;
+    let header = match header {
+        Some(h) => h,
+        None => return (0, last_byte),
+    };
+    let rest = match header.strip_prefix("bytes=") {
+        Some(r) => r,
+        None => return (0, last_byte),
+    };
+    // Take the FIRST range only (multipart range responses are not implemented).
+    let first_range = rest.split(',').next().unwrap_or("").trim();
+    let parts: Vec<&str> = first_range.splitn(2, '-').collect();
+    if parts.len() != 2 {
+        return (0, last_byte);
+    }
+    let start = parts[0].trim().parse::<u64>().unwrap_or(0);
+    let end = if parts[1].trim().is_empty() {
+        last_byte
+    } else {
+        parts[1].trim().parse::<u64>().unwrap_or(last_byte)
+    };
+    (start.min(last_byte), end.min(last_byte))
+}
+
+/// Serve a static file with proper HTTP Range support.
+///
+/// This is the helper the HLS endpoints + the new cast-friendly Range-aware
+/// path use. It always sets `Content-Length`, always honors `Range:` requests
+/// with `206 Partial Content` + `Content-Range`, and always advertises
+/// `Accept-Ranges: bytes`. That's what Chromecast Default Media Receiver +
+/// Shaka Player + every browser media element expects.
+///
+/// Streaming is via a tokio mpsc channel + `Body::from_stream` so we don't
+/// have to load the whole file into memory. 64 KB read chunks balance CPU /
+/// syscall overhead against memory.
+async fn serve_static_with_range(
+    path: PathBuf,
+    content_type: &'static str,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(_) => {
+            return axum::response::Response::builder()
+                .status(404)
+                .header("Content-Type", "text/plain")
+                .body(axum::body::Body::from("Not found"))
+                .unwrap();
+        }
+    };
+    let total_size = metadata.len();
+
+    let range_header = headers.get("range").and_then(|v| v.to_str().ok());
+    let (start, end) = parse_http_range_header(range_header, total_size);
+    let bytes_to_send = end.saturating_sub(start).saturating_add(1);
+    let is_partial = range_header.is_some();
+
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("serve_static_with_range: open failed for {:?}: {}", path, e);
+            return axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from("Read error"))
+                .unwrap();
+        }
+    };
+
+    if start > 0 {
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+            tracing::error!("serve_static_with_range: seek to {} failed for {:?}: {}", start, path, e);
+            return axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from("Seek error"))
+                .unwrap();
+        }
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
+    let mut remaining = bytes_to_send;
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        while remaining > 0 {
+            let to_read = std::cmp::min(remaining as usize, buf.len());
+            match file.read(&mut buf[..to_read]).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let n_u64 = n as u64;
+                    let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
+                    remaining = remaining.saturating_sub(n_u64);
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        // Client disconnected — Chromecast often does this
+                        // between segment requests on a keep-alive connection.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = axum::body::Body::from_stream(stream);
+
+    let mut builder = axum::response::Response::builder()
+        .header("Content-Type", content_type)
+        .header("Content-Length", bytes_to_send.to_string())
+        .header("Accept-Ranges", "bytes")
+        .header("Cache-Control", "no-cache");
+
+    if is_partial {
+        builder = builder
+            .status(206)
+            .header(
+                "Content-Range",
+                format!("bytes {}-{}/{}", start, end, total_size),
+            );
+    } else {
+        builder = builder.status(200);
+    }
+
+    builder.body(body).unwrap()
+}
+
+/// Serve the HLS manifest. Content-Type is the official IANA media type for
+/// HLS manifests; Default Media Receiver / Shaka Player / browsers all map
+/// this to "play this as HLS".
+async fn handle_hls_playlist(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let path = resolve_media_dir(&state)
+        .join("transcoded_hls")
+        .join("playlist.m3u8");
+    serve_static_with_range(path, "application/vnd.apple.mpegurl", &headers).await
+}
+
+/// Serve the HLS fmp4 init segment (moov box). Always one file named
+/// `init.mp4`, referenced from the manifest's `EXT-X-MAP` line.
+async fn handle_hls_init(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let path = resolve_media_dir(&state)
+        .join("transcoded_hls")
+        .join("init.mp4");
+    serve_static_with_range(path, "video/mp4", &headers).await
+}
+
+/// Serve an individual HLS fmp4 segment. The segment name is taken from the
+/// URL path component (`/hls/segment/seg_00042.m4s`) and joined onto
+/// `transcoded_hls/` after a strict whitelist check that prevents path
+/// traversal: only ASCII alphanumerics, `_`, `-`, and a single `.` are
+/// allowed, and the final extension must be `.m4s`.
+async fn handle_hls_segment(
+    State(state): State<SharedState>,
+    axum::extract::Path(segment): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    // Path traversal / abuse hardening: reject anything that isn't a tame
+    // segment filename. We want only `seg_NNNNN.m4s` (or similar) to be
+    // resolvable through this endpoint.
+    let safe = !segment.is_empty()
+        && segment.len() <= 64
+        && segment.ends_with(".m4s")
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        && !segment.contains("..");
+    if !safe {
+        tracing::warn!("HLS segment request rejected as unsafe: {:?}", segment);
+        return axum::response::Response::builder()
+            .status(403)
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from("Forbidden"))
+            .unwrap();
+    }
+    let path = resolve_media_dir(&state)
+        .join("transcoded_hls")
+        .join(&segment);
+    serve_static_with_range(path, "video/mp4", &headers).await
 }
 
 /// Serve the current subtitle WebVTT file.
