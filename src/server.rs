@@ -376,6 +376,31 @@ async fn do_play(
                                 }
                             }
                         }
+                    } else if file_type.is_file() && matches_title && matches_year && matches_quality {
+                        // Top-level single-file release living directly in media_dir
+                        // (e.g. webtorrent finishes a single-file torrent into
+                        // ~/media/Some.Movie.1080p.x264.mkv with no parent folder).
+                        // Without this branch, fully-downloaded top-level files
+                        // would never be recognized for Local Bypass and every
+                        // play call would re-fetch the torrent — the exact bug
+                        // that left a 4.2 GB FLUX file invisible to Bypass on
+                        // Apr 15, 2026.
+                        let path = entry.path();
+                        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                        if (ext == "mp4" || ext == "mkv") && !fname.starts_with("transcoded") {
+                            // For top-level files, a `<filename>.spela_done` sibling
+                            // is the equivalent of the dir-level marker.
+                            let marker_path = path.with_extension(format!("{}.spela_done", ext));
+                            let file_has_done_marker = marker_path.exists();
+                            if local_bypass_file_is_healthy(&path, file_has_done_marker, expected_bytes) {
+                                tracing::info!("Local Bypass: Found healthy top-level file (done_marker: {}): {:?}", file_has_done_marker, path);
+                                server_url = format!("file://{}", path.to_string_lossy());
+                                is_local = true;
+                            } else {
+                                tracing::info!("Local Bypass: Top-level file failed health check (size: {}B, expected: {}B). Delegating to Torrent Engine.", path.metadata().map_or(0, |m| m.len()), expected_bytes);
+                            }
+                        }
                     }
                 }
                 if is_local { break; }
