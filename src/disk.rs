@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -63,10 +64,22 @@ fn cleanup_old_files(media_dir: &Path) {
     prune_disk(media_dir, "");
 }
 
+/// Recursively sum the real on-disk usage of a path tree.
+///
+/// Critically this uses allocated blocks (`metadata.blocks() * 512`), not
+/// the logical `len()`. webtorrent-cli with `-s <file_index>` creates sparse
+/// placeholder files for the unselected files in a torrent: those placeholders
+/// report the full torrent file size via `metadata.len()` even though only a
+/// handful of downloaded pieces actually occupy the disk. Using `len()` made
+/// `check_space()` trip the 10GB cap before the torrent had downloaded
+/// anything — spela would refuse to start new plays with a bogus "disk full"
+/// error while `du -sh ~/media/` reported only a few GB of real usage.
 pub fn dir_size(path: &Path) -> Result<u64> {
     let mut total = 0u64;
     if path.is_file() {
-        total += path.metadata()?.len();
+        // Unix reports allocated storage in 512-byte blocks regardless of the
+        // filesystem's own block size, so this is the correct conversion.
+        total += path.metadata()?.blocks() * 512;
     } else if path.is_dir() {
         for entry in std::fs::read_dir(path)? {
             total += dir_size(&entry?.path())?;
@@ -99,9 +112,15 @@ mod tests {
     #[test]
     fn test_dir_size_with_files() {
         let dir = tempdir("dir_size_files");
-        fs::write(dir.join("a.txt"), "hello").unwrap(); // 5 bytes
-        fs::write(dir.join("b.txt"), "world!").unwrap(); // 6 bytes
-        assert_eq!(dir_size(&dir).unwrap(), 11);
+        fs::write(dir.join("a.txt"), "hello").unwrap();
+        fs::write(dir.join("b.txt"), "world!").unwrap();
+        // `dir_size` reports allocated bytes (blocks * 512), so tiny files
+        // round up to the filesystem's minimum allocation (usually 4KB on
+        // APFS / ext4). We just need the result to be block-aligned and
+        // at least as big as the logical content.
+        let size = dir_size(&dir).unwrap();
+        assert!(size >= 11, "dir_size should be >= logical sum (got {size})");
+        assert_eq!(size % 512, 0, "dir_size should be block-aligned (got {size})");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -110,9 +129,48 @@ mod tests {
         let dir = tempdir("dir_size_recursive");
         let sub = dir.join("sub");
         fs::create_dir(&sub).unwrap();
-        fs::write(dir.join("root.txt"), "abc").unwrap(); // 3
-        fs::write(sub.join("child.txt"), "defgh").unwrap(); // 5
-        assert_eq!(dir_size(&dir).unwrap(), 8);
+        fs::write(dir.join("root.txt"), "abc").unwrap();
+        fs::write(sub.join("child.txt"), "defgh").unwrap();
+        let size = dir_size(&dir).unwrap();
+        assert!(size >= 8, "dir_size should be >= logical sum (got {size})");
+        assert_eq!(size % 512, 0, "dir_size should be block-aligned (got {size})");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_dir_size_counts_sparse_file_as_allocated_not_logical() {
+        // Regression: webtorrent with `-s <file_index>` creates sparse
+        // placeholder files for the unselected files in a torrent — they
+        // report the full torrent file size via metadata.len() but occupy
+        // almost nothing on disk. Before switching to blocks, dir_size
+        // summed those logical sizes and tripped the 10GB cap before any
+        // real download had happened.
+        let dir = tempdir("dir_size_sparse");
+        let sparse = dir.join("sparse.bin");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&sparse)
+            .unwrap();
+        // 100 MB logical, zero actual bytes written.
+        f.set_len(100 * 1024 * 1024).unwrap();
+        drop(f);
+
+        // Sanity: the OS reports the logical length as 100 MB.
+        assert_eq!(
+            std::fs::metadata(&sparse).unwrap().len(),
+            100 * 1024 * 1024
+        );
+
+        // But dir_size must report nearly nothing — the sparse file should
+        // occupy at most a few filesystem blocks of metadata, far below
+        // the 100 MB the naive len() implementation would have returned.
+        let size = dir_size(&dir).unwrap();
+        assert!(
+            size < 10 * 1024 * 1024,
+            "sparse file must not count its logical size (got {size})"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
