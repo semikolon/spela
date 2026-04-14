@@ -28,6 +28,23 @@ the entire userspace was under severe resource pressure.
   logged.
 - Resource limits should be enforced outside the application as well, using a
   systemd unit, slice, or transient scope where possible.
+- Worker spawn paths must always be paired with cleanup paths even on failure.
+  Any error-return between `start_webtorrent` and the post-playback reaper
+  spawn is a leak unless it explicitly tears the worker pipeline down.
+  Specifically: cast failure, transcode failure, or any panic in the early
+  phase of `do_play` must call `do_cleanup(&state)` on the way out.
+- Disk accounting must use allocated blocks, not logical length.
+  webtorrent file selection (`-s <idx>`) creates sparse placeholder files
+  whose `metadata.len()` reports the full multi-GB torrent size while only
+  a few KB exist on disk. Summing `len()` will trip the media cap before
+  any real download. Use `metadata.blocks() * 512` everywhere disk usage is
+  measured (`disk.rs::dir_size`, `Local Bypass` health checks).
+- Disk safety has two independent layers: spela's own media-dir cap
+  (`MAX_MEDIA_MB`) protects spela from itself, and the host-filesystem
+  free-space floor (`MIN_FS_FREE_MB`) protects the rest of the host from
+  spela. Both checks must pass before a new download starts. The host floor
+  is best-effort — `None` on `df` failure proceeds rather than blocks, so
+  a parser regression can never make spela unusable on its own.
 
 ## Defense-In-Depth Plan
 
@@ -74,6 +91,19 @@ the entire userspace was under severe resource pressure.
    so cleanup can write `.spela_done` only after physical bytes match the
    expected size. If size metadata is absent, an existing marker can help, but a
    known expected size always wins over the marker.
+
+8. Cast-failure cleanup:
+   `do_play` must call `do_cleanup(&state)` on every error-return path that
+   occurs after `start_webtorrent` and before the post-playback reaper is
+   spawned. The two paths in scope today are the `Ok(Err(_))` and `Err(_)`
+   branches around `cast::cast_url`: an unreachable Chromecast or a panic
+   inside the spawn_blocking task otherwise leaves the just-started
+   webtorrent + ffmpeg as orphans until the next play / `kill-workers` /
+   restart. This is layer 8 and complements rather than replaces the
+   pre-start cleanup at the top of `do_play`. NEVER reintroduce
+   `do_cleanup` BETWEEN `start_webtorrent` and the transcode/cast step —
+   it would SIGTERM the just-spawned worker and produce the
+   `Connection refused` failure mode that motivated commit `4d3ef73`.
 
 ## Systemd Drop-In
 
