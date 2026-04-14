@@ -94,8 +94,14 @@ impl Config {
     }
 
     pub fn config_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.config"))
+        // Use ~/.config/spela/ on all platforms (including macOS) so the same
+        // config file works whether spela runs as a Linux daemon or a macOS CLI.
+        // `dirs::config_dir()` resolves to ~/Library/Application Support on macOS,
+        // which silently hides an existing ~/.config/spela/config.toml and makes
+        // the CLI fall back to the default `localhost:7890` server address.
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join(".config")
             .join("spela")
             .join("config.toml")
     }
@@ -216,5 +222,20 @@ default_device = "Living Room TV"
     fn test_config_cast_app_id_default_empty() {
         let config = Config::default();
         assert!(config.cast_app_id.is_empty()); // uses Default Media Receiver when empty
+    }
+
+    #[test]
+    fn test_config_path_uses_xdg_on_all_platforms() {
+        // Regression: dirs::config_dir() returns ~/Library/Application Support on macOS,
+        // which silently hid the real ~/.config/spela/config.toml and made the CLI fall
+        // back to server="localhost:7890". The CLI and the Linux server must read the
+        // same file regardless of which OS spela is running on.
+        let path = Config::config_path();
+        let s = path.to_string_lossy();
+        assert!(s.ends_with("/.config/spela/config.toml"), "got {s}");
+        assert!(
+            !s.contains("Library/Application Support"),
+            "config path must not resolve into macOS Application Support: {s}"
+        );
     }
 }
