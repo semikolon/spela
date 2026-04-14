@@ -467,8 +467,11 @@ async fn do_play(
         }
     }
 
-    // Stop current stream if any
-    do_cleanup(&state);
+    // NOTE: previously `do_cleanup(&state)` was called here, but that path
+    // invokes `stop_by_pid_file` → `kill_all_webtorrent()`, which SIGTERMs the
+    // webtorrent we just started a few lines above (and then ffmpeg would
+    // immediately fail with "Connection refused" on the now-dead server).
+    // Pre-start cleanup already happened at the top of `do_play`.
 
     // Codec detection + transcode decision
     let mut final_url = server_url.clone();
