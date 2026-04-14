@@ -700,7 +700,7 @@ async fn do_play(
 
                 if !ffmpeg_alive && wt_alive {
                     // ffmpeg done (movie finished transcoding), webtorrent still seeding.
-                    // Grace period: let Chromecast play remaining buffer. 
+                    // Grace period: let Chromecast play remaining buffer.
                     // 45 minutes account for high-speed HW encoding (12x+).
                     tracing::info!("Reaper: ffmpeg finished for '{}', waiting 45m grace period...", title_for_log);
                     tokio::time::sleep(tokio::time::Duration::from_secs(2700)).await;
@@ -717,6 +717,30 @@ async fn do_play(
                     break;
                 }
             }
+        });
+    }
+
+    // Spawn cast health monitor: detect the silent-failure case where the
+    // Chromecast loaded the media but never started playing (or started then
+    // ended unexpectedly because of a network blip, decoder error, app
+    // eviction, ambient screensaver). rust_cast drops its connection after
+    // cast_url returns OK, so spela's normal status endpoint reports its
+    // local intent rather than the TV's actual playback state. Without this
+    // monitor, a "blue cast icon" failure mode looks identical to a healthy
+    // streaming session in `spela status`.
+    if target == "chromecast" {
+        let state_for_monitor = state.clone();
+        let cast_name_for_monitor = cast_name.clone();
+        let title_for_monitor = title.clone();
+        let started_at_for_monitor = app_state.current.as_ref().map(|c| c.started_at);
+        tokio::spawn(async move {
+            cast_health_monitor(
+                state_for_monitor,
+                cast_name_for_monitor,
+                title_for_monitor,
+                started_at_for_monitor,
+            )
+            .await;
         });
     }
 
@@ -805,6 +829,142 @@ fn do_cleanup(state: &SharedState) {
     let mut app_state = AppState::load(&state.state_dir);
     app_state.stop_current();
     let _ = app_state.save(&state.state_dir);
+}
+
+/// Background task that polls the Chromecast media session AFTER cast_url
+/// returns OK, to detect the silent-failure case where the receiver loaded
+/// the LOAD message but the player_state never reached Playing/Buffering
+/// (the "blue cast icon" failure mode), or transitioned to Idle mid-stream
+/// because of a network blip, decoder error, app eviction, or screensaver.
+///
+/// rust_cast drops its connection after `cast_url` returns, so without this
+/// monitor spela has zero visibility into the TV's actual playback state and
+/// `spela status` reports its local intent ("running: true, status: streaming")
+/// while the TV is back to its ambient wallpaper. Apr 15, 2026 incident:
+/// every cast attempt produced a healthy ffmpeg + a "streaming" status while
+/// Fredriks TV showed nothing but the blue cast icon, with no failure surface.
+///
+/// Behavior:
+///   - Sleeps `STARTUP_GRACE_SECS` so the receiver has time to actually load.
+///   - Polls `cast.get_info()` every `POLL_INTERVAL_SECS`.
+///   - Counts consecutive polls where `player_state` is Idle/Unknown OR the
+///     query itself fails. After `IDLE_FAILURE_THRESHOLD` consecutive misses,
+///     the cast is declared dead, the worker pipeline is cleaned up via
+///     `do_cleanup`, and the task exits.
+///   - Exits cleanly when the saved current stream is replaced by a different
+///     `started_at` timestamp (a new `do_play` ran, this monitor is stale)
+///     or when the saved state's `current` is None at all (someone called
+///     `/stop` and we're done).
+async fn cast_health_monitor(
+    state: SharedState,
+    cast_name: String,
+    title_for_log: String,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    use tokio::time::{sleep, Duration};
+
+    const STARTUP_GRACE_SECS: u64 = 10;
+    const POLL_INTERVAL_SECS: u64 = 5;
+    const IDLE_FAILURE_THRESHOLD: u32 = 3;
+
+    sleep(Duration::from_secs(STARTUP_GRACE_SECS)).await;
+
+    let started_at = match started_at {
+        Some(s) => s,
+        None => {
+            tracing::warn!("cast_health_monitor: no started_at recorded for '{}', exiting", title_for_log);
+            return;
+        }
+    };
+
+    let mut consecutive_failures: u32 = 0;
+    tracing::info!(
+        "cast_health_monitor: started for '{}' on '{}' (poll every {}s, fail after {} consecutive idle/error)",
+        title_for_log, cast_name, POLL_INTERVAL_SECS, IDLE_FAILURE_THRESHOLD
+    );
+
+    loop {
+        // Identity check: are we still the active stream?
+        let still_active = {
+            let app_state = AppState::load(&state.state_dir);
+            app_state
+                .current
+                .as_ref()
+                .map(|c| c.started_at == started_at)
+                .unwrap_or(false)
+        };
+        if !still_active {
+            tracing::info!(
+                "cast_health_monitor: stream '{}' replaced or stopped, exiting",
+                title_for_log
+            );
+            return;
+        }
+
+        // Probe the Chromecast in a blocking task — rust_cast is sync.
+        let state_clone = state.clone();
+        let cast_name_clone = cast_name.clone();
+        let probe_result = tokio::task::spawn_blocking(move || {
+            let mut cast = state_clone.cast.lock().unwrap();
+            cast.get_info(&cast_name_clone)
+        })
+        .await;
+
+        match probe_result {
+            Ok(Ok(info)) => {
+                let player_state_upper = info.player_state.to_uppercase();
+                let is_dead = matches!(
+                    player_state_upper.as_str(),
+                    "IDLE" | "UNKNOWN" | ""
+                );
+
+                if is_dead {
+                    consecutive_failures += 1;
+                    tracing::warn!(
+                        "cast_health_monitor: '{}' player_state={} ({}/{} consecutive idle polls before cleanup)",
+                        title_for_log, info.player_state, consecutive_failures, IDLE_FAILURE_THRESHOLD
+                    );
+                } else {
+                    if consecutive_failures > 0 {
+                        tracing::info!(
+                            "cast_health_monitor: '{}' recovered: player_state={} (was idle {} polls)",
+                            title_for_log, info.player_state, consecutive_failures
+                        );
+                    }
+                    consecutive_failures = 0;
+                    tracing::debug!(
+                        "cast_health_monitor: '{}' player_state={} time={:.0}/{:.0}",
+                        title_for_log, info.player_state, info.current_time, info.duration
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                consecutive_failures += 1;
+                tracing::warn!(
+                    "cast_health_monitor: '{}' get_info failed: {} ({}/{} consecutive failures before cleanup)",
+                    title_for_log, e, consecutive_failures, IDLE_FAILURE_THRESHOLD
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    "cast_health_monitor: '{}' spawn_blocking panic: {}, exiting monitor",
+                    title_for_log, e
+                );
+                return;
+            }
+        }
+
+        if consecutive_failures >= IDLE_FAILURE_THRESHOLD {
+            tracing::error!(
+                "cast_health_monitor: chromecast media session DEAD for '{}' ({} consecutive idle/error polls). Cleaning up workers.",
+                title_for_log, consecutive_failures
+            );
+            do_cleanup(&state);
+            return;
+        }
+
+        sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+    }
 }
 
 async fn handle_stop(State(state): State<SharedState>) -> Json<Value> {
