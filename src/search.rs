@@ -313,11 +313,17 @@ impl SearchEngine {
             }
         }).collect();
 
-        // Smart ranking (3 tiers):
+        // Smart ranking (4 tiers):
         // 1. Single-file > season pack (webtorrent -s is unreliable for packs)
         // 2. H.264 > HEVC/x265, BUT only if H.264 has enough seeds (≥5).
         //    A well-seeded HEVC beats a dead H.264 — NVENC handles the transcode.
-        // 3. More seeds > fewer seeds
+        // 3. Among same codec class, non-Dolby-Vision > Dolby Vision.
+        //    NVENC on Darwin's GTX 1650 cannot decode Dolby Vision profile
+        //    5/7 RPU NAL units cleanly: it logs "RPU validation failed" on
+        //    every frame and transcodes at <1x realtime, which is unviable
+        //    for live streaming. Demoting DV titles below their non-DV
+        //    siblings keeps cold-start playback fast and glitch-free.
+        // 4. More seeds > fewer seeds
         const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
         results.sort_by(|a, b| {
             let a_single = a.file_index.map_or(true, |i| i == 0);
@@ -334,6 +340,12 @@ impl SearchEngine {
                 if preferred.seeds >= MIN_SEEDS_FOR_CODEC_PREF {
                     return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
                 }
+            }
+
+            let a_dv = has_dolby_vision_in_title(&a.title);
+            let b_dv = has_dolby_vision_in_title(&b.title);
+            if a_dv != b_dv {
+                return if a_dv { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
             }
 
             b.seeds.cmp(&a.seeds)
@@ -353,6 +365,32 @@ fn is_hevc_from_title(title: &str) -> bool {
     let lower = title.to_lowercase();
     lower.contains("x265") || lower.contains("h265") || lower.contains("h.265")
         || lower.contains("hevc") || lower.contains("10bit") || lower.contains("10-bit")
+}
+
+/// Detect Dolby Vision profile marker in torrent filename.
+///
+/// Dolby Vision profiles 5 and 7 embed an RPU NAL unit that NVENC on
+/// Darwin's GTX 1650 cannot decode cleanly. ffmpeg logs "Error parsing DOVI
+/// NAL unit" and "RPU validation failed: 0 <= el_bit_depth_minus8 = 32 <= 8"
+/// for every frame and the transcode crawls at <1x realtime, which can't
+/// sustain a live Chromecast stream. Until/unless we get a GPU that handles
+/// DV RPU (or implement a `--strip-dolby-vision` ffmpeg pre-pass), we
+/// demote DV titles below their non-DV siblings in the ranker.
+///
+/// Detection is token-based to avoid matching "DVD" as "DV". Common markers:
+/// `DV`, `DoVi`, `Dolby Vision`, `Dolby.Vision`, `DV.P5`, `DV.P7`.
+fn has_dolby_vision_in_title(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    if lower.contains("dolby vision")
+        || lower.contains("dolby.vision")
+        || lower.contains("dolbyvision")
+    {
+        return true;
+    }
+    // Word-boundary check for "dv"/"dovi" so "DVD" / "DVDRip" don't match.
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok == "dv" || tok == "dovi")
 }
 
 fn extract_episode(val: &Value) -> Option<EpisodeRef> {
@@ -411,6 +449,27 @@ mod tests {
         assert!(!is_hevc_from_title("Movie.2025.1080p.BluRay.x264-GROUP.mkv"));
         assert!(!is_hevc_from_title("Movie.H264.AAC.mp4"));
         assert!(!is_hevc_from_title("Movie.mp4"));
+    }
+
+    #[test]
+    fn test_has_dolby_vision_in_title() {
+        // Real problematic filename from the failed Boys S05E01 play
+        assert!(has_dolby_vision_in_title(
+            "The Boys S05E01 Fifteen Inches of Sheer Dynamite 2160p AMZN WEB-DL DDP5 1 Atmos DV HDR H 265-FLUX"
+        ));
+        // Common DV markers in various punctuation styles
+        assert!(has_dolby_vision_in_title("Movie.2160p.DV.HDR.HEVC.mkv"));
+        assert!(has_dolby_vision_in_title("Movie.2160p.DV.P7.HEVC.mkv"));
+        assert!(has_dolby_vision_in_title("Movie.DoVi.HDR.HEVC.mkv"));
+        assert!(has_dolby_vision_in_title("Movie.Dolby.Vision.HDR.mkv"));
+        assert!(has_dolby_vision_in_title("Movie Dolby Vision HDR.mkv"));
+        // Word-boundary check — DVD and DVDRip must NOT match
+        assert!(!has_dolby_vision_in_title("Movie.2025.DVD.x264.mkv"));
+        assert!(!has_dolby_vision_in_title("Movie.2025.DVDRip.x264.mkv"));
+        assert!(!has_dolby_vision_in_title("Movie.2025.DVD9.x264.mkv"));
+        // No DV markers at all
+        assert!(!has_dolby_vision_in_title("Movie.2025.1080p.BluRay.x264.mkv"));
+        assert!(!has_dolby_vision_in_title("Movie.2025.2160p.HEVC.HDR10.mkv"));
     }
 
     #[test]
@@ -575,5 +634,74 @@ mod tests {
             b.seeds.cmp(&a.seeds)
         });
         assert_eq!(results[0].title, "Movie.x265.mkv"); // HEVC wins (H.264 only 2 seeds < 5)
+    }
+
+    #[test]
+    fn test_ranking_dolby_vision_hevc_demoted_below_plain_hevc() {
+        // Same codec class (HEVC), same single-file status, similar seeds —
+        // the non-DV HEVC must still win because NVENC can't decode DV RPU
+        // cleanly and the live transcode collapses to <1x realtime.
+        let mut results = vec![
+            make_result(1, "Movie.2160p.DV.HDR.HEVC.mkv", 800, Some(0)),
+            make_result(2, "Movie.2160p.HDR10.HEVC.mkv", 600, Some(0)),
+        ];
+        const MIN_SEEDS: u32 = 5;
+        results.sort_by(|a, b| {
+            let a_single = a.file_index.map_or(true, |i| i == 0);
+            let b_single = b.file_index.map_or(true, |i| i == 0);
+            if a_single != b_single {
+                return if a_single { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+            }
+            let a_hevc = is_hevc_from_title(&a.title);
+            let b_hevc = is_hevc_from_title(&b.title);
+            if a_hevc != b_hevc {
+                let preferred = if a_hevc { b } else { a };
+                if preferred.seeds >= MIN_SEEDS {
+                    return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+                }
+            }
+            let a_dv = has_dolby_vision_in_title(&a.title);
+            let b_dv = has_dolby_vision_in_title(&b.title);
+            if a_dv != b_dv {
+                return if a_dv { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+            }
+            b.seeds.cmp(&a.seeds)
+        });
+        assert_eq!(results[0].title, "Movie.2160p.HDR10.HEVC.mkv");
+    }
+
+    #[test]
+    fn test_ranking_h264_still_beats_dolby_vision_hevc() {
+        // Real-world S05E01 search shape: a healthy 1080p H.264 release and
+        // the problematic 2160p Dolby Vision HEVC release. The H.264 must win
+        // unambiguously — the DV demotion only matters within the HEVC tier,
+        // it shouldn't second-guess the existing H.264-over-HEVC tier above.
+        let mut results = vec![
+            make_result(1, "The.Boys.S05E01.2160p.AMZN.WEB-DL.DV.HDR.H.265-FLUX.mkv", 783, Some(0)),
+            make_result(2, "The.Boys.S05E01.1080p.WEB-DL.DUAL.5.1.H.264.mkv", 1433, Some(0)),
+        ];
+        const MIN_SEEDS: u32 = 5;
+        results.sort_by(|a, b| {
+            let a_single = a.file_index.map_or(true, |i| i == 0);
+            let b_single = b.file_index.map_or(true, |i| i == 0);
+            if a_single != b_single {
+                return if a_single { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+            }
+            let a_hevc = is_hevc_from_title(&a.title);
+            let b_hevc = is_hevc_from_title(&b.title);
+            if a_hevc != b_hevc {
+                let preferred = if a_hevc { b } else { a };
+                if preferred.seeds >= MIN_SEEDS {
+                    return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+                }
+            }
+            let a_dv = has_dolby_vision_in_title(&a.title);
+            let b_dv = has_dolby_vision_in_title(&b.title);
+            if a_dv != b_dv {
+                return if a_dv { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+            }
+            b.seeds.cmp(&a.seeds)
+        });
+        assert_eq!(results[0].title, "The.Boys.S05E01.1080p.WEB-DL.DUAL.5.1.H.264.mkv");
     }
 }
