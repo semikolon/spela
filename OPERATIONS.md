@@ -105,6 +105,26 @@ the entire userspace was under severe resource pressure.
    it would SIGTERM the just-spawned worker and produce the
    `Connection refused` failure mode that motivated commit `4d3ef73`.
 
+9. Cast health monitor:
+   `cast_health_monitor` (server.rs) is a background tokio task spawned
+   alongside the post-playback reaper for every chromecast play. After a
+   10s startup grace, it polls `cast.get_info()` every 5s. When the
+   Chromecast's `player_state` is reported as `Idle`/`Unknown`/empty (or
+   the query itself fails) for 3 consecutive polls, the monitor declares
+   the cast DEAD, runs `do_cleanup`, and exits. This catches the silent-
+   failure class that no other defense layer sees: `cast_url()` returned
+   OK, the receiver acknowledged the LOAD message, but the player engine
+   never actually started ("blue cast icon" failure mode) — or started
+   then ended unexpectedly because of a network blip, decoder error, app
+   eviction, or ambient screensaver. Without this monitor, ffmpeg keeps
+   transcoding into the void and `spela status` reports
+   `running: true, status: streaming` while the TV shows the wallpaper.
+   Identity is keyed off `app_state.current.started_at` (DateTime<Utc>),
+   not webtorrent_pid, because Local Bypass plays use pid=0 and back-to-
+   back local plays would otherwise be indistinguishable from the
+   monitor's perspective. Worst-case detection latency: 10s grace + 3 ×
+   5s polls = 25s.
+
 ## Systemd Drop-In
 
 Use the tracked drop-in rather than overwriting the host's full service file:
