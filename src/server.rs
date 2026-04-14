@@ -557,13 +557,25 @@ async fn do_play(
         match cast_result {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
+                // Defense in depth: the post-playback reaper has not been
+                // spawned yet at this point in do_play, so without explicit
+                // cleanup the webtorrent + ffmpeg we just started would
+                // linger as orphans until the next play, the next server
+                // restart, or `spela kill-workers`. This is the exact class
+                // of leak the Apr 8 incident report warns about.
+                do_cleanup(&state);
                 return Json(json!({
                     "error": format!("Cast failed: {}", e),
                     "url": final_url,
                     "recovery_suggestion": "Try 'spela targets' to discover devices, or check if TV is on"
                 }));
             }
-            Err(e) => return Json(json!({"error": format!("Cast task failed: {}", e)})),
+            Err(e) => {
+                // Same defense as above — async task panic must not leak
+                // the freshly-spawned worker pipeline.
+                do_cleanup(&state);
+                return Json(json!({"error": format!("Cast task failed: {}", e)}));
+            }
         }
 
         // --- Seek Logic ---
