@@ -2,6 +2,139 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+/// Shift all timestamps in an SRT file by `-offset_seconds`, writing the
+/// result to a new file. Subtitle entries that end before time 0 are
+/// dropped (their entire duration lies before the seek point), and
+/// entries that straddle 0 are clamped to start at 0.
+///
+/// Why this exists: `ffmpeg -ss N -i input -vf subtitles=sub.srt` uses a
+/// fast input seek (decodes from offset N), and ffmpeg's default behavior
+/// is to RESET output timestamps to start at 0. The `subtitles=` filter
+/// reads the SRT file with source-time stamps (entry for source time 0
+/// says "show this at time 0") and matches those against the filter's
+/// frame timestamps — which, with fast input seek + default timestamp
+/// handling, are the RESET output timestamps (0, 1, 2...). So subtitle
+/// "for source time 0" overlays on frame "source time N" content → every
+/// subtitle appears at the wrong moment, specifically shifted by N
+/// seconds.
+///
+/// Fix: before invoking ffmpeg with a seek offset, physically shift the
+/// SRT file so that the entry for "source time N" now says "time 0". The
+/// filter matches shifted SRT against reset PTS, timing is correct.
+///
+/// Alternative approaches considered and rejected:
+/// - `-copyts`: preserves source PTS through filter, but then output PTS
+///   starts at N (not 0), which breaks HLS / Chromecast expectations.
+/// - `-output_ts_offset -N`: attempts to subtract N at the muxer, but
+///   interacts poorly with the HLS muxer's segment timestamp math and
+///   produces inconsistent segment durations.
+/// - Output seek (`-i input -ss N` instead of `-ss N -i input`): correct
+///   subtitle timing but 30× slower (decodes + discards everything before N).
+/// - `ffmpeg -itsoffset -N -i sub.srt` preprocess pass: works, but
+///   introduces a second ffmpeg invocation per play. The Rust shifter
+///   below is ~50 lines, no ffmpeg dependency, fully unit-testable.
+///
+/// Returns the number of subtitle entries written to the output file.
+/// Apr 15, 2026 fix for the "subtitles out of sync on resume" regression.
+pub fn shift_srt(input: &Path, output: &Path, offset_seconds: f64) -> Result<usize> {
+    let content = std::fs::read_to_string(input)?;
+    let mut result = String::new();
+    let mut kept = 0usize;
+    let mut new_index = 1usize;
+
+    for raw_block in content.split("\n\n") {
+        let block = raw_block.trim_end_matches('\n');
+        if block.is_empty() {
+            continue;
+        }
+        let lines: Vec<&str> = block.lines().collect();
+        // An SRT entry has at least 3 lines: index, timestamps, text.
+        // Some SRT files omit the leading blank line (BOM / single-space
+        // separators), so we allow the first numeric line to be absent.
+        let (ts_line_idx, text_start_idx) = if lines.len() >= 3 && lines[0].parse::<u32>().is_ok() {
+            (1, 2)
+        } else if lines.len() >= 2 && lines[0].contains(" --> ") {
+            (0, 1)
+        } else {
+            continue;
+        };
+
+        let Some((start, end)) = parse_srt_timestamp_line(lines[ts_line_idx]) else {
+            continue;
+        };
+        let new_start = start - offset_seconds;
+        let new_end = end - offset_seconds;
+        if new_end < 0.0 {
+            // Entry ends before the seek point — drop it entirely.
+            continue;
+        }
+        let clamped_start = new_start.max(0.0);
+        let new_ts_line = format_srt_timestamp_line(clamped_start, new_end);
+
+        result.push_str(&new_index.to_string());
+        result.push('\n');
+        result.push_str(&new_ts_line);
+        result.push('\n');
+        for text_line in &lines[text_start_idx..] {
+            result.push_str(text_line);
+            result.push('\n');
+        }
+        result.push('\n');
+        new_index += 1;
+        kept += 1;
+    }
+
+    std::fs::write(output, result)?;
+    Ok(kept)
+}
+
+fn parse_srt_timestamp_line(line: &str) -> Option<(f64, f64)> {
+    let parts: Vec<&str> = line.split(" --> ").collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    Some((
+        parse_srt_timestamp(parts[0].trim())?,
+        parse_srt_timestamp(parts[1].trim())?,
+    ))
+}
+
+/// Parse `HH:MM:SS,mmm` → total seconds as f64.
+fn parse_srt_timestamp(s: &str) -> Option<f64> {
+    // Split on ':' then ',' to get [H, M, S, mmm].
+    let first: Vec<&str> = s.splitn(3, ':').collect();
+    if first.len() != 3 {
+        return None;
+    }
+    let h: u64 = first[0].parse().ok()?;
+    let m: u64 = first[1].parse().ok()?;
+    let sec_ms: Vec<&str> = first[2].splitn(2, ',').collect();
+    if sec_ms.len() != 2 {
+        return None;
+    }
+    let s: u64 = sec_ms[0].parse().ok()?;
+    let ms: u64 = sec_ms[1].parse().ok()?;
+    Some(h as f64 * 3600.0 + m as f64 * 60.0 + s as f64 + ms as f64 / 1000.0)
+}
+
+fn format_srt_timestamp_line(start: f64, end: f64) -> String {
+    format!(
+        "{} --> {}",
+        format_srt_timestamp(start),
+        format_srt_timestamp(end)
+    )
+}
+
+fn format_srt_timestamp(t: f64) -> String {
+    let clamped = t.max(0.0);
+    let total_ms = (clamped * 1000.0).round() as u64;
+    let h = total_ms / 3_600_000;
+    let m = (total_ms / 60_000) % 60;
+    let s = (total_ms / 1000) % 60;
+    let ms = total_ms % 1000;
+    format!("{:02}:{:02}:{:02},{:03}", h, m, s, ms)
+}
+
 /// Detect audio/video codecs and duration of a media URL/file using ffprobe.
 /// Returns (video_codec, audio_codec, duration_secs).
 pub async fn detect_codecs(url: &str) -> Result<(Option<String>, Option<String>, Option<f64>)> {
@@ -266,6 +399,43 @@ pub async fn transcode_hls(
     let _ = std::fs::remove_dir_all(&hls_dir);
     std::fs::create_dir_all(&hls_dir)?;
 
+    // Subtitle sync fix (Apr 15, 2026): if we're seeking AND we have a
+    // subtitle file, physically shift the SRT so its "time 0" lines up
+    // with the frame content at the seek offset. Without this, the
+    // subtitles filter matches source-time stamps against reset output
+    // PTS, shifting every subtitle by the seek offset. See shift_srt()
+    // doc comment for the full rationale and alternatives considered.
+    // The shifted file lives in the transcoded_hls dir so it's cleaned
+    // up automatically by do_cleanup alongside the segments.
+    let effective_subtitle_path: Option<PathBuf> = match (subtitle_path, seek_to) {
+        (Some(orig), Some(seek)) if seek > 0.0 && orig.exists() => {
+            let shifted = hls_dir.join("subtitle_shifted.srt");
+            match shift_srt(orig, &shifted, seek) {
+                Ok(n) => {
+                    tracing::info!(
+                        "Subtitle sync: shifted {} by {:.0}s, {} entries retained → {}",
+                        orig.display(),
+                        seek,
+                        n,
+                        shifted.display()
+                    );
+                    Some(shifted)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Subtitle sync: shift_srt failed ({}), falling back to original — subtitles will be desynced by {:.0}s",
+                        e,
+                        seek
+                    );
+                    Some(orig.to_path_buf())
+                }
+            }
+        }
+        (Some(orig), _) => Some(orig.to_path_buf()),
+        (None, _) => None,
+    };
+    let subtitle_path = effective_subtitle_path.as_deref();
+
     let manifest_path = hls_dir.join("playlist.m3u8");
     // MPEG-TS segments instead of fmp4 (Apr 15, 2026): Default Media Receiver
     // (CAF) requires `media.hlsSegmentFormat = "fmp4"` in the LOAD message
@@ -478,5 +648,188 @@ mod tests {
         // In test env, ~/.config/spela/intro.mp4 likely doesn't exist
         // This just verifies the function doesn't panic
         let _ = find_intro();
+    }
+
+    // ===== SRT shifter (Apr 15, 2026 subtitle-sync fix) =====
+
+    #[test]
+    fn test_parse_srt_timestamp() {
+        assert_eq!(parse_srt_timestamp("00:00:00,000"), Some(0.0));
+        assert_eq!(parse_srt_timestamp("00:00:01,500"), Some(1.5));
+        assert_eq!(parse_srt_timestamp("00:30:00,000"), Some(1800.0));
+        assert_eq!(parse_srt_timestamp("01:03:43,612"), Some(3823.612));
+        assert_eq!(parse_srt_timestamp("00:00:12,345"), Some(12.345));
+    }
+
+    #[test]
+    fn test_parse_srt_timestamp_rejects_malformed() {
+        assert_eq!(parse_srt_timestamp(""), None);
+        assert_eq!(parse_srt_timestamp("00:00"), None);
+        assert_eq!(parse_srt_timestamp("00:00:00"), None); // Missing ,mmm
+        assert_eq!(parse_srt_timestamp("xx:yy:zz,aaa"), None);
+    }
+
+    #[test]
+    fn test_format_srt_timestamp_roundtrip() {
+        for secs in [0.0_f64, 1.5, 12.345, 1800.0, 3823.612, 7200.999] {
+            let formatted = format_srt_timestamp(secs);
+            let reparsed = parse_srt_timestamp(&formatted).unwrap();
+            assert!(
+                (reparsed - secs).abs() < 0.001,
+                "roundtrip lost precision: {} → {} → {}",
+                secs,
+                formatted,
+                reparsed
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_srt_timestamp_clamps_negative() {
+        // Negative input clamps to 0.0 (protects the output-file format)
+        assert_eq!(format_srt_timestamp(-5.0), "00:00:00,000");
+    }
+
+    #[test]
+    fn test_shift_srt_simple_forward_shift() {
+        // Write a tiny SRT, shift by 10s, check output.
+        let tmp_dir = std::env::temp_dir().join("spela_srt_test_1");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let input_path = tmp_dir.join("in.srt");
+        let output_path = tmp_dir.join("out.srt");
+        std::fs::write(
+            &input_path,
+            "1\n00:00:05,000 --> 00:00:07,000\nHello\n\n2\n00:00:15,500 --> 00:00:18,000\nWorld\n\n",
+        )
+        .unwrap();
+
+        // Shift by 10s: entry 1 (5-7s) should be dropped (ends before 0),
+        // entry 2 (15.5-18s) should be rewritten to (5.5-8s).
+        let kept = shift_srt(&input_path, &output_path, 10.0).unwrap();
+        assert_eq!(kept, 1, "Only the entry ending after 10s should remain");
+
+        let result = std::fs::read_to_string(&output_path).unwrap();
+        assert!(
+            result.contains("00:00:05,500 --> 00:00:08,000"),
+            "Expected shifted timestamp in output, got:\n{result}"
+        );
+        assert!(result.contains("World"));
+        assert!(!result.contains("Hello"));
+        // Re-numbered to 1 (was entry 2 in source)
+        assert!(result.starts_with("1\n"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_shift_srt_clamps_straddling_entry() {
+        // An entry that starts before 0 but ends after 0 should be kept
+        // with its start clamped to 0, not dropped.
+        let tmp_dir = std::env::temp_dir().join("spela_srt_test_2");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let input_path = tmp_dir.join("in.srt");
+        let output_path = tmp_dir.join("out.srt");
+        // Entry says 8-12s, shift by 10s → would be (-2, +2). Start clamped to 0.
+        std::fs::write(
+            &input_path,
+            "1\n00:00:08,000 --> 00:00:12,000\nStraddle\n\n",
+        )
+        .unwrap();
+
+        let kept = shift_srt(&input_path, &output_path, 10.0).unwrap();
+        assert_eq!(kept, 1);
+
+        let result = std::fs::read_to_string(&output_path).unwrap();
+        assert!(
+            result.contains("00:00:00,000 --> 00:00:02,000"),
+            "Straddling entry should clamp start to 0, got:\n{result}"
+        );
+        assert!(result.contains("Straddle"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_shift_srt_zero_offset_is_identity_like() {
+        // Shifting by 0 should keep all entries with identical timestamps
+        // (apart from re-numbering, which starts at 1 anyway).
+        let tmp_dir = std::env::temp_dir().join("spela_srt_test_3");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let input_path = tmp_dir.join("in.srt");
+        let output_path = tmp_dir.join("out.srt");
+        std::fs::write(
+            &input_path,
+            "1\n00:00:05,000 --> 00:00:07,000\nA\n\n2\n00:00:15,500 --> 00:00:18,000\nB\n\n",
+        )
+        .unwrap();
+
+        let kept = shift_srt(&input_path, &output_path, 0.0).unwrap();
+        assert_eq!(kept, 2);
+
+        let result = std::fs::read_to_string(&output_path).unwrap();
+        assert!(result.contains("00:00:05,000 --> 00:00:07,000"));
+        assert!(result.contains("00:00:15,500 --> 00:00:18,000"));
+        assert!(result.contains("A"));
+        assert!(result.contains("B"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_shift_srt_multi_line_text_preserved() {
+        // Multi-line subtitle text (line 2 and 3 of the entry) must survive
+        // the shift without being merged or dropped.
+        let tmp_dir = std::env::temp_dir().join("spela_srt_test_4");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let input_path = tmp_dir.join("in.srt");
+        let output_path = tmp_dir.join("out.srt");
+        std::fs::write(
+            &input_path,
+            "1\n00:00:30,000 --> 00:00:33,000\n- First line\n- Second line\n\n",
+        )
+        .unwrap();
+
+        shift_srt(&input_path, &output_path, 10.0).unwrap();
+        let result = std::fs::read_to_string(&output_path).unwrap();
+        assert!(result.contains("- First line"));
+        assert!(result.contains("- Second line"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_shift_srt_realistic_30_minute_seek() {
+        // Scenario: user resumes at 1800s. All subtitles before that should
+        // vanish; all subtitles at or after should be shifted back by 1800s.
+        let tmp_dir = std::env::temp_dir().join("spela_srt_test_5");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let input_path = tmp_dir.join("in.srt");
+        let output_path = tmp_dir.join("out.srt");
+        std::fs::write(
+            &input_path,
+            concat!(
+                "1\n00:00:10,000 --> 00:00:12,000\nOpening credits\n\n",
+                "2\n00:15:00,000 --> 00:15:03,000\nMidway dialogue\n\n",
+                "3\n00:30:05,000 --> 00:30:08,000\nAt resume point\n\n",
+                "4\n00:45:00,000 --> 00:45:04,000\nNear the end\n\n",
+            ),
+        )
+        .unwrap();
+
+        let kept = shift_srt(&input_path, &output_path, 1800.0).unwrap();
+        assert_eq!(kept, 2, "Only entries 3 and 4 should survive a 1800s shift");
+
+        let result = std::fs::read_to_string(&output_path).unwrap();
+        assert!(!result.contains("Opening credits"));
+        assert!(!result.contains("Midway dialogue"));
+        assert!(result.contains("At resume point"));
+        assert!(result.contains("Near the end"));
+
+        // Entry 3 at source 30:05 → output 00:05 (5s after shift)
+        assert!(result.contains("00:00:05,000 --> 00:00:08,000"));
+        // Entry 4 at source 45:00 → output 15:00
+        assert!(result.contains("00:15:00,000 --> 00:15:04,000"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
