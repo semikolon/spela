@@ -741,6 +741,10 @@ async fn do_play(
         duration,
         quality: req.quality.clone(),
         size: req.size.clone(),
+        // Remember the -ss offset so cast_health_monitor can translate the
+        // Chromecast's 0-based current_time into absolute source-timeline
+        // position when it periodically calls save_position_smart.
+        ss_offset: seek_to.unwrap_or(0.0),
     });
     let _ = app_state.save(&state.state_dir);
 
@@ -790,11 +794,64 @@ async fn do_play(
                 }
 
                 if !ffmpeg_alive && wt_alive {
-                    // ffmpeg done (movie finished transcoding), webtorrent still seeding.
-                    // Grace period: let Chromecast play remaining buffer.
-                    // 45 minutes account for high-speed HW encoding (12x+).
-                    tracing::info!("Reaper: ffmpeg finished for '{}', waiting 45m grace period...", title_for_log);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2700)).await;
+                    // ffmpeg done (source finished transcoding), webtorrent still
+                    // seeding. Compute a DURATION-AWARE grace period so long content
+                    // (3-hour movies) gets enough time while short content doesn't
+                    // sit in pointless storage. Apr 15, 2026 fix: the previous
+                    // hardcoded 45-minute grace was too SHORT for a 63-minute TV
+                    // episode (ffmpeg transcoded at ~6x realtime → finished at 11 min
+                    // wall time → 45-min grace expired at 56 min wall time → cleanup
+                    // fired while the user was still at the 30-minute mark of the
+                    // episode → "blue cast icon" mid-watch). It was also wastefully
+                    // LONG for short movies.
+                    //
+                    // New formula: grace = max(
+                    //   (duration - ss_offset) + 10-minute buffer,   // finish the content + cushion
+                    //   5 minutes                                   // floor for stubs / duration-unknown
+                    // )
+                    //
+                    // Rationale: the Chromecast plays the transcoded stream at 1x
+                    // realtime, so the wall-clock time remaining after ffmpeg finishes
+                    // equals (duration - current_chromecast_time). At the moment ffmpeg
+                    // exits, the Chromecast is somewhere in the middle of playback. To
+                    // be safe, assume it's at the very start of the transcoded stream
+                    // (i.e. time 0 = ss_offset in source timeline) and allocate enough
+                    // wall-clock for it to play the entire (duration - ss_offset)
+                    // remaining content, plus a 10-minute cushion for paused-mid-
+                    // episode or user-rewind scenarios.
+                    //
+                    // cast_health_monitor's 92%-of-duration end detection still fires
+                    // independently when the user actually finishes — this grace is
+                    // just a safety net in case the monitor misses (network issues,
+                    // get_info failures, etc).
+                    let (source_duration, ss_offset) = {
+                        let app_state = AppState::load(&state.state_dir);
+                        match app_state.current.as_ref() {
+                            Some(c) => (c.duration, c.ss_offset),
+                            None => (None, 0.0),
+                        }
+                    };
+                    const GRACE_CUSHION_SECS: u64 = 600;  // 10 min
+                    const GRACE_FLOOR_SECS: u64 = 300;    // 5 min
+                    let grace_secs = match source_duration {
+                        Some(dur) if dur > 0.0 => {
+                            let remaining = (dur - ss_offset).max(0.0) as u64;
+                            remaining.saturating_add(GRACE_CUSHION_SECS).max(GRACE_FLOOR_SECS)
+                        }
+                        _ => 2700, // Unknown duration: fall back to the old 45-min default.
+                    };
+                    tracing::info!(
+                        "Reaper: ffmpeg finished for '{}', waiting {} grace period (duration={:?}s, ss_offset={:.0}s)...",
+                        title_for_log,
+                        if grace_secs >= 60 {
+                            format!("{}m{}s", grace_secs / 60, grace_secs % 60)
+                        } else {
+                            format!("{}s", grace_secs)
+                        },
+                        source_duration,
+                        ss_offset,
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(grace_secs)).await;
 
                     // Re-check we're still the active stream
                     let app_state = AppState::load(&state.state_dir);
@@ -968,6 +1025,19 @@ async fn cast_health_monitor(
     const POLL_INTERVAL_SECS: u64 = 5;
     const IDLE_FAILURE_THRESHOLD: u32 = 3;
 
+    // Periodic position save: write the last known position every N seconds
+    // (not every poll, to keep state.json writes cheap). This is the engine
+    // that powers "resume from where I stopped" for the Default Media Receiver
+    // path — the Custom Cast Receiver was supposed to POST /api/position every
+    // 30s but it's blocked on Cast SDK registration, so we do the equivalent
+    // server-side using the polling data we already have in hand.
+    // Apr 15, 2026 addition.
+    const POSITION_SAVE_INTERVAL_SECS: f64 = 30.0;
+    // Near-end threshold: when the absolute position crosses this fraction of
+    // duration, stop saving (let save_position_smart's internal completion
+    // logic clear the position on the next play).
+    const NEAR_END_FRACTION: f64 = 0.92;
+
     sleep(Duration::from_secs(STARTUP_GRACE_SECS)).await;
 
     let started_at = match started_at {
@@ -978,10 +1048,37 @@ async fn cast_health_monitor(
         }
     };
 
+    // Snapshot the CurrentStream fields we need for position bookkeeping
+    // at monitor start. Load them once — they don't change for the lifetime
+    // of this stream (the monitor exits when started_at changes). This is
+    // load-bearing for smart resume: `ss_offset` tells us how to translate
+    // the Chromecast's 0-based current_time back into absolute source
+    // timeline, and `imdb_id` / `title` / `duration` feed save_position_smart.
+    let (ss_offset, imdb_id_snapshot, title_snapshot, duration_snapshot) = {
+        let app_state = AppState::load(&state.state_dir);
+        match app_state.current.as_ref() {
+            Some(c) => (
+                c.ss_offset,
+                c.imdb_id.clone(),
+                Some(c.title.clone()),
+                c.duration,
+            ),
+            None => {
+                tracing::warn!(
+                    "cast_health_monitor: CurrentStream gone for '{}' at startup, exiting",
+                    title_for_log
+                );
+                return;
+            }
+        }
+    };
+
     let mut consecutive_failures: u32 = 0;
+    let mut last_saved_position: f64 = ss_offset; // Baseline = the -ss we opened with
     tracing::info!(
-        "cast_health_monitor: started for '{}' on '{}' (poll every {}s, fail after {} consecutive idle/error)",
-        title_for_log, cast_name, POLL_INTERVAL_SECS, IDLE_FAILURE_THRESHOLD
+        "cast_health_monitor: started for '{}' on '{}' (poll every {}s, fail after {} consecutive idle/error, ss_offset={:.0}s, save every {}s)",
+        title_for_log, cast_name, POLL_INTERVAL_SECS, IDLE_FAILURE_THRESHOLD,
+        ss_offset, POSITION_SAVE_INTERVAL_SECS
     );
 
     loop {
@@ -1037,6 +1134,87 @@ async fn cast_health_monitor(
                         "cast_health_monitor: '{}' player_state={} time={:.0}/{:.0}",
                         title_for_log, info.player_state, info.current_time, info.duration
                     );
+
+                    // === Periodic position save (Apr 15, 2026) ===
+                    // Absolute source-timeline position = chromecast_time + ss_offset.
+                    // Only save when:
+                    //   (1) we have a positive Chromecast time (ignore the LOAD/BUFFERING transient),
+                    //   (2) the delta since last save is ≥ POSITION_SAVE_INTERVAL_SECS
+                    //       (keeps state.json writes to ~1 per 30 seconds instead of per 5s poll),
+                    //   (3) the absolute position is meaningful (>30s in — matches the
+                    //       auto-resume threshold in do_play), and
+                    //   (4) the player is in a non-idle state (already guaranteed by the
+                    //       outer `if !is_dead` branch we're in right now).
+                    //
+                    // save_position_smart handles completion internally: when the absolute
+                    // position crosses 92% of duration or within 5 minutes of the end, it
+                    // clears the entry so the next play starts fresh.
+                    let absolute = info.current_time as f64 + ss_offset;
+                    let duration_hint = duration_snapshot.or_else(|| {
+                        // info.duration is -1 for HLS live manifests (ENDLIST missing).
+                        // Prefer CurrentStream.duration; fall back to info.duration only
+                        // if positive.
+                        if info.duration > 0.0 {
+                            Some(info.duration as f64)
+                        } else {
+                            None
+                        }
+                    });
+
+                    if absolute > 30.0
+                        && (absolute - last_saved_position).abs() >= POSITION_SAVE_INTERVAL_SECS
+                    {
+                        // Don't bother saving if we're already past the NEAR_END threshold
+                        // — save_position_smart would just clear the entry, which is
+                        // fine, but avoids spurious "clearing" log spam near episode end.
+                        let past_end = duration_hint
+                            .map(|d| absolute >= d * NEAR_END_FRACTION)
+                            .unwrap_or(false);
+                        if !past_end {
+                            let mut app_state = AppState::load(&state.state_dir);
+                            let (key, saved) = app_state.save_position_smart(
+                                imdb_id_snapshot.clone(),
+                                title_snapshot.clone(),
+                                absolute,
+                                duration_hint,
+                            );
+                            if saved {
+                                if let Err(e) = app_state.save(&state.state_dir) {
+                                    tracing::warn!(
+                                        "cast_health_monitor: failed to persist resume position for '{}': {}",
+                                        key, e
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "cast_health_monitor: saved resume position for '{}' at {:.0}s (chromecast+{:.0}s)",
+                                        key, absolute, ss_offset
+                                    );
+                                    last_saved_position = absolute;
+                                }
+                            }
+                        }
+                    }
+
+                    // === Episode-end detection ===
+                    // When the Chromecast's absolute position has reached 92% of the
+                    // source duration (the same threshold save_position_smart uses to
+                    // clear the entry), we know the user has effectively finished the
+                    // episode. Clean up immediately instead of waiting for the reaper's
+                    // duration-based grace period to expire. This is the "watched to
+                    // end" happy-path exit.
+                    if let Some(dur) = duration_hint {
+                        if dur > 0.0 && absolute >= dur * NEAR_END_FRACTION {
+                            tracing::info!(
+                                "cast_health_monitor: '{}' reached {:.0}% of duration ({:.0}/{:.0}s absolute). Declaring end-of-episode, cleaning up.",
+                                title_for_log,
+                                absolute / dur * 100.0,
+                                absolute,
+                                dur
+                            );
+                            do_cleanup(&state);
+                            return;
+                        }
+                    }
                 }
             }
             Ok(Err(e)) => {

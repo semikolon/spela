@@ -44,6 +44,18 @@ pub struct CurrentStream {
     pub quality: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
+    /// The `-ss` seek offset passed to ffmpeg at transcode-start, in seconds
+    /// of source-media timeline. Defaults to 0 for a normal play, becomes
+    /// `N` when the user runs `spela play X --seek N` or when auto-resume
+    /// picks up a saved baseline. Load-bearing for the smart resume feature:
+    /// the Chromecast's `current_time` is relative to the transcoded stream
+    /// (which starts at 0 no matter what `-ss` was), so to compute the
+    /// absolute position in the source episode we need
+    /// `absolute = chromecast_time + ss_offset`. Added Apr 15, 2026 to
+    /// complete the "resume from where I stopped" feature for the Default
+    /// Media Receiver path.
+    #[serde(default)]
+    pub ss_offset: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,5 +260,84 @@ mod tests {
         let (key, saved) = state.save_position_smart(None, title.clone(), 480.0, Some(duration));
         assert!(saved);
         assert_eq!(state.resume_positions.get(&key), None); // Should be cleared!
+    }
+
+    /// CurrentStream.ss_offset must round-trip through JSON without loss.
+    /// This is load-bearing for smart resume across server restarts: the
+    /// cast_health_monitor snapshots ss_offset at startup, but if the server
+    /// restarts mid-stream, the monitor re-reads state.json and must recover
+    /// the same value to keep computing correct absolute positions. Apr 15,
+    /// 2026 regression guard for the new field.
+    #[test]
+    fn test_current_stream_ss_offset_roundtrip() {
+        let stream = CurrentStream {
+            magnet: "magnet:?xt=urn:btih:abc".into(),
+            title: "The Boys S05E01".into(),
+            show: Some("The Boys".into()),
+            season: Some(5),
+            episode: Some(1),
+            imdb_id: Some("tt1190634".into()),
+            target: "chromecast:Fredriks TV".into(),
+            url: "http://darwin.home:7890/hls/master.m3u8".into(),
+            started_at: chrono::Utc::now(),
+            pid: 0,
+            has_subtitles: true,
+            subtitle_lang: Some("eng".into()),
+            duration: Some(3823.6),
+            quality: Some("1080p".into()),
+            size: Some("4.5 GB".into()),
+            ss_offset: 1800.0,
+        };
+        let serialized = serde_json::to_string(&stream).expect("serialize");
+        assert!(
+            serialized.contains("\"ss_offset\":1800"),
+            "ss_offset not in serialized form: {serialized}"
+        );
+        let restored: CurrentStream = serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(restored.ss_offset, 1800.0);
+    }
+
+    /// Backwards compatibility: old state.json files from before Apr 15, 2026
+    /// don't have `ss_offset`. They must still deserialize cleanly with
+    /// the default value (0.0) instead of erroring out. Without the
+    /// `#[serde(default)]` attribute on the field, spela's server would
+    /// refuse to start on any host with a pre-upgrade state.json and the
+    /// user would lose their watch history during the migration.
+    #[test]
+    fn test_current_stream_deserializes_without_ss_offset() {
+        let legacy_json = r#"{
+            "magnet": "magnet:?xt=urn:btih:abc",
+            "title": "Old Movie",
+            "target": "chromecast:TV",
+            "url": "http://x/y",
+            "started_at": "2026-04-14T12:00:00Z",
+            "pid": 0
+        }"#;
+        let restored: CurrentStream = serde_json::from_str(legacy_json)
+            .expect("legacy CurrentStream without ss_offset must deserialize");
+        assert_eq!(restored.ss_offset, 0.0);
+        assert_eq!(restored.title, "Old Movie");
+    }
+
+    /// Smoke test: the math for absolute position translation.
+    /// chromecast's current_time is relative to the transcoded stream (which
+    /// starts at 0 no matter what `-ss` was passed to ffmpeg). Absolute
+    /// source-timeline position = chromecast_time + ss_offset.
+    #[test]
+    fn test_absolute_position_translation() {
+        // Scenario: user ran `spela play 1 --seek 1800`, so ss_offset=1800.
+        // Chromecast has been playing the transcoded stream for 845 seconds.
+        // Absolute position in the original episode = 1800 + 845 = 2645s.
+        let ss_offset = 1800.0_f64;
+        let chromecast_time = 845.0_f64;
+        let absolute = chromecast_time + ss_offset;
+        assert_eq!(absolute, 2645.0);
+
+        // The 92% completion threshold on a 3823.6s episode is 3517.7s.
+        let duration = 3823.6_f64;
+        assert!(absolute < duration * 0.92);
+        // At 3517.8s absolute, we should be past the threshold.
+        let near_end = 3517.8_f64;
+        assert!(near_end >= duration * 0.92);
     }
 }
