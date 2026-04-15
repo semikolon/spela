@@ -13,7 +13,8 @@ All ten Apr 15 bug fixes + the resolution-preference ranker tier are live on Dar
 - [x] **prune_disk empty-active-title** — `"any".contains("") == true` used to make empty sentinel a silent no-op; now explicitly handled.
 - [x] **prune_to_fit LRU pressure eviction** — runs age-based prune then LRU-evicts oldest-first until under target_mb. Wired into do_play so the 10 GB cap is a self-maintaining upper bound, not a refusal wall.
 - [x] **Token-based active-title match** — `title_matches_active` tokenizes both sides, tolerates dot/space/dash/underscore separators. Protects `The.Boys.S05E03.FLUX.mkv` against a `The Boys S05E03` active-play.
-- [x] **Resolution preference ranker tier** — new tier 4 between non-DV and seed tiebreak: prefers 2160p > 1080p > 720p > 480p when the higher-res option has ≥50 viable seeds. Tiers 1-3 unchanged (H.264 insta-play still beats HEVC higher-res). 9 new regression tests including the live S05E03 fixture.
+- [x] **Resolution preference ranker tier** — v3.0.0 added tier 4 (2160p > 1080p > 720p > 480p, ≥50 seed viability). v3.1.0 rewrote it for Sarpetorp policy: 1080p > 720p > 480p > 2160p (2160p demoted below 480p) AND promoted the whole tier above codec preference (tier 3 now, codec is tier 4 tiebreak). Regression-pinned via `test_ranking_hevc_1080p_beats_h264_720p_v31_policy`, `test_ranking_1080p_h264_beats_2160p_h264_v31_policy`, `test_ranking_2160p_demoted_below_480p`, `test_ranking_dv_gate_fires_before_resolution_tier`.
+- [x] **Old ranker tests refactored to use `rank_results_mut`** — 8 existing tests that inlined their own sort closures now call production sort directly. Eliminates drift risk (the same mechanism that let the "H 265" regression slip past 58 unit tests).
 
 ### Still Open
 
@@ -23,7 +24,6 @@ All ten Apr 15 bug fixes + the resolution-preference ranker tier are live on Dar
 
 - [ ] **Real release-name corpus test for the ranker** — the resolution-tier tests use live fixtures, but we still lack a broad corpus of ~50 real Torrentio titles to catch regressions in tier 1-3 logic with realistic naming variation. Add `tests/ranker_corpus.rs` that loads the fixture and asserts canonical ordering. Should include every Apr 15 regression case as a pin.
 
-- [ ] **Refactor existing ranker tests to use `rank_results_mut`** — new resolution-tier tests call the production sort directly; old ranker tests still inline their own sort closures (tech debt from before the Apr 15 extraction). Replace each `results.sort_by(|a, b| { ... })` with `rank_results_mut(&mut results)`. Low-risk mechanical change; eliminates drift between test and production.
 
 - [ ] **Custom Cast Receiver — Google Cast SDK $5 registration.** Fredrik offered to pay; not yet done. Registration unlocks the Custom Receiver App ID needed by `static/cast-receiver.html` (Shaka Player + CAF v3). Benefits: (1) **native seeking** — Shaka does HLS seeking by segment index, the current server-side `/api/seek-restart` restart-the-transcode-from-new-ss approach becomes unnecessary; (2) **text-track handling** — can send WebVTT subtitles separately via Cast protocol instead of burning into video, eliminating the subtitle shift dance in `transcode.rs::shift_srt`; (3) **loading state UI** — replaces the blue-cast-icon "Black Flash" between clips. Blocking step: register at `cast.google.com/publish`, pay $5, get Receiver App ID, set it in `~/.config/spela/config.toml`, switch `cast.rs::cast_url` to load the custom receiver instead of Default Media Receiver. Spec lives at `.claude/specs/custom-cast-receiver/`.
 
