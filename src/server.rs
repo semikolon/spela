@@ -88,12 +88,19 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/stream/transcode", get(handle_transcode_stream))
         // HLS streaming endpoints (Apr 15, 2026 rework — proper Chromecast support).
         // The route layout MUST match the URLs the HLS manifest produces:
-        // ffmpeg's HLS muxer emits relative segment paths (e.g. `seg_00000.m4s`),
-        // which Chromecast resolves against the manifest URL. Manifest is at
-        // /hls/playlist.m3u8 → segments resolve to /hls/seg_00000.m4s, so the
+        // ffmpeg's HLS muxer emits relative segment paths (e.g. `seg_00000.ts`),
+        // which Chromecast resolves against the playlist URL. Playlist is at
+        // /hls/playlist.m3u8 → segments resolve to /hls/seg_00000.ts, so the
         // segment route must live directly at /hls/{segment}, NOT /hls/segment/{segment}.
-        // axum 0.8's matchit router gives literal routes (playlist.m3u8 / init.mp4)
-        // precedence over the {segment} capture, so they don't collide.
+        // axum 0.8's matchit router gives literal routes precedence over the
+        // {segment} capture, so they don't collide.
+        //
+        // The cast LOAD URL is /hls/master.m3u8 (NOT playlist.m3u8): older
+        // Chromecast firmwares (CrKey 1.56) won't load a media playlist
+        // directly without explicit CODECS / RESOLUTION / BANDWIDTH hints.
+        // The master playlist is generated synthetically in handle_hls_master
+        // and references the ffmpeg-written media playlist by relative path.
+        .route("/hls/master.m3u8", get(handle_hls_master))
         .route("/hls/playlist.m3u8", get(handle_hls_playlist))
         .route("/hls/init.mp4", get(handle_hls_init))
         .route("/hls/{segment}", get(handle_hls_segment))
@@ -588,13 +595,18 @@ async fn do_play(
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     }
 
-                    // Cast URL is the HLS manifest. Chromecast Default Media
-                    // Receiver sees the .m3u8 + content_type
-                    // application/vnd.apple.mpegurl and routes through Shaka
-                    // Player's HLS adapter, which handles segment fetching,
-                    // 206 Range requests, and growing manifests natively.
+                    // Cast URL is the HLS MASTER playlist (not the media
+                    // playlist directly). Older Chromecast firmwares —
+                    // confirmed live on CrKey 1.56 / Fredriks TV — refuse
+                    // to load a bare media playlist without CODECS /
+                    // RESOLUTION / BANDWIDTH hints. /hls/master.m3u8 wraps
+                    // ffmpeg's media playlist with those hints synthetically.
+                    // Chromecast resolves segment URLs against the master,
+                    // and `playlist.m3u8` (relative) → `/hls/playlist.m3u8`,
+                    // and `seg_00000.ts` (relative to playlist.m3u8) →
+                    // `/hls/seg_00000.ts`.
                     final_url = format!(
-                        "http://{}:{}/hls/playlist.m3u8",
+                        "http://{}:{}/hls/master.m3u8",
                         state.config.stream_host, state.config.port
                     );
                     is_transcoded = true;
@@ -1633,20 +1645,85 @@ async fn serve_static_with_range(
     builder.body(body).unwrap()
 }
 
-/// Serve the HLS manifest. Content-Type is the official IANA media type for
-/// HLS manifests; Default Media Receiver / Shaka Player / browsers all map
-/// this to "play this as HLS".
+/// Serve the HLS media playlist (the one ffmpeg writes — segment list with
+/// EXTINF + ENDLIST). Older Chromecasts won't accept this directly as the
+/// cast LOAD URL because it lacks CODECS / RESOLUTION / BANDWIDTH metadata
+/// — they need the master playlist (`/hls/master.m3u8`) instead.
 async fn handle_hls_playlist(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> axum::response::Response {
     let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("?");
     let range = headers.get("range").and_then(|v| v.to_str().ok()).unwrap_or("-");
-    tracing::info!("HLS manifest hit: ua={:?} range={:?}", ua, range);
+    tracing::info!("HLS playlist hit: ua={:?} range={:?}", ua, range);
     let path = resolve_media_dir(&state)
         .join("transcoded_hls")
         .join("playlist.m3u8");
     serve_static_with_range(path, "application/vnd.apple.mpegurl", &headers).await
+}
+
+/// Serve a synthetic HLS master playlist that declares CODECS / RESOLUTION /
+/// BANDWIDTH and points at the media playlist (`playlist.m3u8`) ffmpeg
+/// generates. CrKey 1.56 firmware on 1st-gen Chromecasts won't load a media
+/// playlist directly via LOAD — Apr 15, 2026 live test against Fredriks TV
+/// proved the receiver fetches the bare media playlist 4 times in a row
+/// then bails to player_state=IDLE / idle_reason=ERROR without ever
+/// requesting a single segment, while Apple's bipbop reference HLS stream
+/// (which has a proper master playlist) plays in 5 seconds on the SAME
+/// device. The diagnostic difference: bipbop's master playlist declares
+/// CODECS="avc1.64001f,mp4a.40.2" + BANDWIDTH + RESOLUTION; ffmpeg's
+/// generated media playlist declares none of that. Without those hints
+/// the older Shaka Player can't pre-validate the stream and gives up.
+///
+/// We generate the master playlist on the fly here rather than wiring up a
+/// second ffmpeg pass, because the CODECS string is constant for every
+/// spela transcode (h264_nvenc preset p4 outputs H.264 High@4.0 →
+/// `avc1.640028`, AAC LC stereo → `mp4a.40.2`) and BANDWIDTH /
+/// RESOLUTION are also fixed by spela's standard 1920×1080 / ~6 Mbps
+/// transcode profile.
+async fn handle_hls_master(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("?");
+    tracing::info!("HLS master hit: ua={:?}", ua);
+    // Make sure the media playlist actually exists before claiming the
+    // master is valid — otherwise the receiver will fetch the master, then
+    // request playlist.m3u8 immediately, then 404, then bail.
+    let media_playlist_path = resolve_media_dir(&state)
+        .join("transcoded_hls")
+        .join("playlist.m3u8");
+    if !media_playlist_path.exists() {
+        tracing::warn!(
+            "HLS master requested but media playlist missing at {:?}",
+            media_playlist_path
+        );
+        return axum::response::Response::builder()
+            .status(404)
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from("Media playlist not yet ready"))
+            .unwrap();
+    }
+
+    // CODECS string for spela's standard transcode pipeline:
+    //   - avc1.640028 = H.264 High profile, level 4.0 (1080p30 well within)
+    //   - mp4a.40.2   = MPEG-4 AAC LC
+    // BANDWIDTH is a hint for ABR; for a single-rendition stream it doesn't
+    // need to be exact. 6 Mbps matches the typical NVENC preset p4 cq 23
+    // output for 1080p H.264 + AAC stereo 192 kbps.
+    let master = "#EXTM3U\n\
+                  #EXT-X-VERSION:3\n\
+                  #EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS=\"avc1.640028,mp4a.40.2\"\n\
+                  playlist.m3u8\n";
+
+    axum::response::Response::builder()
+        .status(200)
+        .header("Content-Type", "application/vnd.apple.mpegurl")
+        .header("Cache-Control", "no-cache")
+        .header("Content-Length", master.len().to_string())
+        .header("Accept-Ranges", "bytes")
+        .body(axum::body::Body::from(master))
+        .unwrap()
 }
 
 /// Serve the HLS fmp4 init segment (moov box). Only used for the legacy
