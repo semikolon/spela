@@ -313,49 +313,7 @@ impl SearchEngine {
             }
         }).collect();
 
-        // Smart ranking (4 tiers):
-        // 1. Single-file > season pack (webtorrent -s is unreliable for packs)
-        // 2. H.264 > HEVC/x265, BUT only if H.264 has enough seeds (≥5).
-        //    A well-seeded HEVC beats a dead H.264 — NVENC handles the transcode.
-        // 3. Among same codec class, non-Dolby-Vision > Dolby Vision.
-        //    NVENC on Darwin's GTX 1650 cannot decode Dolby Vision profile
-        //    5/7 RPU NAL units cleanly: it logs "RPU validation failed" on
-        //    every frame and transcodes at <1x realtime, which is unviable
-        //    for live streaming. Demoting DV titles below their non-DV
-        //    siblings keeps cold-start playback fast and glitch-free.
-        // 4. More seeds > fewer seeds
-        const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
-        results.sort_by(|a, b| {
-            let a_single = a.file_index.map_or(true, |i| i == 0);
-            let b_single = b.file_index.map_or(true, |i| i == 0);
-            if a_single != b_single {
-                return if a_single { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
-            }
-
-            let a_hevc = is_hevc_from_title(&a.title);
-            let b_hevc = is_hevc_from_title(&b.title);
-            // Only apply codec preference when the preferred result has viable seeds
-            if a_hevc != b_hevc {
-                let preferred = if a_hevc { b } else { a }; // the H.264 one
-                if preferred.seeds >= MIN_SEEDS_FOR_CODEC_PREF {
-                    return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
-                }
-            }
-
-            let a_dv = has_dolby_vision_in_title(&a.title);
-            let b_dv = has_dolby_vision_in_title(&b.title);
-            if a_dv != b_dv {
-                return if a_dv { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
-            }
-
-            b.seeds.cmp(&a.seeds)
-        });
-
-        // Assign IDs after sorting
-        for (i, r) in results.iter_mut().enumerate() {
-            r.id = i + 1;
-        }
-
+        rank_results_mut(&mut results);
         Ok(results.into_iter().take(8).collect())
     }
 }
@@ -371,6 +329,128 @@ impl SearchEngine {
 /// as H.264. Ruby then played the 4K HEVC → NVENC couldn't real-time
 /// transcode → bad. We now normalize runs of whitespace/dots between the
 /// codec family letter and the version number before checking.
+/// Canonical torrent-result ranker, shared between production and tests.
+/// Sorts `results` in place using the 5-tier order, then assigns 1-based ids.
+///
+/// **Tiers (first disagreement wins)**:
+/// 1. **Single-file > season pack.** `webtorrent -s` is unreliable for
+///    multi-file torrents — most single-file torrents cast fastest and
+///    most reliably on Chromecast.
+/// 2. **H.264 > HEVC/x265**, BUT only if the H.264 option has ≥5 seeds.
+///    H.264 hits the Chromecast's hardware decoder insta-play with no
+///    transcode. HEVC requires NVENC transcode on Darwin's GTX 1650 which
+///    adds ~3-5 s of cold start and risks RPU/10-bit decode issues.
+///    A well-seeded HEVC still beats a dead H.264.
+/// 3. **Non-Dolby-Vision > Dolby Vision** (within same codec class).
+///    NVENC on GTX 1650 cannot decode DV profile 5/7 RPU NAL units
+///    cleanly: it logs "RPU validation failed" every frame and transcodes
+///    at <1x realtime, which is unviable for live streaming.
+/// 4. **Higher resolution > lower resolution**, but only if the
+///    higher-resolution option has ≥50 seeds (plus viable codec/DV
+///    status from tiers 2-3). `2160p > 1080p > 720p > 480p`. Unknown
+///    resolutions sort last. This is the Apr 15 v3.0.0 addition — before
+///    this tier, a well-seeded 720p H.264 outranked a moderately-seeded
+///    1080p H.264 purely on seed count, and Fredrik had to manually
+///    pick the 1080p result. With this tier, 1080p wins when it has
+///    enough seeds to be viable and only falls back to lower-quality
+///    high-seed options when it genuinely can't download fast enough.
+/// 5. **More seeds > fewer seeds** — final tiebreak within the same
+///    resolution bucket.
+pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
+    const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
+    const MIN_SEEDS_FOR_RESOLUTION_PREF: u32 = 50;
+
+    results.sort_by(|a, b| {
+        // Tier 1: single-file > pack
+        let a_single = a.file_index.map_or(true, |i| i == 0);
+        let b_single = b.file_index.map_or(true, |i| i == 0);
+        if a_single != b_single {
+            return if a_single { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+        }
+
+        // Tier 2: H.264 > HEVC (only when H.264 has viable seeds)
+        let a_hevc = is_hevc_from_title(&a.title);
+        let b_hevc = is_hevc_from_title(&b.title);
+        if a_hevc != b_hevc {
+            let preferred = if a_hevc { b } else { a }; // the H.264 one
+            if preferred.seeds >= MIN_SEEDS_FOR_CODEC_PREF {
+                return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+            }
+        }
+
+        // Tier 3: non-DV > DV (within same codec class)
+        let a_dv = has_dolby_vision_in_title(&a.title);
+        let b_dv = has_dolby_vision_in_title(&b.title);
+        if a_dv != b_dv {
+            return if a_dv { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+        }
+
+        // Tier 4: higher resolution > lower resolution (when higher has ≥50 seeds)
+        let a_res = resolution_tier(&a.title);
+        let b_res = resolution_tier(&b.title);
+        if a_res != b_res {
+            let (higher_res_result, higher_is_a) = if a_res < b_res {
+                (a, true)
+            } else {
+                (b, false)
+            };
+            if higher_res_result.seeds >= MIN_SEEDS_FOR_RESOLUTION_PREF {
+                return if higher_is_a {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
+        }
+
+        // Tier 5: more seeds > fewer seeds
+        b.seeds.cmp(&a.seeds)
+    });
+
+    for (i, r) in results.iter_mut().enumerate() {
+        r.id = i + 1;
+    }
+}
+
+/// Classify a torrent title into a resolution bucket. Lower is better.
+/// Used by tier 4 of `rank_results_mut`.
+///
+///   0 → 2160p / 4K (highest)
+///   1 → 1080p
+///   2 → 720p
+///   3 → 480p
+///   4 → unknown / anything else (sorts last)
+///
+/// Pattern matches are tolerant to the usual scene release separators:
+/// `1080p`, `1080P`, `1080 p`, `1080.p`. 2160p also matches `4k` / `4K`
+/// / `uhd` tags. Called on lowercased title internally.
+fn resolution_tier(title: &str) -> u32 {
+    let lower = title.to_lowercase();
+    // Normalize separator before `p` so `1080 p` / `1080.p` count.
+    // Also catch bare `2160`/`1080`/`720`/`480` surrounded by separators
+    // (some releases write `2160.WEB-DL` etc., but most embed `p`).
+    let res_match = |needle: &str| -> bool {
+        if lower.contains(needle) { return true; }
+        let with_space = needle.replace('p', " p");
+        if lower.contains(&with_space) { return true; }
+        let with_dot = needle.replace('p', ".p");
+        lower.contains(&with_dot)
+    };
+    if res_match("2160p") || lower.contains("4k") || lower.contains(" uhd") || lower.contains(".uhd") {
+        return 0;
+    }
+    if res_match("1080p") {
+        return 1;
+    }
+    if res_match("720p") {
+        return 2;
+    }
+    if res_match("480p") {
+        return 3;
+    }
+    4
+}
+
 fn is_hevc_from_title(title: &str) -> bool {
     let lower = title.to_lowercase();
     // Collapse any separator between "h" and "265" / "264": space, dot, dash, etc.
@@ -775,6 +855,203 @@ mod tests {
             b.seeds.cmp(&a.seeds)
         });
         assert_eq!(results[0].title, "The.Boys.S05E01.1080p.WEB-DL.DUAL.5.1.H.264.mkv");
+    }
+
+    // --- Resolution preference tier (Apr 15, 2026 v3.0.0) ---
+    //
+    // These tests use the extracted `rank_results_mut` so they track
+    // production exactly. Older tests above still inline the sort closure
+    // (legacy tech debt); new tests should all go through `rank_results_mut`.
+
+    #[test]
+    fn test_resolution_tier_ordering() {
+        assert_eq!(resolution_tier("Movie.2160p.HDR.x265.mkv"), 0);
+        assert_eq!(resolution_tier("Movie.4K.HDR.mkv"), 0);
+        assert_eq!(resolution_tier("Movie.UHD.BluRay.mkv"), 0);
+        assert_eq!(resolution_tier("Movie.1080p.WEB-DL.mkv"), 1);
+        assert_eq!(resolution_tier("The Boys S05E03 1080p AMZN"), 1);
+        assert_eq!(resolution_tier("Movie.720p.WEB-DL.mkv"), 2);
+        assert_eq!(resolution_tier("Movie.480p.x264.mkv"), 3);
+        assert_eq!(resolution_tier("Movie.No.Resolution.Tag.mkv"), 4);
+        // Space-separated (playWEB convention)
+        assert_eq!(resolution_tier("The Boys S05E03 1080 p AMZN"), 1);
+    }
+
+    #[test]
+    fn test_ranking_prefers_1080p_h264_over_720p_h264_with_viable_seeds() {
+        // Apr 15 incident: S05E03 search returned 720p H.264 (734 seeds)
+        // above 1080p H.264 (513 seeds). With the resolution tier, 1080p
+        // wins because 513 ≥ 50 viable threshold.
+        let mut results = vec![
+            make_result(
+                1,
+                "The Boys S05E03 Every One of You Sons of Bitches 720p AMZN WEB-DL H 264-FLUX.mkv",
+                734,
+                Some(0),
+            ),
+            make_result(
+                2,
+                "The Boys S05E03 Every One of You Sons of Bitches 1080p AMZN WEB-DL H 264-FLUX.mkv",
+                513,
+                Some(0),
+            ),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            results[0].title.contains("1080p"),
+            "1080p H.264 with 513 seeds should outrank 720p H.264 with 734 seeds. Got: {:?}",
+            results[0].title
+        );
+    }
+
+    #[test]
+    fn test_ranking_falls_back_to_720p_when_1080p_has_insufficient_seeds() {
+        // Threshold is 50 seeds for resolution preference. A dead 1080p
+        // (10 seeds) must LOSE to a well-seeded 720p (500 seeds) because
+        // the dead 1080p would stall mid-download.
+        let mut results = vec![
+            make_result(1, "Movie.720p.H264.FLUX.mkv", 500, Some(0)),
+            make_result(2, "Movie.1080p.H264.FLUX.mkv", 10, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            results[0].title.contains("720p"),
+            "720p with 500 seeds must beat 1080p with 10 seeds. Got: {:?}",
+            results[0].title
+        );
+    }
+
+    #[test]
+    fn test_ranking_prefers_1080p_at_exact_50_seed_threshold() {
+        // Boundary: 50 seeds = the viable threshold, 1080p wins.
+        let mut results = vec![
+            make_result(1, "Movie.720p.H264.mkv", 200, Some(0)),
+            make_result(2, "Movie.1080p.H264.mkv", 50, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            results[0].title.contains("1080p"),
+            "1080p at exact 50 seeds should still win over 720p 200. Got: {:?}",
+            results[0].title
+        );
+    }
+
+    #[test]
+    fn test_ranking_h264_720p_still_beats_hevc_1080p() {
+        // Tier 2 (H.264 > HEVC) sits ABOVE tier 4 (resolution preference).
+        // A viable H.264 720p must always beat an HEVC 1080p regardless
+        // of the resolution-tier logic, because insta-play > quality on
+        // the Chromecast hot path.
+        let mut results = vec![
+            make_result(1, "Movie.1080p.HEVC.x265.mkv", 500, Some(0)),
+            make_result(2, "Movie.720p.H264.FLUX.mkv", 100, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            results[0].title.contains("H264") || results[0].title.contains("H 264") || results[0].title.contains("x264"),
+            "H.264 720p (100 seeds) must beat HEVC 1080p (500 seeds) — tier 2 wins over tier 4. Got: {:?}",
+            results[0].title
+        );
+    }
+
+    #[test]
+    fn test_ranking_2160p_h264_over_1080p_h264() {
+        // Rare but valid: 2160p H.264 exists. If both are H.264 non-DV
+        // with viable seeds, the higher resolution (2160p, tier 0) wins.
+        let mut results = vec![
+            make_result(1, "Movie.1080p.H264.mkv", 500, Some(0)),
+            make_result(2, "Movie.2160p.H264.mkv", 100, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            results[0].title.contains("2160p"),
+            "2160p H.264 (100 seeds) should beat 1080p H.264 (500 seeds). Got: {:?}",
+            results[0].title
+        );
+    }
+
+    #[test]
+    fn test_ranking_1080p_h264_beats_2160p_hevc_with_viable_seeds() {
+        // Another tier-2-over-tier-4 case: a viable H.264 1080p wins
+        // against a well-seeded HEVC 2160p because tier 2 insta-play.
+        let mut results = vec![
+            make_result(1, "Movie.2160p.HEVC.x265.mkv", 1000, Some(0)),
+            make_result(2, "Movie.1080p.H264.FLUX.mkv", 200, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            results[0].title.contains("H264") || results[0].title.contains("H 264"),
+            "1080p H.264 must beat 2160p HEVC — H.264 insta-play wins over higher res + HEVC transcode. Got: {:?}",
+            results[0].title
+        );
+    }
+
+    #[test]
+    fn test_ranking_prefers_720p_over_480p_with_viable_seeds() {
+        let mut results = vec![
+            make_result(1, "Movie.480p.x264.mkv", 1000, Some(0)),
+            make_result(2, "Movie.720p.x264.mkv", 100, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            results[0].title.contains("720p"),
+            "720p (100 seeds) should beat 480p (1000 seeds) — resolution tier wins. Got: {:?}",
+            results[0].title
+        );
+    }
+
+    #[test]
+    fn test_ranking_s05e03_live_fixture_1080p_wins() {
+        // Exact fixture from the Apr 15 evening live search. Before the
+        // resolution tier, the 720p FLUX at 734 seeds ranked #1, and
+        // Fredrik had to manually pick result #4. Post-fix, the 1080p
+        // FLUX at 513 seeds ranks #1 and Ruby's default `spela play 1`
+        // gets 1080p automatically.
+        let mut results = vec![
+            make_result(
+                1,
+                "The Boys S05E03 Every One of You Sons of Bitches 720p AMZN WEB-DL DDP5 1 Atmos H 264-FLUX[EZTVx.to].mkv",
+                734,
+                Some(0),
+            ),
+            make_result(
+                2,
+                "The.Boys.S05E03.480p.x264-mSD[EZTVx.to].mkv",
+                573,
+                Some(0),
+            ),
+            make_result(
+                3,
+                "The Boys S05E03 Every One of You Sons of Bitches 1080p AMZN WEB-DL DDP5 1 Atmos H 264-FLUX[EZTVx.to].mkv",
+                513,
+                Some(0),
+            ),
+            make_result(
+                4,
+                "The.Boys.S05E03.MULTi.1080p.AMZN.WEB-DL.H264.DDP5.1.Atmos-K83.mkv",
+                68,
+                Some(0),
+            ),
+            make_result(
+                5,
+                "The.Boys.S05E03.MULTi.720p.AMZN.WEB-DL.H264.DDP5.1.Atmos-K83.mkv",
+                56,
+                Some(0),
+            ),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            results[0].title.contains("1080p"),
+            "Apr 15 S05E03 live fixture: 1080p must rank first post-tier-4. Got: {:?}",
+            results[0].title
+        );
+        // The primary FLUX 1080p (513 seeds) should beat the MULTi 1080p
+        // (68 seeds) on the seed tiebreak within same resolution.
+        assert!(
+            results[0].title.contains("FLUX"),
+            "Within the 1080p bucket, FLUX (513) beats MULTi (68) on seeds. Got: {:?}",
+            results[0].title
+        );
     }
 
     #[test]
