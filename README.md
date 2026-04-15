@@ -19,9 +19,9 @@ Because "I want to watch a movie" shouldn't require Sonarr + Radarr + Prowlarr +
 
 - **Instant torrent streaming** -- search by name, play by number. No downloads, no waiting
 - **Auto-detect movie vs TV** -- TMDB figures out what you're searching for
-- **Smart torrent ranking** -- prefers single-file over season packs, H.264 over HEVC, well-seeded over dead
+- **Smart torrent ranking** -- 4 tiers: single-file > H.264 > non-Dolby-Vision > well-seeded. Dolby Vision profile 5/7 is demoted because NVENC can't parse RPU NAL units cleanly
 - **Chromecast native** -- rust_cast + mDNS discovery, no Python dependencies
-- **Transparent transcoding** -- HEVC to H.264, AC3/DTS to AAC, all via NVENC on your GPU. You don't notice, it just works
+- **Transparent transcoding** -- HEVC to H.264, AC3/DTS to AAC, all via NVENC on your GPU. Output is HLS (MPEG-TS segments) which Chromecast's Default Media Receiver plays natively
 - **Subtitles** -- auto-fetched from OpenSubtitles, burned into the stream
 - **Intro clip** -- your own Netflix-style bumper before every stream (drop an `intro.mp4` in config)
 - **Pause/resume** -- tested up to 10-minute pauses. No timeouts, no dropped connections
@@ -40,9 +40,9 @@ TMDB (metadata) → Torrentio (torrents) → webtorrent-cli (download + HTTP ser
         ↓
 ffmpeg (transcode if needed: HEVC→H.264, AC3→AAC, subtitle burn-in, intro concat)
         ↓
-/stream/transcode (chunked HTTP, growing file, tails ffmpeg output)
+/hls/master.m3u8 → /hls/playlist.m3u8 → /hls/seg_NNNNN.ts (HLS with MPEG-TS segments)
         ↓
-Chromecast (rust_cast, StreamType::Live, mDNS discovery)
+Chromecast (rust_cast, StreamType::Buffered, mDNS discovery)
 ```
 
 The CLI is a thin HTTP client. The server does everything. Run both on the same machine (laptop, desktop) or split them across your LAN. No dedicated server required -- `spela server` in one terminal tab, `spela play` in another.
@@ -188,14 +188,18 @@ Most torrents are H.264 + AC3/DTS audio. Chromecast only speaks H.264 + AAC. spe
 3. If video is HEVC/VP9/AV1 → transcode to H.264 via NVENC
 4. If subtitles requested → burn into video via NVENC
 5. If intro clip present → prepend via ffmpeg concat filter
-6. Output: fragmented MP4, streamed via chunked HTTP as it's being written
-7. 5MB pre-buffer before casting (proves the torrent is healthy)
+6. **Output: HLS** — ffmpeg writes a `playlist.m3u8` + `seg_NNNNN.ts` MPEG-TS segments to `media/transcoded_hls/`
+7. spela serves a synthetic master playlist (`/hls/master.m3u8`) with hardcoded `CODECS="avc1.640028,mp4a.40.2"` + `BANDWIDTH` + `RESOLUTION` because older Chromecast firmware (CrKey 1.56) refuses to load a bare media playlist without those hints
+8. Pre-buffer waits for the manifest + first segment, then casts
 
 Transcoding uses NVENC (GPU) when available. Without a GPU, ffmpeg falls back to CPU encoding (`libx264`) -- works fine, just takes ~30-60s to buffer instead of ~10s. Most torrents are H.264 + AC3 which only needs audio transcoding (instant, CPU-only).
 
+The HLS muxer stays at v3/v4 — `-hls_playlist_type event` and `-hls_flags independent_segments` are both avoided because they bump the manifest to HLS v6, which Shaka Player on CrKey 1.56 can't parse. Segments are MPEG-TS, not fmp4, because rust_cast's `Media` struct doesn't expose `hlsSegmentFormat` (required for fmp4 on Default Media Receiver). See [TODO.md "Cast Pipeline Rework"](TODO.md) for the full history and the 10 compounding failure modes that got us here.
+
 ## Known Limitations
 
-- **Seeking/rewind** doesn't work with the Default Media Receiver. The Chromecast can't seek in a growing fMP4 stream. A Custom Cast Receiver App (Google Cast SDK, $5 registration) would enable seeking via server-side seek-restart. This is planned.
+- **Seeking/rewind** is limited. Live HLS (while ffmpeg is still writing segments) can't seek past the current segment. Once ffmpeg finishes and the `#EXT-X-ENDLIST` tag appears, Chromecast can seek to any segment boundary. A Custom Cast Receiver App (Google Cast SDK, $5 registration) would enable server-side seek-restart for on-the-fly seeking during transcode. This is planned.
+- **Chromecast DNS** -- Chromecast devices hardcode Google DNS (8.8.8.8 / 8.8.4.4) and ignore the DHCP-advertised LAN resolver. If `stream_host` is a hostname (`media.local`), the receiver can't resolve it and the LOAD silently fails. Either use a LAN IP for `stream_host`, or install a router-side DNAT hijack that forces the Chromecast's port-53 traffic through your local resolver. See [OPERATIONS.md](OPERATIONS.md) and [CLAUDE.md](CLAUDE.md).
 - **Intro clip** triggers full NVENC re-encoding (both intro and main stream). This adds ~30s to startup but is invisible during playback.
 - **Google Home pause** works but the stream must stay connected. Very long pauses (hours) may drop the TCP connection.
 
@@ -218,7 +222,9 @@ Every CLI command maps to an HTTP endpoint:
 | `/targets` | GET | Discover Chromecast devices |
 | `/history` | GET | Watch history |
 | `/config` | GET/POST | Preferences |
-| `/stream/transcode` | GET | Transcoded media stream |
+| `/hls/master.m3u8` | GET | Synthetic HLS master playlist (with CODECS/BANDWIDTH/RESOLUTION hints) |
+| `/hls/playlist.m3u8` | GET | Media playlist written by ffmpeg (growing during transcode) |
+| `/hls/{segment}` | GET | MPEG-TS segment (`seg_NNNNN.ts`), supports Range requests |
 | `/cast-info` | POST | Chromecast playback details |
 
 ## Tests

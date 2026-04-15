@@ -1,5 +1,8 @@
 # Spela TODOs 🎬🍿
 
+### Infrastructure Hardening
+- [ ] **Persist Chromecast DNS DNAT hijack to hemma Darwin overlay.** Currently live in Darwin's `/etc/iptables/rules.v4` (backed up to `rules.v4.bak-2026-04-15`), but not tracked in `~/dotfiles/hemma` — a fresh provision would lose it and `stream_host = "darwin.home"` would silently break again. Track the PREROUTING DNAT rules (one per Chromecast IP, TCP+UDP port 53 → `192.168.4.1:53`) as a managed fragment. See [CLAUDE.md](CLAUDE.md) § "Chromecast hardcoded Google DNS" and the [hemma overlay discipline directive in ~/dotfiles/home/dot_claude/CLAUDE.md](~/.claude/CLAUDE.md) § "Fresh provision is the litmus test". 🛡️
+
 ### Post-Search Optimization
 - [ ] Implement Chromecast Receiver UI loading state (spinner/progress) to replace the "Black Flash" transition between video clips. 🎉🏙️
 - [ ] Refine year-aware and quality-aware result prioritisation in `src/search.rs` to better handle franchise sequels (e.g., 2025 vs 2026). 🕵️‍♂️
