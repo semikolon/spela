@@ -360,11 +360,56 @@ impl SearchEngine {
     }
 }
 
-/// Detect HEVC/x265 from torrent filename — these need NVENC re-encoding for Chromecast.
+/// Detect HEVC/x265 from torrent filename — these need NVENC re-encoding
+/// for Chromecast.
+///
+/// Apr 15, 2026 fix: some release groups (e.g. `playWEB`) format the codec
+/// as `H 265` with a literal space instead of `h265` / `h.265`. The Apr 15
+/// S05E02 incident: `The Boys S05E02 Teenage Kix 2160p AMZN WEB-DL DDP5 1
+/// Atmos H 265-playWEB.mkv` was ranked as result 1 above a 1080p H.264
+/// release because `is_hevc_from_title` didn't match "h 265" and treated it
+/// as H.264. Ruby then played the 4K HEVC → NVENC couldn't real-time
+/// transcode → bad. We now normalize runs of whitespace/dots between the
+/// codec family letter and the version number before checking.
 fn is_hevc_from_title(title: &str) -> bool {
     let lower = title.to_lowercase();
-    lower.contains("x265") || lower.contains("h265") || lower.contains("h.265")
-        || lower.contains("hevc") || lower.contains("10bit") || lower.contains("10-bit")
+    // Collapse any separator between "h" and "265" / "264": space, dot, dash, etc.
+    // "h 265", "h.265", "h-265", "h265" all normalize to "h265".
+    let collapsed: String = {
+        let mut out = String::with_capacity(lower.len());
+        let chars: Vec<char> = lower.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            // Look for a "h" followed by separator(s) followed by "265"/"264"
+            if chars[i] == 'h' && i + 1 < chars.len() {
+                let mut j = i + 1;
+                while j < chars.len() && matches!(chars[j], ' ' | '.' | '-' | '_') {
+                    j += 1;
+                }
+                if j + 2 < chars.len()
+                    && chars[j] == '2'
+                    && chars[j + 1] == '6'
+                    && (chars[j + 2] == '5' || chars[j + 2] == '4')
+                {
+                    out.push('h');
+                    out.push('2');
+                    out.push('6');
+                    out.push(chars[j + 2]);
+                    i = j + 3;
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
+    };
+
+    collapsed.contains("x265")
+        || collapsed.contains("h265")
+        || collapsed.contains("hevc")
+        || collapsed.contains("10bit")
+        || collapsed.contains("10-bit")
 }
 
 /// Detect Dolby Vision profile marker in torrent filename.
@@ -449,6 +494,33 @@ mod tests {
         assert!(!is_hevc_from_title("Movie.2025.1080p.BluRay.x264-GROUP.mkv"));
         assert!(!is_hevc_from_title("Movie.H264.AAC.mp4"));
         assert!(!is_hevc_from_title("Movie.mp4"));
+    }
+
+    #[test]
+    fn test_is_hevc_from_title_space_separated_variants() {
+        // Apr 15, 2026 regression guard: `playWEB` and other release groups
+        // format codec names with literal spaces. Real example from the
+        // Apr 15 incident: "The Boys S05E02 Teenage Kix 2160p AMZN WEB-DL
+        // DDP5 1 Atmos H 265-playWEB.mkv" was ranked #1 above a 1080p
+        // H.264 release because the old codec detector missed "H 265".
+        assert!(
+            is_hevc_from_title(
+                "The Boys S05E02 Teenage Kix 2160p AMZN WEB-DL DDP5 1 Atmos H 265-playWEB.mkv"
+            ),
+            "space-separated 'H 265' must register as HEVC"
+        );
+        assert!(is_hevc_from_title("Movie H 265 playWEB.mkv"));
+        assert!(is_hevc_from_title("Movie H-265 playWEB.mkv"));
+        assert!(is_hevc_from_title("Movie h 265.mkv"));
+        // H 264 variants must NOT register as HEVC.
+        assert!(
+            !is_hevc_from_title(
+                "The Boys S05E02 Teenage Kix 1080p AMZN WEB-DL DDP5 1 Atmos H 264-playWEB.mkv"
+            ),
+            "space-separated 'H 264' must NOT register as HEVC"
+        );
+        assert!(!is_hevc_from_title("Movie H 264 playWEB.mkv"));
+        assert!(!is_hevc_from_title("Movie h 264.mkv"));
     }
 
     #[test]
@@ -703,5 +775,85 @@ mod tests {
             b.seeds.cmp(&a.seeds)
         });
         assert_eq!(results[0].title, "The.Boys.S05E01.1080p.WEB-DL.DUAL.5.1.H.264.mkv");
+    }
+
+    #[test]
+    fn test_ranking_playweb_space_separated_codecs_apr15() {
+        // Apr 15, 2026 regression scenario: the live `spela search 'The Boys'
+        // --season 5 --episode 2` returned three results, all playWEB-style:
+        //   #1: "The Boys S05E02 Teenage Kix 2160p AMZN WEB-DL DDP5 1 Atmos H 265-playWEB.mkv" (674 seeds)
+        //   #2: "The.Boys.S05E02.FRENCH.WEBRip.x264.mp4" (609 seeds)
+        //   #3: "The Boys S05E02 Teenage Kix 1080p AMZN WEB-DL DDP5 1 Atmos H 264-playWEB.mkv" (seeds?)
+        //
+        // The 2160p HEVC release was ranked #1 even though the Apr 15 4-tier
+        // ranker says H.264 > HEVC. Root cause: `is_hevc_from_title` missed
+        // the "H 265" variant (space between letter and number) and treated
+        // the 4K release as H.264. Fixed by normalizing separators between
+        // the codec family letter and version number. This integration-level
+        // test pins the fix by running the actual ranker sort over the
+        // actual release titles from the incident.
+        let mut results = vec![
+            make_result(
+                1,
+                "The Boys S05E02 Teenage Kix 2160p AMZN WEB-DL DDP5 1 Atmos H 265-playWEB.mkv",
+                674,
+                Some(0),
+            ),
+            make_result(
+                2,
+                "The Boys S05E02 Teenage Kix 1080p AMZN WEB-DL DDP5 1 Atmos H 264-playWEB.mkv",
+                200,
+                Some(0),
+            ),
+        ];
+        const MIN_SEEDS: u32 = 5;
+        results.sort_by(|a, b| {
+            let a_single = a.file_index.map_or(true, |i| i == 0);
+            let b_single = b.file_index.map_or(true, |i| i == 0);
+            if a_single != b_single {
+                return if a_single {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
+            let a_hevc = is_hevc_from_title(&a.title);
+            let b_hevc = is_hevc_from_title(&b.title);
+            if a_hevc != b_hevc {
+                let preferred = if a_hevc { b } else { a };
+                if preferred.seeds >= MIN_SEEDS {
+                    return if a_hevc {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    };
+                }
+            }
+            let a_dv = has_dolby_vision_in_title(&a.title);
+            let b_dv = has_dolby_vision_in_title(&b.title);
+            if a_dv != b_dv {
+                return if a_dv {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                };
+            }
+            b.seeds.cmp(&a.seeds)
+        });
+        // Post-fix: the 1080p H 264 release must be ranked above the
+        // 2160p H 265 release, regardless of seed counts, because H.264
+        // has viable seeds (200 >= 5). BEFORE the fix, the ranker saw
+        // both as "not HEVC" and sorted by seeds, putting 2160p on top.
+        assert!(
+            results[0].title.contains("1080p"),
+            "Regression: space-separated 'H 265' bypassed the HEVC ranker tier. \
+             Result 1 was {:?}, expected the 1080p H.264 release.",
+            results[0].title
+        );
+        assert!(
+            results[0].title.contains("H 264"),
+            "Regression: 1080p release not ranked first, got {:?}",
+            results[0].title
+        );
     }
 }
