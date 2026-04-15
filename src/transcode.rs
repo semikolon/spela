@@ -372,34 +372,45 @@ pub async fn transcode_hls(
         "-map_metadata".into(), "-1".into(),
     ]);
 
-    // HLS muxer
+    // HLS muxer — targeted at OLDER Chromecast Default Media Receivers
+    // (CrKey 1.56 firmware on 1st-gen sticks), which only support HLS v3
+    // manifests reliably. EVENT playlist type and independent_segments
+    // both bump the manifest version to v6, which the older Shaka Player
+    // can't parse — the device fetches the manifest 4 times in a row then
+    // bails to player_state=IDLE / idle_reason=ERROR without ever
+    // requesting any segment. Confirmed live on Apr 15, 2026 against
+    // Fredriks TV via direct pychromecast LOAD.
     args.extend([
         "-f".into(), "hls".into(),
+        // Force HLS v3 manifest (no version tag, simpler features).
+        "-hls_version".into(), "3".into(),
         // 6-second segments — Apple's recommended target_duration for HLS,
-        // small enough that pre-buffer is fast (~12 seconds of encoded output
-        // gives 2 segments, enough for Chromecast to start reliably) and
-        // large enough to avoid HTTP-request overhead per second of content.
+        // small enough that pre-buffer is fast (~12 seconds of encoded
+        // output gives 2 segments, enough for Chromecast to start
+        // reliably) and large enough to avoid HTTP-request overhead per
+        // second of content.
         "-hls_time".into(), "6".into(),
         // Keep ALL segments in the manifest — no rotation. Spela serves a
         // finite movie, not a 24/7 broadcast, so the full manifest is fine.
         "-hls_list_size".into(), "0".into(),
-        // Event-type playlist: appendable while ffmpeg is encoding, ENDLIST
-        // is written when ffmpeg closes. This gives growing-manifest live
-        // behavior during transcode and full VOD seeking once complete.
-        "-hls_playlist_type".into(), "event".into(),
+        // No playlist_type. EVENT bumps to HLS v6 and confuses old
+        // receivers; VOD requires waiting for ffmpeg to finish before any
+        // playback. The default (no playlist_type tag) gives live
+        // behavior on the manifest while ffmpeg writes segments and is
+        // automatically marked complete with #EXT-X-ENDLIST when ffmpeg
+        // exits — exactly what we want.
         // MPEG-TS segments (NOT fmp4) so that Default Media Receiver / CAF
         // can play them without requiring `media.hlsSegmentFormat = "fmp4"`
         // in the LOAD message — a field that rust_cast's high-level Media
-        // struct doesn't expose. See the segment_pattern doc above + the
-        // commit message of the Apr 15, 2026 fmp4 → ts switch.
+        // struct doesn't expose.
         "-hls_segment_type".into(), "mpegts".into(),
         "-hls_segment_filename".into(), segment_pattern.to_string_lossy().to_string(),
-        // independent_segments: each segment is independently decodable from
-        // its own keyframe — required for accurate seeking + segment-boundary
-        // recovery if Chromecast drops mid-segment.
-        // temp_file: write each segment to .tmp first, then atomically rename.
-        // Avoids a partial-segment race with the HTTP serve path.
-        "-hls_flags".into(), "independent_segments+temp_file".into(),
+        // temp_file ONLY: write each segment to .tmp first, then atomically
+        // rename. Avoids a partial-segment race with the HTTP serve path.
+        // No `independent_segments` — that flag bumps the manifest version
+        // and old Shaka Player on CrKey 1.56 can't handle the resulting
+        // EXT-X-INDEPENDENT-SEGMENTS tag.
+        "-hls_flags".into(), "temp_file".into(),
         "-y".into(),
         manifest_path.to_string_lossy().to_string(),
     ]);
