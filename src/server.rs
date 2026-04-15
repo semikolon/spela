@@ -794,36 +794,10 @@ async fn do_play(
                 }
 
                 if !ffmpeg_alive && wt_alive {
-                    // ffmpeg done (source finished transcoding), webtorrent still
-                    // seeding. Compute a DURATION-AWARE grace period so long content
-                    // (3-hour movies) gets enough time while short content doesn't
-                    // sit in pointless storage. Apr 15, 2026 fix: the previous
-                    // hardcoded 45-minute grace was too SHORT for a 63-minute TV
-                    // episode (ffmpeg transcoded at ~6x realtime → finished at 11 min
-                    // wall time → 45-min grace expired at 56 min wall time → cleanup
-                    // fired while the user was still at the 30-minute mark of the
-                    // episode → "blue cast icon" mid-watch). It was also wastefully
-                    // LONG for short movies.
-                    //
-                    // New formula: grace = max(
-                    //   (duration - ss_offset) + 10-minute buffer,   // finish the content + cushion
-                    //   5 minutes                                   // floor for stubs / duration-unknown
-                    // )
-                    //
-                    // Rationale: the Chromecast plays the transcoded stream at 1x
-                    // realtime, so the wall-clock time remaining after ffmpeg finishes
-                    // equals (duration - current_chromecast_time). At the moment ffmpeg
-                    // exits, the Chromecast is somewhere in the middle of playback. To
-                    // be safe, assume it's at the very start of the transcoded stream
-                    // (i.e. time 0 = ss_offset in source timeline) and allocate enough
-                    // wall-clock for it to play the entire (duration - ss_offset)
-                    // remaining content, plus a 10-minute cushion for paused-mid-
-                    // episode or user-rewind scenarios.
-                    //
-                    // cast_health_monitor's 92%-of-duration end detection still fires
-                    // independently when the user actually finishes — this grace is
-                    // just a safety net in case the monitor misses (network issues,
-                    // get_info failures, etc).
+                    // ffmpeg done, webtorrent still seeding. Compute a
+                    // duration-aware grace period via the extracted helper
+                    // `compute_reaper_grace_secs` — see its docs + tests for the
+                    // full rationale and edge-case coverage.
                     let (source_duration, ss_offset) = {
                         let app_state = AppState::load(&state.state_dir);
                         match app_state.current.as_ref() {
@@ -831,15 +805,7 @@ async fn do_play(
                             None => (None, 0.0),
                         }
                     };
-                    const GRACE_CUSHION_SECS: u64 = 600;  // 10 min
-                    const GRACE_FLOOR_SECS: u64 = 300;    // 5 min
-                    let grace_secs = match source_duration {
-                        Some(dur) if dur > 0.0 => {
-                            let remaining = (dur - ss_offset).max(0.0) as u64;
-                            remaining.saturating_add(GRACE_CUSHION_SECS).max(GRACE_FLOOR_SECS)
-                        }
-                        _ => 2700, // Unknown duration: fall back to the old 45-min default.
-                    };
+                    let grace_secs = compute_reaper_grace_secs(source_duration, ss_offset);
                     tracing::info!(
                         "Reaper: ffmpeg finished for '{}', waiting {} grace period (duration={:?}s, ss_offset={:.0}s)...",
                         title_for_log,
@@ -1013,6 +979,49 @@ fn do_cleanup(state: &SharedState) {
 ///     `started_at` timestamp (a new `do_play` ran, this monitor is stale)
 ///     or when the saved state's `current` is None at all (someone called
 ///     `/stop` and we're done).
+/// Compute the reaper's grace period after ffmpeg finishes, as a function of
+/// source duration and the input seek offset. Extracted as a pure helper so
+/// unit tests can pin the math for every operationally interesting scenario.
+///
+/// The grace period starts the moment ffmpeg exits (having transcoded the
+/// entire source file to the HLS segment dir). At that moment, the Chromecast
+/// is still playing the stream at 1x realtime, somewhere between "just
+/// started" and "nearly done". The grace is the wall-clock time we're
+/// willing to keep the segment dir alive before running `do_cleanup`.
+///
+/// Formula: `grace = max(remaining_content + 10 min cushion, 5 min floor)`
+///
+/// Where `remaining_content = (duration - ss_offset).max(0)` represents the
+/// total playable wall-clock length of the transcoded stream (Chromecast
+/// plays at 1x realtime, so `duration - ss_offset` seconds of source content
+/// takes exactly `duration - ss_offset` seconds of wall time to play out).
+/// The 10-minute cushion covers paused-mid-episode or user-rewind scenarios.
+/// The 5-minute floor protects against degenerate durations (0, NaN, etc.).
+///
+/// When `duration` is unknown (None or ≤0), fall back to the historical
+/// 45-minute hardcoded default — better than removing the safety net entirely.
+///
+/// Apr 15, 2026: this replaces a hardcoded 45-minute grace period that was
+/// too SHORT for 63-minute TV episodes (ffmpeg at NVENC's 6x realtime finished
+/// transcoding at ~11 min wall time, 45-min grace expired at 56 min wall time,
+/// cleanup fired while the user was still at the 30-minute mark) and too LONG
+/// for short movies.
+pub fn compute_reaper_grace_secs(duration: Option<f64>, ss_offset: f64) -> u64 {
+    const GRACE_CUSHION_SECS: u64 = 600; // 10 min
+    const GRACE_FLOOR_SECS: u64 = 300; // 5 min
+    const UNKNOWN_DURATION_DEFAULT_SECS: u64 = 2700; // 45 min — legacy fallback
+
+    match duration {
+        Some(dur) if dur > 0.0 => {
+            let remaining = (dur - ss_offset).max(0.0) as u64;
+            remaining
+                .saturating_add(GRACE_CUSHION_SECS)
+                .max(GRACE_FLOOR_SECS)
+        }
+        _ => UNKNOWN_DURATION_DEFAULT_SECS,
+    }
+}
+
 async fn cast_health_monitor(
     state: SharedState,
     cast_name: String,
@@ -2233,6 +2242,94 @@ fn cast_result_to_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Reaper grace period math (Apr 15, 2026 regression guards) ---
+    //
+    // The reaper's grace period is how long spela keeps HLS segments alive
+    // after ffmpeg finishes transcoding but while the Chromecast is still
+    // playing them. The old hardcoded 45-minute value bit the user twice:
+    //   - too SHORT for a 63-min TV episode (cleanup fired mid-watch at
+    //     the 30-min mark of S05E01)
+    //   - too LONG for short clips (45 min of idle storage waste)
+    // These tests pin the new duration-aware math so neither regression
+    // can come back.
+
+    #[test]
+    fn test_grace_covers_63_minute_episode() {
+        // 63-min episode, no seek → grace = 63*60 + 10*60 = 4380 s (73 min).
+        // This is the scenario that failed in production Apr 15 at 18:30.
+        let grace = compute_reaper_grace_secs(Some(3823.6), 0.0);
+        assert!(
+            grace >= 3823 + 600,
+            "63-min episode needs at least 73 min grace, got {} s",
+            grace
+        );
+    }
+
+    #[test]
+    fn test_grace_covers_three_hour_movie() {
+        // 3-hour movie, no seek → grace = 180*60 + 10*60 = 11400 s (190 min).
+        // The old 2700 s hardcoded grace would have cleaned up mid-movie.
+        let grace = compute_reaper_grace_secs(Some(10800.0), 0.0);
+        assert!(
+            grace >= 10800 + 600,
+            "3-hour movie needs at least 190 min grace, got {} s",
+            grace
+        );
+    }
+
+    #[test]
+    fn test_grace_respects_seek_offset() {
+        // 63-min episode with seek to 30 min → only 33 min of content remain.
+        // Grace should be (3823.6 - 1800) + 600 = 2623.6 + 600 ≈ 2623 s.
+        // (Historical 2700 s happened to work for THIS specific case, which
+        // is why the bug went unnoticed for so long. But at seek_to=0 it
+        // fails, as the Apr 15 incident shows.)
+        let grace = compute_reaper_grace_secs(Some(3823.6), 1800.0);
+        assert!(
+            grace >= 2023 + 600,
+            "post-seek grace should cover (duration-ss_offset)+cushion, got {} s",
+            grace
+        );
+        assert!(
+            grace < 4000,
+            "post-seek grace should NOT allocate for the whole duration, got {} s",
+            grace
+        );
+    }
+
+    #[test]
+    fn test_grace_floor_protects_short_clips() {
+        // A 30-second clip with no seek → raw remaining = 30 s, +cushion=630 s.
+        // The 5-minute floor doesn't kick in because the cushion already
+        // puts us past it. Test with a truly degenerate 0-duration case too.
+        let grace = compute_reaper_grace_secs(Some(30.0), 0.0);
+        assert!(grace >= 300, "5-min floor should apply, got {} s", grace);
+    }
+
+    #[test]
+    fn test_grace_floor_applies_to_zero_duration_gracefully() {
+        // Duration = 0 is nonsense; we fall through to the 45-min default
+        // rather than returning a nonsensically small grace period.
+        let grace = compute_reaper_grace_secs(Some(0.0), 0.0);
+        assert_eq!(grace, 2700, "duration=0 should use the legacy default");
+    }
+
+    #[test]
+    fn test_grace_unknown_duration_uses_legacy_default() {
+        // When ffprobe fails and we have no duration info, keep the
+        // conservative 45-minute fallback — better than zero.
+        assert_eq!(compute_reaper_grace_secs(None, 0.0), 2700);
+        assert_eq!(compute_reaper_grace_secs(None, 1800.0), 2700);
+    }
+
+    #[test]
+    fn test_grace_seek_past_end_clamps_to_floor() {
+        // Pathological: seek_to > duration. Remaining content is 0,
+        // grace = max(0 + 600, 300) = 600 s. Still meaningful.
+        let grace = compute_reaper_grace_secs(Some(1800.0), 3600.0);
+        assert_eq!(grace, 600);
+    }
 
     // --- Range header parsing (the silent Range feature) ---
     // Edge cases from Mar 26: Accept-Ranges/206 broke Chromecast,

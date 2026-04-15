@@ -135,6 +135,64 @@ fn format_srt_timestamp(t: f64) -> String {
     format!("{:02}:{:02}:{:02},{:03}", h, m, s, ms)
 }
 
+/// Decide which subtitle file ffmpeg's `subtitles=` filter should read,
+/// applying the SRT shift when a seek offset is active. Extracted as a
+/// pure helper so unit tests can verify the four-way decision tree
+/// without running ffmpeg. Apr 15, 2026 regression guard.
+///
+/// Decision table:
+///
+///   input subtitles | seek_to       | output
+///   ----------------+---------------+-----------------------------------------
+///   None            | anything      | None (no subs, nothing to shift)
+///   Some(orig)      | None or Some(0)| Some(orig)        (pass-through, no seek)
+///   Some(orig)      | Some(N>0)     | Some(shifted) if shift_srt succeeds,
+///                   |               | else Some(orig) (graceful degradation —
+///                   |               | subtitles will be desynced but playback
+///                   |               | still works; a `tracing::warn` logs the
+///                   |               | failure so the operator can investigate)
+///
+/// `hls_dir` is the destination directory for the shifted SRT file —
+/// lives alongside the HLS segments so `do_cleanup` sweeps it on play end.
+pub fn resolve_subtitle_path_for_seek(
+    original: Option<&Path>,
+    hls_dir: &Path,
+    seek_to: Option<f64>,
+) -> Option<PathBuf> {
+    let orig = original?;
+    // No seek, or zero seek → pass-through unchanged.
+    let seek = match seek_to {
+        Some(s) if s > 0.0 => s,
+        _ => return Some(orig.to_path_buf()),
+    };
+    // No file on disk → pass-through (shift would fail anyway; let the
+    // filter chain handle the missing-file case with its own error).
+    if !orig.exists() {
+        return Some(orig.to_path_buf());
+    }
+    let shifted = hls_dir.join("subtitle_shifted.srt");
+    match shift_srt(orig, &shifted, seek) {
+        Ok(n) => {
+            tracing::info!(
+                "Subtitle sync: shifted {} by {:.0}s, {} entries retained → {}",
+                orig.display(),
+                seek,
+                n,
+                shifted.display()
+            );
+            Some(shifted)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Subtitle sync: shift_srt failed ({}), falling back to original — subtitles will be desynced by {:.0}s",
+                e,
+                seek
+            );
+            Some(orig.to_path_buf())
+        }
+    }
+}
+
 /// Detect audio/video codecs and duration of a media URL/file using ffprobe.
 /// Returns (video_codec, audio_codec, duration_secs).
 pub async fn detect_codecs(url: &str) -> Result<(Option<String>, Option<String>, Option<f64>)> {
@@ -401,39 +459,15 @@ pub async fn transcode_hls(
 
     // Subtitle sync fix (Apr 15, 2026): if we're seeking AND we have a
     // subtitle file, physically shift the SRT so its "time 0" lines up
-    // with the frame content at the seek offset. Without this, the
-    // subtitles filter matches source-time stamps against reset output
-    // PTS, shifting every subtitle by the seek offset. See shift_srt()
-    // doc comment for the full rationale and alternatives considered.
-    // The shifted file lives in the transcoded_hls dir so it's cleaned
-    // up automatically by do_cleanup alongside the segments.
-    let effective_subtitle_path: Option<PathBuf> = match (subtitle_path, seek_to) {
-        (Some(orig), Some(seek)) if seek > 0.0 && orig.exists() => {
-            let shifted = hls_dir.join("subtitle_shifted.srt");
-            match shift_srt(orig, &shifted, seek) {
-                Ok(n) => {
-                    tracing::info!(
-                        "Subtitle sync: shifted {} by {:.0}s, {} entries retained → {}",
-                        orig.display(),
-                        seek,
-                        n,
-                        shifted.display()
-                    );
-                    Some(shifted)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Subtitle sync: shift_srt failed ({}), falling back to original — subtitles will be desynced by {:.0}s",
-                        e,
-                        seek
-                    );
-                    Some(orig.to_path_buf())
-                }
-            }
-        }
-        (Some(orig), _) => Some(orig.to_path_buf()),
-        (None, _) => None,
-    };
+    // with the frame content at the seek offset. See shift_srt() for
+    // rationale. Extracted into resolve_subtitle_path_for_seek() so
+    // unit tests can validate the shift-or-passthrough decision without
+    // launching ffmpeg.
+    let effective_subtitle_path = resolve_subtitle_path_for_seek(
+        subtitle_path,
+        &hls_dir,
+        seek_to,
+    );
     let subtitle_path = effective_subtitle_path.as_deref();
 
     let manifest_path = hls_dir.join("playlist.m3u8");
@@ -795,6 +829,122 @@ mod tests {
         assert!(result.contains("- Second line"));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ===== resolve_subtitle_path_for_seek (the decision tree that wraps shift_srt) =====
+    //
+    // These tests are THE regression guard against the Apr 15, 2026 subtitle
+    // sync bug class. If someone accidentally bypasses the shift in a future
+    // transcode_hls refactor (or removes the extracted helper entirely),
+    // these tests fail loudly.
+
+    fn resolve_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("spela_resolve_test_{}", label));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_resolve_subtitle_none_returns_none() {
+        let hls_dir = resolve_temp_dir("none_subs");
+        assert!(resolve_subtitle_path_for_seek(None, &hls_dir, None).is_none());
+        assert!(resolve_subtitle_path_for_seek(None, &hls_dir, Some(0.0)).is_none());
+        assert!(resolve_subtitle_path_for_seek(None, &hls_dir, Some(1800.0)).is_none());
+        let _ = std::fs::remove_dir_all(&hls_dir);
+    }
+
+    #[test]
+    fn test_resolve_subtitle_no_seek_passthrough() {
+        // seek_to = None → pass the original path through unchanged.
+        let hls_dir = resolve_temp_dir("no_seek");
+        let orig = hls_dir.join("orig.srt");
+        std::fs::write(&orig, "1\n00:00:05,000 --> 00:00:07,000\nHello\n\n").unwrap();
+
+        let resolved = resolve_subtitle_path_for_seek(Some(&orig), &hls_dir, None).unwrap();
+        assert_eq!(resolved, orig);
+        assert!(!hls_dir.join("subtitle_shifted.srt").exists());
+
+        let _ = std::fs::remove_dir_all(&hls_dir);
+    }
+
+    #[test]
+    fn test_resolve_subtitle_zero_seek_passthrough() {
+        // seek_to = Some(0.0) is treated as no-seek (cheap optimization).
+        // `ss_offset = 0.0` is the default for a non-resume play, and
+        // shifting by 0 would be a pointless file-IO round trip.
+        let hls_dir = resolve_temp_dir("zero_seek");
+        let orig = hls_dir.join("orig.srt");
+        std::fs::write(&orig, "1\n00:00:05,000 --> 00:00:07,000\nX\n\n").unwrap();
+
+        let resolved = resolve_subtitle_path_for_seek(Some(&orig), &hls_dir, Some(0.0)).unwrap();
+        assert_eq!(resolved, orig);
+        assert!(!hls_dir.join("subtitle_shifted.srt").exists());
+
+        let _ = std::fs::remove_dir_all(&hls_dir);
+    }
+
+    #[test]
+    fn test_resolve_subtitle_positive_seek_uses_shifted() {
+        // seek_to = Some(1800) AND subs exist → resolved path MUST be the
+        // shifted file, NOT the original. This is the load-bearing assertion
+        // that would have caught the Apr 15 subtitle-sync bug.
+        let hls_dir = resolve_temp_dir("positive_seek");
+        let orig = hls_dir
+            .parent()
+            .unwrap()
+            .join("spela_resolve_positive_seek_orig.srt");
+        std::fs::write(
+            &orig,
+            concat!(
+                "1\n00:00:10,000 --> 00:00:12,000\nEarly\n\n",
+                "2\n00:30:05,000 --> 00:30:08,000\nAt resume\n\n",
+            ),
+        )
+        .unwrap();
+
+        let resolved =
+            resolve_subtitle_path_for_seek(Some(&orig), &hls_dir, Some(1800.0)).unwrap();
+        // CRITICAL: the resolved path must NOT be the original.
+        assert_ne!(
+            resolved, orig,
+            "Regression: resolve_subtitle_path_for_seek returned the ORIGINAL path \
+             for seek_to=1800. ffmpeg will desync subtitles by 30 min. \
+             Fix: ensure shift_srt is called and its output path is returned."
+        );
+        assert_eq!(resolved, hls_dir.join("subtitle_shifted.srt"));
+        assert!(resolved.exists());
+        let shifted_content = std::fs::read_to_string(&resolved).unwrap();
+        assert!(
+            !shifted_content.contains("Early"),
+            "Entries before the seek point must be dropped from shifted SRT"
+        );
+        assert!(
+            shifted_content.contains("At resume"),
+            "Entries at/after seek point must survive the shift"
+        );
+        assert!(
+            shifted_content.contains("00:00:05,000"),
+            "Shifted entry should have timestamp reduced by the seek offset"
+        );
+
+        let _ = std::fs::remove_dir_all(&hls_dir);
+        let _ = std::fs::remove_file(&orig);
+    }
+
+    #[test]
+    fn test_resolve_subtitle_missing_file_passthrough() {
+        // Edge case: caller passed a path that doesn't exist. Don't crash —
+        // pass through, let the ffmpeg filter chain surface the error.
+        let hls_dir = resolve_temp_dir("missing");
+        let nonexistent = hls_dir.join("does_not_exist.srt");
+
+        let resolved =
+            resolve_subtitle_path_for_seek(Some(&nonexistent), &hls_dir, Some(1800.0)).unwrap();
+        assert_eq!(resolved, nonexistent);
+        assert!(!hls_dir.join("subtitle_shifted.srt").exists());
+
+        let _ = std::fs::remove_dir_all(&hls_dir);
     }
 
     #[test]
