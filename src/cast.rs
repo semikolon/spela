@@ -126,19 +126,42 @@ impl CastController {
     }
 
     /// Cast a URL to a named Chromecast device.
-    /// Uses StreamType::Live for transcoded streams (chunked, growing file).
-    /// Duration passed for display purposes but seeking requires Custom Receiver —
-    /// Default Media Receiver can't seek in fMP4 without byte-offset index.
-    /// Jellyfin solves this with custom receiver + Shaka Player + server-side seek-restart.
+    ///
+    /// `stream_type` is inferred from `content_type`:
+    ///   - HLS playlists (`application/vnd.apple.mpegurl` or `application/x-mpegurl`)
+    ///     → `StreamType::Buffered` because Default Media Receiver / CAF
+    ///     treats HLS as a known-duration VOD source (even with EVENT-type
+    ///     playlists, the receiver buffers segments and seeks within them).
+    ///     Apr 15, 2026 live test discovered that `StreamType::Live` for HLS
+    ///     made the receiver acknowledge the LOAD message but never fetch
+    ///     the manifest URL — `player_state` stayed IDLE indefinitely.
+    ///   - Everything else (video/mp4 + chunked-transfer fragmented MP4 from
+    ///     the legacy /stream/transcode path) → `StreamType::Live` because
+    ///     the file is growing and we don't want the receiver probing
+    ///     Content-Length / asking for byte ranges.
+    ///
+    /// Duration passed for display purposes but seeking requires Custom
+    /// Receiver — Default Media Receiver can't seek in fMP4 without
+    /// byte-offset index. Jellyfin solves this with custom receiver + Shaka
+    /// Player + server-side seek-restart.
     pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, duration: Option<f64>, _current_time: Option<f64>) -> Result<CastResult> {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, session_id) = Self::get_or_launch_app(&device)?;
 
+        let stream_type = if content_type.contains("mpegurl")
+            || content_type.contains("application/dash+xml")
+        {
+            tracing::info!("cast_url: HLS/DASH content_type {:?} → StreamType::Buffered", content_type);
+            StreamType::Buffered
+        } else {
+            StreamType::Live
+        };
+
         let media = Media {
             content_id: url.to_string(),
             content_type: content_type.to_string(),
-            stream_type: StreamType::Live,
+            stream_type,
             duration: duration.map(|d| d as f32),
             metadata: None,
         };
