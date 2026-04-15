@@ -5,8 +5,8 @@
 - [ ] Refine year-aware and quality-aware result prioritisation in `src/search.rs` to better handle franchise sequels (e.g., 2025 vs 2026). 🕵️‍♂️
 - [ ] **TVTime "next unwatched episode" integration for Ruby** — Ruby should know which episodes the user has actually watched before guessing from search ranking. Tonight's failure mode: when user said "play the Boys episode" with no season/episode, Ruby chose the latest available (S05E02 — unwatched) instead of the next unwatched (S05E01). Architecture sketched in `~/.claude/hooks/conversation_engine.py` near `SPELA_TOOL_DECLARATION`: new `tvtime_client.py` with `get_show_progress(show)` + `mark_watched(show, s, e)`, new Gemini tool `get_next_episode(show)` registered alongside `run_spela`, system-prompt rule "before run_spela play on a TV show, always call get_next_episode unless the user explicitly named the season/episode", read-through 1h cache invalidated on every successful spela play of a TV show. Auth: TVTime removed their public API ~2019; reverse-engineered sidecar (`https://beta.tvtime.com/sidecar?o=https://api.tvtime.com/v1/...`) is the only stable route. Trakt.tv has an official API and many TVTime users sync to it — prefer Trakt if available. Currently blocked on user finding working credentials (Apr 15 reset-password-hell). Cross-reference: dotfiles commit `57b2d92`.
 
-### Cast Pipeline Rework — IN PROGRESS (Apr 15, 2026 overnight)
-- [ ] **HLS rework for `/stream/transcode`** — the chunked-transfer fragmented MP4 endpoint is fundamentally incompatible with Chromecast Default Media Receiver. Confirmed live by `cast_health_monitor` on Apr 15, 2026: every cast attempt produced healthy ffmpeg + perfect Local Bypass + `cast_url()` returning OK, while the TV stayed on the blue cast icon and `player_state=IDLE`. Default Media Receiver's MP4 parser refuses the combination of `Transfer-Encoding: chunked` + no `Content-Length` + always-200 (never-206) responses. Workaround that proves the diagnosis: the same FLUX file remuxed via `ffmpeg -c:v copy -c:a aac -movflags +faststart` and served by `catt` (which uses `206 Partial Content` with a real `Content-Length`) plays perfectly on the same Chromecast / same network.
+### Cast Pipeline Rework — DONE (Apr 15, 2026 overnight) ✅
+- [x] **HLS rework for `/stream/transcode`** — the chunked-transfer fragmented MP4 endpoint is fundamentally incompatible with Chromecast Default Media Receiver. Confirmed live by `cast_health_monitor` on Apr 15, 2026: every cast attempt produced healthy ffmpeg + perfect Local Bypass + `cast_url()` returning OK, while the TV stayed on the blue cast icon and `player_state=IDLE`. Default Media Receiver's MP4 parser refuses the combination of `Transfer-Encoding: chunked` + no `Content-Length` + always-200 (never-206) responses. Workaround that proves the diagnosis: the same FLUX file remuxed via `ffmpeg -c:v copy -c:a aac -movflags +faststart` and served by `catt` (which uses `206 Partial Content` with a real `Content-Length`) plays perfectly on the same Chromecast / same network.
 
   **Architecture**: rewrite `transcode.rs` to output HLS instead of fMP4: `ffmpeg ... -f hls -hls_time 6 -hls_list_size 0 -hls_playlist_type event -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 -hls_segment_filename seg_%05d.m4s playlist.m3u8`. Add new axum endpoints `/hls/playlist.m3u8` and `/hls/segment/<name>` that serve the manifest + fmp4 init segment + .m4s segments with proper `Content-Length` and `206 Range` support. The cast LOAD URL becomes `http://darwin.home:7890/hls/playlist.m3u8` with content-type `application/vnd.apple.mpegurl`. Default Media Receiver supports HLS natively. The post-playback reaper still tracks ffmpeg, `cast_health_monitor` still tracks the receiver — both unchanged.
 
@@ -20,17 +20,31 @@
 
   *Production workaround until HLS lands*: `catt -d "Fredriks TV" cast /tmp/<remuxed>.mp4` directly on Darwin. Documented in spela CLAUDE.md and global CLAUDE.md.
 
-  *Implementation status (Apr 15, 2026 overnight)*:
-  - [x] `transcode_hls()` function in `src/transcode.rs` (mirrors filter chain of `transcode()`, swaps the muxer for HLS event playlist)
-  - [ ] `serve_static_with_range()` helper in `src/server.rs` for proper Content-Length + 206 Range
-  - [ ] `/hls/playlist.m3u8`, `/hls/init.mp4`, `/hls/{segment}` axum routes
-  - [ ] `do_play` switched to `transcode_hls()` + cast URL `/hls/playlist.m3u8` + content-type `application/vnd.apple.mpegurl`
-  - [ ] HLS-aware pre-buffer (wait for manifest + init + ≥1 segment instead of "5 MB ready")
-  - [ ] `do_cleanup` deletes `transcoded_hls/` directory in addition to `transcoded_aac.mp4`
-  - [ ] `kill_spela_ffmpeg_workers` pattern updated to also match `ffmpeg.*transcoded_hls`
-  - [ ] Live test against Fredriks TV (TV off — user asleep)
-  - [ ] Docs updated: spela CLAUDE.md, OPERATIONS.md, README.md
-  - [ ] Test cases for `transcode_hls()` and the HLS endpoints
+  *Implementation status (Apr 15, 2026 overnight — DONE)*:
+  - [x] `transcode_hls()` function in `src/transcode.rs` — mirrors filter chain of `transcode()`, swaps the muxer for HLS with MPEG-TS segments (fmp4 abandoned because rust_cast's Media struct doesn't expose `hlsSegmentFormat`)
+  - [x] `serve_static_with_range()` helper in `src/server.rs` — proper Content-Length + 206 Range support
+  - [x] `/hls/master.m3u8`, `/hls/playlist.m3u8`, `/hls/init.mp4`, `/hls/{segment}` axum routes
+  - [x] Synthetic master playlist with explicit `CODECS="avc1.640028,mp4a.40.2"` + BANDWIDTH + RESOLUTION — older Chromecast firmware (CrKey 1.56) refuses to load a bare media playlist without those hints
+  - [x] `do_play` switched to `transcode_hls()` + cast URL `/hls/master.m3u8` + content-type `application/vnd.apple.mpegurl` + `StreamType::Buffered` (auto-inferred from content_type in `cast.rs`)
+  - [x] HLS-aware pre-buffer (waits for manifest + `seg_00001.ts` instead of "5 MB ready")
+  - [x] `do_cleanup` deletes `transcoded_hls/` directory in addition to `transcoded_aac.mp4`
+  - [x] `kill_spela_ffmpeg_workers` pattern updated to also match `ffmpeg.*transcoded_hls`
+  - [x] Live test against Fredriks TV — pychromecast probe + spela CLI play both confirmed `state=PLAYING pos=9.333` within ~2 seconds. Chromecast actively fetched master → playlist → seg_00000 → seg_00001 → seg_00002 at realtime cadence.
+  - [x] `stream_host` config switched from `darwin.home` (which Chromecast can't resolve via Google DNS 8.8.8.8) to LAN IP `192.168.4.1`. Spela startup now WARNs if `stream_host` looks like a hostname.
+  - [x] Reaper pid=0 special-case for Local Bypass plays (without this, `kill_check(0)` always returns true and the reaper's wt_alive check is useless).
+  - [x] Docs updated: spela CLAUDE.md, OPERATIONS.md, global CLAUDE.md.
+
+  *Failure modes encountered during the rework, all resolved*:
+  1. `do_cleanup` mid-flight (commit `4d3ef73`): killed just-started workers
+  2. Sparse-aware `dir_size` (commit `9f58307`): false "disk full" on webtorrent placeholders
+  3. Cast-failure cleanup defense (commit `8735ea4`): orphaned workers when cast errored
+  4. Top-level Local Bypass + title-trust (commits `664b55e` + `3864fd1`): missed FLUX file
+  5. `cast_health_monitor` (commit `dd111ee`): surfaced the silent IDLE failure
+  6. fmp4 segments (reverted to MPEG-TS): rust_cast doesn't expose `hlsSegmentFormat`
+  7. `/hls/segment/{seg}` route → `/hls/{seg}` (commit `2c53b4f`): manifest uses relative URLs
+  8. HLS v6 features (EVENT playlist + independent_segments): CrKey 1.56 can't parse
+  9. Bare media playlist (no master): older receivers need explicit CODECS hints
+  10. `darwin.home` hostname: Chromecast hardcodes Google DNS, can't resolve LAN names
 
   Cross-references: spela `dd111ee` (the cast_health_monitor that surfaced this), `8735ea4` (cast-failure cleanup defense), [Igalia/cog#463](https://github.com/Igalia/cog/issues/463) (upstream confirmation that chunked + MP4 = broken player parsing).
 

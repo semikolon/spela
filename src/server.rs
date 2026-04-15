@@ -45,6 +45,29 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         }
     }
 
+    // Apr 15, 2026: Chromecast hardcodes Google DNS (8.8.8.8 / 8.8.4.4) and
+    // can NOT resolve LAN-only hostnames like `darwin.home` even when the
+    // user's other devices reach them through the LAN's recursive resolver
+    // (AdGuard Home, dnsmasq, mDNS). spela's cast LOAD URL is built from
+    // `stream_host`, so a hostname here means the receiver fetches a name
+    // it can't resolve, the LOAD fails silently, and `player_state` stays
+    // IDLE while the rest of the pipeline runs healthily into the void.
+    // Warn loudly if the configured stream_host looks like a hostname so
+    // the user knows to switch to a private LAN IP.
+    if !config.stream_host.is_empty() {
+        let looks_like_hostname = config
+            .stream_host
+            .chars()
+            .any(|c| c.is_ascii_alphabetic() && c != ':')
+            && !config.stream_host.starts_with('[');
+        if looks_like_hostname {
+            tracing::warn!(
+                "stream_host = {:?} looks like a hostname. Chromecast hardcodes Google DNS and cannot resolve LAN hostnames; cast loads will silently fail with player_state=IDLE. Set stream_host to a private LAN IP (e.g. 192.168.1.x) for Chromecast targets to work.",
+                config.stream_host
+            );
+        }
+    }
+
     let state_dir = Config::state_dir();
     let media_dir = config.media_dir();
     std::fs::create_dir_all(&state_dir)?;
@@ -744,7 +767,17 @@ async fn do_play(
                     }
                 }
 
-                let wt_alive = unsafe { torrent::kill_check(webtorrent_pid) };
+                // Local Bypass plays use webtorrent_pid=0 (no torrent worker).
+                // libc::kill(0, 0) signals the calling process's process group
+                // and always succeeds, so kill_check(0) returns `true` even
+                // though there's no real worker. Special-case pid=0 as
+                // "perpetually alive" so the reaper relies entirely on
+                // ffmpeg liveness for Local Bypass plays.
+                let wt_alive = if webtorrent_pid == 0 {
+                    true
+                } else {
+                    unsafe { torrent::kill_check(webtorrent_pid) }
+                };
                 let ffmpeg_alive = state.ffmpeg_pid.lock().unwrap()
                     .map(|p| unsafe { torrent::kill_check(p) })
                     .unwrap_or(false);

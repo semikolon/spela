@@ -45,6 +45,27 @@ the entire userspace was under severe resource pressure.
   spela. Both checks must pass before a new download starts. The host floor
   is best-effort — `None` on `df` failure proceeds rather than blocks, so
   a parser regression can never make spela unusable on its own.
+- `stream_host` must be a private LAN IP (e.g. `192.168.4.1`) when the play
+  target is a Chromecast. Chromecast devices hardcode Google DNS
+  (8.8.8.8 / 8.8.4.4) and ignore the LAN's recursive resolver, so a
+  hostname like `darwin.home` makes the receiver fetch a name it can't
+  resolve, the LOAD silently fails, and `player_state` stays IDLE forever
+  while every other LAN client sees spela just fine. spela startup WARNs
+  if `stream_host` looks like a hostname.
+- Cast pipeline output for chromecast targets is HLS (`/hls/master.m3u8`),
+  not the legacy chunked-transfer fragmented MP4 path
+  (`/stream/transcode`). The HLS path uses MPEG-TS segments because
+  rust_cast's high-level `Media` struct doesn't expose
+  `hlsSegmentFormat`, which CAF Receiver requires for fmp4 segments.
+  The cast URL is the SYNTHETIC master playlist (`/hls/master.m3u8`,
+  generated on the fly with hardcoded `CODECS="avc1.640028,mp4a.40.2"` +
+  `BANDWIDTH=6000000` + `RESOLUTION=1920x1080`), not the bare media
+  playlist — older Chromecast firmware refuses to load a media playlist
+  without explicit codec / bandwidth / resolution hints.
+- HLS manifest must stay at HLS v3-v4. Avoid `-hls_playlist_type event`
+  and `-hls_flags independent_segments` — both bump the manifest to HLS
+  v6, which the older Shaka Player on CrKey 1.56 firmware can't parse.
+  (`-hls_version` is NOT a valid ffmpeg HLS muxer option.)
 
 ## Defense-In-Depth Plan
 
