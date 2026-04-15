@@ -267,7 +267,16 @@ pub async fn transcode_hls(
     std::fs::create_dir_all(&hls_dir)?;
 
     let manifest_path = hls_dir.join("playlist.m3u8");
-    let segment_pattern = hls_dir.join("seg_%05d.m4s");
+    // MPEG-TS segments instead of fmp4 (Apr 15, 2026): Default Media Receiver
+    // (CAF) requires `media.hlsSegmentFormat = "fmp4"` in the LOAD message
+    // for fmp4-HLS to play, but rust_cast's Media struct doesn't expose
+    // hlsSegmentFormat — only contentId / contentType / streamType /
+    // duration / metadata. Without that signaling, the receiver doesn't
+    // know how to parse the .m4s segments and silently stays IDLE. MPEG-TS
+    // segments are auto-detected from the manifest's
+    // `#EXT-X-PLAYLIST-TYPE` line and don't require any extra LOAD-message
+    // fields. ~3% more bandwidth overhead vs fmp4, fully supported.
+    let segment_pattern = hls_dir.join("seg_%05d.ts");
 
     let has_intro = intro_path.is_some();
     let has_subs = subtitle_path.map_or(false, |p| p.exists());
@@ -378,11 +387,12 @@ pub async fn transcode_hls(
         // is written when ffmpeg closes. This gives growing-manifest live
         // behavior during transcode and full VOD seeking once complete.
         "-hls_playlist_type".into(), "event".into(),
-        // Fragmented MP4 segments (Chromecast / Shaka Player handle natively).
-        // The alternative is MPEG-TS (.ts), which works too but adds the
-        // PES/TS framing overhead that fMP4 avoids.
-        "-hls_segment_type".into(), "fmp4".into(),
-        "-hls_fmp4_init_filename".into(), "init.mp4".into(),
+        // MPEG-TS segments (NOT fmp4) so that Default Media Receiver / CAF
+        // can play them without requiring `media.hlsSegmentFormat = "fmp4"`
+        // in the LOAD message — a field that rust_cast's high-level Media
+        // struct doesn't expose. See the segment_pattern doc above + the
+        // commit message of the Apr 15, 2026 fmp4 → ts switch.
+        "-hls_segment_type".into(), "mpegts".into(),
         "-hls_segment_filename".into(), segment_pattern.to_string_lossy().to_string(),
         // independent_segments: each segment is independently decodable from
         // its own keyframe — required for accurate seeking + segment-boundary

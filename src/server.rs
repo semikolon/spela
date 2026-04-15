@@ -555,18 +555,18 @@ async fn do_play(
                     // Track ffmpeg PID for the post-playback reaper + cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
 
-                    // HLS pre-buffer: wait for the manifest file + the fmp4
-                    // init segment + at least one segment to exist on disk.
-                    // ffmpeg writes the manifest atomically (temp_file flag)
-                    // when adding segments, so when we see seg_00001.m4s it
-                    // is guaranteed to be playable. The ~12 seconds of
-                    // encoded content (2 segments at 6s each) we wait for is
-                    // ~2 seconds of wall time at NVENC's 6x realtime — well
-                    // inside the cast handshake budget.
+                    // HLS pre-buffer: wait for the manifest file + at least
+                    // two MPEG-TS segments to exist on disk. ffmpeg writes
+                    // each segment atomically (temp_file flag) so when we
+                    // see seg_00001.ts it is guaranteed to be playable.
+                    // Waiting for the SECOND segment (not the first) ensures
+                    // at least one segment is fully written and the
+                    // manifest already references it. ~12 seconds of encoded
+                    // content at NVENC's 6x realtime is ~2 seconds of wall
+                    // time — well inside the cast handshake budget.
                     let hls_dir = manifest_path.parent().map(|p| p.to_path_buf())
                         .unwrap_or_else(|| media_dir.join("transcoded_hls"));
-                    let init_path = hls_dir.join("init.mp4");
-                    let first_segment = hls_dir.join("seg_00001.m4s");
+                    let first_segment = hls_dir.join("seg_00001.ts");
                     let prebuffer_timeout_secs: u64 = if intro_path.is_some() { 60 } else { 40 };
                     let prebuffer_deadline = tokio::time::Instant::now()
                         + tokio::time::Duration::from_secs(prebuffer_timeout_secs);
@@ -578,9 +578,9 @@ async fn do_play(
                             );
                             break;
                         }
-                        if manifest_path.exists() && init_path.exists() && first_segment.exists() {
+                        if manifest_path.exists() && first_segment.exists() {
                             tracing::info!(
-                                "HLS pre-buffer ready: manifest + init + seg_00001 exist at {:?}",
+                                "HLS pre-buffer ready: manifest + seg_00001.ts exist at {:?}",
                                 hls_dir
                             );
                             break;
@@ -1658,22 +1658,25 @@ async fn handle_hls_init(
     serve_static_with_range(path, "video/mp4", &headers).await
 }
 
-/// Serve an individual HLS fmp4 segment. The segment name is taken from the
-/// URL path component (`/hls/segment/seg_00042.m4s`) and joined onto
+/// Serve an individual HLS MPEG-TS segment. The segment name is taken from
+/// the URL path component (`/hls/seg_00042.ts`) and joined onto
 /// `transcoded_hls/` after a strict whitelist check that prevents path
-/// traversal: only ASCII alphanumerics, `_`, `-`, and a single `.` are
-/// allowed, and the final extension must be `.m4s`.
+/// traversal: only ASCII alphanumerics, `_`, `-`, and `.` are allowed, the
+/// final extension must be `.ts`, and the total length is capped at 64 chars.
+///
+/// Also accepts `.m4s` for the legacy fmp4 path, kept as dead code for
+/// future use if rust_cast ever exposes `media.hlsSegmentFormat`.
 async fn handle_hls_segment(
     State(state): State<SharedState>,
     axum::extract::Path(segment): axum::extract::Path<String>,
     headers: HeaderMap,
 ) -> axum::response::Response {
     // Path traversal / abuse hardening: reject anything that isn't a tame
-    // segment filename. We want only `seg_NNNNN.m4s` (or similar) to be
+    // segment filename. We want only `seg_NNNNN.ts` (or `.m4s`) to be
     // resolvable through this endpoint.
     let safe = !segment.is_empty()
         && segment.len() <= 64
-        && segment.ends_with(".m4s")
+        && (segment.ends_with(".ts") || segment.ends_with(".m4s"))
         && segment
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
@@ -1686,10 +1689,18 @@ async fn handle_hls_segment(
             .body(axum::body::Body::from("Forbidden"))
             .unwrap();
     }
+    // MPEG-TS segments use the official `video/mp2t` MIME type; legacy fmp4
+    // segments use `video/mp4`. Default Media Receiver accepts both.
+    let content_type: &'static str = if segment.ends_with(".ts") {
+        "video/mp2t"
+    } else {
+        "video/mp4"
+    };
+    tracing::debug!("HLS segment serve: {:?} ({})", segment, content_type);
     let path = resolve_media_dir(&state)
         .join("transcoded_hls")
         .join(&segment);
-    serve_static_with_range(path, "video/mp4", &headers).await
+    serve_static_with_range(path, content_type, &headers).await
 }
 
 /// Serve the current subtitle WebVTT file.
