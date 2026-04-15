@@ -382,8 +382,11 @@ pub async fn transcode_hls(
     // Fredriks TV via direct pychromecast LOAD.
     args.extend([
         "-f".into(), "hls".into(),
-        // Force HLS v3 manifest (no version tag, simpler features).
-        "-hls_version".into(), "3".into(),
+        // No -hls_version flag: ffmpeg's HLS muxer doesn't accept one. The
+        // manifest version is auto-determined by which features get used.
+        // Avoiding `-hls_playlist_type event` and `-hls_flags
+        // independent_segments` (both HLS v6) keeps the output at v3-v4,
+        // which CrKey 1.56 firmware can parse.
         // 6-second segments — Apple's recommended target_duration for HLS,
         // small enough that pre-buffer is fast (~12 seconds of encoded
         // output gives 2 segments, enough for Chromecast to start
