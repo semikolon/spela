@@ -352,8 +352,13 @@ async fn do_play(
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
 
     // --- SMART DISK HYGIENE ---
-    // Proactively prune stale media.
-    disk::prune_disk(&media_dir, &title);
+    // Proactively prune stale media AND enforce the 10 GB cache cap via
+    // LRU pressure eviction. `prune_to_fit` runs the age-based prune first,
+    // then evicts oldest-first if still over cap — so the cap is a
+    // self-maintaining upper bound instead of a hard refusal wall. The
+    // active title is always protected. See `disk::prune_to_fit` for the
+    // full rationale + Apr 15 2026 incident context.
+    disk::prune_to_fit(&media_dir, &title, disk::MAX_MEDIA_MB);
 
     // Local Bypass System: Check if the movie already exists on disk
     let mut server_url = String::new();
@@ -531,14 +536,33 @@ async fn do_play(
 
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
 
-    // Auto-resume from saved position if no explicit seek requested
+    // Auto-resume from saved position if no explicit seek requested.
+    //
+    // Apr 15, 2026 UX fix: explicit `--seek N` (including `--seek 0`) is a
+    // user-intentional action that must BYPASS auto-resume AND CLEAR any
+    // stale high-water-mark. Principle: explicit user actions override
+    // remembered state. Without this, running `spela play 3 --seek 0` to
+    // restart an episode would silently resume at a saved 2236s position
+    // because `save_position_smart`'s HWM logic preserved the old value.
+    // The ONLY clean restart was `spela clear <imdb>` then `spela play 3`.
+    let user_explicitly_set_seek = req.seek_to.is_some();
     let mut seek_to = req.seek_to;
-    if seek_to.is_none() {
+    let mut auto_resumed_from: Option<f64> = None;
+    if user_explicitly_set_seek {
+        let mut app_state = AppState::load(&state.state_dir);
+        let key = app_state.reset_position(req.imdb_id.clone(), req.title.clone());
+        let _ = app_state.save(&state.state_dir);
+        tracing::info!(
+            "Explicit --seek {:?} overrides saved HWM for '{}' (cleared)",
+            req.seek_to, key
+        );
+    } else {
         let app_state = AppState::load(&state.state_dir);
         let pos = app_state.get_position(req.imdb_id.clone(), req.title.clone());
         if pos > 30.0 { // Don't bother resuming if less than 30s in
             tracing::info!("Auto-resume: found saved position for '{}' at {:.0}s", title, pos);
             seek_to = Some(pos);
+            auto_resumed_from = Some(pos);
         }
     }
 
@@ -744,7 +768,17 @@ async fn do_play(
         // Remember the -ss offset so cast_health_monitor can translate the
         // Chromecast's 0-based current_time into absolute source-timeline
         // position when it periodically calls save_position_smart.
-        ss_offset: seek_to.unwrap_or(0.0),
+        //
+        // Apr 15, 2026: this value ONLY applies when we passed `-ss N` to
+        // ffmpeg (the transcoded-HLS path). For non-transcoded streams,
+        // spela calls `cast.seek(pos)` AFTER the cast starts, and the
+        // Chromecast's `current_time` already reflects the seeked position
+        // on its own timeline — adding ss_offset to it would double-count
+        // and produce impossible "absolute" values (this is the bug that
+        // made cast_health_monitor declare 176% of duration and clean up
+        // the stream before it could play). So: ss_offset is only ever
+        // non-zero on a transcoded play whose seek was done via ffmpeg.
+        ss_offset: if is_transcoded { seek_to.unwrap_or(0.0) } else { 0.0 },
     });
     let _ = app_state.save(&state.state_dir);
 
@@ -864,7 +898,11 @@ async fn do_play(
         "target": format!("{}:{}", target, cast_name),
         "title": title,
         "subtitles": has_subtitles,
-        "url": final_url
+        "url": final_url,
+        // Apr 15, 2026: surfaces auto-resume to the CLI / voice-assistant
+        // consumers. Some(pos) when do_play picked up a saved HWM,
+        // None otherwise (fresh start, or explicit --seek that cleared HWM).
+        "resumed_from": auto_resumed_from
     }))
 }
 
@@ -1022,6 +1060,30 @@ pub fn compute_reaper_grace_secs(duration: Option<f64>, ss_offset: f64) -> u64 {
     }
 }
 
+/// Sanity check for cast_health_monitor position saves.
+///
+/// Apr 15, 2026: added after a debug session where Chromecast reported a
+/// phantom 30× jump in `current_time` in a single 60s wall-clock window —
+/// most-likely a stale cast session that survived a spela restart combined
+/// with a new ss_offset from auto-resume. Without this guard, the phantom
+/// reading poisoned the saved HWM and the next play auto-resumed at an
+/// impossible position (e.g. 88% through a brand-new episode).
+///
+/// Allowed: normal playback (delta_abs ≈ delta_wall), 2× playback rate,
+/// plus 60s slack for clock skew and coarse polling cadence.
+///
+/// Blocked: any tick where the apparent absolute position has advanced
+/// by more than `2.0 * delta_wall + 60.0`. Callers SKIP the save on a
+/// suspicious tick and leave the baseline unchanged — a one-off glitch
+/// self-heals on the next tick, a persistent glitch keeps skipping.
+pub fn is_position_jump_suspicious(delta_wall_secs: f64, delta_abs_secs: f64) -> bool {
+    if delta_wall_secs <= 0.0 {
+        // First tick (no baseline) or clock glitch → never suspicious.
+        return false;
+    }
+    delta_abs_secs > 2.0 * delta_wall_secs + 60.0
+}
+
 async fn cast_health_monitor(
     state: SharedState,
     cast_name: String,
@@ -1084,6 +1146,10 @@ async fn cast_health_monitor(
 
     let mut consecutive_failures: u32 = 0;
     let mut last_saved_position: f64 = ss_offset; // Baseline = the -ss we opened with
+    // Wall-clock timestamp of the last ACCEPTED save. Used by the sanity
+    // check in `is_position_jump_suspicious` to distinguish normal playback
+    // advance from stale-Chromecast-state glitches. Apr 15, 2026.
+    let mut last_save_wall: Option<std::time::Instant> = Some(std::time::Instant::now());
     tracing::info!(
         "cast_health_monitor: started for '{}' on '{}' (poll every {}s, fail after {} consecutive idle/error, ss_offset={:.0}s, save every {}s)",
         title_for_log, cast_name, POLL_INTERVAL_SECS, IDLE_FAILURE_THRESHOLD,
@@ -1173,13 +1239,35 @@ async fn cast_health_monitor(
                     if absolute > 30.0
                         && (absolute - last_saved_position).abs() >= POSITION_SAVE_INTERVAL_SECS
                     {
+                        // Apr 15, 2026 sanity check: reject physically-impossible
+                        // position jumps (stale Chromecast state surviving a spela
+                        // restart, etc.). See `is_position_jump_suspicious` for
+                        // threshold rationale.
+                        let now_wall = std::time::Instant::now();
+                        let suspicious = last_save_wall.map_or(false, |prev_wall| {
+                            let delta_wall = now_wall.duration_since(prev_wall).as_secs_f64();
+                            let delta_abs = absolute - last_saved_position;
+                            if is_position_jump_suspicious(delta_wall, delta_abs) {
+                                tracing::warn!(
+                                    "cast_health_monitor: impossible position jump for '{}': +{:.0}s in {:.0}s wall (ratio={:.1}x) — SKIPPING save, likely stale Chromecast state",
+                                    title_for_log,
+                                    delta_abs,
+                                    delta_wall,
+                                    delta_abs / delta_wall.max(0.001)
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        });
+
                         // Don't bother saving if we're already past the NEAR_END threshold
                         // — save_position_smart would just clear the entry, which is
                         // fine, but avoids spurious "clearing" log spam near episode end.
                         let past_end = duration_hint
                             .map(|d| absolute >= d * NEAR_END_FRACTION)
                             .unwrap_or(false);
-                        if !past_end {
+                        if !suspicious && !past_end {
                             let mut app_state = AppState::load(&state.state_dir);
                             let (key, saved) = app_state.save_position_smart(
                                 imdb_id_snapshot.clone(),
@@ -1199,6 +1287,7 @@ async fn cast_health_monitor(
                                         key, absolute, ss_offset
                                     );
                                     last_saved_position = absolute;
+                                    last_save_wall = Some(now_wall);
                                 }
                             }
                         }
@@ -1219,6 +1308,27 @@ async fn cast_health_monitor(
                                 absolute / dur * 100.0,
                                 absolute,
                                 dur
+                            );
+                            // Apr 15, 2026 fix: the `past_end` guard above
+                            // short-circuits the save block, so
+                            // save_position_smart's internal completion reset
+                            // never fires on the last tick. That left a stale
+                            // HWM in state.json — which then auto-resumed the
+                            // NEXT episode of the same TV show at the stale
+                            // position (IMDb-ID collision between episodes,
+                            // now also fixed in state.rs). Belt-and-suspenders:
+                            // explicitly reset the HWM here so even if the
+                            // keying scheme changes again the end-of-episode
+                            // path guarantees a clean state.
+                            let mut app_state = AppState::load(&state.state_dir);
+                            let cleared = app_state.reset_position(
+                                imdb_id_snapshot.clone(),
+                                title_snapshot.clone(),
+                            );
+                            let _ = app_state.save(&state.state_dir);
+                            tracing::info!(
+                                "cast_health_monitor: cleared resume HWM for '{}' at end-of-episode",
+                                cleared
                             );
                             do_cleanup(&state);
                             return;
@@ -2329,6 +2439,57 @@ mod tests {
         // grace = max(0 + 600, 300) = 600 s. Still meaningful.
         let grace = compute_reaper_grace_secs(Some(1800.0), 3600.0);
         assert_eq!(grace, 600);
+    }
+
+    // --- Cast health monitor position-jump sanity check (Apr 15, 2026) ---
+
+    #[test]
+    fn test_position_jump_sanity_normal_playback() {
+        // 30s wall, 30s absolute advance = 1x realtime — fine
+        assert!(!is_position_jump_suspicious(30.0, 30.0));
+        // 5s wall, 5s advance = normal poll cadence
+        assert!(!is_position_jump_suspicious(5.0, 5.0));
+    }
+
+    #[test]
+    fn test_position_jump_sanity_fast_playback() {
+        // 30s wall, 60s absolute advance = 2x realtime — fine (2x double-speed)
+        assert!(!is_position_jump_suspicious(30.0, 60.0));
+        // 30s wall, 120s advance = exactly at the 2×+60s threshold boundary
+        assert!(!is_position_jump_suspicious(30.0, 120.0));
+    }
+
+    #[test]
+    fn test_position_jump_sanity_boundary_just_over() {
+        // 30s wall, 120.1s advance = just over threshold → suspicious
+        assert!(is_position_jump_suspicious(30.0, 120.1));
+    }
+
+    #[test]
+    fn test_position_jump_sanity_impossible_advance() {
+        // The Apr 15 incident scenario: 60s wall, 1796s advance = 30× realtime
+        assert!(is_position_jump_suspicious(60.0, 1796.0));
+        // Even more dramatic: 5s wall, 1000s advance
+        assert!(is_position_jump_suspicious(5.0, 1000.0));
+        // 30s wall, 3478s jump (the second play's phantom reading)
+        assert!(is_position_jump_suspicious(30.0, 3478.0));
+    }
+
+    #[test]
+    fn test_position_jump_sanity_first_tick_allowed() {
+        // delta_wall = 0.0 (first tick, no baseline) → never suspicious.
+        // cast_health_monitor initializes last_save_wall at monitor start,
+        // so this path only fires for clock glitches.
+        assert!(!is_position_jump_suspicious(0.0, 1000.0));
+        assert!(!is_position_jump_suspicious(0.0, 10.0));
+    }
+
+    #[test]
+    fn test_position_jump_sanity_rewind_allowed() {
+        // User seeks backward via /api/seek — delta_abs is negative.
+        // Must never be flagged (negative < positive threshold).
+        assert!(!is_position_jump_suspicious(30.0, -100.0));
+        assert!(!is_position_jump_suspicious(5.0, -5.0));
     }
 
     // --- Range header parsing (the silent Range feature) ---

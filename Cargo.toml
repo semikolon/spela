@@ -23,6 +23,10 @@ dirs = "6"
 tokio-stream = "0.1"
 bytes = "1"
 
+[dev-dependencies]
+# mtime manipulation for disk-prune regression tests (Apr 15, 2026)
+filetime = "0.2"
+
 [profile.release]
 strip = true
 lto = true

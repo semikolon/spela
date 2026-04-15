@@ -421,6 +421,28 @@ fn print_human(val: &Value) {
     // Status
     if let Some(status) = val.get("status").and_then(|v| v.as_str()) {
         println!("Status: {}", status);
+        // Apr 15, 2026: surface auto-resume to the user so nobody is surprised
+        // that a "fresh" play of an episode starts 37 minutes in. `resumed_from`
+        // is only present (non-null) in the `play` response when do_play picked
+        // up a saved HWM.
+        if status == "streaming" {
+            if let Some(resumed) = val.get("resumed_from").and_then(|v| v.as_f64()) {
+                let total = resumed as u64;
+                let h = total / 3600;
+                let m = (total % 3600) / 60;
+                let s = total % 60;
+                if h > 0 {
+                    println!("  ↩ Resuming at {}:{:02}:{:02} (from saved position)", h, m, s);
+                } else {
+                    println!("  ↩ Resuming at {}:{:02} (from saved position)", m, s);
+                }
+            }
+            if let Some(t) = val.get("title").and_then(|v| v.as_str()) {
+                if let Some(target) = val.get("target").and_then(|v| v.as_str()) {
+                    println!("  Playing: {} → {}", t, target);
+                }
+            }
+        }
         if status == "workers_terminated" {
             let webtorrent = val
                 .get("webtorrent_pids")

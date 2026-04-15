@@ -157,12 +157,9 @@ impl AppState {
     /// Returns (key, reset_or_saved).
     /// If duration is provided and t is near the end (>92% or within 300s), resets/clears the position.
     pub fn save_position_smart(&mut self, imdb_id: Option<String>, title: Option<String>, t: f64, duration: Option<f64>) -> (String, bool) {
-        let key = if let Some(id) = imdb_id.as_ref().filter(|s| !s.is_empty()) {
-            id.to_string()
-        } else if let Some(t) = title.as_ref().filter(|s| !s.is_empty()) {
-            slugify(&t)
-        } else {
-            return ("unknown".into(), false);
+        let key = match resume_position_key(imdb_id.as_deref(), title.as_deref()) {
+            Some(k) => k,
+            None => return ("unknown".into(), false),
         };
 
         // --- Completion Logic ---
@@ -176,7 +173,7 @@ impl AppState {
         }
 
         let current = self.resume_positions.get(&key).copied().unwrap_or(0.0);
-        
+
         // --- High-Water Mark Logic ---
         // Only update if we've moved further than before.
         if t > current {
@@ -189,13 +186,7 @@ impl AppState {
 
     /// Load resume position by IMDb ID or Title.
     pub fn get_position(&self, imdb_id: Option<String>, title: Option<String>) -> f64 {
-        if let Some(id) = imdb_id.filter(|s| !s.is_empty()) {
-            if let Some(pos) = self.resume_positions.get(&id) {
-                return *pos;
-            }
-        }
-        if let Some(t) = title.filter(|s| !s.is_empty()) {
-            let key = slugify(&t);
+        if let Some(key) = resume_position_key(imdb_id.as_deref(), title.as_deref()) {
             return self.resume_positions.get(&key).copied().unwrap_or(0.0);
         }
         0.0
@@ -203,17 +194,77 @@ impl AppState {
 
     /// Force reset a resume position (bypasses High-Water Mark).
     pub fn reset_position(&mut self, imdb_id: Option<String>, title: Option<String>) -> String {
-        let key = if let Some(id) = imdb_id.filter(|s| !s.is_empty()) {
-            id
-        } else if let Some(t) = title.filter(|s| !s.is_empty()) {
-            slugify(&t)
-        } else {
-            return "unknown".into();
+        let key = match resume_position_key(imdb_id.as_deref(), title.as_deref()) {
+            Some(k) => k,
+            None => return "unknown".into(),
         };
-
         self.resume_positions.remove(&key);
         key
     }
+}
+
+/// Build the resume-position key for a movie or TV episode.
+///
+/// Apr 15, 2026 fix: TV episodes share the SHOW's imdb_id (e.g. `tt1190634`
+/// is The Boys as a whole, not S05E03 specifically). Keying resume_positions
+/// by raw imdb_id made every episode of the same show collide: finishing
+/// S05E02 near its 92% threshold wrote 3437s under `tt1190634`, and the next
+/// night's S05E03 auto-resume picked up that stale HWM → started the new
+/// episode at minute 57. This helper parses an `SxxExx` marker out of the
+/// title whenever present and appends it to the imdb_id so each episode
+/// gets its own bucket. Movies (no S/E marker) keep the raw imdb_id.
+///
+/// Order of preference:
+///   1. `imdb_id + "_sXXeYY"` when title contains a parseable SxxExx marker
+///   2. `imdb_id` alone when the title has no S/E marker (movie)
+///   3. `slugify(title)` when no imdb_id is available
+///   4. `None` when neither imdb_id nor title is usable
+fn resume_position_key(imdb_id: Option<&str>, title: Option<&str>) -> Option<String> {
+    if let Some(id) = imdb_id.filter(|s| !s.is_empty()) {
+        let suffix = title.and_then(extract_se_suffix).unwrap_or_default();
+        return Some(format!("{}{}", id, suffix));
+    }
+    if let Some(t) = title.filter(|s| !s.is_empty()) {
+        return Some(slugify(t));
+    }
+    None
+}
+
+/// Extract `_sXXeYY` suffix from a TV release title, or `None` if the
+/// title doesn't contain a recognizable SxxExx pattern.
+///
+/// Accepts both zero-padded and unpadded forms (`S05E03`, `S5E3`, `s5e03`).
+/// Returns a canonical zero-padded suffix for consistent keying across
+/// different release-name conventions.
+fn extract_se_suffix(title: &str) -> Option<String> {
+    let lower = title.to_lowercase();
+    let bytes = lower.as_bytes();
+    let n = bytes.len();
+    // Walk the string scanning for `s<digits>e<digits>` patterns. We want
+    // the FIRST occurrence — scene release names sometimes have a year that
+    // includes digits, but the SxxExx marker comes after the show name in
+    // torrent naming conventions and is unambiguous once we anchor on 's'.
+    let mut i = 0;
+    while i + 3 < n {
+        if bytes[i] == b's' && bytes[i + 1].is_ascii_digit() {
+            // Require a word boundary before the 's' to avoid matching the
+            // 's' at the end of a show name like "Lost".
+            let boundary_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            if boundary_ok {
+                let mut j = i + 1;
+                while j < n && bytes[j].is_ascii_digit() { j += 1; }
+                if j < n && bytes[j] == b'e' && j + 1 < n && bytes[j + 1].is_ascii_digit() {
+                    let mut k = j + 1;
+                    while k < n && bytes[k].is_ascii_digit() { k += 1; }
+                    let season: u32 = lower[i + 1..j].parse().ok()?;
+                    let episode: u32 = lower[j + 1..k].parse().ok()?;
+                    return Some(format!("_s{:02}e{:02}", season, episode));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Simple slugify for title-based keys.
@@ -260,6 +311,92 @@ mod tests {
         let (key, saved) = state.save_position_smart(None, title.clone(), 480.0, Some(duration));
         assert!(saved);
         assert_eq!(state.resume_positions.get(&key), None); // Should be cleared!
+    }
+
+    /// Apr 15, 2026 regression pin: TV episodes of the SAME show (sharing an
+    /// imdb_id) must not collide in resume_positions. This is the bug that
+    /// made S05E03 auto-resume at minute 57 because S05E02's final save
+    /// used the same `tt1190634` key. Fixed by appending `_sXXeYY` suffix
+    /// parsed from the release title.
+    #[test]
+    fn test_tv_episodes_do_not_collide_on_shared_imdb_id() {
+        let mut state = AppState::default();
+        let show_id = Some("tt1190634".to_string()); // The Boys
+
+        // Save S05E02 at minute 57 (close to end but not yet 92%)
+        let dur = 3753.0; // ~63 min episode
+        let (s02_key, _) = state.save_position_smart(
+            show_id.clone(),
+            Some("The Boys S05E02".to_string()),
+            3437.0,
+            Some(dur),
+        );
+
+        // Save S05E03 at minute 2 of a 66-min episode
+        let (s03_key, _) = state.save_position_smart(
+            show_id.clone(),
+            Some("The Boys S05E03".to_string()),
+            120.0,
+            Some(3947.0),
+        );
+
+        // Keys MUST be different — otherwise one save overwrites the other.
+        assert_ne!(s02_key, s03_key);
+        assert!(s02_key.contains("s05e02"), "S02 key missing suffix: {s02_key}");
+        assert!(s03_key.contains("s05e03"), "S03 key missing suffix: {s03_key}");
+
+        // Both positions must be independently retrievable
+        let s02_pos = state.get_position(show_id.clone(), Some("The Boys S05E02".to_string()));
+        let s03_pos = state.get_position(show_id.clone(), Some("The Boys S05E03".to_string()));
+        assert_eq!(s02_pos, 3437.0);
+        assert_eq!(s03_pos, 120.0);
+
+        // Resetting one must NOT affect the other
+        state.reset_position(show_id.clone(), Some("The Boys S05E02".to_string()));
+        let s02_after = state.get_position(show_id.clone(), Some("The Boys S05E02".to_string()));
+        let s03_after = state.get_position(show_id.clone(), Some("The Boys S05E03".to_string()));
+        assert_eq!(s02_after, 0.0, "S02 should be cleared");
+        assert_eq!(s03_after, 120.0, "S03 must survive S02's reset");
+    }
+
+    /// Movies (no SxxExx in title) keep using the raw imdb_id as key, so
+    /// the bug fix for TV shows doesn't regress movie behavior.
+    #[test]
+    fn test_movies_use_raw_imdb_id_key() {
+        let key = resume_position_key(Some("tt10548174"), Some("28 Years Later (2025)")).unwrap();
+        assert_eq!(key, "tt10548174");
+
+        // Same id + different marketing titles → same key (correct for movies)
+        let key_alt = resume_position_key(Some("tt10548174"), Some("28 Years Later — Extended")).unwrap();
+        assert_eq!(key, key_alt);
+    }
+
+    /// extract_se_suffix test corpus — handle all the real naming conventions
+    /// spela encounters from Torrentio (playWEB, FLUX, etc.) plus edge cases.
+    #[test]
+    fn test_extract_se_suffix_variants() {
+        // Zero-padded forms (most common)
+        assert_eq!(extract_se_suffix("The Boys S05E03 Every One of You Sons of Bitches"),
+                   Some("_s05e03".to_string()));
+        assert_eq!(extract_se_suffix("The.Boys.S05E02.Teenage.Kix.1080p"),
+                   Some("_s05e02".to_string()));
+        // Case-insensitive
+        assert_eq!(extract_se_suffix("the.boys.s05e03.flux"), Some("_s05e03".to_string()));
+        // Unpadded single-digit forms — normalize to 2-digit
+        assert_eq!(extract_se_suffix("Lost S1E1 Pilot"), Some("_s01e01".to_string()));
+        // Double-digit episodes
+        assert_eq!(extract_se_suffix("Show S1E12 Finale"), Some("_s01e12".to_string()));
+        // Space-separated (playWEB-style release names)
+        assert_eq!(extract_se_suffix("The Boys S05E03 Every One"), Some("_s05e03".to_string()));
+        // No SxxExx marker → None
+        assert_eq!(extract_se_suffix("28 Years Later (2025)"), None);
+        assert_eq!(extract_se_suffix("The Matrix 1999 1080p"), None);
+        // Empty string
+        assert_eq!(extract_se_suffix(""), None);
+        // Word-boundary guard: "ses" should NOT trigger on the trailing 's'
+        // (this was a real pitfall in earlier drafts — "Loses"/"Dragons" etc).
+        assert_eq!(extract_se_suffix("Dragons S05E01"), Some("_s05e01".to_string()));
+        assert_eq!(extract_se_suffix("NoSeOrEHere"), None);
     }
 
     /// CurrentStream.ss_offset must round-trip through JSON without loss.
