@@ -188,8 +188,10 @@ impl SearchEngine {
             },
         };
 
-        // Step 3: Torrentio lookup
-        let results = self.torrentio_streams(&imdb_id, Some(s), Some(e)).await?;
+        // Step 3: Torrentio lookup (filtered by show title to drop spurious
+        // cross-show results — the Apr 15 "French Chef for The Boys S05E03"
+        // incident).
+        let results = self.torrentio_streams(&imdb_id, &show_info.title, Some(s), Some(e)).await?;
         Ok(SearchResult {
             query: query.into(),
             show: Some(show_info),
@@ -233,7 +235,7 @@ impl SearchEngine {
             }),
         };
 
-        let results = self.torrentio_streams(&imdb_id, None, None).await?;
+        let results = self.torrentio_streams(&imdb_id, &show_info.title, None, None).await?;
         Ok(SearchResult {
             query: query.into(),
             show: Some(show_info),
@@ -273,7 +275,7 @@ impl SearchEngine {
         Ok(self.client.get(&url).send().await?.json().await?)
     }
 
-    async fn torrentio_streams(&self, imdb_id: &str, season: Option<u32>, episode: Option<u32>) -> Result<Vec<TorrentResult>> {
+    async fn torrentio_streams(&self, imdb_id: &str, show_title: &str, season: Option<u32>, episode: Option<u32>) -> Result<Vec<TorrentResult>> {
         let path = match (season, episode) {
             (Some(s), Some(e)) => format!("stream/series/{}:{}:{}.json", imdb_id, s, e),
             _ => format!("stream/movie/{}.json", imdb_id),
@@ -289,7 +291,7 @@ impl SearchEngine {
             .await?;
 
         let streams = resp["streams"].as_array().cloned().unwrap_or_default();
-        let mut results: Vec<TorrentResult> = streams.iter().map(|s| {
+        let results: Vec<TorrentResult> = streams.iter().map(|s| {
             let title_text = s["title"].as_str().unwrap_or("");
             let meta = parse_torrentio_title(title_text);
             let quality = s["name"].as_str().unwrap_or("")
@@ -313,6 +315,12 @@ impl SearchEngine {
             }
         }).collect();
 
+        // Filter spurious cross-show results BEFORE ranking, so result IDs
+        // assigned by rank_results_mut reflect only legitimate matches.
+        // Apr 15 incident: Torrentio returned "The.French.Chef.Season.05.03of20"
+        // as a top-seeded candidate for a `The Boys` S05E03 query (IMDb-ID
+        // routed, no cross-show data should have been possible — but it was).
+        let mut results = filter_results_by_show_title(results, show_title);
         rank_results_mut(&mut results);
         Ok(results.into_iter().take(8).collect())
     }
@@ -424,6 +432,71 @@ pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
     for (i, r) in results.iter_mut().enumerate() {
         r.id = i + 1;
     }
+}
+
+/// Drop torrent results whose title doesn't contain all significant tokens
+/// from the requested show's name. Apr 15, 2026 fix for the "French Chef
+/// for The Boys S05E03" incident where Torrentio's IMDb-ID-routed endpoint
+/// returned a completely different show's release as a top-seeded candidate.
+/// Safety net: if filtering would drop ALL results, the unfiltered list is
+/// returned instead (user gets SOMETHING to play, with a warning log).
+///
+/// Matching is token-based with stop-word filtering:
+/// - Lowercased, split on non-alphanumerics.
+/// - Common English articles / prepositions (`the`, `a`, `of`, etc.) are
+///   dropped — "The Boys" has only `boys` as a significant token; "Game
+///   of Thrones" has `game` and `thrones`.
+/// - All significant tokens must appear somewhere in the result's title
+///   string (substring match on the lowercased title).
+///
+/// Edge cases:
+/// - Empty significant-token set (show title was all stop words): no
+///   filter applied, returns the full list.
+/// - Filter drops everything: returns the full list with a warning,
+///   because "some spurious results" is less bad than "no results at all".
+fn filter_results_by_show_title(results: Vec<TorrentResult>, show_title: &str) -> Vec<TorrentResult> {
+    let tokens = extract_significant_tokens(show_title);
+    if tokens.is_empty() {
+        return results;
+    }
+    let (matching, dropped): (Vec<_>, Vec<_>) = results.into_iter().partition(|r| {
+        let lower = r.title.to_lowercase();
+        tokens.iter().all(|t| lower.contains(t.as_str()))
+    });
+    if matching.is_empty() && !dropped.is_empty() {
+        tracing::warn!(
+            "Show-title filter dropped all {} Torrentio result(s) for tokens {:?} — returning unfiltered (user will see mixed results)",
+            dropped.len(), tokens
+        );
+        return dropped;
+    }
+    if !dropped.is_empty() {
+        tracing::info!(
+            "Show-title filter dropped {} cross-show result(s) not matching {:?}",
+            dropped.len(), tokens
+        );
+    }
+    matching
+}
+
+/// Extract the significant (non-stop-word) tokens from a show title.
+/// Used by `filter_results_by_show_title`.
+///
+/// Stop words are English articles + common prepositions that appear
+/// in scene release naming but don't help identify a specific show:
+/// `the`, `a`, `an`, `of`, `and`, `in`, `on`, `to`, `at`, `is`.
+/// Everything else after lowercasing + splitting on non-alphanumeric is
+/// kept as a required token.
+fn extract_significant_tokens(title: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "the", "a", "an", "of", "and", "in", "on", "to", "at", "is",
+    ];
+    title
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !STOP_WORDS.contains(w))
+        .map(String::from)
+        .collect()
 }
 
 /// Classify a torrent title into a resolution bucket. Lower is better.
@@ -796,6 +869,137 @@ mod tests {
     // These tests use the extracted `rank_results_mut` so they track
     // production exactly. Older tests above still inline the sort closure
     // (legacy tech debt); new tests should all go through `rank_results_mut`.
+
+    // --- Show-title filter for spurious Torrentio results (Apr 15, 2026) ---
+
+    #[test]
+    fn test_extract_significant_tokens_strips_stop_words() {
+        assert_eq!(
+            extract_significant_tokens("The Boys"),
+            vec!["boys".to_string()]
+        );
+        assert_eq!(
+            extract_significant_tokens("Game of Thrones"),
+            vec!["game".to_string(), "thrones".to_string()]
+        );
+        assert_eq!(
+            extract_significant_tokens("The Lord of the Rings"),
+            vec!["lord".to_string(), "rings".to_string()]
+        );
+        // No stop words at all
+        assert_eq!(
+            extract_significant_tokens("Breaking Bad"),
+            vec!["breaking".to_string(), "bad".to_string()]
+        );
+        // Single significant token
+        assert_eq!(extract_significant_tokens("Lost"), vec!["lost".to_string()]);
+        // Punctuation split
+        assert_eq!(
+            extract_significant_tokens("Dr. Who"),
+            vec!["dr".to_string(), "who".to_string()]
+        );
+        // Empty
+        assert_eq!(extract_significant_tokens(""), Vec::<String>::new());
+        // All stop words (edge case — filter should be skipped)
+        assert_eq!(extract_significant_tokens("The"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_filter_drops_french_chef_for_the_boys_query() {
+        // The Apr 15 live incident: searching "The Boys" S05E03 returned
+        // a French Chef release as the top-seeded candidate. Token filter
+        // must drop it because "boys" (the only significant token of
+        // "The Boys") doesn't appear in the French Chef filename.
+        let results = vec![
+            make_result(
+                1,
+                "The.French.Chef.Season.05.03of20.Queen.of.Sheba.Cake.WEB-DL.x264.AAC.mp4",
+                820,
+                Some(0),
+            ),
+            make_result(
+                2,
+                "The.Boys.S05E03.Every.One.of.You.Sons.of.Bitches.1080p.AMZN.WEB-DL.H264.FLUX.mkv",
+                513,
+                Some(0),
+            ),
+        ];
+        let filtered = filter_results_by_show_title(results, "The Boys");
+        assert_eq!(filtered.len(), 1, "French Chef should have been dropped");
+        assert!(
+            filtered[0].title.contains("Boys"),
+            "Remaining result should be the Boys release. Got: {:?}",
+            filtered[0].title
+        );
+    }
+
+    #[test]
+    fn test_filter_fallback_when_everything_would_be_dropped() {
+        // Safety net: if token filtering would leave zero results, return
+        // the unfiltered list instead (with a warning). Better to give the
+        // user SOMETHING to play than nothing at all.
+        let results = vec![
+            make_result(1, "Nothing.Matches.The.Query.mkv", 100, Some(0)),
+            make_result(2, "Another.Release.mkv", 50, Some(0)),
+        ];
+        let filtered = filter_results_by_show_title(results, "Breaking Bad");
+        assert_eq!(
+            filtered.len(),
+            2,
+            "Filter should fall back to unfiltered when it would drop everything"
+        );
+    }
+
+    #[test]
+    fn test_filter_empty_token_set_returns_unfiltered() {
+        // Show title that's all stop words (extremely unlikely, but
+        // extract_significant_tokens might return empty). Filter should
+        // skip itself rather than explode or drop everything.
+        let results = vec![make_result(1, "Some.Random.Release.mkv", 100, Some(0))];
+        let filtered = filter_results_by_show_title(results, "The");
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_multi_word_show_requires_all_significant_tokens() {
+        // "Game of Thrones" → significant tokens [game, thrones]. A
+        // release named "Game of Hearts" should be dropped (has "game"
+        // but not "thrones"). A release named "Game.of.Thrones.S01E01"
+        // should be kept.
+        let results = vec![
+            make_result(1, "Game.of.Thrones.S01E01.1080p.mkv", 500, Some(0)),
+            make_result(2, "Game.of.Hearts.S01E01.mkv", 500, Some(0)),
+        ];
+        let filtered = filter_results_by_show_title(results, "Game of Thrones");
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].title.contains("Thrones"));
+    }
+
+    #[test]
+    fn test_filter_passes_through_case_insensitive() {
+        // Release names use varying case; match must be case-insensitive.
+        let results = vec![make_result(1, "THE.BOYS.S05E03.1080P.MKV", 100, Some(0))];
+        let filtered = filter_results_by_show_title(results, "The Boys");
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_handles_separator_variants() {
+        // Torrent filenames use dots/spaces/dashes/underscores. Since
+        // match is substring on lowercased title, `boys` should match in
+        // any separator layout.
+        let cases = vec![
+            "The.Boys.S05E03.FLUX.mkv",
+            "The Boys S05E03 FLUX.mkv",
+            "The-Boys-S05E03-FLUX.mkv",
+            "The_Boys_S05E03_FLUX.mkv",
+        ];
+        for c in cases {
+            let results = vec![make_result(1, c, 100, Some(0))];
+            let filtered = filter_results_by_show_title(results, "The Boys");
+            assert_eq!(filtered.len(), 1, "failed to keep {:?}", c);
+        }
+    }
 
     #[test]
     fn test_resolution_tier_ordering_v31_policy() {
