@@ -335,7 +335,13 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
         Commands::Pause => Ok(client.post(format!("{}/pause", base)).send().await?.json().await?),
         Commands::Resume => Ok(client.post(format!("{}/resume", base)).send().await?.json().await?),
         Commands::Seek { seconds } => {
-            Ok(client.get(format!("{}/seek?t={}", base, seconds)).send().await?.json().await?)
+            // Server's /seek route is POST + JSON body (SeekRequest { t, seconds }).
+            // Previously this CLI sent `GET /seek?t=N` which hit a 405 Method Not
+            // Allowed → reqwest tried to parse the 405 body as JSON → user saw
+            // "error decoding response body" with no indication the endpoint shape
+            // was wrong. Apr 15, 2026 regression — fixed by matching the server.
+            let body = serde_json::json!({"t": seconds});
+            Ok(client.post(format!("{}/seek", base)).json(&body).send().await?.json().await?)
         }
         Commands::Volume { level } => {
             let body = serde_json::json!({"level": level});
