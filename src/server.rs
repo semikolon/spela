@@ -86,10 +86,17 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/config", get(handle_get_config).post(handle_set_config))
         .route("/cast-info", post(handle_cast_info))
         .route("/stream/transcode", get(handle_transcode_stream))
-        // HLS streaming endpoints (Apr 15, 2026 rework — proper Chromecast support)
+        // HLS streaming endpoints (Apr 15, 2026 rework — proper Chromecast support).
+        // The route layout MUST match the URLs the HLS manifest produces:
+        // ffmpeg's HLS muxer emits relative segment paths (e.g. `seg_00000.m4s`),
+        // which Chromecast resolves against the manifest URL. Manifest is at
+        // /hls/playlist.m3u8 → segments resolve to /hls/seg_00000.m4s, so the
+        // segment route must live directly at /hls/{segment}, NOT /hls/segment/{segment}.
+        // axum 0.8's matchit router gives literal routes (playlist.m3u8 / init.mp4)
+        // precedence over the {segment} capture, so they don't collide.
         .route("/hls/playlist.m3u8", get(handle_hls_playlist))
         .route("/hls/init.mp4", get(handle_hls_init))
-        .route("/hls/segment/{segment}", get(handle_hls_segment))
+        .route("/hls/{segment}", get(handle_hls_segment))
         // Custom Cast Receiver endpoints
         .route("/cast-receiver.html", get(handle_cast_receiver_html))
         .route("/cast-receiver/intro.mp4", get(handle_cast_receiver_intro))
