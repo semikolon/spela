@@ -1640,18 +1640,25 @@ async fn handle_hls_playlist(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> axum::response::Response {
+    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("?");
+    let range = headers.get("range").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    tracing::info!("HLS manifest hit: ua={:?} range={:?}", ua, range);
     let path = resolve_media_dir(&state)
         .join("transcoded_hls")
         .join("playlist.m3u8");
     serve_static_with_range(path, "application/vnd.apple.mpegurl", &headers).await
 }
 
-/// Serve the HLS fmp4 init segment (moov box). Always one file named
-/// `init.mp4`, referenced from the manifest's `EXT-X-MAP` line.
+/// Serve the HLS fmp4 init segment (moov box). Only used for the legacy
+/// fmp4 path. With the Apr 15, 2026 switch to MPEG-TS segments this is a
+/// 404 (no file) for any new play, kept registered for the legacy fmp4
+/// fallback path.
 async fn handle_hls_init(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> axum::response::Response {
+    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("?");
+    tracing::info!("HLS init.mp4 hit: ua={:?}", ua);
     let path = resolve_media_dir(&state)
         .join("transcoded_hls")
         .join("init.mp4");
@@ -1696,7 +1703,12 @@ async fn handle_hls_segment(
     } else {
         "video/mp4"
     };
-    tracing::debug!("HLS segment serve: {:?} ({})", segment, content_type);
+    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("?");
+    let range = headers.get("range").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    tracing::info!(
+        "HLS segment hit: {} ({}) ua={:?} range={:?}",
+        segment, content_type, ua, range
+    );
     let path = resolve_media_dir(&state)
         .join("transcoded_hls")
         .join(&segment);
