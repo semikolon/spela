@@ -1199,6 +1199,7 @@ async fn cast_health_monitor(
                     player_state_upper.as_str(),
                     "IDLE" | "UNKNOWN" | ""
                 );
+                let is_buffering = player_state_upper == "BUFFERING";
 
                 if is_dead {
                     consecutive_failures += 1;
@@ -1206,10 +1207,20 @@ async fn cast_health_monitor(
                         "cast_health_monitor: '{}' player_state={} ({}/{} consecutive idle polls before cleanup)",
                         title_for_log, info.player_state, consecutive_failures, IDLE_FAILURE_THRESHOLD
                     );
+                } else if is_buffering {
+                    // Apr 18: Treat prolonged BUFFERING (spinner) as a failure.
+                    // Brief buffering (1-2 polls) is normal during transcode.
+                    // Prolonged buffering (6+ polls = 30s) means the Chromecast
+                    // is stuck and won't recover without a re-cast.
+                    consecutive_failures += 1;
+                    tracing::warn!(
+                        "cast_health_monitor: '{}' BUFFERING ({}/{} consecutive polls before re-cast)",
+                        title_for_log, consecutive_failures, IDLE_FAILURE_THRESHOLD
+                    );
                 } else {
                     if consecutive_failures > 0 {
                         tracing::info!(
-                            "cast_health_monitor: '{}' recovered: player_state={} (was idle {} polls)",
+                            "cast_health_monitor: '{}' recovered: player_state={} (was failing {} polls)",
                             title_for_log, info.player_state, consecutive_failures
                         );
                     }
