@@ -194,10 +194,29 @@ pub fn resolve_subtitle_path_for_seek(
 }
 
 /// Detect audio/video codecs and duration of a media URL/file using ffprobe.
-/// Returns (video_codec, audio_codec, duration_secs).
-pub async fn detect_codecs(url: &str) -> Result<(Option<String>, Option<String>, Option<f64>)> {
+/// Codec detection result with preferred audio stream index.
+pub struct CodecInfo {
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub duration: Option<f64>,
+    /// ffmpeg audio stream specifier for the preferred (English) audio track.
+    /// e.g., "0:a:1" for the second audio stream. Falls back to "0:a:0" if
+    /// no English track found. Used in -map and filter_complex references.
+    pub audio_stream: String,
+    /// The audio-only index (0-based among audio streams, for filter refs).
+    pub audio_index: usize,
+}
+
+/// Detect video/audio codecs, duration, and preferred English audio stream.
+pub async fn detect_codecs(url: &str) -> Result<CodecInfo> {
     let output = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name", "-show_entries", "format=duration", url])
+        .args([
+            "-v", "error",
+            "-show_entries", "stream=codec_type,codec_name,index",
+            "-show_entries", "stream_tags=language",
+            "-show_entries", "format=duration",
+            url,
+        ])
         .output()
         .await?;
 
@@ -208,18 +227,57 @@ pub async fn detect_codecs(url: &str) -> Result<(Option<String>, Option<String>,
     let mut video_codec = None;
     let mut audio_codec = None;
     let mut duration = None;
-    let mut current_type = None;
+    let mut current_type: Option<String> = None;
+    let mut current_lang: Option<String> = None;
+
+    // Collect all audio streams with their language tags
+    struct AudioStream { audio_index: usize, codec: String, lang: String }
+    let mut audio_streams: Vec<AudioStream> = Vec::new();
+    let mut audio_count = 0usize;
 
     for line in combined.lines() {
+        if line.starts_with("[STREAM]") {
+            current_type = None;
+            current_lang = None;
+        }
         if let Some(ct) = line.strip_prefix("codec_type=") {
             current_type = Some(ct.trim().to_string());
         }
         if let Some(cn) = line.strip_prefix("codec_name=") {
             match current_type.as_deref() {
-                Some("video") if video_codec.is_none() => video_codec = Some(cn.trim().to_string()),
-                Some("audio") if audio_codec.is_none() => audio_codec = Some(cn.trim().to_string()),
+                Some("video") if video_codec.is_none() => {
+                    video_codec = Some(cn.trim().to_string());
+                }
+                Some("audio") => {
+                    let codec = cn.trim().to_string();
+                    if audio_codec.is_none() {
+                        audio_codec = Some(codec.clone());
+                    }
+                    // We'll finalize the AudioStream at [/STREAM]
+                    // For now just note the codec
+                    current_lang = current_lang.or(Some(String::new()));
+                    // Temporarily store codec in current_lang's place
+                    // Actually, let's collect at [/STREAM]
+                }
                 _ => {}
             }
+        }
+        if let Some(lang) = line.strip_prefix("TAG:language=") {
+            current_lang = Some(lang.trim().to_lowercase());
+        }
+        if line.starts_with("[/STREAM]") {
+            if current_type.as_deref() == Some("audio") {
+                let codec = audio_codec.clone().unwrap_or_default();
+                let lang = current_lang.take().unwrap_or_default();
+                audio_streams.push(AudioStream {
+                    audio_index: audio_count,
+                    codec: codec,
+                    lang,
+                });
+                audio_count += 1;
+            }
+            current_type = None;
+            current_lang = None;
         }
         if let Some(dur) = line.strip_prefix("duration=") {
             if let Ok(d) = dur.trim().parse::<f64>() {
@@ -228,7 +286,26 @@ pub async fn detect_codecs(url: &str) -> Result<(Option<String>, Option<String>,
         }
     }
 
-    Ok((video_codec, audio_codec, duration))
+    // Pick preferred audio: first English track, else first track
+    let preferred = audio_streams.iter()
+        .find(|a| a.lang == "eng" || a.lang == "en")
+        .or_else(|| audio_streams.first());
+
+    let (audio_index, preferred_codec) = match preferred {
+        Some(a) => {
+            tracing::info!("Preferred audio: stream a:{} lang={} codec={}", a.audio_index, a.lang, a.codec);
+            (a.audio_index, Some(a.codec.clone()))
+        }
+        None => (0, audio_codec.clone()),
+    };
+
+    Ok(CodecInfo {
+        video_codec,
+        audio_codec: preferred_codec.or(audio_codec),
+        duration,
+        audio_stream: format!("0:a:{}", audio_index),
+        audio_index,
+    })
 }
 
 /// Returns true if the audio codec needs transcoding for Chromecast.
@@ -270,6 +347,7 @@ pub async fn transcode(
     intro_path: Option<&Path>,
     video_reencode: bool,
     seek_to: Option<f64>,
+    audio_index: usize,
 ) -> Result<(PathBuf, u32)> {
     let output_path = media_dir.join("transcoded_aac.mp4");
     let has_intro = intro_path.is_some();
@@ -318,7 +396,7 @@ pub async fn transcode(
 
         // Intro: scale + ensure compatible format
         filter.push_str("[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v0]; ");
-        filter.push_str("[0:a]aresample=48000[a0]; ");
+        filter.push_str("[0:a:0]aresample=48000[a0]; ");  // Intro always has one audio track
 
         // Main stream: scale + optional subtitles
         if has_subs {
@@ -334,7 +412,7 @@ pub async fn transcode(
                 main_idx
             ));
         }
-        filter.push_str(&format!("[{}:a]aresample=48000[a1]; ", main_idx));
+        filter.push_str(&format!("[{}:a:{}]aresample=48000[a1]; ", main_idx, audio_index));
 
         // Concat
         filter.push_str("[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]");
@@ -347,26 +425,32 @@ pub async fn transcode(
             "-preset".into(), "p4".into(),
             "-cq".into(), "23".into(),
         ]);
-    } else if has_subs {
-        // No intro, but subtitles — NVENC re-encode
-        let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
-            .replace(':', "\\:");
-        args.extend([
-            "-vf".into(), format!("subtitles='{}'", srt_str),
-            "-c:v".into(), "h264_nvenc".into(),
-            "-preset".into(), "p4".into(),
-            "-cq".into(), "23".into(),
-        ]);
-    } else if video_reencode {
-        // No intro, no subs, but video needs re-encoding (HEVC→H.264)
-        args.extend([
-            "-c:v".into(), "h264_nvenc".into(),
-            "-preset".into(), "p4".into(),
-            "-cq".into(), "23".into(),
-        ]);
     } else {
-        // No intro, no subs, compatible video — video copy (cheapest path)
-        args.extend(["-c:v".into(), "copy".into()]);
+        // No intro: explicitly map video + preferred audio track.
+        // Without -map, ffmpeg picks the DEFAULT audio (could be Russian).
+        args.extend([
+            "-map".into(), "0:v:0".into(),
+            "-map".into(), format!("0:a:{}", audio_index),
+        ]);
+
+        if has_subs {
+            let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
+                .replace(':', "\\:");
+            args.extend([
+                "-vf".into(), format!("subtitles='{}'", srt_str),
+                "-c:v".into(), "h264_nvenc".into(),
+                "-preset".into(), "p4".into(),
+                "-cq".into(), "23".into(),
+            ]);
+        } else if video_reencode {
+            args.extend([
+                "-c:v".into(), "h264_nvenc".into(),
+                "-preset".into(), "p4".into(),
+                "-cq".into(), "23".into(),
+            ]);
+        } else {
+            args.extend(["-c:v".into(), "copy".into()]);
+        }
     }
 
     args.extend([
@@ -448,6 +532,7 @@ pub async fn transcode_hls(
     intro_path: Option<&Path>,
     video_reencode: bool,
     seek_to: Option<f64>,
+    audio_index: usize,
 ) -> Result<(PathBuf, u32)> {
     let hls_dir = media_dir.join("transcoded_hls");
 
@@ -524,7 +609,7 @@ pub async fn transcode_hls(
     if has_intro {
         let mut filter = String::new();
         filter.push_str("[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v0]; ");
-        filter.push_str("[0:a]aresample=48000[a0]; ");
+        filter.push_str("[0:a:0]aresample=48000[a0]; ");  // Intro always has one audio track
         if has_subs {
             let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
                 .replace(':', "\\:");
@@ -538,7 +623,7 @@ pub async fn transcode_hls(
                 main_idx
             ));
         }
-        filter.push_str(&format!("[{}:a]aresample=48000[a1]; ", main_idx));
+        filter.push_str(&format!("[{}:a:{}]aresample=48000[a1]; ", main_idx, audio_index));
         filter.push_str("[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]");
         args.extend([
             "-filter_complex".into(), filter,
@@ -548,24 +633,31 @@ pub async fn transcode_hls(
             "-preset".into(), "p4".into(),
             "-cq".into(), "23".into(),
         ]);
-    } else if has_subs {
-        let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
-            .replace(':', "\\:");
-        args.extend([
-            "-vf".into(), format!("subtitles='{}'", srt_str),
-            "-c:v".into(), "h264_nvenc".into(),
-            "-preset".into(), "p4".into(),
-            "-cq".into(), "23".into(),
-        ]);
-    } else if video_reencode {
-        args.extend([
-            "-c:v".into(), "h264_nvenc".into(),
-            "-preset".into(), "p4".into(),
-            "-cq".into(), "23".into(),
-        ]);
     } else {
-        // H.264 video can be stream-copied — fastest path
-        args.extend(["-c:v".into(), "copy".into()]);
+        // No intro: explicitly map video + preferred audio track.
+        args.extend([
+            "-map".into(), "0:v:0".into(),
+            "-map".into(), format!("0:a:{}", audio_index),
+        ]);
+
+        if has_subs {
+            let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
+                .replace(':', "\\:");
+            args.extend([
+                "-vf".into(), format!("subtitles='{}'", srt_str),
+                "-c:v".into(), "h264_nvenc".into(),
+                "-preset".into(), "p4".into(),
+                "-cq".into(), "23".into(),
+            ]);
+        } else if video_reencode {
+            args.extend([
+                "-c:v".into(), "h264_nvenc".into(),
+                "-preset".into(), "p4".into(),
+                "-cq".into(), "23".into(),
+            ]);
+        } else {
+            args.extend(["-c:v".into(), "copy".into()]);
+        }
     }
 
     args.extend([

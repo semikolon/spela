@@ -578,10 +578,19 @@ async fn do_play(
     let no_intro = req.no_intro.unwrap_or(false);
     let intro_path = if no_intro { None } else { transcode::find_intro() };
 
-    let (video_codec, audio_codec, source_duration) = transcode::detect_codecs(&server_url).await
-        .unwrap_or((None, None, None));
+    let codec_info = transcode::detect_codecs(&server_url).await
+        .unwrap_or(transcode::CodecInfo {
+            video_codec: None, audio_codec: None, duration: None,
+            audio_stream: "0:a:0".to_string(), audio_index: 0,
+        });
+    let video_codec = codec_info.video_codec;
+    let audio_codec = codec_info.audio_codec;
+    let source_duration = codec_info.duration;
+    let audio_stream = codec_info.audio_stream.clone();
+    let audio_index = codec_info.audio_index;
     if let Some(dur) = source_duration {
-        tracing::info!("Source duration: {:.0}s ({:.0} min)", dur, dur / 60.0);
+        tracing::info!("Source duration: {:.0}s ({:.0} min), preferred audio: {} (index {})",
+                      dur, dur / 60.0, audio_stream, audio_index);
     }
 
     let need_audio_tc = audio_codec.as_deref().map_or(false, transcode::audio_needs_transcode);
@@ -604,7 +613,7 @@ async fn do_play(
         // served via /hls/playlist.m3u8 with proper Content-Length + Range).
         // See ~/Projects/spela/TODO.md § "Cast Pipeline Rework" for the full
         // trade-off analysis.
-        match transcode::transcode_hls(&server_url, &media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to).await {
+        match transcode::transcode_hls(&server_url, &media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to, audio_index).await {
                 Ok((manifest_path, ffmpeg_pid)) => {
                     // Track ffmpeg PID for the post-playback reaper + cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
