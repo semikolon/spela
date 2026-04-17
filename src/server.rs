@@ -618,33 +618,46 @@ async fn do_play(
                     // Track ffmpeg PID for the post-playback reaper + cleanup
                     *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
 
-                    // HLS pre-buffer: wait for the manifest file + at least
-                    // two MPEG-TS segments to exist on disk. ffmpeg writes
-                    // each segment atomically (temp_file flag) so when we
-                    // see seg_00001.ts it is guaranteed to be playable.
-                    // Waiting for the SECOND segment (not the first) ensures
-                    // at least one segment is fully written and the
-                    // manifest already references it. ~12 seconds of encoded
-                    // content at NVENC's 6x realtime is ~2 seconds of wall
-                    // time — well inside the cast handshake budget.
+                    // HLS pre-buffer: wait for the manifest + enough segments
+                    // to survive the Chromecast's initial read-ahead burst.
+                    //
+                    // Apr 18, 2026 root cause fix: waiting for just 1 segment
+                    // caused the Chromecast to catch up to the transcode
+                    // frontier after ~30s and start buffering (spinner). With
+                    // intro concat + subtitle burn-in + seek, ffmpeg produces
+                    // segments at ~1x realtime initially. The Chromecast
+                    // consumes at 1x too, so 1-segment head start = 6 seconds
+                    // of cushion, exhausted by segment 5.
+                    //
+                    // Fix: wait for 10 segments (~60s of content). At NVENC's
+                    // ~3-6x realtime, this takes 10-20s of wall time. Gives
+                    // the Chromecast a 60-second buffer before it can catch
+                    // the frontier, by which time ffmpeg is well ahead.
                     let hls_dir = manifest_path.parent().map(|p| p.to_path_buf())
                         .unwrap_or_else(|| media_dir.join("transcoded_hls"));
-                    let first_segment = hls_dir.join("seg_00001.ts");
-                    let prebuffer_timeout_secs: u64 = if intro_path.is_some() { 60 } else { 40 };
+                    let min_segments: usize = 10;
+                    let target_segment = hls_dir.join(format!("seg_{:05}.ts", min_segments));
+                    let prebuffer_timeout_secs: u64 = if intro_path.is_some() { 90 } else { 60 };
                     let prebuffer_deadline = tokio::time::Instant::now()
                         + tokio::time::Duration::from_secs(prebuffer_timeout_secs);
                     loop {
                         if tokio::time::Instant::now() > prebuffer_deadline {
                             tracing::warn!(
-                                "HLS pre-buffer timeout ({}s) — casting with available data",
-                                prebuffer_timeout_secs
+                                "HLS pre-buffer timeout ({}s) — casting with {} segments available",
+                                prebuffer_timeout_secs,
+                                std::fs::read_dir(&hls_dir).map(|d| d.filter(|e| {
+                                    e.as_ref().map(|e| e.path().extension().map_or(false, |ext| ext == "ts")).unwrap_or(false)
+                                }).count()).unwrap_or(0)
                             );
                             break;
                         }
-                        if manifest_path.exists() && first_segment.exists() {
+                        if manifest_path.exists() && target_segment.exists() {
+                            let seg_count = std::fs::read_dir(&hls_dir).map(|d| d.filter(|e| {
+                                e.as_ref().map(|e| e.path().extension().map_or(false, |ext| ext == "ts")).unwrap_or(false)
+                            }).count()).unwrap_or(0);
                             tracing::info!(
-                                "HLS pre-buffer ready: manifest + seg_00001.ts exist at {:?}",
-                                hls_dir
+                                "HLS pre-buffer ready: {} segments at {:?} (target was {})",
+                                seg_count, hls_dir, min_segments
                             );
                             break;
                         }
@@ -1208,14 +1221,16 @@ async fn cast_health_monitor(
                         title_for_log, info.player_state, consecutive_failures, IDLE_FAILURE_THRESHOLD
                     );
                 } else if is_buffering {
-                    // Apr 18: Treat prolonged BUFFERING (spinner) as a failure.
-                    // Brief buffering (1-2 polls) is normal during transcode.
-                    // Prolonged buffering (6+ polls = 30s) means the Chromecast
-                    // is stuck and won't recover without a re-cast.
-                    consecutive_failures += 1;
-                    tracing::warn!(
-                        "cast_health_monitor: '{}' BUFFERING ({}/{} consecutive polls before re-cast)",
-                        title_for_log, consecutive_failures, IDLE_FAILURE_THRESHOLD
+                    // Apr 18: BUFFERING is a TRANSIENT state — the Chromecast
+                    // is alive and waiting for more HLS segments. It WILL
+                    // recover once ffmpeg writes enough. Do NOT increment
+                    // failure counter. Log for observability only.
+                    // (Directive: "Symptoms are signals — recoverable states
+                    // are not failures. Killing a buffering stream is worse
+                    // than waiting.")
+                    tracing::info!(
+                        "cast_health_monitor: '{}' BUFFERING (transient — not incrementing failure counter)",
+                        title_for_log
                     );
                 } else {
                     if consecutive_failures > 0 {
