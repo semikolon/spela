@@ -37,7 +37,8 @@ use tokio::process::Command;
 /// Returns the number of subtitle entries written to the output file.
 /// Apr 15, 2026 fix for the "subtitles out of sync on resume" regression.
 pub fn shift_srt(input: &Path, output: &Path, offset_seconds: f64) -> Result<usize> {
-    let content = std::fs::read_to_string(input)?;
+    let content = std::fs::read_to_string(input)?
+        .replace("\r\n", "\n");  // Normalize CRLF → LF (OpenSubtitles often uses Windows line endings)
     let mut result = String::new();
     let mut kept = 0usize;
     let mut new_index = 1usize;
@@ -172,6 +173,17 @@ pub fn resolve_subtitle_path_for_seek(
     }
     let shifted = hls_dir.join("subtitle_shifted.srt");
     match shift_srt(orig, &shifted, seek) {
+        Ok(0) => {
+            // All subtitle entries are before the seek point — nothing to burn.
+            // Return None so the transcode skips subtitle burn-in entirely.
+            // Previously returned Some(empty file) → ffmpeg "Unable to open" error.
+            tracing::info!(
+                "Subtitle sync: shifted {} by {:.0}s, 0 entries retained — skipping subtitles for this segment",
+                orig.display(),
+                seek,
+            );
+            None
+        }
         Ok(n) => {
             tracing::info!(
                 "Subtitle sync: shifted {} by {:.0}s, {} entries retained → {}",
