@@ -16,7 +16,7 @@ use crate::cast::CastController;
 use crate::config::Config;
 use crate::disk;
 use crate::search::SearchEngine;
-use crate::state::{AppState, CurrentStream};
+use crate::state::{AppState, CurrentStream, HWM_CLEAR_FRACTION};
 use crate::subtitles;
 use crate::torrent;
 use crate::transcode;
@@ -1126,10 +1126,18 @@ async fn cast_health_monitor(
     // server-side using the polling data we already have in hand.
     // Apr 15, 2026 addition.
     const POSITION_SAVE_INTERVAL_SECS: f64 = 30.0;
-    // Near-end threshold: when the absolute position crosses this fraction of
-    // duration, stop saving (let save_position_smart's internal completion
-    // logic clear the position on the next play).
-    const NEAR_END_FRACTION: f64 = 0.92;
+    // Near-end save-skip threshold: once absolute position crosses this
+    // fraction of duration, `save_position_smart` would clear the entry
+    // anyway — skip the call entirely to avoid log spam.
+    //
+    // Apr 19, 2026: this is intentionally the SAME constant as
+    // `state::HWM_CLEAR_FRACTION`. We do NOT have a separate "cleanup" fraction
+    // anymore. cast_health_monitor relies on:
+    //   1. Chromecast reporting IDLE at real EOF (player_state match below)
+    //   2. The Reaper's duration-aware grace period if the device stays alive
+    // Those two paths handle cleanup. A percentage-based early-kill was doing
+    // nothing except amputating the last 8% of films — see the Send Help
+    // incident (Apr 19, 2026) where a 113-min film was killed at 1:43:54.
 
     sleep(Duration::from_secs(STARTUP_GRACE_SECS)).await;
 
@@ -1172,6 +1180,13 @@ async fn cast_health_monitor(
     // check in `is_position_jump_suspicious` to distinguish normal playback
     // advance from stale-Chromecast-state glitches. Apr 15, 2026.
     let mut last_save_wall: Option<std::time::Instant> = Some(std::time::Instant::now());
+    // Freshest absolute position seen while Chromecast was in a non-idle state.
+    // Used at IDLE-driven cleanup time (Apr 19, 2026) to decide whether the
+    // session ended past HWM_CLEAR_FRACTION — if so, we clear the saved HWM
+    // so the next play of the same title starts fresh instead of auto-resuming
+    // at the credits. Updated on every successful non-idle probe (not just
+    // the 30-second save cadence), so at EOF we have current-to-within-5s data.
+    let mut last_known_absolute: Option<f64> = None;
     tracing::info!(
         "cast_health_monitor: started for '{}' on '{}' (poll every {}s, fail after {} consecutive idle/error, ss_offset={:.0}s, save every {}s)",
         title_for_log, cast_name, POLL_INTERVAL_SECS, IDLE_FAILURE_THRESHOLD,
@@ -1257,9 +1272,16 @@ async fn cast_health_monitor(
                     //       outer `if !is_dead` branch we're in right now).
                     //
                     // save_position_smart handles completion internally: when the absolute
-                    // position crosses 92% of duration or within 5 minutes of the end, it
-                    // clears the entry so the next play starts fresh.
+                    // position crosses HWM_CLEAR_FRACTION of duration or within
+                    // HWM_CLEAR_TAIL_SECS of the end, it clears the entry so the next
+                    // play starts fresh.
                     let absolute = info.current_time as f64 + ss_offset;
+                    // Record the freshest non-idle position for the IDLE-cleanup
+                    // HWM-clear decision (Apr 19, 2026). Only trust positive
+                    // current_time readings — at LOAD, Chromecast briefly reports 0.
+                    if info.current_time > 0.0 {
+                        last_known_absolute = Some(absolute);
+                    }
                     let duration_hint = duration_snapshot.or_else(|| {
                         // info.duration is -1 for HLS live manifests (ENDLIST missing).
                         // Prefer CurrentStream.duration; fall back to info.duration only
@@ -1296,11 +1318,11 @@ async fn cast_health_monitor(
                             }
                         });
 
-                        // Don't bother saving if we're already past the NEAR_END threshold
-                        // — save_position_smart would just clear the entry, which is
-                        // fine, but avoids spurious "clearing" log spam near episode end.
+                        // Don't bother saving if we're already past the HWM_CLEAR
+                        // threshold — save_position_smart would just clear the entry,
+                        // which is fine, but avoids spurious "clearing" log spam.
                         let past_end = duration_hint
-                            .map(|d| absolute >= d * NEAR_END_FRACTION)
+                            .map(|d| absolute >= d * HWM_CLEAR_FRACTION)
                             .unwrap_or(false);
                         if !suspicious && !past_end {
                             let mut app_state = AppState::load(&state.state_dir);
@@ -1328,47 +1350,15 @@ async fn cast_health_monitor(
                         }
                     }
 
-                    // === Episode-end detection ===
-                    // When the Chromecast's absolute position has reached 92% of the
-                    // source duration (the same threshold save_position_smart uses to
-                    // clear the entry), we know the user has effectively finished the
-                    // episode. Clean up immediately instead of waiting for the reaper's
-                    // duration-based grace period to expire. This is the "watched to
-                    // end" happy-path exit.
-                    if let Some(dur) = duration_hint {
-                        if dur > 0.0 && absolute >= dur * NEAR_END_FRACTION {
-                            tracing::info!(
-                                "cast_health_monitor: '{}' reached {:.0}% of duration ({:.0}/{:.0}s absolute). Declaring end-of-episode, cleaning up.",
-                                title_for_log,
-                                absolute / dur * 100.0,
-                                absolute,
-                                dur
-                            );
-                            // Apr 15, 2026 fix: the `past_end` guard above
-                            // short-circuits the save block, so
-                            // save_position_smart's internal completion reset
-                            // never fires on the last tick. That left a stale
-                            // HWM in state.json — which then auto-resumed the
-                            // NEXT episode of the same TV show at the stale
-                            // position (IMDb-ID collision between episodes,
-                            // now also fixed in state.rs). Belt-and-suspenders:
-                            // explicitly reset the HWM here so even if the
-                            // keying scheme changes again the end-of-episode
-                            // path guarantees a clean state.
-                            let mut app_state = AppState::load(&state.state_dir);
-                            let cleared = app_state.reset_position(
-                                imdb_id_snapshot.clone(),
-                                title_snapshot.clone(),
-                            );
-                            let _ = app_state.save(&state.state_dir);
-                            tracing::info!(
-                                "cast_health_monitor: cleared resume HWM for '{}' at end-of-episode",
-                                cleared
-                            );
-                            do_cleanup(&state);
-                            return;
-                        }
-                    }
+                    // Apr 19, 2026: the percentage-based "end-of-episode" early-kill
+                    // was removed here. It was amputating the final 8% of films
+                    // (climax + resolution) because 92% threshold < credits start on
+                    // modern features. Real end-of-stream is handled by the
+                    // Chromecast IDLE path above (player_state transitions to IDLE
+                    // at EOF, cleanup fires after IDLE_FAILURE_THRESHOLD polls) and
+                    // the Reaper's duration-aware grace period. See Send Help
+                    // incident Apr 19, 2026 — 113-min film killed at 1:43:54 with
+                    // 8:42 of climax remaining.
                 }
             }
             Ok(Err(e)) => {
@@ -1392,6 +1382,25 @@ async fn cast_health_monitor(
                 "cast_health_monitor: chromecast media session DEAD for '{}' ({} consecutive idle/error polls). Cleaning up workers.",
                 title_for_log, consecutive_failures
             );
+            // Apr 19, 2026: if the Chromecast went IDLE past HWM_CLEAR_FRACTION,
+            // this was real EOF (not a mid-playback disconnect) — clear the
+            // saved HWM so the next play of the same title starts fresh instead
+            // of auto-resuming from the credits. Belt-and-suspenders against
+            // the 30s save cadence leaving a stale 94%-ish HWM behind.
+            if let (Some(dur), Some(abs_pos)) = (duration_snapshot, last_known_absolute) {
+                if dur > 0.0 && abs_pos >= dur * HWM_CLEAR_FRACTION {
+                    let mut app_state = AppState::load(&state.state_dir);
+                    let cleared = app_state.reset_position(
+                        imdb_id_snapshot.clone(),
+                        title_snapshot.clone(),
+                    );
+                    let _ = app_state.save(&state.state_dir);
+                    tracing::info!(
+                        "cast_health_monitor: Chromecast IDLE past {:.0}% ({:.0}/{:.0}s) — cleared resume HWM for '{}'",
+                        HWM_CLEAR_FRACTION * 100.0, abs_pos, dur, cleared
+                    );
+                }
+            }
             do_cleanup(&state);
             return;
         }

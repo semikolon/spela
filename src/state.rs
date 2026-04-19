@@ -6,6 +6,22 @@ use std::path::{Path, PathBuf};
 
 use crate::search::SearchResult;
 
+/// Fraction of duration past which the saved resume HWM is cleared.
+/// Above this threshold, we assume the user has effectively reached the end
+/// (credits or otherwise) and they don't want to auto-resume there next play.
+///
+/// This is NOT a cleanup threshold — cast_health_monitor relies on the
+/// Chromecast's own IDLE signal (real EOF) and the Reaper's duration-aware
+/// grace period to tear streams down. Apr 19, 2026: raised from 0.92 after
+/// Send Help (113 min) had its stream killed at 1:43:54 with 8:42 of climax
+/// remaining. 92% was too early for modern films whose credits start at 96-99%.
+pub const HWM_CLEAR_FRACTION: f64 = 0.96;
+
+/// Absolute tail window: within this many seconds of the end, clear the HWM
+/// too (covers short-form content where a percentage threshold lands only a
+/// few seconds from EOF).
+pub const HWM_CLEAR_TAIL_SECS: f64 = 300.0;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
     pub current: Option<CurrentStream>,
@@ -155,7 +171,9 @@ impl AppState {
 
     /// Update resume position for a movie/show using High-Water Mark logic.
     /// Returns (key, reset_or_saved).
-    /// If duration is provided and t is near the end (>92% or within 300s), resets/clears the position.
+    /// If duration is provided and t is near the end (>= HWM_CLEAR_FRACTION or within
+    /// HWM_CLEAR_TAIL_SECS of the end), clears the saved position so next play starts
+    /// fresh instead of auto-resuming from the credits.
     pub fn save_position_smart(&mut self, imdb_id: Option<String>, title: Option<String>, t: f64, duration: Option<f64>) -> (String, bool) {
         let key = match resume_position_key(imdb_id.as_deref(), title.as_deref()) {
             Some(k) => k,
@@ -163,9 +181,9 @@ impl AppState {
         };
 
         // --- Completion Logic ---
-        // If we are within the last 5 minutes or past 92% of the film, clear the position.
+        // Clear the HWM when the user has effectively watched to the end.
         if let Some(dur) = duration {
-            if dur > 0.0 && (t >= dur * 0.92 || t >= (dur - 300.0)) {
+            if dur > 0.0 && (t >= dur * HWM_CLEAR_FRACTION || t >= (dur - HWM_CLEAR_TAIL_SECS)) {
                 tracing::info!("Playback completion detected for '{}' at {}s (of {}s) — clearing resume point", key, t, dur);
                 self.reset_position(imdb_id, title);
                 return (key, true);
@@ -288,17 +306,39 @@ mod tests {
         let mut state = AppState::default();
         let imdb_id = Some("tt10548174".to_string());
         let title = Some("28 Years Later".to_string());
-        
-        // 1. Regular save (50 mins in)
+
+        // 1. Regular save (50 mins in) — well below HWM_CLEAR_FRACTION
         let (key, saved) = state.save_position_smart(imdb_id.clone(), title.clone(), 3000.0, Some(6907.0));
         assert!(saved);
         assert_eq!(state.resume_positions.get(&key), Some(&3000.0));
 
-        // 2. Completion reset (1:49:00 out of 1:55:00)
-        // 6540s / 6907s = 0.946 ( > 0.92 )
+        // 2. Apr 19, 2026 regression pin: at 95.5% (6600s / 6907s = 0.9555),
+        //    below the 0.96 HWM_CLEAR_FRACTION threshold, the HWM must SURVIVE
+        //    — the Send Help incident was caused by killing streams past 92%
+        //    when the user was still mid-climax. This case must save, not clear.
         let (key2, saved2) = state.save_position_smart(imdb_id.clone(), title.clone(), 6600.0, Some(6907.0));
         assert!(saved2);
-        assert_eq!(state.resume_positions.get(&key2), None); // Should be cleared!
+        assert_eq!(state.resume_positions.get(&key2), Some(&6600.0),
+                   "HWM must survive at 95.5% — below HWM_CLEAR_FRACTION (0.96)");
+
+        // 3. Completion clear at 97.1% (6708s / 6907s) — past HWM_CLEAR_FRACTION.
+        let (key3, saved3) = state.save_position_smart(imdb_id.clone(), title.clone(), 6708.0, Some(6907.0));
+        assert!(saved3);
+        assert_eq!(state.resume_positions.get(&key3), None,
+                   "HWM must clear at 97.1% — past HWM_CLEAR_FRACTION");
+    }
+
+    /// Apr 19, 2026: the HWM clear threshold must be at least 0.96. Lower values
+    /// kill real content — Send Help (113 min) would have its HWM cleared at
+    /// 1:43:54, with 8:42 of climax remaining, making it impossible to finish.
+    /// The 0.96 lower bound is load-bearing UX policy — don't regress it.
+    #[test]
+    fn test_hwm_clear_fraction_invariant() {
+        assert!(HWM_CLEAR_FRACTION >= 0.96,
+                "HWM_CLEAR_FRACTION must not drop below 0.96 — see Send Help incident \
+                 Apr 19, 2026. Lower values amputate climax scenes of modern films.");
+        assert!(HWM_CLEAR_FRACTION < 1.0,
+                "HWM_CLEAR_FRACTION must be < 1.0 or the HWM never clears.");
     }
 
     #[test]
@@ -470,11 +510,11 @@ mod tests {
         let absolute = chromecast_time + ss_offset;
         assert_eq!(absolute, 2645.0);
 
-        // The 92% completion threshold on a 3823.6s episode is 3517.7s.
+        // The HWM_CLEAR_FRACTION threshold on a 3823.6s episode is ~3670s.
         let duration = 3823.6_f64;
-        assert!(absolute < duration * 0.92);
-        // At 3517.8s absolute, we should be past the threshold.
-        let near_end = 3517.8_f64;
-        assert!(near_end >= duration * 0.92);
+        assert!(absolute < duration * HWM_CLEAR_FRACTION);
+        // At 3700s absolute (~96.8%), we should be past the threshold.
+        let near_end = 3700.0_f64;
+        assert!(near_end >= duration * HWM_CLEAR_FRACTION);
     }
 }
