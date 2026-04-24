@@ -1106,6 +1106,135 @@ pub fn is_position_jump_suspicious(delta_wall_secs: f64, delta_abs_secs: f64) ->
     delta_abs_secs > 2.0 * delta_wall_secs + 60.0
 }
 
+/// Minimum wall-clock age of a stream before we'll attempt `attempt_cast_recast`.
+///
+/// Apr 25, 2026: a stream that goes IDLE within its first minute is almost
+/// certainly a LOAD-side failure (stream_host unreachable, DNS hairpin
+/// broken, transcode not warm yet, Chromecast rejecting the manifest version).
+/// Re-LOAD won't fix those — it just burns another 15 s of user patience
+/// before the real cleanup. So we gate the recast on the stream having
+/// actually played for a while; failures in that regime are far more likely
+/// to be mid-stream CAF flakes that the device recovers from on a fresh LOAD.
+pub const MIN_STREAM_AGE_FOR_RECAST_SECS: u64 = 60;
+
+/// Decision: should `cast_health_monitor` attempt auto-recast before cleanup?
+///
+/// Apr 25, 2026 — added after the Vardagsrum CrKey 1.56 Chromecast repeatedly
+/// entered `player_state=IDLE` mid-stream during sustained high-bitrate
+/// BluRay H.264 playback (~7 Mbps). Pattern: healthy for ~11 minutes, then a
+/// sudden transition to IDLE with no error surface the cast protocol will
+/// hand us. The workers (webtorrent + ffmpeg) stay alive throughout; it's
+/// purely a receiver-side flake. One recast attempt is free recovery when
+/// the Chromecast just needs a new LOAD message.
+///
+/// Returns true only when ALL of these hold:
+///   - `recast_attempts == 0` — exactly one chance per stream lifecycle, so
+///     a truly wedged device can't trap us in an infinite LOAD/IDLE loop.
+///     If the second IDLE batch fires, cleanup proceeds normally.
+///   - `stream_age_secs >= MIN_STREAM_AGE_FOR_RECAST_SECS` — see constant doc.
+///   - `have_valid_hwm` — no point recasting if we can't restore position.
+pub fn should_attempt_recast(
+    recast_attempts: u32,
+    stream_age_secs: u64,
+    have_valid_hwm: bool,
+) -> bool {
+    recast_attempts == 0
+        && stream_age_secs >= MIN_STREAM_AGE_FOR_RECAST_SECS
+        && have_valid_hwm
+}
+
+/// Try to re-LOAD the current stream to the Chromecast and seek to the saved HWM.
+///
+/// Apr 25, 2026. This is the muscle behind `should_attempt_recast`. Sequence:
+///   1. Pull the existing stream's URL from `CurrentStream`.
+///   2. Infer cast `content_type` from URL suffix (HLS master → mpegurl).
+///   3. Fire `cast_url` again — Default Media Receiver accepts a fresh LOAD
+///      message and replaces its (idle) session with a new one starting at 0.
+///   4. Fire `cast.seek(hwm - ss_offset)` — the HLS playlist's `t=0` is at
+///      source `t=ss_offset`, so the within-HLS seek target is
+///      `hwm_absolute - ss_offset` (clamped at 0).
+///
+/// Workers (webtorrent, ffmpeg, HLS dir) stay alive throughout — this is
+/// purely client-side state recovery. If `cast_url` or `seek` fails, the
+/// caller logs and falls through to `do_cleanup` as before.
+///
+/// The function parks both blocking Cast operations on `spawn_blocking` so
+/// they don't starve the async runtime (rust_cast is synchronous).
+async fn attempt_cast_recast(
+    state: &SharedState,
+    cast_name: &str,
+    hwm_absolute: f64,
+    ss_offset: f64,
+    duration_hint: Option<f64>,
+) -> anyhow::Result<()> {
+    use anyhow::anyhow;
+
+    // Pull the URL from state — the stream the monitor is watching has it on
+    // `CurrentStream`. No allocation needed past the clone.
+    let url = {
+        let app_state = AppState::load(&state.state_dir);
+        match app_state.current.as_ref() {
+            Some(c) => c.url.clone(),
+            None => return Err(anyhow!("CurrentStream gone before recast could fire")),
+        }
+    };
+
+    // HLS master playlists are the only LOAD URLs spela currently hands out,
+    // but do the match-by-suffix anyway so this stays honest if the legacy
+    // /stream/transcode fMP4 path gets re-enabled.
+    let content_type = if url.ends_with(".m3u8") || url.contains("/hls/") {
+        "application/vnd.apple.mpegurl"
+    } else {
+        "video/mp4"
+    };
+
+    // Re-LOAD on the receiver.
+    let state_clone = state.clone();
+    let cast_name_clone = cast_name.to_string();
+    let url_clone = url.clone();
+    let content_type_clone = content_type.to_string();
+    let load_outcome = tokio::task::spawn_blocking(move || {
+        let mut cast = state_clone.cast.lock().unwrap();
+        cast.cast_url(
+            &cast_name_clone,
+            &url_clone,
+            &content_type_clone,
+            duration_hint,
+            None,
+        )
+    })
+    .await;
+
+    match load_outcome {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(anyhow!("recast cast_url failed: {}", e)),
+        Err(e) => return Err(anyhow!("recast cast_url spawn panic: {}", e)),
+    }
+
+    // Seek target within the HLS stream (HLS t=0 is source t=ss_offset).
+    let seek_within_hls = (hwm_absolute - ss_offset).max(0.0);
+    if seek_within_hls > 1.0 {
+        let state_clone = state.clone();
+        let cast_name_clone = cast_name.to_string();
+        let seek_outcome = tokio::task::spawn_blocking(move || {
+            let mut cast = state_clone.cast.lock().unwrap();
+            cast.seek(&cast_name_clone, seek_within_hls)
+        })
+        .await;
+        if let Ok(Err(e)) = seek_outcome {
+            // LOAD worked; SEEK didn't. Accept playback from ss_offset (user
+            // loses what they watched since the last 30 s HWM save — worst case
+            // ~30 s). Preferable to a full-restart cleanup.
+            tracing::warn!(
+                "attempt_cast_recast: LOAD succeeded but seek to {:.0}s within HLS failed: {} — continuing from ss_offset",
+                seek_within_hls, e
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn cast_health_monitor(
     state: SharedState,
     cast_name: String,
@@ -1187,6 +1316,15 @@ async fn cast_health_monitor(
     // at the credits. Updated on every successful non-idle probe (not just
     // the 30-second save cadence), so at EOF we have current-to-within-5s data.
     let mut last_known_absolute: Option<f64> = None;
+    // Apr 25, 2026: auto-recast state.
+    // `recast_attempts` is the gate used by `should_attempt_recast` to cap
+    // recovery at one attempt per stream — a genuinely wedged Chromecast
+    // must not be able to trap the monitor in an infinite LOAD/IDLE loop.
+    // `prev_player_state_upper` powers state-transition logging (e.g.
+    // PLAYING → BUFFERING → IDLE) so we have a legible timeline in the
+    // journal instead of per-poll spam at DEBUG.
+    let mut recast_attempts: u32 = 0;
+    let mut prev_player_state_upper: Option<String> = None;
     tracing::info!(
         "cast_health_monitor: started for '{}' on '{}' (poll every {}s, fail after {} consecutive idle/error, ss_offset={:.0}s, save every {}s)",
         title_for_log, cast_name, POLL_INTERVAL_SECS, IDLE_FAILURE_THRESHOLD,
@@ -1229,11 +1367,31 @@ async fn cast_health_monitor(
                 );
                 let is_buffering = player_state_upper == "BUFFERING";
 
+                // Apr 25, 2026: log every state transition at INFO. This is the
+                // cheap half of the diagnostic upgrade — with `idle_reason`
+                // now surfaced through PlaybackInfo, a single line tells us
+                // whether an IDLE was Finished (natural EOF), Interrupted
+                // (old-CrKey mid-stream death), Cancelled (user action), or
+                // Error (manifest/codec rejection). Per-poll verbosity stays
+                // at DEBUG via the existing log.
+                if prev_player_state_upper.as_deref() != Some(player_state_upper.as_str()) {
+                    tracing::info!(
+                        "cast_health_monitor: '{}' state transition: {:?} → {} idle_reason={:?} time={:.0}s media_session={:?}",
+                        title_for_log,
+                        prev_player_state_upper.as_deref().unwrap_or("<init>"),
+                        info.player_state,
+                        info.idle_reason,
+                        info.current_time,
+                        info.media_session_id
+                    );
+                    prev_player_state_upper = Some(player_state_upper.clone());
+                }
+
                 if is_dead {
                     consecutive_failures += 1;
                     tracing::warn!(
-                        "cast_health_monitor: '{}' player_state={} ({}/{} consecutive idle polls before cleanup)",
-                        title_for_log, info.player_state, consecutive_failures, IDLE_FAILURE_THRESHOLD
+                        "cast_health_monitor: '{}' player_state={} idle_reason={:?} media_session={:?} ({}/{} consecutive idle polls before cleanup)",
+                        title_for_log, info.player_state, info.idle_reason, info.media_session_id, consecutive_failures, IDLE_FAILURE_THRESHOLD
                     );
                 } else if is_buffering {
                     // Apr 18: BUFFERING is a TRANSIENT state — the Chromecast
@@ -1378,6 +1536,91 @@ async fn cast_health_monitor(
         }
 
         if consecutive_failures >= IDLE_FAILURE_THRESHOLD {
+            // Apr 25, 2026: auto-recast on first mid-stream IDLE batch.
+            //
+            // Old CrKey firmware occasionally drops its CAF session without
+            // error after sustained high-bitrate playback — classic Vardagsrum
+            // failure mode. Workers stay alive (ffmpeg keeps writing, webtorrent
+            // keeps seeding); it's the receiver that needs a kick. One fresh
+            // LOAD + seek to HWM recovers ~10-30 s later with no manual action.
+            //
+            // Guards (see `should_attempt_recast` doc):
+            //   - exactly one recast per stream (infinite-loop protection)
+            //   - stream must have played for ≥ MIN_STREAM_AGE_FOR_RECAST_SECS
+            //     (startup LOAD failures don't recover from re-LOAD)
+            //   - a usable HWM exists to seek to
+            //
+            // EOF is NOT a recast case: when `last_known_absolute` crossed
+            // HWM_CLEAR_FRACTION we treat the IDLE as natural end and fall
+            // through to the HWM-clear + cleanup path below. Recovering
+            // "playback" of the credits is not useful and would just re-trigger
+            // the same IDLE.
+            let stream_age_secs = Utc::now()
+                .signed_duration_since(started_at)
+                .num_seconds()
+                .max(0) as u64;
+            let is_natural_eof = match (duration_snapshot, last_known_absolute) {
+                (Some(dur), Some(abs_pos)) if dur > 0.0 => abs_pos >= dur * HWM_CLEAR_FRACTION,
+                _ => false,
+            };
+            if !is_natural_eof
+                && should_attempt_recast(
+                    recast_attempts,
+                    stream_age_secs,
+                    last_known_absolute.is_some(),
+                )
+            {
+                let hwm = last_known_absolute.unwrap_or(last_saved_position);
+                tracing::warn!(
+                    "cast_health_monitor: '{}' — attempting auto-recast (attempt 1/1) at HWM={:.0}s ss_offset={:.0}s stream_age={}s",
+                    title_for_log, hwm, ss_offset, stream_age_secs
+                );
+                match attempt_cast_recast(
+                    &state,
+                    &cast_name,
+                    hwm,
+                    ss_offset,
+                    duration_snapshot,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            "cast_health_monitor: '{}' — auto-recast LOAD+seek issued; resuming poll loop",
+                            title_for_log
+                        );
+                        recast_attempts += 1;
+                        consecutive_failures = 0;
+                        // Force a transition-log entry on the next poll (the
+                        // state may still read IDLE for one more tick while
+                        // the Chromecast processes the new LOAD).
+                        prev_player_state_upper = None;
+                        sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "cast_health_monitor: '{}' — auto-recast failed: {} — proceeding to cleanup",
+                            title_for_log, e
+                        );
+                        // fall through to the normal cleanup path
+                    }
+                }
+            }
+
+            // Apr 25, 2026: pre-cleanup diagnostic dump. Records the load-bearing
+            // in-memory state the monitor accumulated — without touching disk,
+            // so it never racks up at a bad time. Pairs with idle_reason logging
+            // to replace the old "something happened, we gave up" black box with
+            // a replayable timeline. Stays at ERROR level so operators don't
+            // have to raise verbosity to see it after an incident.
+            tracing::error!(
+                "cast_health_monitor: PRE-CLEANUP for '{}' — consecutive_failures={} recast_attempts={} stream_age={}s ss_offset={:.0}s last_known_absolute={:.0?} last_saved_position={:.1}s duration={:?} prev_state={:?}",
+                title_for_log, consecutive_failures, recast_attempts, stream_age_secs,
+                ss_offset, last_known_absolute, last_saved_position, duration_snapshot,
+                prev_player_state_upper
+            );
+
             tracing::error!(
                 "cast_health_monitor: chromecast media session DEAD for '{}' ({} consecutive idle/error polls). Cleaning up workers.",
                 title_for_log, consecutive_failures
@@ -2698,6 +2941,60 @@ mod tests {
         assert!(!local_bypass_file_is_healthy(&path, false, 0));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    // --- Auto-recast decision (Apr 25, 2026 regression guards) ---
+    //
+    // `should_attempt_recast` is the gate that keeps a wedged Chromecast from
+    // trapping cast_health_monitor in an infinite LOAD/IDLE loop while still
+    // giving the common "CrKey 1.56 dropped its CAF session after 11 minutes"
+    // case a cheap recovery. These tests pin the three guards so none of them
+    // can drift silently.
+
+    #[test]
+    fn test_recast_normal_mid_stream_death() {
+        // Vardagsrum-style failure: ~12 min in, we have an HWM, no prior recast.
+        // This is the primary recovery case — must attempt.
+        assert!(should_attempt_recast(0, 720, true));
+    }
+
+    #[test]
+    fn test_recast_caps_at_one_attempt_per_stream() {
+        // Second IDLE batch after a prior recast → MUST NOT loop. A wedged
+        // device that keeps IDLE-ing will otherwise burn cycles indefinitely.
+        assert!(!should_attempt_recast(1, 720, true));
+        assert!(!should_attempt_recast(2, 720, true));
+        assert!(!should_attempt_recast(u32::MAX, 720, true));
+    }
+
+    #[test]
+    fn test_recast_rejects_startup_failures() {
+        // Stream < 60 s old → the Chromecast failed the initial LOAD, not a
+        // mid-stream flake. Re-LOAD won't help; those failures need stream_host
+        // / transcode / manifest fixes. Don't waste the user's patience.
+        assert!(!should_attempt_recast(0, 0, true));
+        assert!(!should_attempt_recast(0, 30, true));
+        assert!(!should_attempt_recast(0, 59, true));
+        // Exactly at the threshold → attempt.
+        assert!(should_attempt_recast(0, MIN_STREAM_AGE_FOR_RECAST_SECS, true));
+    }
+
+    #[test]
+    fn test_recast_requires_valid_hwm() {
+        // No HWM → nothing sensible to seek to. Playback from ss_offset is a
+        // worse UX than a clean cleanup + manual replay, because the user
+        // loses their place silently.
+        assert!(!should_attempt_recast(0, 720, false));
+    }
+
+    #[test]
+    fn test_recast_min_stream_age_is_stable() {
+        // The threshold is load-bearing for the "startup LOAD failure" guard
+        // described in the constant's docstring. Raising it wastes mid-stream
+        // recovery opportunities; lowering it wastes recovery attempts on
+        // unrecoverable config failures. If this assertion needs to change,
+        // update the doc comment on MIN_STREAM_AGE_FOR_RECAST_SECS too.
+        assert_eq!(MIN_STREAM_AGE_FOR_RECAST_SECS, 60);
     }
 }
 

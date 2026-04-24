@@ -35,6 +35,15 @@ pub struct PlaybackInfo {
     pub muted: bool,
     pub title: String,
     pub content_id: String,
+    // Apr 25, 2026: surfaced for cast_health_monitor diagnostics so we can
+    // distinguish IdleReason::Finished (natural EOF) from Interrupted/Error
+    // (old-CrKey mid-stream death). Previously the monitor saw only
+    // `player_state=IDLE` and had to guess. The underlying field in
+    // rust_cast::channels::media::StatusEntry is Option<IdleReason>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_session_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +294,8 @@ impl CastController {
                             content_id: entry.media.as_ref()
                                 .map(|m| m.content_id.clone())
                                 .unwrap_or_default(),
+                            idle_reason: entry.idle_reason.as_ref().map(|r| format!("{:?}", r)),
+                            media_session_id: Some(entry.media_session_id),
                         });
                     }
                 }
@@ -300,6 +311,8 @@ impl CastController {
             muted,
             title: String::new(),
             content_id: String::new(),
+            idle_reason: None,
+            media_session_id: None,
         })
     }
 
