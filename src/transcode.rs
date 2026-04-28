@@ -406,8 +406,17 @@ pub async fn transcode(
         // but main stream might vary). Apply subtitles to main if needed.
         let mut filter = String::new();
 
+        // Apr 28, 2026: ALL video paths through h264_nvenc must end with
+        // format=yuv420p. NVENC's h264 encoder rejects 10-bit input
+        // (yuv420p10le, common for HEVC Main 10 sources like ELiTE/MeGusta
+        // releases): "10 bit encode not supported / No capable devices
+        // found / Nothing was written into output file" → 0 segments → cast
+        // IDLE at <init>. Forcing yuv420p as the last filter step
+        // downconverts to 8-bit before NVENC sees the frames. No-op for
+        // already-8-bit inputs.
+
         // Intro: scale + ensure compatible format
-        filter.push_str("[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v0]; ");
+        filter.push_str("[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v0]; ");
         filter.push_str("[0:a:0]aresample=48000[a0]; ");  // Intro always has one audio track
 
         // Main stream: scale + optional subtitles
@@ -415,12 +424,12 @@ pub async fn transcode(
             let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
                 .replace(':', "\\:");
             filter.push_str(&format!(
-                "[{}:v]subtitles='{}',scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v1]; ",
+                "[{}:v]subtitles='{}',scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v1]; ",
                 main_idx, srt_str
             ));
         } else {
             filter.push_str(&format!(
-                "[{}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v1]; ",
+                "[{}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v1]; ",
                 main_idx
             ));
         }
@@ -449,13 +458,16 @@ pub async fn transcode(
             let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
                 .replace(':', "\\:");
             args.extend([
-                "-vf".into(), format!("subtitles='{}'", srt_str),
+                // format=yuv420p forces 8-bit before NVENC — see comment above.
+                "-vf".into(), format!("subtitles='{}',format=yuv420p", srt_str),
                 "-c:v".into(), "h264_nvenc".into(),
                 "-preset".into(), "p4".into(),
                 "-cq".into(), "23".into(),
             ]);
         } else if video_reencode {
             args.extend([
+                // format=yuv420p forces 8-bit before NVENC — see comment above.
+                "-vf".into(), "format=yuv420p".into(),
                 "-c:v".into(), "h264_nvenc".into(),
                 "-preset".into(), "p4".into(),
                 "-cq".into(), "23".into(),
@@ -620,18 +632,18 @@ pub async fn transcode_hls(
 
     if has_intro {
         let mut filter = String::new();
-        filter.push_str("[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v0]; ");
+        filter.push_str("[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v0]; ");
         filter.push_str("[0:a:0]aresample=48000[a0]; ");  // Intro always has one audio track
         if has_subs {
             let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
                 .replace(':', "\\:");
             filter.push_str(&format!(
-                "[{}:v]subtitles='{}',scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v1]; ",
+                "[{}:v]subtitles='{}',scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v1]; ",
                 main_idx, srt_str
             ));
         } else {
             filter.push_str(&format!(
-                "[{}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v1]; ",
+                "[{}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v1]; ",
                 main_idx
             ));
         }
@@ -656,13 +668,18 @@ pub async fn transcode_hls(
             let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
                 .replace(':', "\\:");
             args.extend([
-                "-vf".into(), format!("subtitles='{}'", srt_str),
+                // format=yuv420p forces 8-bit before NVENC h264 — see Apr 28
+                // 10-bit-HEVC fix in transcode() above.
+                "-vf".into(), format!("subtitles='{}',format=yuv420p", srt_str),
                 "-c:v".into(), "h264_nvenc".into(),
                 "-preset".into(), "p4".into(),
                 "-cq".into(), "23".into(),
             ]);
         } else if video_reencode {
             args.extend([
+                // format=yuv420p forces 8-bit before NVENC h264 — see Apr 28
+                // 10-bit-HEVC fix in transcode() above.
+                "-vf".into(), "format=yuv420p".into(),
                 "-c:v".into(), "h264_nvenc".into(),
                 "-preset".into(), "p4".into(),
                 "-cq".into(), "23".into(),
