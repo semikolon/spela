@@ -54,6 +54,21 @@ pub struct Config {
     /// Hard-won lesson context: spela CLAUDE.md § "DMR persistent overlay".
     #[serde(default)]
     pub rich_metadata_in_load: bool,
+    /// Apr 28, 2026 [EXPERIMENTAL]: Append `#EXT-X-ENDLIST` to the playlist
+    /// route response even though the playlist is still being written.
+    /// Cast Web Receiver only honors `EXT-X-ENDLIST` for VOD detection (per
+    /// Google's Cast team's own statement on the SDK forum), so adding it
+    /// SHOULD trick the receiver into rendering VOD-style auto-hide
+    /// controls. The risk: receiver may interpret current-segment-count as
+    /// "total stream length" and stop fetching new segments after that
+    /// point, truncating playback. If that happens, flip back to false.
+    ///
+    /// If this experiment works, we get auto-hide controls AND can safely
+    /// re-enable `rich_metadata_in_load`. If it doesn't, fall back to the
+    /// metadata-off compromise (small persistent overlay) until Custom
+    /// Receiver lands.
+    #[serde(default)]
+    pub experimental_endlist_hack: bool,
 }
 
 fn default_server() -> String { "localhost:7890".into() }
@@ -78,6 +93,7 @@ impl Default for Config {
             known_devices: HashMap::new(),
             cast_app_id: String::new(),
             rich_metadata_in_load: false,
+            experimental_endlist_hack: false,
         }
     }
 }

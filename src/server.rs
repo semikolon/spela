@@ -2337,6 +2337,41 @@ async fn handle_hls_playlist(
     let path = resolve_media_dir(&state)
         .join("transcoded_hls")
         .join("playlist.m3u8");
+
+    // Apr 28, 2026 [EXPERIMENTAL]: When `config.experimental_endlist_hack`
+    // is true, post-process the playlist to append `#EXT-X-ENDLIST` if it's
+    // not already present. Cast Web Receiver only honors this tag for VOD
+    // detection — without it, growing playlists are treated as live and
+    // controls never auto-hide. Risk: receiver may interpret the current
+    // segment count as the total stream length and stop fetching new
+    // segments after that point. If playback truncates, flip the flag off.
+    if state.config.experimental_endlist_hack {
+        match tokio::fs::read_to_string(&path).await {
+            Ok(body) => {
+                let body = if body.contains("#EXT-X-ENDLIST") {
+                    body
+                } else {
+                    let mut b = body;
+                    if !b.ends_with('\n') { b.push('\n'); }
+                    b.push_str("#EXT-X-ENDLIST\n");
+                    tracing::debug!("HLS playlist: appended ENDLIST hack");
+                    b
+                };
+                return axum::response::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "application/vnd.apple.mpegurl")
+                    .header("Content-Length", body.len().to_string())
+                    .header("Cache-Control", "no-cache")
+                    .body(axum::body::Body::from(body))
+                    .unwrap();
+            }
+            Err(e) => {
+                tracing::warn!("HLS playlist read failed: {}; falling back to file serve", e);
+                // fall through
+            }
+        }
+    }
+
     serve_static_with_range(path, "application/vnd.apple.mpegurl", &headers).await
 }
 
