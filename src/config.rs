@@ -30,6 +30,30 @@ pub struct Config {
     /// Google Cast app ID for custom receiver. Leave empty to use Default Media Receiver.
     #[serde(default)]
     pub cast_app_id: String,
+    /// Apr 28, 2026: Whether to send rich `Metadata::TvShow`/`Movie` in the
+    /// LOAD message. Defaults to `false` because the **Default Media Receiver
+    /// renders metadata-rich overlays as a permanent on-screen layer when the
+    /// HLS playlist lacks `EXT-X-ENDLIST`** — which is always the case for
+    /// spela's growing-during-transcode playlist (Cast Web Receiver only
+    /// honors `EXT-X-ENDLIST` for VOD detection; `EXT-X-PLAYLIST-TYPE` and
+    /// `MediaInfo.streamType` are explicitly ignored for this UI decision
+    /// per Google's Cast team statement on the SDK forum).
+    ///
+    /// With metadata enabled: poster + title + season/episode block renders
+    /// permanently along the bottom-left, plus the seek bar — ~25% screen
+    /// occupied. Without metadata: just a thin progress line + elapsed-time
+    /// counter at the very bottom edge — ~5% screen occupied.
+    ///
+    /// Flip to `true` once a Custom Cast Receiver is registered with the
+    /// Cast SDK Developer Console ($5 one-time, blocks `cast_app_id` ≠ "")
+    /// and deployed. Custom Receivers can programmatically hide the rich UI
+    /// after a few seconds of inactivity, getting both the polish AND the
+    /// auto-hide behavior. Until then the bare-bones UI is the lesser evil.
+    ///
+    /// Tracking issue: spela TODO.md § "Custom Receiver registration".
+    /// Hard-won lesson context: spela CLAUDE.md § "DMR persistent overlay".
+    #[serde(default)]
+    pub rich_metadata_in_load: bool,
 }
 
 fn default_server() -> String { "localhost:7890".into() }
@@ -53,6 +77,7 @@ impl Default for Config {
             host: default_host(),
             known_devices: HashMap::new(),
             cast_app_id: String::new(),
+            rich_metadata_in_load: false,
         }
     }
 }
@@ -222,6 +247,41 @@ default_device = "Living Room TV"
     fn test_config_cast_app_id_default_empty() {
         let config = Config::default();
         assert!(config.cast_app_id.is_empty()); // uses Default Media Receiver when empty
+    }
+
+    #[test]
+    fn test_rich_metadata_in_load_defaults_off() {
+        // Apr 28, 2026: Default OFF until Custom Receiver lands. With DMR
+        // and metadata enabled, the rich-UI overlay never auto-hides because
+        // spela's growing HLS playlist lacks EXT-X-ENDLIST → receiver thinks
+        // it's a live stream → persistent overlay → ~25% screen occupied.
+        // Default off keeps the bare progress bar (~5% screen occupied).
+        // Flip to true when registering a Custom Receiver via Cast SDK
+        // Developer Console.
+        let config = Config::default();
+        assert!(!config.rich_metadata_in_load,
+            "Default must be OFF — DMR overlay-shrink trumps metadata polish");
+    }
+
+    #[test]
+    fn test_rich_metadata_in_load_back_compat_on_old_toml() {
+        // Pre-Apr-28 config files don't have rich_metadata_in_load. Adding
+        // a new field must not break existing deployments — serde default.
+        let toml_str = r#"
+default_device = "Living Room TV"
+tmdb_api_key = "abc"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.rich_metadata_in_load, "missing field must default to false");
+    }
+
+    #[test]
+    fn test_rich_metadata_in_load_roundtrip() {
+        let mut config = Config::default();
+        config.rich_metadata_in_load = true;
+        let s = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&s).unwrap();
+        assert!(parsed.rich_metadata_in_load);
     }
 
     #[test]

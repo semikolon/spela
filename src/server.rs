@@ -720,23 +720,26 @@ async fn do_play(
         } else {
             "video/mp4"
         };
-        // Apr 28, 2026: Build CastMetadata from the play request so the
-        // Default Media Receiver renders its rich-UI player (poster + title +
-        // auto-hide controls) instead of the persistent minimal overlay.
-        // Decision tree inside `cast::build_cast_metadata`:
-        //   - season + episode + show set → TvShow metadata
-        //   - else title set → Movie metadata
-        //   - else None → DMR fallback (legacy behavior)
-        let cast_metadata = cast::CastMetadata {
-            title: req.title.clone(),
-            series_title: req.show.clone(),
-            season: req.season,
-            episode: req.episode,
-            poster_url: req.poster_url.clone(),
-            release_date: None, // populated by movie path inside search.rs;
-                                // not currently plumbed through req — left
-                                // as a future polish (TvShow uses
-                                // original_air_date which is also unset).
+        // Apr 28, 2026: Build CastMetadata from the play request. Gated by
+        // `config.rich_metadata_in_load` because the Default Media Receiver
+        // renders metadata-rich overlays as a PERMANENT on-screen layer when
+        // the HLS playlist lacks `EXT-X-ENDLIST` (always the case for spela's
+        // growing playlist). With metadata: ~25% of screen permanently
+        // occupied. Without: ~5% (bare progress bar). Flip the config flag
+        // to true once a Custom Receiver is deployed (it can programmatically
+        // auto-hide the rich UI). See config.rs comment + spela CLAUDE.md
+        // § "DMR persistent overlay" for full rationale.
+        let cast_metadata = if state.config.rich_metadata_in_load {
+            cast::CastMetadata {
+                title: req.title.clone(),
+                series_title: req.show.clone(),
+                season: req.season,
+                episode: req.episode,
+                poster_url: req.poster_url.clone(),
+                release_date: None,
+            }
+        } else {
+            cast::CastMetadata::default()
         };
         let cast_metadata_clone = cast_metadata.clone();
         let cast_result = tokio::task::spawn_blocking(move || {
@@ -1207,24 +1210,27 @@ async fn attempt_cast_recast(
     use anyhow::anyhow;
 
     // Pull the URL + metadata from state — the stream the monitor is
-    // watching carries them on `CurrentStream`. Apr 28, 2026: also recover
-    // metadata so the recast LOAD message reproduces the rich-UI player
-    // (poster + title + auto-hide controls). Without this, a recast would
-    // re-issue LOAD with `metadata: None` and the receiver would drop into
-    // its persistent minimal-overlay UI for the recovered stream — losing
-    // the polish the original LOAD established.
+    // watching carries them on `CurrentStream`. Apr 28, 2026: gate the rich
+    // metadata on `config.rich_metadata_in_load` (same rationale as do_play
+    // — see config.rs comment). The recast must produce the SAME UI the
+    // original LOAD did, otherwise mid-stream IDLE recovery would visibly
+    // change the on-screen overlay (large↔small toggle).
     let (url, recast_metadata) = {
         let app_state = AppState::load(&state.state_dir);
         match app_state.current.as_ref() {
             Some(c) => (
                 c.url.clone(),
-                cast::CastMetadata {
-                    title: Some(c.title.clone()).filter(|t| !t.is_empty()),
-                    series_title: c.show.clone(),
-                    season: c.season,
-                    episode: c.episode,
-                    poster_url: c.poster_url.clone(),
-                    release_date: None,
+                if state.config.rich_metadata_in_load {
+                    cast::CastMetadata {
+                        title: Some(c.title.clone()).filter(|t| !t.is_empty()),
+                        series_title: c.show.clone(),
+                        season: c.season,
+                        episode: c.episode,
+                        poster_url: c.poster_url.clone(),
+                        release_date: None,
+                    }
+                } else {
+                    cast::CastMetadata::default()
                 },
             ),
             None => return Err(anyhow!("CurrentStream gone before recast could fire")),
