@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::cast::CastController;
+use crate::cast::{self, CastController};
 use crate::config::Config;
 use crate::disk;
 use crate::search::SearchEngine;
@@ -206,6 +206,12 @@ pub struct PlayRequest {
     pub duration: Option<f64>,
     pub quality: Option<String>,
     pub size: Option<String>,
+    /// Apr 28, 2026: TMDB poster URL for the playing item. Auto-filled by
+    /// the play handler from `last_search.json`'s `show.poster_url`. Sent
+    /// through to `cast_url`'s `CastMetadata` so the Default Media Receiver
+    /// renders the rich-UI player (poster background + auto-hide controls)
+    /// instead of its persistent minimal overlay.
+    pub poster_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -334,6 +340,10 @@ async fn do_play(
                         }
                         if req.size.is_none() {
                             req.size = Some(r.size.clone());
+                        }
+                        if req.poster_url.is_none() {
+                            req.poster_url = search.show.as_ref()
+                                .and_then(|s| s.poster_url.clone());
                         }
                         tracing::info!("Playing result #{}: {} (file_index: {:?})", rid, req.title.as_deref().unwrap_or("?"), req.file_index);
                     }
@@ -710,9 +720,35 @@ async fn do_play(
         } else {
             "video/mp4"
         };
+        // Apr 28, 2026: Build CastMetadata from the play request so the
+        // Default Media Receiver renders its rich-UI player (poster + title +
+        // auto-hide controls) instead of the persistent minimal overlay.
+        // Decision tree inside `cast::build_cast_metadata`:
+        //   - season + episode + show set → TvShow metadata
+        //   - else title set → Movie metadata
+        //   - else None → DMR fallback (legacy behavior)
+        let cast_metadata = cast::CastMetadata {
+            title: req.title.clone(),
+            series_title: req.show.clone(),
+            season: req.season,
+            episode: req.episode,
+            poster_url: req.poster_url.clone(),
+            release_date: None, // populated by movie path inside search.rs;
+                                // not currently plumbed through req — left
+                                // as a future polish (TvShow uses
+                                // original_air_date which is also unset).
+        };
+        let cast_metadata_clone = cast_metadata.clone();
         let cast_result = tokio::task::spawn_blocking(move || {
             let mut cast = state_clone.cast.lock().unwrap();
-            cast.cast_url(&cast_name_clone, &url_clone, cast_content_type, cast_duration, seek_to)
+            cast.cast_url(
+                &cast_name_clone,
+                &url_clone,
+                cast_content_type,
+                cast_duration,
+                seek_to,
+                &cast_metadata_clone,
+            )
         }).await;
 
         match cast_result {
@@ -787,6 +823,7 @@ async fn do_play(
         duration,
         quality: req.quality.clone(),
         size: req.size.clone(),
+        poster_url: req.poster_url.clone(),
         // Remember the -ss offset so cast_health_monitor can translate the
         // Chromecast's 0-based current_time into absolute source-timeline
         // position when it periodically calls save_position_smart.
@@ -1169,12 +1206,27 @@ async fn attempt_cast_recast(
 ) -> anyhow::Result<()> {
     use anyhow::anyhow;
 
-    // Pull the URL from state — the stream the monitor is watching has it on
-    // `CurrentStream`. No allocation needed past the clone.
-    let url = {
+    // Pull the URL + metadata from state — the stream the monitor is
+    // watching carries them on `CurrentStream`. Apr 28, 2026: also recover
+    // metadata so the recast LOAD message reproduces the rich-UI player
+    // (poster + title + auto-hide controls). Without this, a recast would
+    // re-issue LOAD with `metadata: None` and the receiver would drop into
+    // its persistent minimal-overlay UI for the recovered stream — losing
+    // the polish the original LOAD established.
+    let (url, recast_metadata) = {
         let app_state = AppState::load(&state.state_dir);
         match app_state.current.as_ref() {
-            Some(c) => c.url.clone(),
+            Some(c) => (
+                c.url.clone(),
+                cast::CastMetadata {
+                    title: Some(c.title.clone()).filter(|t| !t.is_empty()),
+                    series_title: c.show.clone(),
+                    season: c.season,
+                    episode: c.episode,
+                    poster_url: c.poster_url.clone(),
+                    release_date: None,
+                },
+            ),
             None => return Err(anyhow!("CurrentStream gone before recast could fire")),
         }
     };
@@ -1193,6 +1245,7 @@ async fn attempt_cast_recast(
     let cast_name_clone = cast_name.to_string();
     let url_clone = url.clone();
     let content_type_clone = content_type.to_string();
+    let recast_metadata_clone = recast_metadata.clone();
     let load_outcome = tokio::task::spawn_blocking(move || {
         let mut cast = state_clone.cast.lock().unwrap();
         cast.cast_url(
@@ -1201,6 +1254,7 @@ async fn attempt_cast_recast(
             &content_type_clone,
             duration_hint,
             None,
+            &recast_metadata_clone,
         )
     })
     .await;
@@ -1790,6 +1844,7 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         duration: None,
         quality: Some(best.quality.clone()),
         size: Some(best.size.clone()),
+        poster_url: result.show.as_ref().and_then(|s| s.poster_url.clone()),
     };
 
     handle_play(State(state.clone()), Json(play_req)).await

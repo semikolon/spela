@@ -46,6 +46,15 @@ pub struct ShowInfo {
     pub release_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overview: Option<String>,
+    /// Apr 28, 2026: Full TMDB poster URL, already prefixed with the image
+    /// base (`https://image.tmdb.org/t/p/w500{poster_path}`). Populated at
+    /// search time, persisted into `last_search.json`, plumbed through
+    /// `PlayRequest.poster_url` → `CurrentStream.poster_url` → `CastMetadata`
+    /// so the Default Media Receiver renders its rich-UI player (poster
+    /// background + auto-hide controls) instead of the minimal persistent
+    /// overlay it shows when `Media.metadata` is None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poster_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +167,7 @@ impl SearchEngine {
             next_episode: extract_episode(&detail["next_episode_to_air"]),
             release_date: None,
             overview: None,
+            poster_url: tmdb_poster_url(detail["poster_path"].as_str()),
         };
 
         let imdb_id = match &show_info.imdb_id {
@@ -221,6 +231,7 @@ impl SearchEngine {
             next_episode: None,
             release_date: detail["release_date"].as_str().map(String::from),
             overview: detail["overview"].as_str().map(|s| s.chars().take(200).collect()),
+            poster_url: tmdb_poster_url(detail["poster_path"].as_str()),
         };
 
         let imdb_id = match &show_info.imdb_id {
@@ -620,6 +631,37 @@ fn extract_episode(val: &Value) -> Option<EpisodeRef> {
     })
 }
 
+/// Apr 28, 2026: Build a full TMDB poster URL from a `poster_path` field.
+///
+/// TMDB's `/movie/{id}` and `/tv/{id}` endpoints return `poster_path` as a
+/// relative segment like `"/qZQqEgXgGRpC8nJa9j5ej31Ynmm.jpg"`; the consumer
+/// is expected to prefix it with the image base URL + a size descriptor.
+/// We pick `w500` because it's the sweet spot for Cast UI rendering: large
+/// enough for the receiver's full-screen poster background on a 1080p TV
+/// without paying for unused pixels (`original` is often 2-4 MB; `w500`
+/// is ~80-120 KB and indistinguishable at TV viewing distance).
+///
+/// Defenses:
+///   - `None` / empty → `None` (no synthetic URL)
+///   - Already-prefixed URL (someone manually built one) → returned as-is
+///     so we don't end up with `https://image.tmdb.org/t/p/w500https://...`
+///   - Missing leading slash → still works, we insert one
+fn tmdb_poster_url(poster_path: Option<&str>) -> Option<String> {
+    let path = poster_path?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return Some(path.to_string());
+    }
+    let normalized = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    Some(format!("https://image.tmdb.org/t/p/w500{normalized}"))
+}
+
 fn parse_torrentio_title(title: &str) -> (u32, String, String) {
     let seeds = title.find("👤").and_then(|i| {
         title[i..].split_whitespace().nth(1)?.parse().ok()
@@ -654,6 +696,89 @@ fn urlencoded(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- Apr 28, 2026: tmdb_poster_url regression suite -----
+    //
+    // Pin the URL-construction logic so it can't silently regress and start
+    // emitting bogus URLs the Default Media Receiver can't fetch. A wrong
+    // URL in the LOAD message would land us back in the persistent-overlay
+    // fallback (the very bug we're trying to fix).
+
+    #[test]
+    fn tmdb_poster_url_typical_path() {
+        let url = tmdb_poster_url(Some("/qZQqEgXgGRpC8nJa9j5ej31Ynmm.jpg"));
+        assert_eq!(url.as_deref(),
+            Some("https://image.tmdb.org/t/p/w500/qZQqEgXgGRpC8nJa9j5ej31Ynmm.jpg"));
+    }
+
+    #[test]
+    fn tmdb_poster_url_missing_leading_slash_is_inserted() {
+        // TMDB always returns leading slash, but defend against a future
+        // schema change or upstream bug where it doesn't.
+        let url = tmdb_poster_url(Some("abc.jpg"));
+        assert_eq!(url.as_deref(),
+            Some("https://image.tmdb.org/t/p/w500/abc.jpg"));
+    }
+
+    #[test]
+    fn tmdb_poster_url_already_full_url_passes_through() {
+        // If someone (mistakenly or via cache migration) has stored a
+        // already-prefixed URL, don't double-prefix it.
+        let url = tmdb_poster_url(Some("https://example.com/poster.jpg"));
+        assert_eq!(url.as_deref(), Some("https://example.com/poster.jpg"));
+
+        let url = tmdb_poster_url(Some("http://example.com/poster.jpg"));
+        assert_eq!(url.as_deref(), Some("http://example.com/poster.jpg"));
+    }
+
+    #[test]
+    fn tmdb_poster_url_none_returns_none() {
+        assert_eq!(tmdb_poster_url(None), None);
+    }
+
+    #[test]
+    fn tmdb_poster_url_empty_returns_none() {
+        assert_eq!(tmdb_poster_url(Some("")), None);
+        assert_eq!(tmdb_poster_url(Some("   ")), None,
+            "Whitespace-only path must be rejected.");
+    }
+
+    #[test]
+    fn tmdb_poster_url_handles_special_chars_in_path() {
+        // TMDB poster paths are alphanumeric + dot, but defend against
+        // unusual filenames (different image bucket, different content type).
+        let url = tmdb_poster_url(Some("/some-name_with.dots-and_underscores.png"));
+        assert_eq!(url.as_deref(),
+            Some("https://image.tmdb.org/t/p/w500/some-name_with.dots-and_underscores.png"));
+    }
+
+    #[test]
+    fn tmdb_poster_url_picks_w500_size() {
+        // Pin the size choice so a future "let's use original" tweak that
+        // bloats Cast LOAD messages by 20× gets caught by tests.
+        let url = tmdb_poster_url(Some("/x.jpg")).unwrap();
+        assert!(url.contains("/w500/"),
+            "URL must include the w500 size descriptor: {url}");
+        assert!(!url.contains("/original/"),
+            "Original-size posters are 2-4 MB, too heavy for the LOAD msg");
+    }
+
+    #[test]
+    fn tmdb_poster_url_show_info_serde_roundtrip() {
+        // Apr 28, 2026: Adding a new optional field to ShowInfo shouldn't
+        // break deserialization of pre-Apr-28 cached last_search.json files.
+        // Pin the back-compat property here so a #[serde(default)] regression
+        // is immediately visible.
+        let legacy_json = r#"{
+            "tmdb_id": 12345,
+            "title": "Hijack"
+        }"#;
+        let info: ShowInfo = serde_json::from_str(legacy_json)
+            .expect("legacy ShowInfo must deserialize");
+        assert_eq!(info.title, "Hijack");
+        assert!(info.poster_url.is_none(),
+            "Missing poster_url field in old JSON must default to None.");
+    }
 
     #[test]
     fn test_is_hevc_from_title() {

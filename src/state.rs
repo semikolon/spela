@@ -60,6 +60,15 @@ pub struct CurrentStream {
     pub quality: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
+    /// Apr 28, 2026: TMDB poster URL (full, prefixed with image base) for
+    /// the currently-playing show/movie. Plumbed through to `cast.rs`
+    /// `CastMetadata` so the receiver renders the rich-UI player. Persists
+    /// across server restarts so a recast (cast_health_monitor's auto-recover
+    /// path) can re-issue LOAD with the same metadata. Optional + serde
+    /// default for forward compat with state.json files written before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poster_url: Option<String>,
     /// The `-ss` seek offset passed to ffmpeg at transcode-start, in seconds
     /// of source-media timeline. Defaults to 0 for a normal play, becomes
     /// `N` when the user runs `spela play X --seek N` or when auto-resume
@@ -463,6 +472,7 @@ mod tests {
             duration: Some(3823.6),
             quality: Some("1080p".into()),
             size: Some("4.5 GB".into()),
+            poster_url: None,
             ss_offset: 1800.0,
         };
         let serialized = serde_json::to_string(&stream).expect("serialize");

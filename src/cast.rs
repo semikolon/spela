@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
-use rust_cast::channels::media::{Media, Metadata, PlayerState, StreamType};
+use rust_cast::channels::media::{
+    Image, Media, Metadata, MovieMediaMetadata, PlayerState, StreamType,
+    TvShowMediaMetadata,
+};
 use rust_cast::channels::receiver::CastDeviceApp;
 use rust_cast::{CastDevice, ChannelMessage};
 
@@ -14,6 +17,115 @@ const CAST_PORT: u16 = 8009;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+
+/// Apr 28, 2026: Inputs to `build_cast_metadata`, derived from the play
+/// request + `last_search.json` context. Pure data — no network/IO. Default
+/// is "all None" which produces `Metadata::None` (the legacy behavior),
+/// preserving back-compat for any caller that doesn't have rich context.
+///
+/// Why a struct instead of 6 positional args to `cast_url`: the LOAD path
+/// is going to keep growing (subtitle tracks, audio track index, custom
+/// receiver app id …). A named struct lets future fields land additively
+/// without forcing every caller to thread positional args through. Also
+/// makes `build_cast_metadata` independently testable from `cast_url`'s
+/// network plumbing.
+#[derive(Debug, Clone, Default)]
+pub struct CastMetadata {
+    /// For TV: the episode title (rendered as subtitle in the rich UI).
+    /// For movies: the movie title.
+    pub title: Option<String>,
+    /// For TV: the show name (e.g. "Hijack"). When `series_title` AND
+    /// `season` AND `episode` are all set, `Metadata::TvShow` is emitted;
+    /// otherwise we fall back to `Metadata::Movie` if `title` is set.
+    pub series_title: Option<String>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    /// Full TMDB poster URL, already prefixed with the image base
+    /// (`https://image.tmdb.org/t/p/w500{path}`). Goes into
+    /// `Vec<Image>` for receiver UI rendering. Optional — we still get
+    /// auto-hide controls from a metadata-only LOAD message; the poster
+    /// is the polish on top.
+    pub poster_url: Option<String>,
+    /// ISO-8601 release date for movies. Goes into `MovieMediaMetadata.subtitle`
+    /// AND `release_date` so the receiver can render it under the title.
+    pub release_date: Option<String>,
+}
+
+/// Build the rust_cast `Metadata` enum to put inside the LOAD message.
+///
+/// Apr 28, 2026: Replaces the previous `metadata: None` which made the
+/// Default Media Receiver fall back to its persistent minimal-overlay UI
+/// (thin progress line + elapsed-time counter that never auto-hide). With
+/// proper metadata the receiver renders its rich-UI player: poster
+/// background, episode/movie title overlay, controls auto-hide after
+/// ~3 seconds of inactivity. See [Cast Web Receiver — Secondary
+/// Image](https://developers.google.com/cast/docs/web_receiver/secondary_image)
+/// for the receiver-side rendering rules.
+///
+/// Decision tree:
+///
+/// 1. Has `series_title` AND `season` AND `episode` → `TvShow`.
+///    (`title` is treated as the episode_title; missing → just season+episode.)
+/// 2. Else has non-empty `title` → `Movie`.
+///    (`release_date` populated when present; subtitle defaults to the year.)
+/// 3. Else → `None`. If we have nothing useful to show, sending bogus
+///    placeholder metadata would be worse than letting DMR fall back —
+///    at least the fallback path is what we had before this change.
+///
+/// Pure function: trivially testable, no network, no I/O, no global state.
+pub fn build_cast_metadata(meta: &CastMetadata) -> Option<Metadata> {
+    let images: Vec<Image> = match meta.poster_url.as_deref() {
+        Some(url) if !url.trim().is_empty() => vec![Image::new(url.to_string())],
+        _ => Vec::new(),
+    };
+
+    // Tier 1 — TV show: requires series_title + season + episode all present.
+    // Apr 28: Season=0 / Episode=0 are legal (specials, pilots, teasers) so
+    // we don't gate on >0; only require the fields to be Some.
+    if let (Some(s), Some(e), Some(series)) = (
+        meta.season,
+        meta.episode,
+        meta.series_title.as_deref().filter(|s| !s.trim().is_empty()),
+    ) {
+        let episode_title = meta
+            .title
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| t.to_string());
+        return Some(Metadata::TvShow(TvShowMediaMetadata {
+            series_title: Some(series.to_string()),
+            episode_title,
+            season: Some(s),
+            episode: Some(e),
+            images,
+            original_air_date: meta.release_date.clone(),
+        }));
+    }
+
+    // Tier 2 — Movie: requires title.
+    if let Some(title) = meta
+        .title
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+    {
+        // Subtitle: just the release year if we have a date, else None. The
+        // receiver renders subtitle directly under the title — keeping it
+        // short avoids overflow on TVs with smaller poster overlays.
+        let subtitle = meta.release_date.as_deref().and_then(|d| {
+            d.split('-').next().filter(|y| y.len() == 4).map(|y| y.to_string())
+        });
+        return Some(Metadata::Movie(MovieMediaMetadata {
+            title: Some(title.to_string()),
+            subtitle,
+            studio: None,
+            images,
+            release_date: meta.release_date.clone(),
+        }));
+    }
+
+    None
+}
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,7 +265,7 @@ impl CastController {
     /// Receiver — Default Media Receiver can't seek in fMP4 without
     /// byte-offset index. Jellyfin solves this with custom receiver + Shaka
     /// Player + server-side seek-restart.
-    pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, duration: Option<f64>, _current_time: Option<f64>) -> Result<CastResult> {
+    pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, duration: Option<f64>, _current_time: Option<f64>, metadata: &CastMetadata) -> Result<CastResult> {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, session_id) = Self::get_or_launch_app(&device)?;
@@ -167,12 +279,20 @@ impl CastController {
             StreamType::Live
         };
 
+        let cast_metadata = build_cast_metadata(metadata);
+        if cast_metadata.is_none() {
+            tracing::debug!(
+                "cast_url: no rich metadata to send — Default Media Receiver \
+                 will use minimal-overlay fallback UI"
+            );
+        }
+
         let media = Media {
             content_id: url.to_string(),
             content_type: content_type.to_string(),
             stream_type,
             duration: duration.map(|d| d as f32),
-            metadata: None,
+            metadata: cast_metadata,
         };
 
         // Note: rust_cast's Load message currently doesn't expose currentTime in its high-level API.
@@ -385,5 +505,411 @@ fn extract_metadata_title(metadata: &Metadata) -> String {
             .unwrap_or_default(),
         Metadata::MusicTrack(m) => m.title.clone().unwrap_or_default(),
         Metadata::Photo(m) => m.title.clone().unwrap_or_default(),
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Apr 28, 2026: build_cast_metadata regression suite.
+//
+// The Default Media Receiver renders two different UIs depending on the
+// LOAD message's `Media.metadata` field:
+//
+//   - `metadata: Some(Metadata::TvShow|Movie)` with title + image →
+//     rich-UI player (poster background, title overlay, controls
+//     auto-hide after ~3s of inactivity)
+//   - `metadata: None` → minimal-overlay fallback (thin progress line +
+//     elapsed-time counter that NEVER auto-hide because there's no rich
+//     layer to switch to)
+//
+// Pre-Apr-28 spela always sent `metadata: None` (cast.rs line 175 had
+// the literal `metadata: None` for the entire history of this file). The
+// Apr 28 fix routes show/episode/poster context from the play request
+// through `CastMetadata` → `build_cast_metadata` → the LOAD message.
+//
+// These tests pin the decision tree so a future refactor can't silently
+// regress the UI back to the persistent overlay. Tests are creative +
+// combinatorial per Fredrik's testing directive — each case is an
+// invariant that, if broken, would re-introduce a specific real bug.
+#[cfg(test)]
+mod build_cast_metadata_tests {
+    use super::*;
+
+    fn meta() -> CastMetadata { CastMetadata::default() }
+
+    // ---- Decision-tree happy path ----
+
+    #[test]
+    fn tv_show_with_all_fields_emits_tvshow_metadata() {
+        let m = CastMetadata {
+            title: Some("Marwan".into()),
+            series_title: Some("Hijack".into()),
+            season: Some(2),
+            episode: Some(1),
+            poster_url: Some("https://image.tmdb.org/t/p/w500/abc.jpg".into()),
+            release_date: Some("2026-04-26".into()),
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::TvShow(t)) => {
+                assert_eq!(t.series_title.as_deref(), Some("Hijack"));
+                assert_eq!(t.episode_title.as_deref(), Some("Marwan"));
+                assert_eq!(t.season, Some(2));
+                assert_eq!(t.episode, Some(1));
+                assert_eq!(t.images.len(), 1);
+                assert_eq!(t.images[0].url, "https://image.tmdb.org/t/p/w500/abc.jpg");
+                assert_eq!(t.original_air_date.as_deref(), Some("2026-04-26"));
+            }
+            other => panic!("expected TvShow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn movie_with_title_emits_movie_metadata() {
+        let m = CastMetadata {
+            title: Some("Send Help".into()),
+            series_title: None,
+            season: None,
+            episode: None,
+            poster_url: Some("https://image.tmdb.org/t/p/w500/zzz.jpg".into()),
+            release_date: Some("2026-01-15".into()),
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::Movie(mv)) => {
+                assert_eq!(mv.title.as_deref(), Some("Send Help"));
+                assert_eq!(mv.subtitle.as_deref(), Some("2026"),
+                    "Subtitle should be the year extracted from release_date");
+                assert_eq!(mv.images.len(), 1);
+                assert_eq!(mv.release_date.as_deref(), Some("2026-01-15"));
+            }
+            other => panic!("expected Movie, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_useful_returns_none_so_dmr_falls_back_to_legacy_behavior() {
+        // When neither title nor series_title is set, sending bogus
+        // placeholder metadata would mislead the receiver. Returning None
+        // preserves the pre-Apr-28 behavior for the truly-unknown case.
+        assert!(build_cast_metadata(&meta()).is_none());
+    }
+
+    // ---- Partial / malformed input cases ----
+
+    #[test]
+    fn season_and_episode_without_series_title_falls_back_to_movie_or_none() {
+        let m = CastMetadata {
+            title: Some("Some Episode".into()),
+            series_title: None,
+            season: Some(2),
+            episode: Some(1),
+            ..meta()
+        };
+        // Without a series_title the TvShow branch can't fire — fall back
+        // to Movie since title is set. Better to render rich Movie metadata
+        // than the persistent-overlay fallback.
+        assert!(matches!(build_cast_metadata(&m), Some(Metadata::Movie(_))));
+    }
+
+    #[test]
+    fn series_title_without_season_or_episode_falls_back_to_movie() {
+        // Edge: caller knows it's a TV show but doesn't know the episode
+        // numbering yet (e.g. anthology series). Fall back to Movie shape
+        // using the show name as the title.
+        let m = CastMetadata {
+            title: Some("Hijack".into()),
+            series_title: Some("Hijack".into()),
+            season: None,
+            episode: None,
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::Movie(mv)) => {
+                assert_eq!(mv.title.as_deref(), Some("Hijack"));
+            }
+            other => panic!("expected Movie fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_string_series_title_treated_as_absent() {
+        // An empty Some("") shouldn't activate the TvShow branch — the
+        // receiver would render an empty header bar. Defense against
+        // upstream bugs feeding us blank strings.
+        let m = CastMetadata {
+            title: Some("Episode".into()),
+            series_title: Some("   ".into()), // whitespace-only
+            season: Some(1),
+            episode: Some(1),
+            ..meta()
+        };
+        assert!(matches!(build_cast_metadata(&m), Some(Metadata::Movie(_))),
+            "Whitespace-only series_title must not trigger TvShow path.");
+    }
+
+    #[test]
+    fn empty_string_title_treated_as_absent() {
+        let m = CastMetadata {
+            title: Some("   ".into()),
+            ..meta()
+        };
+        assert!(build_cast_metadata(&m).is_none());
+    }
+
+    #[test]
+    fn season_zero_episode_zero_still_emits_tvshow() {
+        // Season 0 = specials, Episode 0 = pilot/teaser — both legal
+        // TVDB/TMDB conventions. Don't gate on >0.
+        let m = CastMetadata {
+            title: Some("Pilot".into()),
+            series_title: Some("Show".into()),
+            season: Some(0),
+            episode: Some(0),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::TvShow(t)) => {
+                assert_eq!(t.season, Some(0));
+                assert_eq!(t.episode, Some(0));
+            }
+            other => panic!("expected TvShow for s0e0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tvshow_without_episode_title_still_works() {
+        // Episode title unknown is fine — receiver renders just
+        // "Show — S2E1" header.
+        let m = CastMetadata {
+            title: None,
+            series_title: Some("Hijack".into()),
+            season: Some(2),
+            episode: Some(1),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::TvShow(t)) => {
+                assert!(t.episode_title.is_none());
+                assert_eq!(t.series_title.as_deref(), Some("Hijack"));
+            }
+            other => panic!("expected TvShow, got {other:?}"),
+        }
+    }
+
+    // ---- Image / poster_url handling ----
+
+    #[test]
+    fn no_poster_url_yields_empty_images_vec() {
+        let m = CastMetadata {
+            title: Some("Test".into()),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::Movie(mv)) => assert_eq!(mv.images.len(), 0),
+            other => panic!("expected Movie, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_string_poster_url_yields_empty_images() {
+        let m = CastMetadata {
+            title: Some("Test".into()),
+            poster_url: Some("".into()),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::Movie(mv)) => assert_eq!(mv.images.len(), 0),
+            other => panic!("expected Movie, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whitespace_poster_url_yields_empty_images() {
+        let m = CastMetadata {
+            title: Some("Test".into()),
+            poster_url: Some("   ".into()),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::Movie(mv)) => assert_eq!(mv.images.len(), 0),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn poster_url_passes_through_verbatim_no_double_encoding() {
+        // URLs already contain percent-encoded chars from TMDB; we must
+        // not re-encode them (would produce %25xx instead of %xx).
+        let url = "https://image.tmdb.org/t/p/w500/path%20with%20spaces.jpg";
+        let m = CastMetadata {
+            title: Some("Test".into()),
+            poster_url: Some(url.into()),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::Movie(mv)) => {
+                assert_eq!(mv.images[0].url, url);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // ---- Subtitle / release_date logic ----
+
+    #[test]
+    fn movie_subtitle_extracts_year_from_iso_date() {
+        let m = CastMetadata {
+            title: Some("Send Help".into()),
+            release_date: Some("2026-01-15".into()),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::Movie(mv)) => assert_eq!(mv.subtitle.as_deref(), Some("2026")),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn movie_subtitle_handles_year_only_release_date() {
+        let m = CastMetadata {
+            title: Some("Old Film".into()),
+            release_date: Some("1985".into()),
+            ..meta()
+        };
+        // "1985" splits to ["1985"], first element is 4-char numeric → year.
+        match build_cast_metadata(&m) {
+            Some(Metadata::Movie(mv)) => assert_eq!(mv.subtitle.as_deref(), Some("1985")),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn movie_subtitle_skips_non_year_release_dates() {
+        // Garbage release_date shouldn't produce a garbage subtitle.
+        let m = CastMetadata {
+            title: Some("X".into()),
+            release_date: Some("not-a-date".into()),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::Movie(mv)) => assert!(mv.subtitle.is_none()),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn movie_subtitle_none_when_no_release_date() {
+        let m = CastMetadata {
+            title: Some("X".into()),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::Movie(mv)) => assert!(mv.subtitle.is_none()),
+            _ => unreachable!(),
+        }
+    }
+
+    // ---- Unicode / exotic input ----
+
+    #[test]
+    fn swedish_chars_preserved_in_title() {
+        let m = CastMetadata {
+            title: Some("Björk".into()),
+            series_title: Some("Sång & Dans".into()),
+            season: Some(1),
+            episode: Some(1),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::TvShow(t)) => {
+                assert_eq!(t.series_title.as_deref(), Some("Sång & Dans"));
+                assert_eq!(t.episode_title.as_deref(), Some("Björk"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn long_episode_title_passes_through_untruncated() {
+        // The receiver decides truncation/ellipsis itself based on the
+        // overlay box. We must not pre-truncate or we lose info on TVs
+        // with bigger overlays.
+        let long_title = "a".repeat(500);
+        let m = CastMetadata {
+            title: Some(long_title.clone()),
+            series_title: Some("S".into()),
+            season: Some(1),
+            episode: Some(1),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::TvShow(t)) => {
+                assert_eq!(t.episode_title.as_deref(), Some(long_title.as_str()));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn title_with_quotes_and_apostrophes() {
+        // "What's Past Is Prologue" — apostrophe + quotes should pass through
+        let m = CastMetadata {
+            title: Some(r#"What's "Past" Is Prologue"#.into()),
+            ..meta()
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::Movie(mv)) => {
+                assert_eq!(mv.title.as_deref(), Some(r#"What's "Past" Is Prologue"#));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn realistic_apr28_hijack_case_emits_tvshow() {
+        // The actual case from the bug report screenshot: Hijack S2E1
+        // playing on Fredriks TV with the persistent progress bar. With
+        // metadata wired correctly this should produce TvShow metadata.
+        let m = CastMetadata {
+            title: Some("Hijack S02E01".into()),
+            series_title: Some("Hijack".into()),
+            season: Some(2),
+            episode: Some(1),
+            poster_url: Some("https://image.tmdb.org/t/p/w500/qZQqEgXgGRpC8nJa9j5ej31Ynmm.jpg".into()),
+            release_date: None,
+        };
+        match build_cast_metadata(&m) {
+            Some(Metadata::TvShow(t)) => {
+                assert_eq!(t.series_title.as_deref(), Some("Hijack"));
+                assert_eq!(t.season, Some(2));
+                assert_eq!(t.episode, Some(1));
+                assert_eq!(t.images.len(), 1);
+            }
+            other => panic!("expected TvShow for the Apr 28 Hijack case, got {other:?}"),
+        }
+    }
+
+    // ---- Default impl sanity ----
+
+    #[test]
+    fn default_castmetadata_produces_none() {
+        assert!(build_cast_metadata(&CastMetadata::default()).is_none());
+    }
+
+    #[test]
+    fn cast_metadata_clone_is_pure() {
+        // CastMetadata is passed through tokio spawn_blocking — verify
+        // Clone is honest (no shared state). If someone changes a field
+        // to non-Clone-safe in the future this test will fail to compile.
+        let m = CastMetadata {
+            title: Some("x".into()),
+            series_title: Some("y".into()),
+            season: Some(1),
+            episode: Some(1),
+            poster_url: Some("https://x".into()),
+            release_date: Some("2026".into()),
+        };
+        let c = m.clone();
+        assert_eq!(m.title, c.title);
+        assert_eq!(m.series_title, c.series_title);
     }
 }
