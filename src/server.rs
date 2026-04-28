@@ -1171,6 +1171,51 @@ pub fn is_position_jump_suspicious(delta_wall_secs: f64, delta_abs_secs: f64) ->
 /// to be mid-stream CAF flakes that the device recovers from on a fresh LOAD.
 pub const MIN_STREAM_AGE_FOR_RECAST_SECS: u64 = 60;
 
+/// Apr 29, 2026: minimum wall-clock cooldown between recast attempts. Replaces
+/// the original Apr 25 lifetime-cap-of-1 with a frequency-cap design.
+///
+/// Why the change: the cap-of-1 was correct for the failure class it was
+/// built for (Apr 25 Vardagsrum CrKey 1.56 mid-stream IDLE — single random
+/// flake, one retry, give up if the retry doesn't work). It was wrong for
+/// a different class we hit Apr 28-29: receiver IDLEs every ~15-30 minutes
+/// of sustained playback, recovers with a recast for another 15-30 min,
+/// IDLEs again. Each recast was successful recovery, not "burning cycles
+/// on a wedge" — but the lifetime cap rejected them anyway, leaving the
+/// user with a permanent dead stream. (Hijack S2E2 Apr 28-29 incident: 6
+/// rapid Playing↔Buffering oscillations at 38-40 min into stream after
+/// burning the recast budget on the first IDLE; would have benefited from
+/// 2-3 more recasts to keep playback alive.)
+///
+/// The cap-of-1 conflated wedge-detection with attempt-limiting. They're
+/// separate concerns: the WEDGE we're protecting against is rapid-fire
+/// recast→IDLE→recast→IDLE within seconds (looks like infinite loop on a
+/// truly broken device). That's a FREQUENCY property, not a lifetime
+/// property — express it as a cooldown.
+///
+/// 90 seconds is well-above the maximum legitimate recast→Playing recovery
+/// time (~15-25s observed) and well-below the minimum healthy-recast cycle
+/// time we've seen (~3-15 minutes in practice).
+pub const RECAST_COOLDOWN_SECS: u64 = 90;
+
+/// Apr 29, 2026: BUFFERING-too-long → escalate to recast.
+///
+/// Apr 18 fix established that BUFFERING is a TRANSIENT state (alive
+/// receiver waiting for data, will recover). Killing on BUFFERING was
+/// converting recoverable conditions into permanent stream death. But
+/// "BUFFERING is transient" was implicit — never bounded by a timeout.
+/// Apr 28-29 incident: receiver entered BUFFERING and stayed there
+/// permanently (still BUFFERING when the user fell asleep 5+ minutes
+/// later) with cast_health_monitor logging "BUFFERING (transient — not
+/// incrementing failure counter)" forever.
+///
+/// This threshold makes "transient" mean what it says: a normal HLS
+/// re-buffer takes 5-15 seconds; an aggressive seek takes ~30s; a
+/// recast-induced buffer takes ~25s. 60s is well above all of these.
+/// If the receiver is still BUFFERING at 60s, it's stalled — escalate
+/// to the same path as IDLE (try recast subject to cooldown, else
+/// cleanup).
+pub const MAX_BUFFERING_DURATION_SECS: u64 = 60;
+
 /// Decision: should `cast_health_monitor` attempt auto-recast before cleanup?
 ///
 /// Apr 25, 2026 — added after the Vardagsrum CrKey 1.56 Chromecast repeatedly
@@ -1181,20 +1226,26 @@ pub const MIN_STREAM_AGE_FOR_RECAST_SECS: u64 = 60;
 /// purely a receiver-side flake. One recast attempt is free recovery when
 /// the Chromecast just needs a new LOAD message.
 ///
-/// Returns true only when ALL of these hold:
-///   - `recast_attempts == 0` — exactly one chance per stream lifecycle, so
-///     a truly wedged device can't trap us in an infinite LOAD/IDLE loop.
-///     If the second IDLE batch fires, cleanup proceeds normally.
-///   - `stream_age_secs >= MIN_STREAM_AGE_FOR_RECAST_SECS` — see constant doc.
+/// Apr 29, 2026 — replaced lifetime cap-of-1 with rate limit. See
+/// `RECAST_COOLDOWN_SECS` doc for rationale. Returns true only when ALL of
+/// these hold:
 ///   - `have_valid_hwm` — no point recasting if we can't restore position.
+///   - `stream_age_secs >= MIN_STREAM_AGE_FOR_RECAST_SECS` — see constant doc.
+///   - Either `secs_since_last_recast` is `None` (first recast this stream)
+///     OR it's at least `RECAST_COOLDOWN_SECS` — frequency-cap that prevents
+///     the rapid-fire wedge case (recast→IDLE→recast→IDLE in seconds) without
+///     artificially stopping recoverable cycles.
 pub fn should_attempt_recast(
-    recast_attempts: u32,
+    secs_since_last_recast: Option<u64>,
     stream_age_secs: u64,
     have_valid_hwm: bool,
 ) -> bool {
-    recast_attempts == 0
+    have_valid_hwm
         && stream_age_secs >= MIN_STREAM_AGE_FOR_RECAST_SECS
-        && have_valid_hwm
+        && match secs_since_last_recast {
+            None => true, // first recast of this stream — always allowed
+            Some(s) => s >= RECAST_COOLDOWN_SECS,
+        }
 }
 
 /// Try to re-LOAD the current stream to the Chromecast and seek to the saved HWM.
@@ -1390,14 +1441,18 @@ async fn cast_health_monitor(
     // at the credits. Updated on every successful non-idle probe (not just
     // the 30-second save cadence), so at EOF we have current-to-within-5s data.
     let mut last_known_absolute: Option<f64> = None;
-    // Apr 25, 2026: auto-recast state.
-    // `recast_attempts` is the gate used by `should_attempt_recast` to cap
-    // recovery at one attempt per stream — a genuinely wedged Chromecast
-    // must not be able to trap the monitor in an infinite LOAD/IDLE loop.
-    // `prev_player_state_upper` powers state-transition logging (e.g.
-    // PLAYING → BUFFERING → IDLE) so we have a legible timeline in the
-    // journal instead of per-poll spam at DEBUG.
+    // Apr 25, 2026 (rev. Apr 29 — see `RECAST_COOLDOWN_SECS` for rationale):
+    // auto-recast state. `recast_attempts` stays as a diagnostic counter
+    // (surfaced in the PRE-CLEANUP log) but no longer gates the recast
+    // decision; `last_recast_at` does, via the rate-limit in
+    // `should_attempt_recast`.
     let mut recast_attempts: u32 = 0;
+    let mut last_recast_at: Option<std::time::Instant> = None;
+    // Apr 29, 2026: tracking BUFFERING duration. BUFFERING is "transient" per
+    // the Apr 18 rule, but a permanent BUFFERING is a stall (Apr 28-29
+    // incident). When this exceeds `MAX_BUFFERING_DURATION_SECS`, escalate
+    // to the recast/cleanup path the same way IDLE does.
+    let mut buffering_started_at: Option<std::time::Instant> = None;
     let mut prev_player_state_upper: Option<String> = None;
     tracing::info!(
         "cast_health_monitor: started for '{}' on '{}' (poll every {}s, fail after {} consecutive idle/error, ss_offset={:.0}s, save every {}s)",
@@ -1467,18 +1522,40 @@ async fn cast_health_monitor(
                         "cast_health_monitor: '{}' player_state={} idle_reason={:?} media_session={:?} ({}/{} consecutive idle polls before cleanup)",
                         title_for_log, info.player_state, info.idle_reason, info.media_session_id, consecutive_failures, IDLE_FAILURE_THRESHOLD
                     );
+                    // Apr 29, 2026: an IDLE poll definitively ends the
+                    // BUFFERING regime if there was one — receiver isn't
+                    // buffering anymore, it's dead.
+                    buffering_started_at = None;
                 } else if is_buffering {
-                    // Apr 18: BUFFERING is a TRANSIENT state — the Chromecast
-                    // is alive and waiting for more HLS segments. It WILL
-                    // recover once ffmpeg writes enough. Do NOT increment
-                    // failure counter. Log for observability only.
-                    // (Directive: "Symptoms are signals — recoverable states
-                    // are not failures. Killing a buffering stream is worse
-                    // than waiting.")
-                    tracing::info!(
-                        "cast_health_monitor: '{}' BUFFERING (transient — not incrementing failure counter)",
-                        title_for_log
-                    );
+                    // Apr 18: BUFFERING is a TRANSIENT state — receiver
+                    // is alive and waiting for HLS segments. Do NOT
+                    // increment failure counter on a single poll.
+                    // Apr 29, 2026: but bound the "transient" claim. Track
+                    // when BUFFERING started; when it persists past
+                    // MAX_BUFFERING_DURATION_SECS, escalate to the
+                    // recast/cleanup path (it stalled, not "transient").
+                    let now = std::time::Instant::now();
+                    let started = *buffering_started_at.get_or_insert(now);
+                    let buffering_for_secs = now.duration_since(started).as_secs();
+                    if buffering_for_secs >= MAX_BUFFERING_DURATION_SECS {
+                        tracing::warn!(
+                            "cast_health_monitor: '{}' STALLED — BUFFERING for {}s (≥ {}s threshold); escalating to recast/cleanup path",
+                            title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS
+                        );
+                        // Force the cleanup gate (consecutive_failures >=
+                        // IDLE_FAILURE_THRESHOLD) to trigger recast. Set the
+                        // exact threshold so the PRE-CLEANUP log shows a
+                        // legible "3" rather than an ever-growing count.
+                        consecutive_failures = IDLE_FAILURE_THRESHOLD;
+                        // Reset so a successful recast → BUFFERING again
+                        // gets its own fresh threshold timer.
+                        buffering_started_at = None;
+                    } else {
+                        tracing::info!(
+                            "cast_health_monitor: '{}' BUFFERING (transient — {}s elapsed, threshold {}s)",
+                            title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS
+                        );
+                    }
                 } else {
                     if consecutive_failures > 0 {
                         tracing::info!(
@@ -1487,6 +1564,9 @@ async fn cast_health_monitor(
                         );
                     }
                     consecutive_failures = 0;
+                    // Apr 29, 2026: receiver is healthy — clear any
+                    // BUFFERING timer accumulated from prior poll(s).
+                    buffering_started_at = None;
                     tracing::debug!(
                         "cast_health_monitor: '{}' player_state={} time={:.0}/{:.0}",
                         title_for_log, info.player_state, info.current_time, info.duration
@@ -1637,17 +1717,20 @@ async fn cast_health_monitor(
                 (Some(dur), Some(abs_pos)) if dur > 0.0 => abs_pos >= dur * HWM_CLEAR_FRACTION,
                 _ => false,
             };
+            let secs_since_last_recast = last_recast_at
+                .map(|t| t.elapsed().as_secs());
             if !is_natural_eof
                 && should_attempt_recast(
-                    recast_attempts,
+                    secs_since_last_recast,
                     stream_age_secs,
                     last_known_absolute.is_some(),
                 )
             {
                 let hwm = last_known_absolute.unwrap_or(last_saved_position);
                 tracing::warn!(
-                    "cast_health_monitor: '{}' — attempting auto-recast (attempt 1/1) at HWM={:.0}s ss_offset={:.0}s stream_age={}s",
-                    title_for_log, hwm, ss_offset, stream_age_secs
+                    "cast_health_monitor: '{}' — attempting auto-recast (attempt #{}, secs_since_last={:?}, cooldown={}s) at HWM={:.0}s ss_offset={:.0}s stream_age={}s",
+                    title_for_log, recast_attempts + 1, secs_since_last_recast,
+                    RECAST_COOLDOWN_SECS, hwm, ss_offset, stream_age_secs
                 );
                 match attempt_cast_recast(
                     &state,
@@ -1664,6 +1747,7 @@ async fn cast_health_monitor(
                             title_for_log
                         );
                         recast_attempts += 1;
+                        last_recast_at = Some(std::time::Instant::now());
                         consecutive_failures = 0;
                         // Force a transition-log entry on the next poll (the
                         // state may still read IDLE for one more tick while
@@ -3053,28 +3137,47 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    // --- Auto-recast decision (Apr 25, 2026 regression guards) ---
+    // --- Auto-recast decision (Apr 25 + Apr 29, 2026 regression guards) ---
     //
     // `should_attempt_recast` is the gate that keeps a wedged Chromecast from
-    // trapping cast_health_monitor in an infinite LOAD/IDLE loop while still
-    // giving the common "CrKey 1.56 dropped its CAF session after 11 minutes"
-    // case a cheap recovery. These tests pin the three guards so none of them
-    // can drift silently.
+    // trapping cast_health_monitor in a pointless retry loop while ENABLING
+    // recurring recovery for receivers that flake periodically. Apr 29
+    // replaced the original Apr 25 lifetime cap-of-1 with a frequency cap
+    // (cooldown) — see RECAST_COOLDOWN_SECS doc for rationale.
+    //
+    // These tests pin every guard so none of them can drift silently.
 
     #[test]
     fn test_recast_normal_mid_stream_death() {
         // Vardagsrum-style failure: ~12 min in, we have an HWM, no prior recast.
         // This is the primary recovery case — must attempt.
-        assert!(should_attempt_recast(0, 720, true));
+        assert!(should_attempt_recast(None, 720, true));
     }
 
     #[test]
-    fn test_recast_caps_at_one_attempt_per_stream() {
-        // Second IDLE batch after a prior recast → MUST NOT loop. A wedged
-        // device that keeps IDLE-ing will otherwise burn cycles indefinitely.
-        assert!(!should_attempt_recast(1, 720, true));
-        assert!(!should_attempt_recast(2, 720, true));
-        assert!(!should_attempt_recast(u32::MAX, 720, true));
+    fn test_recast_unbounded_with_cooldown_satisfied() {
+        // Apr 29, 2026: replaced the cap-of-1 — many recasts allowed as long
+        // as the cooldown has elapsed since the last one. Hijack S2E2
+        // Apr 28-29 incident showed that recurring receiver flakes are
+        // recoverable via repeated recast, and the old cap was leaving the
+        // user with permanently dead streams after the first recovery.
+        // Cooldown satisfied → attempt regardless of attempt history depth.
+        let just_above = RECAST_COOLDOWN_SECS;
+        assert!(should_attempt_recast(Some(just_above), 720, true));
+        assert!(should_attempt_recast(Some(600), 720, true));
+        assert!(should_attempt_recast(Some(u64::MAX), 720, true));
+    }
+
+    #[test]
+    fn test_recast_blocked_during_cooldown() {
+        // Rapid-fire wedge protection — the actual purpose the original
+        // cap-of-1 was trying to serve. A receiver that IDLEs within
+        // seconds of LOAD must NOT trigger another recast immediately;
+        // wait at least RECAST_COOLDOWN_SECS to confirm we're not in an
+        // infinite LOAD/IDLE loop on a truly wedged device.
+        assert!(!should_attempt_recast(Some(0), 720, true));
+        assert!(!should_attempt_recast(Some(10), 720, true));
+        assert!(!should_attempt_recast(Some(RECAST_COOLDOWN_SECS - 1), 720, true));
     }
 
     #[test]
@@ -3082,11 +3185,11 @@ mod tests {
         // Stream < 60 s old → the Chromecast failed the initial LOAD, not a
         // mid-stream flake. Re-LOAD won't help; those failures need stream_host
         // / transcode / manifest fixes. Don't waste the user's patience.
-        assert!(!should_attempt_recast(0, 0, true));
-        assert!(!should_attempt_recast(0, 30, true));
-        assert!(!should_attempt_recast(0, 59, true));
+        assert!(!should_attempt_recast(None, 0, true));
+        assert!(!should_attempt_recast(None, 30, true));
+        assert!(!should_attempt_recast(None, 59, true));
         // Exactly at the threshold → attempt.
-        assert!(should_attempt_recast(0, MIN_STREAM_AGE_FOR_RECAST_SECS, true));
+        assert!(should_attempt_recast(None, MIN_STREAM_AGE_FOR_RECAST_SECS, true));
     }
 
     #[test]
@@ -3094,7 +3197,8 @@ mod tests {
         // No HWM → nothing sensible to seek to. Playback from ss_offset is a
         // worse UX than a clean cleanup + manual replay, because the user
         // loses their place silently.
-        assert!(!should_attempt_recast(0, 720, false));
+        assert!(!should_attempt_recast(None, 720, false));
+        assert!(!should_attempt_recast(Some(120), 720, false));
     }
 
     #[test]
@@ -3105,6 +3209,74 @@ mod tests {
         // unrecoverable config failures. If this assertion needs to change,
         // update the doc comment on MIN_STREAM_AGE_FOR_RECAST_SECS too.
         assert_eq!(MIN_STREAM_AGE_FOR_RECAST_SECS, 60);
+    }
+
+    #[test]
+    fn test_recast_cooldown_is_stable() {
+        // Apr 29, 2026: pinning the rate-limit value. Tightening costs
+        // recovery responsiveness; loosening risks rapid-fire wedge spam.
+        // 90s is well above max recast→Playing recovery time observed
+        // (~25s) and well below typical healthy-recast cycles (~3-15 min).
+        assert_eq!(RECAST_COOLDOWN_SECS, 90);
+    }
+
+    #[test]
+    fn test_max_buffering_duration_is_stable() {
+        // Apr 29, 2026: pinning the BUFFERING-too-long threshold. A normal
+        // HLS rebuffer takes 5-15s; aggressive seek ~30s; recast-induced
+        // ~25s. 60s is well above all of these. The rule: if the receiver
+        // is still BUFFERING at this threshold, it's stalled, not transient.
+        assert_eq!(MAX_BUFFERING_DURATION_SECS, 60);
+    }
+
+    // ---- Apr 28-29 Hijack S2E2 incident replay ----
+
+    #[test]
+    fn test_apr29_hijack_s2e2_recurring_idle_recovery() {
+        // Reconstructs the exact pattern from journalctl (Hijack S2E2,
+        // Apr 28-29). With Apr 25's cap-of-1, this case left the user
+        // with a permanently dead stream after the second IDLE. With
+        // Apr 29's rate-limit, every cycle recovers as long as the
+        // receiver doesn't IDLE faster than the cooldown.
+
+        // Stream age 32 min when first IDLE hit, no prior recast.
+        let first_idle_secs_since_recast = None;
+        let first_idle_stream_age = 32 * 60;
+        assert!(should_attempt_recast(first_idle_secs_since_recast, first_idle_stream_age, true),
+            "First IDLE → recast permitted under both old and new logic");
+
+        // ~3 min later, second IDLE hits. Old logic rejected (cap=1);
+        // new logic permits because cooldown is satisfied (180s >= 90s).
+        let second_idle_secs_since_recast = Some(180);
+        let second_idle_stream_age = 32 * 60 + 180;
+        assert!(should_attempt_recast(second_idle_secs_since_recast, second_idle_stream_age, true),
+            "Second IDLE 3 min later → recast permitted with cooldown (was blocked by cap-of-1)");
+    }
+
+    #[test]
+    fn test_recast_blocks_simulated_wedge() {
+        // Wedge case: receiver IDLEs every 15s. With cooldown=90, recasts
+        // would fire at most once per 90s. A wedge that IDLEs faster than
+        // cooldown cannot trap the loop in rapid retries.
+        let mut elapsed_since_recast: u64 = 0;
+        let stream_age: u64 = 120;
+        let mut recast_count = 0;
+        for _tick in 0..40 { // simulate 40 IDLE batches @ 15s apart
+            if should_attempt_recast(Some(elapsed_since_recast), stream_age, true) {
+                recast_count += 1;
+                elapsed_since_recast = 0;
+            } else {
+                elapsed_since_recast += 15;
+            }
+        }
+        // 40 ticks × 15 s = 600 s of wall time. Cooldown=90 → at most
+        // 600/90 = 6 recasts. Worst case for the test infra is 7 (if
+        // first recast fires at tick 0).
+        assert!(recast_count <= 7,
+            "Expected ≤ 7 recasts in 600s of 15s-period wedge; got {}",
+            recast_count);
+        // But it must fire at least 1 — otherwise we've broken normal recovery.
+        assert!(recast_count >= 1, "Wedge protection must not block the FIRST recast");
     }
 }
 
