@@ -528,10 +528,24 @@ async fn do_play(
     // Fetch subtitles FIRST (needed for burn-in during transcode)
     let mut has_subtitles = false;
     let mut subtitle_srt_path: Option<PathBuf> = None;
+    // Apr 28, 2026: pass the local source MKV (Local Bypass plays only) so
+    // subtitles.rs can prefer the embedded forced English track over
+    // OpenSubtitles' SDH-flavored file. For webtorrent-served plays the
+    // path is `http://...` and we skip embedded extraction (the file may be
+    // partially-downloaded and missing the subtitle tracks).
+    let local_source_for_subs: Option<PathBuf> = if server_url.starts_with("file://") {
+        Some(PathBuf::from(&server_url[7..]))
+    } else {
+        None
+    };
     if !no_subs {
         if let Some(imdb_id) = &req.imdb_id {
             let client = reqwest::Client::new();
-            match subtitles::fetch_subtitles(&client, imdb_id, req.season, req.episode, &sub_lang, &state.media_dir).await {
+            match subtitles::fetch_subtitles(
+                &client, imdb_id, req.season, req.episode,
+                &sub_lang, &state.media_dir,
+                local_source_for_subs.as_deref(),
+            ).await {
                 Ok(Some(_vtt_path)) => {
                     has_subtitles = true;
                     // Use the SRT version for ffmpeg burn-in (ffmpeg handles SRT natively)
