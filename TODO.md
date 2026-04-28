@@ -1,5 +1,15 @@
 # Spela TODOs 🎬🍿
 
+### v3.2.0 — Subtitle pipeline + 10-bit + recast hardening (SHIPPED Apr 28-29, 2026) ✅
+Five fixes shipped during the Hijack S2E1/S2E2 watching session. All deployed to Darwin and live-tested. Test suite 125 → 164 (+39 regression pins). Hard-won lessons pinned in [CLAUDE.md](CLAUDE.md):
+
+- [x] **Rich-UI metadata in LOAD message** (`17ef4c0`) — TMDB poster pipeline through ShowInfo → CurrentStream → CastMetadata → Metadata::TvShow/Movie. Gated by `config.rich_metadata_in_load` (default off because DMR's metadata-rich UI doesn't auto-hide on growing-playlist HLS — receipt for the deferred Custom Receiver decision).
+- [x] **Forced English subtitle extraction** (`6e85eba`) — replaces OpenSubtitles SDH (which only NOTATES "[in German]") with the source MKV's embedded `English (forced)` track that actually translates the German speech. Three-tier preference: forced → full non-SDH → SDH → OpenSubtitles fallback. ISO 639-1→639-2 mapping for embedded-track matching. Local Bypass plays only.
+- [x] **10-bit HEVC NVENC fix** (`ee38f92`) — `format=yuv420p` appended to all six video filter chains feeding NVENC h264. Fixes "10 bit encode not supported / Nothing was written into output file" on HEVC Main 10 sources (MeGusta, ELiTE). Receiver was IDLE'ing at <init> with zero diagnostic surface — looked like a Chromecast wedge, was actually ffmpeg producing zero output.
+- [x] **Rate-limited unbounded recast** (`d312913`) — replaced Apr 25's lifetime cap-of-1 with `RECAST_COOLDOWN_SECS=90` frequency cap. Hijack S2E2 incident: receiver IDLE'd every ~15-30 min during sustained playback, recast would have recovered each cycle, but cap-of-1 left the user with permanent dead stream after first recovery. Rapid-fire wedge protection unchanged (cooldown handles it cleanly). Incident replay test pinned.
+- [x] **BUFFERING-too-long detection** (`d312913`) — `MAX_BUFFERING_DURATION_SECS=60` bounds Apr 18's "BUFFERING is transient" rule. After 60s of stalled BUFFERING without transition to Playing, escalates to the same recast/cleanup path IDLE uses. Fixes "permanent BUFFERING, monitor logs transient forever" pattern.
+- [x] **Experimental ENDLIST hack** (`1fda4a7`) — `config.experimental_endlist_hack` (default off). Empirically auto-hides the DMR overlay BUT side-effect: Shaka chases moving end marker, current_time inflates, HWM saves corrupt. Recommend leaving off until Custom Receiver lands; preserved as a parked option.
+
 ### v3.0.0 Smart Resume + Disk Hygiene + Resolution Ranker — SHIPPED (Apr 15, 2026) ✅
 All ten Apr 15 bug fixes + the resolution-preference ranker tier are live on Darwin. Hard-won lessons pinned in [CLAUDE.md](CLAUDE.md). Test suite grew from 58 → 108 (+50 regression pins).
 
