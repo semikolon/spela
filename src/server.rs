@@ -2141,16 +2141,101 @@ async fn handle_queue_list(State(state): State<SharedState>) -> Json<Value> {
     Json(json!({"queue": app_state.queue}))
 }
 
+/// Apr 29, 2026: queue-add request payload. The CLI sends `result_id` for
+/// the common path (resolved server-side from last_search.json); explicit
+/// fields below let API consumers bypass last_search lookup if they have
+/// a magnet directly. result_id wins if both are provided.
+#[derive(serde::Deserialize)]
+pub struct QueueAddRequest {
+    pub result_id: Option<usize>,
+    pub cast_name: Option<String>,
+    // Direct-payload fields — used when result_id is None.
+    pub magnet: Option<String>,
+    pub title: Option<String>,
+    pub show: Option<String>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub imdb_id: Option<String>,
+    pub file_index: Option<u32>,
+    pub poster_url: Option<String>,
+    pub quality: Option<String>,
+    pub size: Option<String>,
+}
+
 async fn handle_queue_add(
     State(state): State<SharedState>,
-    Json(item): Json<crate::state::QueuedItem>,
+    Json(req): Json<QueueAddRequest>,
 ) -> Json<Value> {
+    // Resolve result_id (if provided) against the server's last_search.json.
+    // This is the same lookup path `do_play` uses — keeping it server-side
+    // means CLI clients don't need to share the server's filesystem.
+    let item = if let Some(rid) = req.result_id {
+        match AppState::load_last_search(&state.state_dir) {
+            Some(search) => {
+                let result = match search.results.iter().find(|r| r.id == rid) {
+                    Some(r) => r,
+                    None => return Json(json!({
+                        "error": format!("Result #{} not found in last search", rid)
+                    })),
+                };
+                let title = match (search.show.as_ref(), search.searching.as_ref()) {
+                    (Some(show), Some(ep)) => {
+                        format!("{} S{:02}E{:02}", show.title, ep.season, ep.episode)
+                    }
+                    (Some(show), None) => show.title.clone(),
+                    _ => result.title.clone(),
+                };
+                crate::state::QueuedItem {
+                    magnet: result.magnet.clone(),
+                    title,
+                    show: search.show.as_ref().map(|s| s.title.clone()),
+                    season: search.searching.as_ref().map(|e| e.season),
+                    episode: search.searching.as_ref().map(|e| e.episode),
+                    imdb_id: search.show.as_ref().and_then(|s| s.imdb_id.clone()),
+                    file_index: result.file_index,
+                    cast_name: req.cast_name.clone(),
+                    target: None,
+                    poster_url: search.show.as_ref().and_then(|s| s.poster_url.clone()),
+                    quality: Some(result.quality.clone()),
+                    size: Some(result.size.clone()),
+                }
+            }
+            None => return Json(json!({
+                "error": "No previous search results — run `spela search` first."
+            })),
+        }
+    } else if let Some(magnet) = req.magnet {
+        // Direct payload — caller fully populated.
+        crate::state::QueuedItem {
+            magnet,
+            title: req.title.unwrap_or_else(|| "Unknown".into()),
+            show: req.show,
+            season: req.season,
+            episode: req.episode,
+            imdb_id: req.imdb_id,
+            file_index: req.file_index,
+            cast_name: req.cast_name,
+            target: None,
+            poster_url: req.poster_url,
+            quality: req.quality,
+            size: req.size,
+        }
+    } else {
+        return Json(json!({
+            "error": "Need either `result_id` or `magnet` to queue an item."
+        }));
+    };
+
     let mut app_state = AppState::load(&state.state_dir);
     app_state.queue.push(item.clone());
     if let Err(e) = app_state.save(&state.state_dir) {
         return Json(json!({"error": format!("save failed: {e}")}));
     }
-    Json(json!({"status": "queued", "queue_length": app_state.queue.len(), "added": item}))
+    Json(json!({
+        "status": "queued",
+        "queue_length": app_state.queue.len(),
+        "added": item,
+    }))
 }
 
 async fn handle_queue_clear(State(state): State<SharedState>) -> Json<Value> {
