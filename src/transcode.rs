@@ -2,6 +2,56 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+/// Apr 29, 2026: rotate `ffmpeg.log` ring-buffer style before truncating.
+///
+/// Both `transcode()` and `transcode_hls()` open `~/.spela/ffmpeg.log` with
+/// `File::create`, which truncates to zero. That destroyed the previous
+/// stream's diagnostic data the moment the next stream started. The Apr 28
+/// H.264 5-min freeze was unrecoverable post-mortem because I started a
+/// HEVC stream right after, overwriting the log.
+///
+/// Ring keeps the last 5 logs:
+///   `ffmpeg.log` (current write target — about to be truncated)
+///   `ffmpeg.log.1` (most recent past)
+///   ...
+///   `ffmpeg.log.5` (oldest kept; next rotation deletes it)
+///
+/// Best-effort: any rename/remove failure is logged but doesn't stop the
+/// caller — log preservation is a debugging aid, not a correctness path.
+pub fn rotate_ffmpeg_log(current: &Path) {
+    if !current.exists() {
+        return;
+    }
+    const KEEP: usize = 5;
+    // Drop the oldest if it exists, then shift each .N to .N+1.
+    let with_n = |n: usize| -> PathBuf {
+        let mut p = current.as_os_str().to_os_string();
+        p.push(format!(".{n}"));
+        PathBuf::from(p)
+    };
+    let oldest = with_n(KEEP);
+    if oldest.exists() {
+        let _ = std::fs::remove_file(&oldest);
+    }
+    for n in (1..KEEP).rev() {
+        let src = with_n(n);
+        let dst = with_n(n + 1);
+        if src.exists() {
+            if let Err(e) = std::fs::rename(&src, &dst) {
+                tracing::warn!(
+                    "rotate_ffmpeg_log: rename {src:?}→{dst:?} failed: {e}"
+                );
+            }
+        }
+    }
+    let dst = with_n(1);
+    if let Err(e) = std::fs::rename(current, &dst) {
+        tracing::warn!(
+            "rotate_ffmpeg_log: rename {current:?}→{dst:?} failed: {e}"
+        );
+    }
+}
+
 /// Shift all timestamps in an SRT file by `-offset_seconds`, writing the
 /// result to a new file. Subtitle entries that end before time 0 are
 /// dropped (their entire duration lies before the seek point), and
@@ -490,11 +540,18 @@ pub async fn transcode(
 
     tracing::info!("ffmpeg args: {:?}", args);
 
-    // Log FFmpeg stderr to a file for debugging (was /dev/null — invisible failures)
+    // Log FFmpeg stderr to a file for debugging (was /dev/null — invisible failures).
+    // Apr 29, 2026: rotate before truncating so the LAST stream's log
+    // survives the next stream's File::create. Without this, debugging an
+    // intermittent failure that recurs the next play is impossible — the
+    // first stream's log gets overwritten when the second stream starts.
+    // (Apr 28 incident: lost the H.264 5-min freeze evidence by switching
+    // to HEVC mid-investigation.)
     let ffmpeg_log_path = media_dir.parent()
         .and_then(|_| dirs::home_dir())
         .map(|h| h.join(".spela").join("ffmpeg.log"))
         .unwrap_or_else(|| media_dir.join("ffmpeg.log"));
+    rotate_ffmpeg_log(&ffmpeg_log_path);
     let stderr_file = std::fs::File::create(&ffmpeg_log_path)
         .unwrap_or_else(|_| std::fs::File::create("/tmp/spela-ffmpeg.log").expect("Cannot create any log file"));
     tracing::info!("FFmpeg stderr → {:?}", ffmpeg_log_path);
@@ -773,6 +830,62 @@ pub async fn transcode_hls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Apr 29, 2026: rotate_ffmpeg_log preserves debug evidence across stream
+    // restarts. Apr 28 incident: lost the H.264 5-min-freeze ffmpeg.log when
+    // I started a HEVC stream right after — the log had been overwritten by
+    // ffmpeg's File::create. These tests pin that the ring rotates correctly
+    // and that nothing crashes when files are missing.
+
+    #[test]
+    fn test_rotate_creates_dot1_from_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("ffmpeg.log");
+        std::fs::write(&log, "stream A").unwrap();
+        rotate_ffmpeg_log(&log);
+        assert!(!log.exists(), "current was rotated away");
+        assert_eq!(std::fs::read_to_string(log.with_extension("log.1")).unwrap(), "stream A");
+    }
+
+    #[test]
+    fn test_rotate_shifts_existing_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("ffmpeg.log");
+        std::fs::write(&log, "current").unwrap();
+        std::fs::write(log.with_extension("log.1"), "older").unwrap();
+        std::fs::write(log.with_extension("log.2"), "older2").unwrap();
+        rotate_ffmpeg_log(&log);
+        assert_eq!(std::fs::read_to_string(log.with_extension("log.1")).unwrap(), "current");
+        assert_eq!(std::fs::read_to_string(log.with_extension("log.2")).unwrap(), "older");
+        assert_eq!(std::fs::read_to_string(log.with_extension("log.3")).unwrap(), "older2");
+    }
+
+    #[test]
+    fn test_rotate_drops_oldest_when_at_keep_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("ffmpeg.log");
+        std::fs::write(&log, "current").unwrap();
+        for n in 1..=5 {
+            std::fs::write(log.with_extension(format!("log.{n}")), format!("gen{n}")).unwrap();
+        }
+        rotate_ffmpeg_log(&log);
+        // gen5 (the oldest) should be dropped; gen1..gen4 shifted to .2..=.5
+        assert_eq!(std::fs::read_to_string(log.with_extension("log.1")).unwrap(), "current");
+        assert_eq!(std::fs::read_to_string(log.with_extension("log.2")).unwrap(), "gen1");
+        assert_eq!(std::fs::read_to_string(log.with_extension("log.5")).unwrap(), "gen4");
+        // .6 must NOT exist — ring is bounded
+        assert!(!log.with_extension("log.6").exists());
+    }
+
+    #[test]
+    fn test_rotate_no_crash_when_log_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("ffmpeg.log");
+        // No file exists — rotate should be a no-op, not an error.
+        rotate_ffmpeg_log(&log);
+        assert!(!log.exists());
+        assert!(!log.with_extension("log.1").exists());
+    }
 
     #[test]
     fn test_audio_needs_transcode() {

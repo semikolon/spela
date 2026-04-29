@@ -26,6 +26,7 @@ bytes = "1"
 [dev-dependencies]
 # mtime manipulation for disk-prune regression tests (Apr 15, 2026)
 filetime = "0.2"
+tempfile = "3.27.0"
 
 [profile.release]
 strip = true
