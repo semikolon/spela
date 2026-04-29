@@ -2425,6 +2425,132 @@ async fn serve_static_with_range(
 /// EXTINF + ENDLIST). Older Chromecasts won't accept this directly as the
 /// cast LOAD URL because it lacks CODECS / RESOLUTION / BANDWIDTH metadata
 /// — they need the master playlist (`/hls/master.m3u8`) instead.
+/// Apr 29, 2026: Parse ffmpeg's playlist.m3u8 into the structural pieces we
+/// need to PAD into a full-duration VOD manifest.
+///
+/// Returns:
+///   - `header_lines`: every line up to but not including the first `#EXTINF:`
+///     entry (preserves `#EXTM3U`, `#EXT-X-VERSION`, `#EXT-X-TARGETDURATION`,
+///     `#EXT-X-MEDIA-SEQUENCE`, etc.). These are echoed verbatim into the
+///     padded output.
+///   - `entries`: each emitted segment's (extinf_secs, filename) pair.
+///   - `had_endlist`: whether ffmpeg already appended `#EXT-X-ENDLIST` (it
+///     does so on clean shutdown). If true, the manifest is already complete
+///     and padding is a no-op.
+///
+/// Pure function. No I/O. Trivially testable.
+pub fn parse_hls_playlist_for_padding(body: &str)
+    -> (Vec<String>, Vec<(f64, String)>, bool)
+{
+    let mut header_lines = Vec::new();
+    let mut entries: Vec<(f64, String)> = Vec::new();
+    let mut had_endlist = false;
+    let mut pending_extinf: Option<f64> = None;
+    let mut header_done = false;
+
+    for line in body.lines() {
+        let line = line.trim_end();
+        if line == "#EXT-X-ENDLIST" {
+            had_endlist = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            // Format: `#EXTINF:10.427089,` (sometimes with title after comma)
+            header_done = true;
+            let secs_str = rest.split(',').next().unwrap_or("0");
+            pending_extinf = secs_str.parse::<f64>().ok();
+            continue;
+        }
+        // A non-comment line after a pending EXTINF is the segment filename.
+        if pending_extinf.is_some() && !line.is_empty() && !line.starts_with('#') {
+            if let Some(secs) = pending_extinf.take() {
+                entries.push((secs, line.to_string()));
+            }
+            continue;
+        }
+        // Anything else before the first EXTINF is header.
+        if !header_done {
+            header_lines.push(line.to_string());
+        }
+    }
+    (header_lines, entries, had_endlist)
+}
+
+/// Apr 29, 2026: Generate a VOD-style padded manifest from ffmpeg's actual
+/// playlist + the source's known total duration.
+///
+/// Strategy:
+///   1. Compute remaining content duration: `duration - ss_offset` (clamped
+///      to ≥ 0). This is the wall-clock playback time the receiver should
+///      see in its progress bar. ss_offset accounts for `--seek N` or
+///      auto-resume (ffmpeg's HLS output starts at t=0 regardless of
+///      source seek; only `duration - ss_offset` of content is in the
+///      transcoded stream).
+///   2. Compute average EXTINF from emitted segments. Falls back to the
+///      `default_segment_secs` (`hls_time` arg, typically 6) when no
+///      segments emitted yet.
+///   3. Predict total segments: `ceil(remaining / avg) + 2-buffer`. The
+///      +2 covers keyframe-alignment variance — actual segment count
+///      typically lands within ±1 of `remaining/avg`.
+///   4. Output: header verbatim → emitted entries verbatim → padded
+///      placeholder entries (using avg as EXTINF) → `#EXT-X-ENDLIST`.
+///
+/// If the receiver's accumulated playback (sum of EXTINF as it advances)
+/// reaches a placeholder segment that ffmpeg never produces, the long-poll
+/// in `handle_hls_segment` waits up to 28 s then 503s. Receiver retries
+/// or gracefully ends.
+///
+/// Pure function. No I/O. Inputs/outputs match what tests can construct.
+pub fn build_padded_vod_manifest(
+    body: &str,
+    remaining_duration_secs: f64,
+    default_segment_secs: f64,
+) -> String {
+    let (header_lines, entries, had_endlist) = parse_hls_playlist_for_padding(body);
+
+    // If ffmpeg already finished + ENDLIST is present, use the manifest as-is.
+    if had_endlist {
+        return body.to_string();
+    }
+
+    // Compute average EXTINF from emitted segments, defaulting if none.
+    let avg_extinf = if entries.is_empty() {
+        default_segment_secs.max(1.0)
+    } else {
+        let sum: f64 = entries.iter().map(|(s, _)| *s).sum();
+        (sum / entries.len() as f64).max(1.0)
+    };
+
+    let remaining = remaining_duration_secs.max(0.0);
+    let predicted_total = ((remaining / avg_extinf).ceil() as usize) + 2;
+
+    // We never want to produce FEWER entries than ffmpeg has actually
+    // written — that would point the receiver at non-existent indexes and
+    // truncate playback observably. If the sum-of-existing-extinf already
+    // exceeds the predicted total span, take whichever is larger.
+    let predicted_total = predicted_total.max(entries.len() + 1);
+
+    let mut out = String::new();
+    for line in &header_lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Emit existing entries with their REAL EXTINF — receiver's progress bar
+    // should reflect actual segment durations for what's already on disk.
+    for (extinf, name) in &entries {
+        out.push_str(&format!("#EXTINF:{:.6},\n", extinf));
+        out.push_str(name);
+        out.push('\n');
+    }
+    // Pad with placeholder segments using the predicted EXTINF.
+    for i in entries.len()..predicted_total {
+        out.push_str(&format!("#EXTINF:{:.6},\n", avg_extinf));
+        out.push_str(&format!("seg_{:05}.ts\n", i));
+    }
+    out.push_str("#EXT-X-ENDLIST\n");
+    out
+}
+
 async fn handle_hls_playlist(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -2436,13 +2562,51 @@ async fn handle_hls_playlist(
         .join("transcoded_hls")
         .join("playlist.m3u8");
 
-    // Apr 28, 2026 [EXPERIMENTAL]: When `config.experimental_endlist_hack`
-    // is true, post-process the playlist to append `#EXT-X-ENDLIST` if it's
-    // not already present. Cast Web Receiver only honors this tag for VOD
-    // detection — without it, growing playlists are treated as live and
-    // controls never auto-hide. Risk: receiver may interpret the current
-    // segment count as the total stream length and stop fetching new
-    // segments after that point. If playback truncates, flip the flag off.
+    // Apr 29, 2026: VOD-padded manifest mode (config.vod_manifest_padded).
+    // Predicted full-duration manifest with ENDLIST upfront — receiver sees
+    // the stream as VOD, controls auto-hide, no chase-the-end inflation.
+    // Companion: handle_hls_segment's long-poll for not-yet-written
+    // placeholders. Replaces the simpler `experimental_endlist_hack` which
+    // had correct intent but caused current_time inflation / HWM corruption.
+    if state.config.vod_manifest_padded {
+        match tokio::fs::read_to_string(&path).await {
+            Ok(body) => {
+                let app_state = AppState::load(&state.state_dir);
+                let (duration, ss_offset) = app_state
+                    .current
+                    .as_ref()
+                    .map(|c| (c.duration.unwrap_or(0.0), c.ss_offset))
+                    .unwrap_or((0.0, 0.0));
+                let remaining = (duration - ss_offset).max(0.0);
+                if remaining > 0.0 {
+                    let padded = build_padded_vod_manifest(&body, remaining, 6.0);
+                    tracing::debug!(
+                        "HLS playlist: padded VOD manifest ({} bytes, remaining={:.0}s)",
+                        padded.len(), remaining
+                    );
+                    return axum::response::Response::builder()
+                        .status(200)
+                        .header("Content-Type", "application/vnd.apple.mpegurl")
+                        .header("Content-Length", padded.len().to_string())
+                        .header("Cache-Control", "no-cache")
+                        .body(axum::body::Body::from(padded))
+                        .unwrap();
+                } else {
+                    tracing::warn!(
+                        "HLS playlist: vod_manifest_padded enabled but duration unknown — falling through to default serve"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("HLS playlist read failed: {}; falling back to file serve", e);
+            }
+        }
+    }
+
+    // Apr 28, 2026 [EXPERIMENTAL — superseded by vod_manifest_padded above]:
+    // Plain ENDLIST append. Side effects (chase-the-end / HWM inflation)
+    // documented in spela TODO.md. Kept gated behind its own flag for
+    // research/comparison purposes.
     if state.config.experimental_endlist_hack {
         match tokio::fs::read_to_string(&path).await {
             Ok(body) => {
@@ -2600,6 +2764,54 @@ async fn handle_hls_segment(
     let path = resolve_media_dir(&state)
         .join("transcoded_hls")
         .join(&segment);
+
+    // Apr 29, 2026: VOD-padded manifest mode requires us to long-poll for
+    // segments that the receiver requested based on the predicted manifest
+    // but ffmpeg hasn't written yet. Without this, the receiver gets a
+    // 404, gives up on that segment, and may stop playback entirely.
+    //
+    // Wait up to 28 s (under the typical 30 s receiver HTTP timeout) for
+    // the file to appear, polling the filesystem every 200 ms. ffmpeg's
+    // HLS muxer uses temp_file flag, so the file appears atomically at
+    // its final path only when fully written — no torn reads.
+    //
+    // If timeout: serve 503 with Retry-After. Receiver will retry with a
+    // new request, which restarts the wait. This handles the edge case
+    // where ffmpeg falls slightly behind playback (transcode pace varies)
+    // — receiver pauses briefly, then resumes once segment lands.
+    //
+    // For segments well past actual content (predicted+buffer overshoot),
+    // the file never appears and the timeout fires repeatedly. Each
+    // request burns 28 s wall, then 503 Retry-After. Receiver eventually
+    // gives up and ends playback near the right spot.
+    if state.config.vod_manifest_padded && !path.exists() {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(28);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if path.exists() {
+                tracing::debug!(
+                    "HLS segment {} appeared after long-poll wait", segment
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::info!(
+                    "HLS segment {} not produced within 28 s — returning 503 Retry-After",
+                    segment
+                );
+                return axum::response::Response::builder()
+                    .status(503)
+                    .header("Retry-After", "10")
+                    .header("Content-Type", "text/plain")
+                    .body(axum::body::Body::from(
+                        "segment not yet available; retry"
+                    ))
+                    .unwrap();
+            }
+        }
+    }
+
     serve_static_with_range(path, content_type, &headers).await
 }
 
@@ -3227,6 +3439,169 @@ mod tests {
         // ~25s. 60s is well above all of these. The rule: if the receiver
         // is still BUFFERING at this threshold, it's stalled, not transient.
         assert_eq!(MAX_BUFFERING_DURATION_SECS, 60);
+    }
+
+    // ---- Apr 29, 2026: VOD-padded manifest tests (B2) ----
+    //
+    // These pin the parser + manifest-builder so future regressions in the
+    // VOD-padded mode are immediately visible. The B2 design replaces the
+    // earlier `experimental_endlist_hack` (which caused chase-the-end /
+    // HWM inflation by lying about total duration). B2 declares the full
+    // duration upfront — receiver's clock matches reality.
+
+    #[test]
+    fn parse_extracts_header_entries_no_endlist() {
+        let body = "\
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:10.427089,
+seg_00000.ts
+#EXTINF:10.427078,
+seg_00001.ts
+";
+        let (header, entries, had_endlist) = parse_hls_playlist_for_padding(body);
+        assert!(!had_endlist);
+        assert_eq!(header, vec![
+            "#EXTM3U", "#EXT-X-VERSION:3",
+            "#EXT-X-TARGETDURATION:10", "#EXT-X-MEDIA-SEQUENCE:0",
+        ]);
+        assert_eq!(entries.len(), 2);
+        assert!((entries[0].0 - 10.427089).abs() < 1e-6);
+        assert_eq!(entries[0].1, "seg_00000.ts");
+        assert_eq!(entries[1].1, "seg_00001.ts");
+    }
+
+    #[test]
+    fn parse_detects_endlist() {
+        let body = "\
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:6.0,
+seg_00000.ts
+#EXT-X-ENDLIST
+";
+        let (_, _, had_endlist) = parse_hls_playlist_for_padding(body);
+        assert!(had_endlist, "ENDLIST presence must be detected");
+    }
+
+    #[test]
+    fn parse_handles_empty_playlist() {
+        let body = "#EXTM3U\n#EXT-X-VERSION:3\n";
+        let (header, entries, had_endlist) = parse_hls_playlist_for_padding(body);
+        assert!(!had_endlist);
+        assert_eq!(entries.len(), 0);
+        assert_eq!(header.len(), 2);
+    }
+
+    #[test]
+    fn padded_manifest_existing_endlist_is_passthrough() {
+        // If ffmpeg already wrote ENDLIST (clean shutdown / completed
+        // transcode), there's nothing to pad — return verbatim. Avoids
+        // double-ENDLIST and preserves whatever metadata ffmpeg emitted.
+        let body = "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg_00000.ts\n#EXT-X-ENDLIST\n";
+        let out = build_padded_vod_manifest(body, 60.0, 6.0);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn padded_manifest_predicts_correct_count_from_avg() {
+        // 3 emitted segments avg 10s → remaining 600s → 60 segments
+        // expected, plus +2 buffer = 62 total. We expect output to have
+        // EXACTLY 62 entries (3 real + 59 placeholder) + ENDLIST.
+        let body = "\
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:10.0,
+seg_00000.ts
+#EXTINF:10.0,
+seg_00001.ts
+#EXTINF:10.0,
+seg_00002.ts
+";
+        let out = build_padded_vod_manifest(body, 600.0, 6.0);
+        let segment_count = out.matches("seg_").count();
+        // 600s / 10s = 60 ceil + 2 buffer = 62
+        assert_eq!(segment_count, 62);
+        assert!(out.contains("#EXT-X-ENDLIST"));
+        // Only ONE endlist
+        assert_eq!(out.matches("#EXT-X-ENDLIST").count(), 1);
+        // First three entries preserve their REAL extinf
+        assert!(out.contains("#EXTINF:10.000000,\nseg_00000.ts"));
+        // Placeholders are sequential past existing
+        assert!(out.contains("seg_00059.ts"));
+        assert!(out.contains("seg_00061.ts"));
+        // Don't go past the predicted total
+        assert!(!out.contains("seg_00062.ts"));
+    }
+
+    #[test]
+    fn padded_manifest_no_emitted_segments_uses_default() {
+        // No segments yet → fall back to default_segment_secs for prediction.
+        let body = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n";
+        let out = build_padded_vod_manifest(body, 60.0, 6.0);
+        // 60s / 6s = 10 ceil + 2 = 12
+        let segment_count = out.matches("seg_").count();
+        assert_eq!(segment_count, 12);
+        assert!(out.contains("#EXT-X-ENDLIST"));
+    }
+
+    #[test]
+    fn padded_manifest_zero_remaining_returns_minimal_endlist() {
+        // Edge case: ss_offset >= duration. Don't crash.
+        let body = "#EXTM3U\n#EXT-X-VERSION:3\n";
+        let out = build_padded_vod_manifest(body, 0.0, 6.0);
+        // No segments needed but still emit ENDLIST so receiver doesn't
+        // think it's a live stream.
+        assert!(out.contains("#EXT-X-ENDLIST"));
+    }
+
+    #[test]
+    fn padded_manifest_never_under_predicts_emitted_count() {
+        // Edge case: 100 emitted segments but remaining_duration is small
+        // (e.g., user paused far past predicted). Output must include all
+        // emitted entries — never truncate ffmpeg's actual output.
+        let mut body = String::from(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        );
+        for i in 0..100 {
+            body.push_str(&format!("#EXTINF:10.0,\nseg_{:05}.ts\n", i));
+        }
+        let out = build_padded_vod_manifest(&body, 60.0, 6.0); // claims only 60s left
+        let segment_count = out.matches("seg_").count();
+        // Must have at LEAST the 100 emitted entries + 1 padding (max).
+        assert!(segment_count >= 100);
+    }
+
+    #[test]
+    fn padded_manifest_apr29_realistic_hijack_s2e2_case() {
+        // Realistic: Hijack S2E2 episode is 48m40s = 2920s. With 10 segments
+        // pre-buffered (avg ~10.4s), the receiver fetches the playlist for
+        // the first time and needs to see total ≈ 2920s of content.
+        let mut body = String::from(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:11\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        );
+        for i in 0..10 {
+            body.push_str(&format!("#EXTINF:10.4,\nseg_{:05}.ts\n", i));
+        }
+        let out = build_padded_vod_manifest(&body, 2920.0, 6.0);
+
+        // Expected: ceil(2920 / 10.4) = 281 + 2 buffer = 283 segments
+        let segment_count = out.matches("seg_").count();
+        assert!((283..=285).contains(&segment_count),
+            "Expected ~283 segments for full Hijack S2E2 episode, got {}",
+            segment_count);
+
+        // Total declared duration ≈ 2920s (within tolerance — placeholder
+        // EXTINF uses the avg so total ≈ count * 10.4 ≈ 2940-2960s).
+        // Just sanity-check that ENDLIST is present and structure is sane.
+        assert!(out.contains("#EXT-X-ENDLIST"));
+        assert!(out.contains("#EXTINF:"));
     }
 
     // ---- Apr 28-29 Hijack S2E2 incident replay ----

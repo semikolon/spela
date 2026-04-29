@@ -69,6 +69,35 @@ pub struct Config {
     /// Receiver lands.
     #[serde(default)]
     pub experimental_endlist_hack: bool,
+    /// Apr 29, 2026: VOD-style manifest with predicted segment count + ENDLIST
+    /// upfront, plus long-polled segment serving for not-yet-written segments.
+    /// Receiver sees a complete VOD playlist, total duration matches reality
+    /// (computed from `ss_offset` and source `duration`), controls auto-hide,
+    /// no chase-the-end / current_time inflation.
+    ///
+    /// Two-part contract:
+    ///   1. `handle_hls_playlist` parses ffmpeg's actual playlist, computes
+    ///      avg EXTINF from emitted segments, predicts total = ceil(remaining
+    ///      duration / avg) + 2-buffer, pads with placeholder segment names,
+    ///      appends EXT-X-ENDLIST.
+    ///   2. `handle_hls_segment` long-polls (up to 28s, < typical receiver
+    ///      HTTP timeout) for not-yet-written segments. Receiver retries are
+    ///      absorbed by the wait loop; it serves 200 OK as soon as ffmpeg
+    ///      writes the segment, or 503 Retry-After if it never appears.
+    ///
+    /// Strictly better than `experimental_endlist_hack`: that one preserved
+    /// only the segments-emitted-so-far list with appended ENDLIST, causing
+    /// receiver to think total duration = current ffmpeg progress and chase
+    /// the moving end marker (HWM-saving inflated, see Apr 28-29 incident).
+    /// `vod_manifest_padded` declares the FULL duration upfront so the
+    /// receiver's clock matches reality.
+    ///
+    /// Default off — requires field testing per stream type (long episodes,
+    /// movies, edge-case sources). Flip on, watch one full episode, observe
+    /// whether the receiver completes naturally or hits 503 on the trailing
+    /// over-predicted segments.
+    #[serde(default)]
+    pub vod_manifest_padded: bool,
 }
 
 fn default_server() -> String { "localhost:7890".into() }
@@ -94,6 +123,7 @@ impl Default for Config {
             cast_app_id: String::new(),
             rich_metadata_in_load: false,
             experimental_endlist_hack: false,
+            vod_manifest_padded: false,
         }
     }
 }
