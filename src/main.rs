@@ -126,6 +126,31 @@ enum Commands {
         /// IMDb ID or Title
         target: String,
     },
+    /// Queue management — auto-fire next item on natural EOF.
+    /// Examples:
+    ///   spela queue add 1 --cast "Fredriks TV"   (queue search result #1)
+    ///   spela queue list
+    ///   spela queue clear
+    Queue {
+        #[command(subcommand)]
+        action: QueueAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueueAction {
+    /// Add a search result (1-8 from last `spela search`) to the queue.
+    Add {
+        /// Result number from last `spela search`.
+        result_id: usize,
+        /// Override the default cast device (e.g. "Fredriks TV").
+        #[arg(long)]
+        cast: Option<String>,
+    },
+    /// List queue contents.
+    List,
+    /// Clear the queue.
+    Clear,
 }
 
 #[tokio::main]
@@ -379,6 +404,67 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             };
             Ok(client.post(format!("{}/api/position/reset", base)).json(&body).send().await?.json().await?)
         }
+        Commands::Queue { action } => match action {
+            QueueAction::List => {
+                Ok(client.get(format!("{}/queue", base)).send().await?.json().await?)
+            }
+            QueueAction::Clear => {
+                Ok(client.delete(format!("{}/queue", base)).send().await?.json().await?)
+            }
+            QueueAction::Add { result_id, cast } => {
+                // Resolve result_id against last_search.json (read directly
+                // — same approach as `spela play <id>`). The CLI translates
+                // the search-result-by-id into a fully-populated QueuedItem
+                // with metadata that survives across spela process
+                // restarts (no dependency on last_search persisting).
+                let state_dir = config::Config::state_dir();
+                let last_search_path = state_dir.join("last_search.json");
+                let search_text = std::fs::read_to_string(&last_search_path)
+                    .map_err(|e| anyhow::anyhow!(
+                        "No previous search results at {:?} ({}). Run `spela search` first.",
+                        last_search_path, e
+                    ))?;
+                let search: Value = serde_json::from_str(&search_text)?;
+                let results = search["results"].as_array()
+                    .ok_or_else(|| anyhow::anyhow!("last_search.json missing results"))?;
+                let result = results.iter()
+                    .find(|r| r["id"].as_u64() == Some(result_id as u64))
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "Result #{} not found in last search ({} results available)",
+                        result_id, results.len()
+                    ))?;
+
+                // Build a sensible title: "Show SxxExx" for TV shows or
+                // result's title verbatim for movies.
+                let title = match (search.get("show"), search.get("searching")) {
+                    (Some(show), Some(ep)) => {
+                        let show_title = show["title"].as_str().unwrap_or("Unknown");
+                        let s = ep["season"].as_u64().unwrap_or(0);
+                        let e = ep["episode"].as_u64().unwrap_or(0);
+                        format!("{} S{:02}E{:02}", show_title, s, e)
+                    }
+                    (Some(show), None) => {
+                        show["title"].as_str().unwrap_or("Unknown").to_string()
+                    }
+                    _ => result["title"].as_str().unwrap_or("Unknown").to_string(),
+                };
+
+                let body = serde_json::json!({
+                    "magnet": result["magnet"].as_str().unwrap_or(""),
+                    "title": title,
+                    "show": search["show"]["title"].as_str(),
+                    "season": search["searching"]["season"].as_u64(),
+                    "episode": search["searching"]["episode"].as_u64(),
+                    "imdb_id": search["show"]["imdb_id"].as_str(),
+                    "file_index": result["file_index"].as_u64(),
+                    "cast_name": cast,
+                    "poster_url": search["show"]["poster_url"].as_str(),
+                    "quality": result["quality"].as_str(),
+                    "size": result["size"].as_str(),
+                });
+                Ok(client.post(format!("{}/queue", base)).json(&body).send().await?.json().await?)
+            }
+        },
         Commands::Server { .. } | Commands::Setup | Commands::KillWorkers => unreachable!(),
     }
 }

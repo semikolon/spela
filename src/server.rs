@@ -106,6 +106,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/prev", post(handle_prev))
         .route("/targets", get(handle_targets))
         .route("/history", get(handle_history))
+        .route("/queue", get(handle_queue_list).post(handle_queue_add).delete(handle_queue_clear))
         .route("/config", get(handle_get_config).post(handle_set_config))
         .route("/cast-info", post(handle_cast_info))
         .route("/stream/transcode", get(handle_transcode_stream))
@@ -1788,6 +1789,14 @@ async fn cast_health_monitor(
             // saved HWM so the next play of the same title starts fresh instead
             // of auto-resuming from the credits. Belt-and-suspenders against
             // the 30s save cadence leaving a stale 94%-ish HWM behind.
+            // Apr 29, 2026: detect natural EOF here. We need this BEFORE
+            // do_cleanup runs so we can fire the queue if the user lined
+            // up a follow-up (e.g., next episode).
+            let was_natural_eof = matches!(
+                (duration_snapshot, last_known_absolute),
+                (Some(dur), Some(abs_pos)) if dur > 0.0 && abs_pos >= dur * HWM_CLEAR_FRACTION
+            );
+
             if let (Some(dur), Some(abs_pos)) = (duration_snapshot, last_known_absolute) {
                 if dur > 0.0 && abs_pos >= dur * HWM_CLEAR_FRACTION {
                     let mut app_state = AppState::load(&state.state_dir);
@@ -1803,6 +1812,67 @@ async fn cast_health_monitor(
                 }
             }
             do_cleanup(&state);
+
+            // Apr 29, 2026: queue auto-fire on natural EOF. After cleanup
+            // (workers killed, HLS dir gone, current=None), pop the queue
+            // front and self-call /play with its fields. Spawned as a
+            // detached task so the monitor exits cleanly while the next
+            // stream sets up. Only fires on NATURAL EOF — user-initiated
+            // stops route through `handle_stop` which clears state.current,
+            // breaking the monitor's `still_active` check before we get
+            // here. So queue is preserved across user stops, not consumed.
+            if was_natural_eof {
+                let next = {
+                    let mut app_state = AppState::load(&state.state_dir);
+                    if app_state.queue.is_empty() {
+                        None
+                    } else {
+                        let item = app_state.queue.remove(0);
+                        let _ = app_state.save(&state.state_dir);
+                        Some(item)
+                    }
+                };
+                if let Some(item) = next {
+                    let port = state.config.port;
+                    let title = item.title.clone();
+                    tokio::spawn(async move {
+                        // Wait briefly so cleanup completes (HLS dir gone,
+                        // workers fully reaped) before the new play setup
+                        // tries to write to the same paths.
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        let url = format!("http://127.0.0.1:{port}/play");
+                        let body = serde_json::json!({
+                            "magnet": item.magnet,
+                            "title": item.title,
+                            "show": item.show,
+                            "season": item.season,
+                            "episode": item.episode,
+                            "imdb_id": item.imdb_id,
+                            "file_index": item.file_index,
+                            "cast_name": item.cast_name,
+                            "target": item.target,
+                            "poster_url": item.poster_url,
+                            "quality": item.quality,
+                            "size": item.size,
+                        });
+                        let client = reqwest::Client::new();
+                        match client.post(&url).json(&body).send().await {
+                            Ok(resp) => {
+                                tracing::info!(
+                                    "queue: auto-fired '{}' on natural EOF; status={}",
+                                    title, resp.status()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "queue: failed to auto-fire '{}': {}",
+                                    title, e
+                                );
+                            }
+                        }
+                    });
+                }
+            }
             return;
         }
 
@@ -2054,6 +2124,43 @@ async fn handle_targets(State(state): State<SharedState>) -> Json<Value> {
 async fn handle_history(State(state): State<SharedState>) -> Json<Value> {
     let app_state = AppState::load(&state.state_dir);
     Json(json!({"history": app_state.history.iter().take(20).collect::<Vec<_>>()}))
+}
+
+// ----- Apr 29, 2026: queue endpoints -----
+//
+// Queue lets the user line up the next item to play after natural EOF.
+// `cast_health_monitor` pops the front entry when the current stream
+// reaches HWM_CLEAR_FRACTION and fires a self-call to /play. FIFO.
+//
+// CLI: `spela queue add <result_id> [--cast <name>]` resolves a search
+// result into a QueuedItem and POSTs here. `spela queue list` GETs.
+// `spela queue clear` DELETEs. CLI is implemented in main.rs.
+
+async fn handle_queue_list(State(state): State<SharedState>) -> Json<Value> {
+    let app_state = AppState::load(&state.state_dir);
+    Json(json!({"queue": app_state.queue}))
+}
+
+async fn handle_queue_add(
+    State(state): State<SharedState>,
+    Json(item): Json<crate::state::QueuedItem>,
+) -> Json<Value> {
+    let mut app_state = AppState::load(&state.state_dir);
+    app_state.queue.push(item.clone());
+    if let Err(e) = app_state.save(&state.state_dir) {
+        return Json(json!({"error": format!("save failed: {e}")}));
+    }
+    Json(json!({"status": "queued", "queue_length": app_state.queue.len(), "added": item}))
+}
+
+async fn handle_queue_clear(State(state): State<SharedState>) -> Json<Value> {
+    let mut app_state = AppState::load(&state.state_dir);
+    let cleared = app_state.queue.len();
+    app_state.queue.clear();
+    if let Err(e) = app_state.save(&state.state_dir) {
+        return Json(json!({"error": format!("save failed: {e}")}));
+    }
+    Json(json!({"status": "cleared", "removed": cleared}))
 }
 
 async fn handle_get_config(State(state): State<SharedState>) -> Json<Value> {

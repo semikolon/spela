@@ -29,9 +29,45 @@ pub struct AppState {
     pub history: Vec<HistoryEntry>,
     #[serde(default)]
     pub preferences: Preferences,
+    /// Apr 29, 2026: items queued to auto-fire when the current stream
+    /// reaches natural EOF (HWM past HWM_CLEAR_FRACTION). FIFO. The
+    /// cast_health_monitor pops the front entry after `do_cleanup` and
+    /// spawns a self-call to `/play` with its fields.
+    #[serde(default)]
+    pub queue: Vec<QueuedItem>,
     /// Resume positions by IMDB ID (seconds). Used by Custom Cast Receiver.
     #[serde(default)]
     pub resume_positions: HashMap<String, f64>,
+}
+
+/// Apr 29, 2026: a queued play request for auto-firing when the current
+/// stream reaches natural EOF. Subset of PlayRequest fields — sufficient
+/// for `do_play` to reconstruct everything via last_search auto-fill OR
+/// directly from the magnet + metadata captured here at queue-time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedItem {
+    pub magnet: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub season: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imdb_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cast_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poster_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +165,7 @@ impl Default for AppState {
             history: Vec::new(),
             preferences: Preferences::default(),
             resume_positions: HashMap::new(),
+            queue: Vec::new(),
         }
     }
 }
