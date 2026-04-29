@@ -1221,6 +1221,20 @@ pub const RECAST_COOLDOWN_SECS: u64 = 30;
 // Net effect: more responsive recovery on faster-degrading devices,
 // no regression in wedge protection.
 
+/// Apr 29, 2026 PM: lowered 60→30s. The earlier 60s value was conservative
+/// against startup-buffering false positives (cold start legitimately takes
+/// 20-30s of BUFFERING before reaching Playing). The cleaner answer is to
+/// gate BUFFERING-stall on `stream_age >= MIN_STREAM_AGE_FOR_RECAST_SECS`
+/// (the same startup floor the recast itself uses) and use a tighter mid-
+/// stream threshold. With the gate, any stall longer than 30s past startup
+/// triggers recovery 30 seconds earlier than before — user-visible freeze
+/// drops from ~78s (60s detection + 3s LOAD + 15s recovery) to ~48s.
+///
+/// 30s is well above legitimate mid-stream buffering events: HLS rebuffer
+/// 5-15s, recast-induced ~25s, in-stream seek ~15-25s. Receiver-internal
+/// freezes (the actual failure we're catching) typically last 60-90s, well
+/// above this threshold.
+///
 /// Apr 29, 2026: BUFFERING-too-long → escalate to recast.
 ///
 /// Apr 18 fix established that BUFFERING is a TRANSIENT state (alive
@@ -1238,7 +1252,7 @@ pub const RECAST_COOLDOWN_SECS: u64 = 30;
 /// If the receiver is still BUFFERING at 60s, it's stalled — escalate
 /// to the same path as IDLE (try recast subject to cooldown, else
 /// cleanup).
-pub const MAX_BUFFERING_DURATION_SECS: u64 = 60;
+pub const MAX_BUFFERING_DURATION_SECS: u64 = 30;
 
 /// Decision: should `cast_health_monitor` attempt auto-recast before cleanup?
 ///
@@ -1561,10 +1575,16 @@ async fn cast_health_monitor(
                     let now = std::time::Instant::now();
                     let started = *buffering_started_at.get_or_insert(now);
                     let buffering_for_secs = now.duration_since(started).as_secs();
-                    if buffering_for_secs >= MAX_BUFFERING_DURATION_SECS {
+                    let stream_age_secs = Utc::now()
+                        .signed_duration_since(started_at)
+                        .num_seconds()
+                        .max(0) as u64;
+                    if buffering_for_secs >= MAX_BUFFERING_DURATION_SECS
+                        && stream_age_secs >= MIN_STREAM_AGE_FOR_RECAST_SECS
+                    {
                         tracing::warn!(
-                            "cast_health_monitor: '{}' STALLED — BUFFERING for {}s (≥ {}s threshold); escalating to recast/cleanup path",
-                            title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS
+                            "cast_health_monitor: '{}' STALLED — BUFFERING for {}s (≥ {}s threshold, stream_age={}s); escalating to recast/cleanup path",
+                            title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS, stream_age_secs
                         );
                         // Force the cleanup gate (consecutive_failures >=
                         // IDLE_FAILURE_THRESHOLD) to trigger recast. Set the
@@ -1573,6 +1593,22 @@ async fn cast_health_monitor(
                         consecutive_failures = IDLE_FAILURE_THRESHOLD;
                         // Reset so a successful recast → BUFFERING again
                         // gets its own fresh threshold timer.
+                        buffering_started_at = None;
+                    } else if buffering_for_secs >= MAX_BUFFERING_DURATION_SECS {
+                        // Apr 29, 2026 PM: BUFFERING crossed the threshold
+                        // BUT we're still in startup window (stream_age <
+                        // MIN_STREAM_AGE_FOR_RECAST_SECS). Cold-start cases
+                        // legitimately buffer for 20-30+s while the receiver
+                        // pre-fills. Don't escalate — recast wouldn't fire
+                        // (rejected by startup gate) and we'd just kill the
+                        // stream prematurely. Reset the timer and keep
+                        // waiting; mid-stream stalls catch on the next
+                        // accumulation.
+                        tracing::info!(
+                            "cast_health_monitor: '{}' BUFFERING crossed threshold ({}s ≥ {}s) but stream still in startup window ({}s < {}s) — not escalating",
+                            title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS,
+                            stream_age_secs, MIN_STREAM_AGE_FOR_RECAST_SECS
+                        );
                         buffering_started_at = None;
                     } else {
                         tracing::info!(
@@ -3700,11 +3736,12 @@ mod tests {
 
     #[test]
     fn test_max_buffering_duration_is_stable() {
-        // Apr 29, 2026: pinning the BUFFERING-too-long threshold. A normal
-        // HLS rebuffer takes 5-15s; aggressive seek ~30s; recast-induced
-        // ~25s. 60s is well above all of these. The rule: if the receiver
-        // is still BUFFERING at this threshold, it's stalled, not transient.
-        assert_eq!(MAX_BUFFERING_DURATION_SECS, 60);
+        // Apr 29, 2026 PM: pinning at 30s. The earlier 60s value was
+        // conservative against startup false positives. Cleaner answer:
+        // 30s threshold + stream_age >= MIN_STREAM_AGE_FOR_RECAST_SECS
+        // gate (which the cast_health_monitor enforces). 30s shaves
+        // ~30s off every receiver-internal-freeze recovery.
+        assert_eq!(MAX_BUFFERING_DURATION_SECS, 30);
     }
 
     // ---- Apr 29, 2026: VOD-padded manifest tests (B2) ----
