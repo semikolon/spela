@@ -31,71 +31,55 @@ pub struct Config {
     #[serde(default)]
     pub cast_app_id: String,
     /// Apr 28, 2026: Whether to send rich `Metadata::TvShow`/`Movie` in the
-    /// LOAD message. Defaults to `false` because the **Default Media Receiver
-    /// renders metadata-rich overlays as a permanent on-screen layer when the
-    /// HLS playlist lacks `EXT-X-ENDLIST`** — which is always the case for
-    /// spela's growing-during-transcode playlist (Cast Web Receiver only
-    /// honors `EXT-X-ENDLIST` for VOD detection; `EXT-X-PLAYLIST-TYPE` and
-    /// `MediaInfo.streamType` are explicitly ignored for this UI decision
-    /// per Google's Cast team statement on the SDK forum).
+    /// LOAD message.  Default `false`.  When true, DMR shows a poster+title
+    /// splash on top of the playback view.
     ///
-    /// With metadata enabled: poster + title + season/episode block renders
-    /// permanently along the bottom-left, plus the seek bar — ~25% screen
-    /// occupied. Without metadata: just a thin progress line + elapsed-time
-    /// counter at the very bottom edge — ~5% screen occupied.
-    ///
-    /// Flip to `true` once a Custom Cast Receiver is registered with the
-    /// Cast SDK Developer Console ($5 one-time, blocks `cast_app_id` ≠ "")
-    /// and deployed. Custom Receivers can programmatically hide the rich UI
-    /// after a few seconds of inactivity, getting both the polish AND the
-    /// auto-hide behavior. Until then the bare-bones UI is the lesser evil.
-    ///
-    /// Tracking issue: spela TODO.md § "Custom Receiver registration".
-    /// Hard-won lesson context: spela CLAUDE.md § "DMR persistent overlay".
+    /// **Apr 29, 2026 correction**: this flag does NOT govern the persistent
+    /// progress-bar overlay — that is governed by stream type (live HLS = no
+    /// progress bar; VOD HLS = persistent progress bar).  Earlier commit
+    /// messages and comments framed this as the cause of the persistent
+    /// overlay; that was wrong.  For overlay-free playback set
+    /// `vod_manifest_padded = false` regardless of this flag's value.
+    /// Full case study: spela CLAUDE.md § "DMR overlay is stream-type-dependent,
+    /// not metadata-dependent".
     #[serde(default)]
     pub rich_metadata_in_load: bool,
-    /// Apr 28, 2026 [EXPERIMENTAL]: Append `#EXT-X-ENDLIST` to the playlist
-    /// route response even though the playlist is still being written.
-    /// Cast Web Receiver only honors `EXT-X-ENDLIST` for VOD detection (per
-    /// Google's Cast team's own statement on the SDK forum), so adding it
-    /// SHOULD trick the receiver into rendering VOD-style auto-hide
-    /// controls. The risk: receiver may interpret current-segment-count as
-    /// "total stream length" and stop fetching new segments after that
-    /// point, truncating playback. If that happens, flip back to false.
+    /// Apr 28, 2026 [EXPERIMENTAL — superseded]: Append `#EXT-X-ENDLIST` to
+    /// the playlist response while the playlist is still being written.
+    /// Side effect: Shaka chases the moving end marker, current_time
+    /// inflates, HWM saves corrupt.
     ///
-    /// If this experiment works, we get auto-hide controls AND can safely
-    /// re-enable `rich_metadata_in_load`. If it doesn't, fall back to the
-    /// metadata-off compromise (small persistent overlay) until Custom
-    /// Receiver lands.
+    /// **Apr 29, 2026 correction**: this never produced "auto-hide controls"
+    /// — it just flipped the stream type from live to VOD, which on DMR
+    /// adds a persistent progress-bar overlay (the opposite of what was
+    /// wanted).  Functionally a redundant subset of `vod_manifest_padded`
+    /// and should be removed in a future cleanup pass.  See spela CLAUDE.md
+    /// § "DMR overlay is stream-type-dependent, not metadata-dependent".
     #[serde(default)]
     pub experimental_endlist_hack: bool,
-    /// Apr 29, 2026: VOD-style manifest with predicted segment count + ENDLIST
+    /// Apr 29, 2026: VOD-style manifest with predicted full duration + ENDLIST
     /// upfront, plus long-polled segment serving for not-yet-written segments.
-    /// Receiver sees a complete VOD playlist, total duration matches reality
-    /// (computed from `ss_offset` and source `duration`), controls auto-hide,
-    /// no chase-the-end / current_time inflation.
+    /// Receiver sees a complete VOD playlist with honest total duration so
+    /// `current_time` doesn't inflate and HWM saves stay accurate.
     ///
-    /// Two-part contract:
+    /// **Default `false`.**  Trade-off: enables receiver-side total-duration
+    /// display (TV shows "1:23 / 2:00") at the cost of DMR rendering a
+    /// persistent progress-bar overlay.  Live mode (this flag false) = no
+    /// progress bar AND no overlay, which is spela's preferred user-facing
+    /// experience until the Custom Receiver is registered.  Full case study
+    /// + decision tree: spela CLAUDE.md § "DMR overlay is stream-type-dependent,
+    /// not metadata-dependent".
+    ///
+    /// Two-part implementation contract:
     ///   1. `handle_hls_playlist` parses ffmpeg's actual playlist, computes
     ///      avg EXTINF from emitted segments, predicts total = ceil(remaining
     ///      duration / avg) + 2-buffer, pads with placeholder segment names,
     ///      appends EXT-X-ENDLIST.
     ///   2. `handle_hls_segment` long-polls (up to 28s, < typical receiver
-    ///      HTTP timeout) for not-yet-written segments. Receiver retries are
-    ///      absorbed by the wait loop; it serves 200 OK as soon as ffmpeg
-    ///      writes the segment, or 503 Retry-After if it never appears.
-    ///
-    /// Strictly better than `experimental_endlist_hack`: that one preserved
-    /// only the segments-emitted-so-far list with appended ENDLIST, causing
-    /// receiver to think total duration = current ffmpeg progress and chase
-    /// the moving end marker (HWM-saving inflated, see Apr 28-29 incident).
-    /// `vod_manifest_padded` declares the FULL duration upfront so the
-    /// receiver's clock matches reality.
-    ///
-    /// Default off — requires field testing per stream type (long episodes,
-    /// movies, edge-case sources). Flip on, watch one full episode, observe
-    /// whether the receiver completes naturally or hits 503 on the trailing
-    /// over-predicted segments.
+    ///      HTTP timeout) for not-yet-written segments.  Receiver retries
+    ///      are absorbed by the wait loop; it serves 200 OK as soon as
+    ///      ffmpeg writes the segment, or 503 Retry-After if it never
+    ///      appears.
     #[serde(default)]
     pub vod_manifest_padded: bool,
 }
@@ -297,16 +281,15 @@ default_device = "Living Room TV"
 
     #[test]
     fn test_rich_metadata_in_load_defaults_off() {
-        // Apr 28, 2026: Default OFF until Custom Receiver lands. With DMR
-        // and metadata enabled, the rich-UI overlay never auto-hides because
-        // spela's growing HLS playlist lacks EXT-X-ENDLIST → receiver thinks
-        // it's a live stream → persistent overlay → ~25% screen occupied.
-        // Default off keeps the bare progress bar (~5% screen occupied).
-        // Flip to true when registering a Custom Receiver via Cast SDK
-        // Developer Console.
+        // Apr 28, 2026 (Apr 29 corrected): Default OFF.  When ON, DMR adds
+        // a poster+title splash on top of the playback view; the persistent
+        // progress-bar overlay is governed by stream type (live vs VOD HLS),
+        // not by this flag — see spela CLAUDE.md § "DMR overlay is
+        // stream-type-dependent".  Flip to true once a Custom Receiver is
+        // registered with the Cast SDK Developer Console.
         let config = Config::default();
         assert!(!config.rich_metadata_in_load,
-            "Default must be OFF — DMR overlay-shrink trumps metadata polish");
+            "Default must be OFF — opt-in to the poster splash deliberately");
     }
 
     #[test]

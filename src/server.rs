@@ -207,11 +207,13 @@ pub struct PlayRequest {
     pub duration: Option<f64>,
     pub quality: Option<String>,
     pub size: Option<String>,
-    /// Apr 28, 2026: TMDB poster URL for the playing item. Auto-filled by
-    /// the play handler from `last_search.json`'s `show.poster_url`. Sent
-    /// through to `cast_url`'s `CastMetadata` so the Default Media Receiver
-    /// renders the rich-UI player (poster background + auto-hide controls)
-    /// instead of its persistent minimal overlay.
+    /// Apr 28, 2026 (Apr 29 corrected): TMDB poster URL for the playing
+    /// item. Auto-filled by the play handler from `last_search.json`'s
+    /// `show.poster_url`. Sent through to `cast_url`'s `CastMetadata` so
+    /// the Default Media Receiver shows a poster + title splash on top of
+    /// the playback view. Does NOT affect progress-bar overlay behavior —
+    /// that is governed by stream type (live vs VOD HLS). See spela
+    /// CLAUDE.md § "DMR overlay is stream-type-dependent".
     pub poster_url: Option<String>,
 }
 
@@ -735,15 +737,14 @@ async fn do_play(
         } else {
             "video/mp4"
         };
-        // Apr 28, 2026: Build CastMetadata from the play request. Gated by
-        // `config.rich_metadata_in_load` because the Default Media Receiver
-        // renders metadata-rich overlays as a PERMANENT on-screen layer when
-        // the HLS playlist lacks `EXT-X-ENDLIST` (always the case for spela's
-        // growing playlist). With metadata: ~25% of screen permanently
-        // occupied. Without: ~5% (bare progress bar). Flip the config flag
-        // to true once a Custom Receiver is deployed (it can programmatically
-        // auto-hide the rich UI). See config.rs comment + spela CLAUDE.md
-        // § "DMR persistent overlay" for full rationale.
+        // Apr 28, 2026 (Apr 29 corrected): Build CastMetadata from the play
+        // request. Gated by `config.rich_metadata_in_load`. When enabled,
+        // DMR shows a poster + title splash on top of the playback view.
+        // Does NOT govern the persistent progress-bar overlay — that's
+        // stream-type-dependent (live HLS vs VOD HLS). Default off because
+        // the splash adds clutter without solving the overlay axis. Full
+        // case study: spela CLAUDE.md § "DMR overlay is stream-type-dependent,
+        // not metadata-dependent".
         let cast_metadata = if state.config.rich_metadata_in_load {
             cast::CastMetadata {
                 title: req.title.clone(),
@@ -2845,11 +2846,14 @@ async fn handle_hls_playlist(
         .join("playlist.m3u8");
 
     // Apr 29, 2026: VOD-padded manifest mode (config.vod_manifest_padded).
-    // Predicted full-duration manifest with ENDLIST upfront — receiver sees
-    // the stream as VOD, controls auto-hide, no chase-the-end inflation.
-    // Companion: handle_hls_segment's long-poll for not-yet-written
-    // placeholders. Replaces the simpler `experimental_endlist_hack` which
-    // had correct intent but caused current_time inflation / HWM corruption.
+    // Predicted full-duration manifest with ENDLIST upfront — receiver
+    // treats the stream as VOD with honest total duration, so current_time
+    // doesn't inflate and HWM saves stay accurate.  Companion:
+    // handle_hls_segment's long-poll for not-yet-written placeholders.
+    // Trade-off: enables receiver-side total-duration display at the cost
+    // of DMR rendering a persistent progress-bar overlay.  Default off;
+    // live mode (this path skipped) = no overlay AND no total display.
+    // See spela CLAUDE.md § "DMR overlay is stream-type-dependent".
     if state.config.vod_manifest_padded {
         match tokio::fs::read_to_string(&path).await {
             Ok(body) => {

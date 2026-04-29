@@ -46,13 +46,14 @@ pub struct ShowInfo {
     pub release_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overview: Option<String>,
-    /// Apr 28, 2026: Full TMDB poster URL, already prefixed with the image
-    /// base (`https://image.tmdb.org/t/p/w500{poster_path}`). Populated at
-    /// search time, persisted into `last_search.json`, plumbed through
-    /// `PlayRequest.poster_url` → `CurrentStream.poster_url` → `CastMetadata`
-    /// so the Default Media Receiver renders its rich-UI player (poster
-    /// background + auto-hide controls) instead of the minimal persistent
-    /// overlay it shows when `Media.metadata` is None.
+    /// Apr 28, 2026 (Apr 29 corrected): Full TMDB poster URL, already
+    /// prefixed with the image base (`https://image.tmdb.org/t/p/w500{poster_path}`).
+    /// Populated at search time, persisted into `last_search.json`, plumbed
+    /// through `PlayRequest.poster_url` → `CurrentStream.poster_url` →
+    /// `CastMetadata` so the Default Media Receiver shows a poster + title
+    /// splash on top of the playback view.  Does NOT govern overlay-mode
+    /// (that's stream-type-dependent — see spela CLAUDE.md § "DMR overlay
+    /// is stream-type-dependent").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poster_url: Option<String>,
 }

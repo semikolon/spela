@@ -42,10 +42,11 @@ pub struct CastMetadata {
     pub season: Option<u32>,
     pub episode: Option<u32>,
     /// Full TMDB poster URL, already prefixed with the image base
-    /// (`https://image.tmdb.org/t/p/w500{path}`). Goes into
-    /// `Vec<Image>` for receiver UI rendering. Optional — we still get
-    /// auto-hide controls from a metadata-only LOAD message; the poster
-    /// is the polish on top.
+    /// (`https://image.tmdb.org/t/p/w500{path}`).  Goes into
+    /// `Vec<Image>` for receiver UI rendering.  Optional — controls
+    /// auto-hiding is governed by stream type (live vs VOD HLS), not by
+    /// the LOAD message metadata; see spela CLAUDE.md § "DMR overlay is
+    /// stream-type-dependent".  Poster is purely the visual splash on top.
     pub poster_url: Option<String>,
     /// ISO-8601 release date for movies. Goes into `MovieMediaMetadata.subtitle`
     /// AND `release_date` so the receiver can render it under the title.
@@ -54,14 +55,15 @@ pub struct CastMetadata {
 
 /// Build the rust_cast `Metadata` enum to put inside the LOAD message.
 ///
-/// Apr 28, 2026: Replaces the previous `metadata: None` which made the
-/// Default Media Receiver fall back to its persistent minimal-overlay UI
-/// (thin progress line + elapsed-time counter that never auto-hide). With
-/// proper metadata the receiver renders its rich-UI player: poster
-/// background, episode/movie title overlay, controls auto-hide after
-/// ~3 seconds of inactivity. See [Cast Web Receiver — Secondary
+/// Apr 28, 2026 (Apr 29 corrected): Replaces the previous `metadata: None`
+/// which made the Default Media Receiver fall back to its bare playback UI.
+/// With proper metadata the receiver shows a poster + title splash on top
+/// of the playback view.  See [Cast Web Receiver — Secondary
 /// Image](https://developers.google.com/cast/docs/web_receiver/secondary_image)
-/// for the receiver-side rendering rules.
+/// for the receiver-side rendering rules.  Note: the persistent
+/// progress-bar overlay is governed by stream type (live HLS vs VOD HLS),
+/// NOT by this metadata — see spela CLAUDE.md § "DMR overlay is
+/// stream-type-dependent" for the full case study.
 ///
 /// Decision tree:
 ///
@@ -510,27 +512,29 @@ fn extract_metadata_title(metadata: &Metadata) -> String {
 
 
 // ---------------------------------------------------------------------------
-// Apr 28, 2026: build_cast_metadata regression suite.
+// Apr 28, 2026 (Apr 29 corrected): build_cast_metadata regression suite.
 //
-// The Default Media Receiver renders two different UIs depending on the
-// LOAD message's `Media.metadata` field:
+// The Default Media Receiver renders the LOAD message's `Media.metadata`
+// field as a poster + title splash on top of the playback view:
 //
 //   - `metadata: Some(Metadata::TvShow|Movie)` with title + image →
-//     rich-UI player (poster background, title overlay, controls
-//     auto-hide after ~3s of inactivity)
-//   - `metadata: None` → minimal-overlay fallback (thin progress line +
-//     elapsed-time counter that NEVER auto-hide because there's no rich
-//     layer to switch to)
+//     poster background + episode/movie title overlay
+//   - `metadata: None` → bare playback UI, no poster
 //
-// Pre-Apr-28 spela always sent `metadata: None` (cast.rs line 175 had
-// the literal `metadata: None` for the entire history of this file). The
-// Apr 28 fix routes show/episode/poster context from the play request
-// through `CastMetadata` → `build_cast_metadata` → the LOAD message.
+// Pre-Apr-28 spela always sent `metadata: None`.  The Apr 28 fix routes
+// show/episode/poster context from the play request through `CastMetadata`
+// → `build_cast_metadata` → the LOAD message.
 //
-// These tests pin the decision tree so a future refactor can't silently
-// regress the UI back to the persistent overlay. Tests are creative +
-// combinatorial per Fredrik's testing directive — each case is an
-// invariant that, if broken, would re-introduce a specific real bug.
+// **Apr 29 correction**: The original framing of these tests claimed
+// metadata governed "auto-hide controls" vs "persistent overlay" — that
+// was wrong.  The persistent progress-bar overlay is governed by stream
+// type (live HLS vs VOD HLS), independent of metadata.  These tests
+// nonetheless still pin the splash decision tree correctly; only the
+// "what overlay state does each branch produce" framing was inverted.
+// Full case study: spela CLAUDE.md § "DMR overlay is stream-type-dependent,
+// not metadata-dependent".  Tests are creative + combinatorial per
+// Fredrik's testing directive — each case is an invariant that, if
+// broken, would re-introduce a specific real bug.
 #[cfg(test)]
 mod build_cast_metadata_tests {
     use super::*;
