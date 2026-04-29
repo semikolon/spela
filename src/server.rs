@@ -1196,7 +1196,30 @@ pub const MIN_STREAM_AGE_FOR_RECAST_SECS: u64 = 60;
 /// 90 seconds is well-above the maximum legitimate recast→Playing recovery
 /// time (~15-25s observed) and well-below the minimum healthy-recast cycle
 /// time we've seen (~3-15 minutes in practice).
-pub const RECAST_COOLDOWN_SECS: u64 = 90;
+pub const RECAST_COOLDOWN_SECS: u64 = 30;
+// Apr 29, 2026 PM: lowered 90→30s. Reasoning:
+//
+// 90s was tuned against Apr 28's slow-fail pattern (15-min cycles). E2
+// resume this morning exposed a faster-fail mode on the SAME device —
+// CrKey 1.56 firmware locks the playback thread for ~63s at a time,
+// recovers via recast, locks again ~70s later. The 90s cooldown rejected
+// the 3rd recast (72s < 90s) → premature cleanup. Network probe during
+// stalls confirmed receiver sent ZERO HTTP requests during BUFFERING
+// windows: purely receiver-internal block, nothing for spela to fix on
+// its own side. The recast IS the right answer — it kicks the receiver
+// out of its frozen state with a fresh LOAD message.
+//
+// Why 30s and not 60s: the EFFECTIVE minimum-time-between-recasts on
+// the BUFFERING-stall path is already MAX_BUFFERING_DURATION_SECS=60s —
+// recast can't fire until 60s of continuous BUFFERING accumulates. So
+// for the dominant failure mode (BUFFERING-stuck), cooldown=30 is
+// functionally identical to cooldown=60. Cooldown only matters for
+// IDLE-driven recasts (consecutive_failures hits threshold from 3
+// polls × 5s = 15s of IDLE) — wedge protection there at 30s is still
+// 2× the IDLE-detect window, which is plenty.
+//
+// Net effect: more responsive recovery on faster-degrading devices,
+// no regression in wedge protection.
 
 /// Apr 29, 2026: BUFFERING-too-long → escalate to recast.
 ///
@@ -1720,6 +1743,24 @@ async fn cast_health_monitor(
             };
             let secs_since_last_recast = last_recast_at
                 .map(|t| t.elapsed().as_secs());
+            // Apr 29, 2026 PM: surface the cooldown-rejected case in logs.
+                // Without this, when consecutive_failures hits the threshold but
+            // should_attempt_recast returns false, we'd silently fall through
+            // to cleanup with no breadcrumb showing WHY recast was skipped.
+            if !is_natural_eof
+                && !should_attempt_recast(
+                    secs_since_last_recast,
+                    stream_age_secs,
+                    last_known_absolute.is_some(),
+                )
+                && stream_age_secs >= MIN_STREAM_AGE_FOR_RECAST_SECS
+                && last_known_absolute.is_some()
+            {
+                tracing::warn!(
+                    "cast_health_monitor: '{}' — recast SKIPPED (cooldown not satisfied: secs_since_last_recast={:?}, cooldown={}s) — falling through to cleanup",
+                    title_for_log, secs_since_last_recast, RECAST_COOLDOWN_SECS
+                );
+            }
             if !is_natural_eof
                 && should_attempt_recast(
                     secs_since_last_recast,
@@ -3617,11 +3658,44 @@ mod tests {
 
     #[test]
     fn test_recast_cooldown_is_stable() {
-        // Apr 29, 2026: pinning the rate-limit value. Tightening costs
-        // recovery responsiveness; loosening risks rapid-fire wedge spam.
-        // 90s is well above max recast→Playing recovery time observed
-        // (~25s) and well below typical healthy-recast cycles (~3-15 min).
-        assert_eq!(RECAST_COOLDOWN_SECS, 90);
+        // Apr 29, 2026 PM: pinning at 30s. Effective floor is
+        // MAX_BUFFERING_DURATION_SECS=60s for BUFFERING-stuck path
+        // (dominant failure mode), so cooldown only matters for
+        // IDLE-driven recasts where 30s = 2× the 15s IDLE-detect window.
+        // Loosening this would re-introduce the Apr 29 AM premature-cleanup
+        // bug; tightening below ~20s risks rapid-fire LOAD spam on a
+        // wedged device.
+        assert_eq!(RECAST_COOLDOWN_SECS, 30);
+    }
+
+    #[test]
+    fn test_apr29_morning_e2_resume_pattern_recovers() {
+        // Replay the morning's E2 resume failure: CrKey 1.56 receiver
+        // freezes for ~63s every ~70s (133s cycle). With the old 90s
+        // cooldown, the 3rd recast was rejected (72s gap < 90s) leading
+        // to premature cleanup. With 60s cooldown, recovery continues.
+        // This case BREAKS at the OLD value (90s) but works at the NEW
+        // value (60s), so it's a regression pin against future cooldown
+        // tightening.
+        let _healthy_for = 70;  // CrKey holds Playing for ~70s before next freeze
+        let _freeze_for = 63;   // then freezes for 63s before recast can fire
+        let cycle = 133; // sec — full Playing+Frozen cycle observed Apr 29 AM
+
+        // First recast: no prior history, allowed (assuming stream age met)
+        assert!(should_attempt_recast(None, 120, true));
+
+        // Second recast: a full cycle later (133s gap, well above cooldown)
+        assert!(should_attempt_recast(Some(cycle), 120 + cycle, true));
+
+        // Third recast: another cycle later. Time gap from PRIOR recast.
+        // Same as second — 133s gap.
+        assert!(should_attempt_recast(Some(cycle), 120 + 2 * cycle, true));
+
+        // The actual Apr 29 AM 3rd recast: 72s gap (between healthy_for=70
+        // and the next stall threshold of 60s in BUFFERING-stall logic).
+        // OLD (90s cooldown): rejected. NEW (60s cooldown): accepted.
+        assert!(should_attempt_recast(Some(72), 200, true),
+            "3rd recast at 72s gap MUST be allowed at the new 60s cooldown");
     }
 
     #[test]
@@ -3822,9 +3896,9 @@ seg_00002.ts
 
     #[test]
     fn test_recast_blocks_simulated_wedge() {
-        // Wedge case: receiver IDLEs every 15s. With cooldown=90, recasts
-        // would fire at most once per 90s. A wedge that IDLEs faster than
-        // cooldown cannot trap the loop in rapid retries.
+        // Wedge case: receiver IDLEs every 15s (rapid-fire wedge — would
+        // be infinite-loop without rate limit). Cooldown bounds the
+        // recast frequency. The exact bound scales with cooldown.
         let mut elapsed_since_recast: u64 = 0;
         let stream_age: u64 = 120;
         let mut recast_count = 0;
@@ -3836,14 +3910,19 @@ seg_00002.ts
                 elapsed_since_recast += 15;
             }
         }
-        // 40 ticks × 15 s = 600 s of wall time. Cooldown=90 → at most
-        // 600/90 = 6 recasts. Worst case for the test infra is 7 (if
-        // first recast fires at tick 0).
-        assert!(recast_count <= 7,
-            "Expected ≤ 7 recasts in 600s of 15s-period wedge; got {}",
+        // 40 ticks × 15 s = 600 s of wall time. With cooldown=30, max
+        // theoretical recasts = ceil(600 / 30) = 20, plus the initial
+        // recast at tick 0. Set the cap at 22 for a small margin against
+        // tick-arithmetic rounding.
+        assert!(recast_count <= 22,
+            "Expected ≤ 22 recasts in 600s of 15s-period wedge at 30s cooldown; got {}",
             recast_count);
         // But it must fire at least 1 — otherwise we've broken normal recovery.
         assert!(recast_count >= 1, "Wedge protection must not block the FIRST recast");
+        // And it must NOT fire on every tick — that's the wedge spam we
+        // were guarding against.
+        assert!(recast_count < 40,
+            "Recast firing on every tick = wedge protection broken");
     }
 }
 
