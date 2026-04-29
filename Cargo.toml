@@ -21,7 +21,16 @@ chrono = { version = "0.4", features = ["serde"] }
 tower-http = { version = "0.6", features = ["cors"] }
 dirs = "6"
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
+
+# Apr 29, 2026: pure-Rust BitTorrent client to replace webtorrent-cli (Node).
+# Migration plan: see `~/Projects/spela/CLAUDE.md` § "webtorrent-cli weak peer
+# discovery" hard-won lesson. Pin 8.1.x — 9.0-beta has macOS build issues
+# (rqbit issue #578) and edition-2024 Rust requirement. The streaming API
+# (`ManagedTorrent::stream` -> `FileStream: AsyncRead + AsyncSeek`) is stable
+# across 8.1 -> 9.0-beta.2, so the eventual upgrade is non-breaking.
+librqbit = { version = "8.1", default-features = false, features = ["rust-tls"] }
 
 [dev-dependencies]
 # mtime manipulation for disk-prune regression tests (Apr 15, 2026)

@@ -6,6 +6,8 @@ mod server;
 mod state;
 mod subtitles;
 mod torrent;
+mod torrent_engine;
+mod torrent_stream;
 mod transcode;
 
 use clap::{Parser, Subcommand};

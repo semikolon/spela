@@ -1,5 +1,37 @@
 # Spela TODOs 🎬🍿
 
+### librqbit migration — replace webtorrent-cli (open, Phase 1 ✅) 🦀
+
+**Driver**: Apr 29, 2026 — three Torrentio results reporting 419/79/39 seeds attached to ZERO reachable peers under webtorrent-cli; one fourth (FLUX 720p, 30 reported seeds) attached to 31-57 peers at 10 MB/s on the same Darwin host within minutes. Same-host, same-network, only-the-magnet-changed test isolated the variable to webtorrent's peer-connection behavior. Pattern matches well-documented webtorrent-cli weakness ([webtorrent/webtorrent-cli #175](https://github.com/webtorrent/webtorrent-cli/issues/175), [#241](https://github.com/webtorrent/webtorrent-cli/issues/241)) — Node implementation's peer discovery is meaningfully weaker than libtorrent-class clients across magnets with quirky tracker subsets.
+
+**Target architecture**: replace the Node.js `webtorrent-cli` subprocess + separate `:8888` HTTP server with embedded `librqbit = "8.1"` (pure-Rust libtorrent-class client). End state: single Rust binary, no Node dep, torrent streams served through spela's existing axum router on `:7890`. HLS chain + DNAT hijack unchanged.
+
+#### Phase 1 — Foundation (✅ Apr 29, 2026)
+- [x] Add `librqbit = "8.1"` (rust-tls feature only, default-features off) + `tokio-util` deps to Cargo.toml.
+- [x] `src/torrent_engine.rs` — `TorrentEngine` wrapper around `librqbit::Session` with start/progress/handle/stop API. spela-shaped types (`TorrentStartInfo`, `TorrentProgress`, `TorrentState`) so callers don't depend on librqbit types.
+- [x] `src/torrent_stream.rs` — axum-compatible HTTP Range handler. Pure `parse_range_header()` function with full RFC 7233 coverage (open-ended, bounded, suffix, multi-range, malformed, unsatisfiable, EOF clamps). 19 unit tests including ffmpeg's typical probe + resume-seek patterns.
+- [x] `cargo test` 203/203 passing (25 new + 178 existing).
+- [x] Compile-clean against axum 0.8 + librqbit 8.1.1 + the existing spela tree.
+
+#### Phase 2 — Wire-up + live validation (next session, NOT during running cast)
+- [ ] Add `torrent_backend: Option<String>` to `Config` (`~/.config/spela/config.toml`). Default `"webtorrent"`, switch to `"librqbit"` per-deploy.
+- [ ] Add `Option<Arc<TorrentEngine>>` field to `ServerState`. Lazy-init only when backend = "librqbit" (saves DHT bootstrap on legacy deployments).
+- [ ] Register axum route `GET /torrent/{id}/stream/{file_idx}` calling `torrent_stream::serve_torrent_stream`.
+- [ ] Refactor `do_play` (server.rs ~lines 503-528) to switch on `config.torrent_backend`:
+  - `"webtorrent"` → existing `torrent::start_webtorrent` path
+  - `"librqbit"` → `engine.start(magnet, file_index)` + poll `engine.progress(id)` for the 12s self-healing check
+- [ ] Refactor cleanup paths (`do_cleanup`, post-playback reaper, `reconcile_webtorrent_workers_on_startup`) to be backend-aware. The reaper's `webtorrent_pid` semantics carry over for librqbit (use `id` as the lookup key into the session); `engine.stop(id, delete_files)` is the analog of `kill_pid` + the `--keep-seeding` torrent removal.
+- [ ] Live test on Darwin: deploy with `torrent_backend = "librqbit"`, search a known-low-seed-on-webtorrent magnet (the NTb releases that failed Apr 29 are perfect regression cases), verify ≥10 peers attached.
+- [ ] Validate self-healing: simulate dead-seed scenario, verify the 0%-progress fall-through still works against librqbit's progress polling.
+- [ ] Validate Local Bypass: verify librqbit's file layout matches what `disk.rs::top_level_file_is_healthy` + `dir_size` expect (sparse-aware via `metadata.blocks() * 512`). Per the librarian's research it should be identical, but confirm with a real download.
+
+#### Phase 3 — Default flip + cleanup (after Phase 2 validation)
+- [ ] Flip `Config::torrent_backend` default to `"librqbit"`.
+- [ ] Delete the legacy `start_webtorrent` / `check_progress` / webtorrent-specific kill paths from `src/torrent.rs`. Keep the generic `kill_pid` / process-pattern utilities used by ffmpeg cleanup.
+- [ ] Drop `webtorrent` from Darwin's mise tools list. Remove `NODE_OPTIONS=--max-old-space-size=4096` and the webtorrent-cli PATH dependency from spela's systemd unit.
+- [ ] Update [CLAUDE.md](CLAUDE.md) § "Hard-Won Lessons": archive the webtorrent `-s` PR #3011 entry (still valuable history, no longer load-bearing) and add a new entry pinning librqbit's `only_files` semantics.
+- [ ] Bump version to v3.3.0 ("Pure-Rust torrent engine") in Cargo.toml.
+
 ### Corrupt-source-file detection (open) 🔧
 - [ ] **Auto-detect corrupt source files via ffmpeg.log post-mortem** — Apr 29 incident (Hijack S02E05 MeGusta) silently produced ~5 min of NVENC-duplicated junk past byte 417 MB Matroska corruption. Local Bypass treated the broken file as good on every subsequent play; recast loop wedged 5x at the same `time=2022s` before manual rm. Implementation: after each transcode_hls completion, parse `~/.spela/ffmpeg.log` for (a) `dup=<N>` on final summary line where N>100, (b) any `Could not find ref with POC` lines, (c) any `invalid as first byte of an EBML number` lines. If any match, mark the source file path in `state.json::corrupt_files` and have Local Bypass skip it on subsequent matches. Hard-won lesson context in [CLAUDE.md](CLAUDE.md) § "Corrupt source files defeat auto-recast — wedge isn't on the receiver".
 
