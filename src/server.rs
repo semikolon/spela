@@ -1911,13 +1911,26 @@ async fn cast_health_monitor(
                 };
                 if let Some(item) = next {
                     let port = state.config.port;
+                    let host = state.config.host.clone();
                     let title = item.title.clone();
                     tokio::spawn(async move {
                         // Wait briefly so cleanup completes (HLS dir gone,
                         // workers fully reaped) before the new play setup
                         // tries to write to the same paths.
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        let url = format!("http://127.0.0.1:{port}/play");
+                        // Apr 29, 2026 PM bug fix: spela binds to
+                        // `config.host` (e.g. 192.168.4.1 on Darwin per its
+                        // systemd unit) — NOT 0.0.0.0. Self-calling 127.0.0.1
+                        // failed because the server isn't listening on
+                        // loopback. Use the actual bind host. Fall back to
+                        // 127.0.0.1 only when config.host is the wildcard
+                        // 0.0.0.0 (then loopback IS in scope).
+                        let host_for_self_call = if host.is_empty() || host == "0.0.0.0" {
+                            "127.0.0.1".to_string()
+                        } else {
+                            host
+                        };
+                        let url = format!("http://{host_for_self_call}:{port}/play");
                         let body = serde_json::json!({
                             "magnet": item.magnet,
                             "title": item.title,
