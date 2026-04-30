@@ -199,9 +199,20 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         // requests as it transcodes, and librqbit re-prioritizes pieces around
         // the requested offset. See `torrent_stream.rs` for the Range parser
         // (full RFC 7233 coverage, 19 unit tests).
-        .route(
-            "/torrent/{id}/stream/{file_idx}",
-            get(handle_torrent_stream),
+        // Apr 30, 2026 (security audit H4): librqbit stream endpoint
+        // restricted to loopback via a sub-router. The only legitimate
+        // consumer is ffmpeg, which always runs on the same host as spela.
+        // Chromecast hits /hls/* (the transcoded output), NEVER /torrent/*
+        // (the raw librqbit-served bytes). DoS via Range-flooding and
+        // exfiltration of in-progress torrent contents both require
+        // non-loopback access; the per-route layer closes that surface.
+        .merge(
+            Router::new()
+                .route(
+                    "/torrent/{id}/stream/{file_idx}",
+                    get(handle_torrent_stream),
+                )
+                .layer(axum::middleware::from_fn(require_loopback_source)),
         )
         // Apr 30, 2026 (H2): Host-header allowlist applied to ALL routes.
         // Order matters: middleware runs in reverse (CORS-then-host means
@@ -219,7 +230,16 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     tracing::info!("Endpoints: /search /play /stop /status /pause /resume /seek /volume /next /prev /targets /history /config");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    // Apr 30, 2026 (H4): use into_make_service_with_connect_info so the
+    // require_loopback_source middleware can extract `ConnectInfo<SocketAddr>`
+    // and check the source IP. axum's default `Router::into_make_service`
+    // doesn't expose ConnectInfo; without this swap the middleware would
+    // 500 on every request to /torrent/*.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -280,6 +300,25 @@ pub(crate) fn parse_host_header(raw: &str) -> &str {
     match raw.rfind(':') {
         Some(idx) => &raw[..idx],
         None => raw,
+    }
+}
+
+/// Apr 30, 2026 (security audit H4): only loopback may hit
+/// `/torrent/{id}/stream/{file_idx}`. ffmpeg is the sole legitimate
+/// consumer and runs in-process. Rejects 403 for any non-loopback source IP.
+async fn require_loopback_source(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Result<axum::response::Response, StatusCode> {
+    if addr.ip().is_loopback() {
+        Ok(next.run(req).await)
+    } else {
+        tracing::warn!(
+            "/torrent/* rejected from non-loopback source: {}",
+            addr
+        );
+        Err(StatusCode::FORBIDDEN)
     }
 }
 
