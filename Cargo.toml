@@ -32,6 +32,17 @@ bytes = "1"
 # across 8.1 -> 9.0-beta.2, so the eventual upgrade is non-breaking.
 librqbit = { version = "8.1", default-features = false, features = ["rust-tls"] }
 
+# Apr 30, 2026: rustls 0.23+ requires an explicit `CryptoProvider::install_default()`
+# call before any TLS use when multiple provider crates can coexist transitively.
+# librqbit's `rust-tls` feature pulls in rustls via reqwest/rustls-tls without
+# pinning a provider. Without this dep + an early `install_default()` call in
+# main.rs, librqbit's tracker / UPnP HTTPS path panics with:
+#   "Could not automatically determine the process-level CryptoProvider from
+#    Rustls crate features."
+# The panic poisons whatever mutex the panicking task was holding, cascading
+# into PoisonError on every subsequent `.lock().unwrap()`.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+
 [dev-dependencies]
 # mtime manipulation for disk-prune regression tests (Apr 15, 2026)
 filetime = "0.2"

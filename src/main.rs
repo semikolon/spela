@@ -162,6 +162,17 @@ async fn main() {
     match cli.command {
         Commands::Server { port, host } => {
             tracing_subscriber::fmt::init();
+
+            // Apr 30, 2026: rustls 0.23+ requires an explicit default
+            // CryptoProvider before any TLS use. librqbit's tracker/UPnP HTTPS
+            // path otherwise panics with "Could not automatically determine
+            // the process-level CryptoProvider", poisoning whatever mutex the
+            // panicking task was holding and cascading PoisonError into every
+            // subsequent .lock().unwrap() (including the cast Mutex). `.ok()`
+            // because if some other dep already installed a provider, the
+            // second install returns Err and we don't care.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
             let mut config = config::Config::load().unwrap_or_default();
             config.port = port;
             config.host = host;
