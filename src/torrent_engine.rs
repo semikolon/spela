@@ -28,9 +28,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, TorrentStats,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, PeerConnectionOptions,
+    Session, SessionOptions, TorrentStats,
 };
 
 // `librqbit::torrent_state::FileStream` and `ManagedTorrentHandle` (the
@@ -110,9 +113,26 @@ impl TorrentEngine {
         stream_port: u16,
     ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(media_dir).context("creating media_dir for torrent engine")?;
-        let session = Session::new(media_dir.to_path_buf())
+        // Apr 30, 2026 (L1 hardening — partial): librqbit 8.1.1 doesn't
+        // expose a peer-count cap in SessionOptions / PeerConnectionOptions
+        // (the librarian's research suggested one but it's not in this
+        // version's API). What we CAN tune: per-peer connection timeouts
+        // (slowloris defense) and concurrent_init_limit (caps how many
+        // torrents can simultaneously bootstrap = bounded peak resource use).
+        // Together these meaningfully reduce the long-running-embed FD
+        // exhaustion class that rqbit issue #525 surfaced.
+        let opts = SessionOptions {
+            peer_opts: Some(PeerConnectionOptions {
+                connect_timeout: Some(Duration::from_secs(15)),
+                read_write_timeout: Some(Duration::from_secs(60)),
+                keep_alive_interval: Some(Duration::from_secs(120)),
+            }),
+            concurrent_init_limit: Some(4),
+            ..Default::default()
+        };
+        let session = Session::new_with_opts(media_dir.to_path_buf(), opts)
             .await
-            .context("librqbit::Session::new failed during engine bootstrap")?;
+            .context("librqbit::Session::new_with_opts failed during engine bootstrap")?;
         Ok(Arc::new(Self {
             session,
             stream_host: stream_host.into(),
