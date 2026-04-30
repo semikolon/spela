@@ -47,8 +47,10 @@ spela status / history / targets                 # Info
 # Repo cloned on Darwin at ~/Projects/spela (Rust 1.94):
 cd ~/Projects/spela && git push   # from Mac
 ssh darwin 'cd ~/Projects/spela && git pull && cargo build --release'
-ssh darwin 'sudo systemctl stop spela && cp ~/Projects/spela/target/release/spela ~/.local/bin/ && sudo systemctl start spela'
+ssh darwin 'sudo systemctl restart spela'
 ```
+
+`~/.local/bin/spela` on Darwin is a symlink to `~/Projects/spela/target/release/spela` (verified Apr 30, 2026 — `lrwxrwxrwx ... -> /home/fredrik/Projects/spela/target/release/spela`). `cargo build --release` rewrites the inode the symlink points at; the running spela process keeps the OLD inode open until `systemctl restart` re-execs against the symlink. **No `cp` step needed** — earlier versions of this doc had `cp ~/Projects/spela/target/release/spela ~/.local/bin/` which errors with "are the same file" (Apr 30 deploy hit this).
 
 ## Mac Mini (Client)
 
