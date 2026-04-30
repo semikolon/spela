@@ -19,6 +19,8 @@ use crate::search::SearchEngine;
 use crate::state::{AppState, CurrentStream, HWM_CLEAR_FRACTION};
 use crate::subtitles;
 use crate::torrent;
+use crate::torrent_engine::TorrentEngine;
+use crate::torrent_stream;
 use crate::transcode;
 
 pub struct ServerState {
@@ -29,6 +31,14 @@ pub struct ServerState {
     pub media_dir: PathBuf,
     /// PID of the running ffmpeg transcode process (if any)
     pub ffmpeg_pid: Mutex<Option<u32>>,
+    /// Apr 30, 2026: librqbit-backed pure-Rust torrent engine. `Some` only when
+    /// `config.torrent_backend = "librqbit"`; otherwise the legacy webtorrent
+    /// path handles all torrent operations and this is `None`. The branch
+    /// lives in helper functions (`start_torrent_for_play`, etc.) so the rest
+    /// of `do_play` / `do_cleanup` / the reaper / startup reconcile is
+    /// uniformly one if-else-let pattern. Cf. `torrent_engine.rs` and Phase 1
+    /// commit `a583c05`.
+    pub torrent_engine: Option<Arc<TorrentEngine>>,
 }
 
 type SharedState = Arc<ServerState>;
@@ -72,7 +82,49 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     let media_dir = config.media_dir();
     std::fs::create_dir_all(&state_dir)?;
     std::fs::create_dir_all(&media_dir)?;
-    reconcile_webtorrent_workers_on_startup(&state_dir);
+
+    // Apr 30, 2026: backend-aware torrent engine init. When `librqbit` is
+    // selected, fail-fast on init error (NEVER fall back to webtorrent
+    // silently — that's the silent-capability-degradation anti-pattern from
+    // global CLAUDE.md). The user explicitly asked for librqbit; if the
+    // session can't bootstrap, surface the error and let them debug.
+    let torrent_engine = match config.torrent_backend.as_str() {
+        "librqbit" => {
+            tracing::info!(
+                "torrent_backend=librqbit — initializing pure-Rust torrent engine"
+            );
+            let engine = TorrentEngine::new(
+                &media_dir,
+                config.stream_host.clone(),
+                config.port,
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "librqbit engine bootstrap failed: {} — set torrent_backend = \"webtorrent\" in ~/.config/spela/config.toml to use the legacy path",
+                    e
+                )
+            })?;
+            tracing::info!(
+                "librqbit engine ready; stream URLs route through {}:{}/torrent/...",
+                config.stream_host,
+                config.port
+            );
+            Some(engine)
+        }
+        "webtorrent" | "" => {
+            tracing::info!("torrent_backend=webtorrent — using legacy Node-based subprocess");
+            None
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "Unknown torrent_backend = {:?}. Valid values: \"webtorrent\" (default) or \"librqbit\".",
+                other
+            ));
+        }
+    };
+
+    reconcile_torrent_state_on_startup(&state_dir, torrent_engine.is_some());
 
     let search_engine = SearchEngine::new(config.tmdb_api_key.clone());
     let cast = Mutex::new(CastController::new(&state_dir, config.known_devices.clone()));
@@ -86,6 +138,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         state_dir,
         media_dir,
         ffmpeg_pid: Mutex::new(None),
+        torrent_engine,
     });
 
     let cors = CorsLayer::new()
@@ -137,6 +190,16 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/api/position", get(handle_get_position).post(handle_save_position))
         .route("/api/position/reset", post(handle_reset_position))
         .route("/api/retry", post(handle_retry))
+        // Apr 30, 2026: librqbit-backed torrent streaming. Replaces webtorrent's
+        // separate :8888 HTTP server with a route on spela's existing axum
+        // router. ffmpeg is the only consumer; it issues `Range: bytes=N-`
+        // requests as it transcodes, and librqbit re-prioritizes pieces around
+        // the requested offset. See `torrent_stream.rs` for the Range parser
+        // (full RFC 7233 coverage, 19 unit tests).
+        .route(
+            "/torrent/{id}/stream/{file_idx}",
+            get(handle_torrent_stream),
+        )
         .layer(cors)
         .with_state(state);
 
@@ -149,31 +212,207 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn reconcile_webtorrent_workers_on_startup(state_dir: &PathBuf) {
+/// Backend-aware version of the original webtorrent-only reconcile.
+/// `has_engine` is `true` when `config.torrent_backend = "librqbit"`.
+///
+/// Responsibilities:
+/// - Clear `app_state.current` if it references a worker/torrent that no
+///   longer exists (e.g. spela was killed mid-play, or backend was switched
+///   between runs).
+/// - Kill any lingering Node-based webtorrent processes regardless of
+///   backend (defense-in-depth: a config flip from webtorrent to librqbit
+///   would otherwise leave the old subprocess running).
+fn reconcile_torrent_state_on_startup(state_dir: &PathBuf, has_engine: bool) {
     let mut app_state = AppState::load(state_dir);
-    let active_pid = app_state
-        .current
-        .as_ref()
-        .map(|current| current.pid)
-        .filter(|pid| *pid > 0 && unsafe { torrent::kill_check(*pid) });
 
-    if app_state.current.is_some() && active_pid.is_none() {
-        tracing::warn!("Clearing stale current stream on startup: recorded WebTorrent PID is not running");
+    // Decide whether the recorded `current` is still alive.
+    //
+    // librqbit case: a freshly-bootstrapped Session has zero torrents — any
+    //   non-zero `pid` (which represents a librqbit `TorrentId`) recorded in
+    //   the previous run is by definition stale. `pid == 0` is Local Bypass
+    //   (no worker) and we can't easily tell from disk whether ffmpeg/HLS
+    //   state is still meaningful, so we conservatively clear it on every
+    //   startup — matches webtorrent's "PID-not-running → clear" semantic.
+    //
+    // webtorrent case: PID-based liveness check via `libc::kill(pid, 0)`.
+    let active_alive = match app_state.current.as_ref().map(|c| c.pid) {
+        Some(0) => false,
+        Some(pid) if has_engine => {
+            // librqbit Session is fresh; nothing inherited from prior run.
+            tracing::debug!(
+                "Discarding recorded torrent id {} from previous run (librqbit fresh session)",
+                pid
+            );
+            false
+        }
+        Some(pid) => unsafe { torrent::kill_check(pid) },
+        None => false,
+    };
+
+    if app_state.current.is_some() && !active_alive {
+        tracing::warn!("Clearing stale current stream on startup");
         app_state.current = None;
         let _ = app_state.save(state_dir);
     }
 
-    let allowed: Vec<u32> = active_pid.into_iter().collect();
+    // Kill any lingering Node webtorrent processes. With `has_engine = true`
+    // there should be none (and if there are, they're orphans from a config
+    // flip and worth terminating). With `has_engine = false` we preserve the
+    // legacy "all webtorrent except the recorded active PID" behavior.
+    let allowed: Vec<u32> = if !has_engine && active_alive {
+        app_state.current.as_ref().map(|c| c.pid).into_iter().collect()
+    } else {
+        Vec::new()
+    };
     let killed = torrent::kill_webtorrent_except(&allowed);
     if !killed.is_empty() {
         tracing::warn!("Terminated stale WebTorrent workers on startup: {:?}", killed);
     }
 
+    // webtorrent.pid file is webtorrent-specific. Keep it in sync only on
+    // the legacy path; on librqbit blank it (no Node PID to record).
     let pid_path = state_dir.join("webtorrent.pid");
-    if let Some(pid) = allowed.first() {
-        let _ = torrent::save_pid(&pid_path, *pid);
+    if !has_engine {
+        if let Some(pid) = allowed.first() {
+            let _ = torrent::save_pid(&pid_path, *pid);
+        } else {
+            let _ = std::fs::write(pid_path, "");
+        }
     } else {
         let _ = std::fs::write(pid_path, "");
+    }
+}
+
+/// Backend-aware torrent start. Returns `(pid_or_id, http_url)` matching the
+/// legacy `start_webtorrent` tuple shape so `do_play` doesn't care which
+/// backend produced it. The `pid_or_id` u32 IS interpreted differently per
+/// backend (Node PID vs librqbit `TorrentId`) but downstream code only uses
+/// it to (a) tag `CurrentStream.pid` for staleness detection and (b) pass to
+/// the matching `stop_torrent_for_backend` call — both of which are also
+/// backend-aware. The two semantics never cross.
+async fn start_torrent_for_backend(
+    state: &SharedState,
+    magnet: &str,
+    file_index: Option<u32>,
+    media_dir: &PathBuf,
+) -> anyhow::Result<(u32, String)> {
+    match state.torrent_engine.as_ref() {
+        Some(engine) => {
+            let info = engine.start(magnet, file_index).await?;
+            tracing::info!(
+                "librqbit: torrent {} started, file_idx={}, url={}",
+                info.id,
+                info.file_index,
+                info.url
+            );
+            Ok((info.id, info.url))
+        }
+        None => {
+            let log_path = state.state_dir.join("webtorrent.log");
+            let (pid, url) = torrent::start_webtorrent(
+                magnet,
+                file_index,
+                media_dir,
+                &state.config.stream_host,
+                &log_path,
+            )
+            .await?;
+            torrent::save_pid(&state.state_dir.join("webtorrent.pid"), pid)?;
+            Ok((pid, url))
+        }
+    }
+}
+
+/// Backend-aware "is the torrent making progress?" check used by do_play's
+/// 12s self-healing fall-through. Returns `true` once the backend reports
+/// any sign of life (peers connected, bytes downloaded, or non-zero speed)
+/// before the deadline.
+async fn check_torrent_progress(
+    state: &SharedState,
+    pid_or_id: u32,
+    timeout_secs: u64,
+) -> bool {
+    match state.torrent_engine.as_ref() {
+        Some(engine) => {
+            let deadline =
+                tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+            while tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                if let Some(p) = engine.progress(pid_or_id) {
+                    if p.bytes_downloaded > 0 || p.peers_connected > 0 || p.speed_bps > 0 {
+                        tracing::info!(
+                            "librqbit: torrent {} progress detected (bytes={}, peers={}, speed={} B/s)",
+                            pid_or_id,
+                            p.bytes_downloaded,
+                            p.peers_connected,
+                            p.speed_bps
+                        );
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        None => {
+            let log_path = state.state_dir.join("webtorrent.log");
+            torrent::check_progress(&log_path, timeout_secs).await
+        }
+    }
+}
+
+/// Backend-aware torrent stop. `delete_files=true` for failed-start cleanup
+/// (sparse placeholders aren't worth keeping); `delete_files=false` for
+/// post-playback "keep on disk so Local Bypass can reuse" cleanup.
+async fn stop_torrent_for_backend(state: &SharedState, pid_or_id: u32, delete_files: bool) {
+    match state.torrent_engine.as_ref() {
+        Some(engine) => {
+            if let Err(e) = engine.stop(pid_or_id, delete_files).await {
+                tracing::warn!("librqbit: stop({}, {}) failed: {}", pid_or_id, delete_files, e);
+            }
+        }
+        None => {
+            torrent::kill_pid(pid_or_id);
+            torrent::kill_all_webtorrent();
+        }
+    }
+}
+
+/// Backend-aware "is the torrent worker still alive?" check used by the
+/// post-playback reaper. For webtorrent: process-existence via `kill(0)`.
+/// For librqbit: still-managed-by-session check.
+fn is_torrent_alive(state: &SharedState, pid_or_id: u32) -> bool {
+    if pid_or_id == 0 {
+        // Local Bypass — no torrent worker. Reaper relies on ffmpeg liveness.
+        return true;
+    }
+    match state.torrent_engine.as_ref() {
+        Some(engine) => engine.handle(pid_or_id).is_some(),
+        None => unsafe { torrent::kill_check(pid_or_id) },
+    }
+}
+
+/// axum handler for the librqbit streaming endpoint. `GET /torrent/{id}/stream/{file_idx}`.
+/// Returns 404 when `torrent_backend != "librqbit"`. The handler is a thin
+/// wrapper around `torrent_stream::serve_torrent_stream` (which is the
+/// pure HTTP-response builder unit-tested in Phase 1).
+async fn handle_torrent_stream(
+    State(state): State<SharedState>,
+    axum::extract::Path((id, file_idx)): axum::extract::Path<(u32, usize)>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let engine = match state.torrent_engine.as_ref() {
+        Some(e) => e,
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                "torrent_backend != librqbit",
+            )
+                .into_response();
+        }
+    };
+    match torrent_stream::serve_torrent_stream(engine, id, file_idx, &headers).await {
+        Ok(resp) => resp,
+        Err(status) => status.into_response(),
     }
 }
 
@@ -476,9 +715,26 @@ async fn do_play(
         }
     }
 
-    // Stop existing stream (webtorrent and ffmpeg)
-    let pid_path = state.state_dir.join("webtorrent.pid");
-    torrent::stop_by_pid_file(&pid_path);
+    // Stop existing stream (torrent worker + ffmpeg). Backend-aware: when
+    // running on librqbit, the previous torrent's id lives in
+    // `app_state.current.pid` and we route through `engine.stop`; when running
+    // on legacy webtorrent, the pid file + Node-process kill chain handles it.
+    let prev_pid = AppState::load(&state.state_dir)
+        .current
+        .as_ref()
+        .map(|c| c.pid)
+        .unwrap_or(0);
+    if prev_pid != 0 {
+        stop_torrent_for_backend(state, prev_pid, false).await;
+    } else {
+        // Local-Bypass-only previous play, OR no previous play; the
+        // legacy pid-file path is also a no-op safety net for cases where
+        // CurrentStream wasn't recorded but stale state files linger.
+        if state.torrent_engine.is_none() {
+            let pid_path = state.state_dir.join("webtorrent.pid");
+            torrent::stop_by_pid_file(&pid_path);
+        }
+    }
     if let Some(old_fb_pid) = state.ffmpeg_pid.lock().unwrap().take() {
         tracing::info!("do_play: killing existing ffmpeg zombie (PID {})", old_fb_pid);
         torrent::kill_pid(old_fb_pid);
@@ -500,29 +756,28 @@ async fn do_play(
     let no_subs = req.no_subs.unwrap_or(false);
     let sub_lang = req.subtitle_lang.clone().unwrap_or_else(|| "eng".into());
 
-    // Start webtorrent if NOT local
+    // Start torrent worker if NOT local. Backend-aware via the helpers above:
+    // librqbit (when configured) routes through `TorrentEngine::start`;
+    // webtorrent (default) routes through the legacy Node subprocess.
+    // Either way `pid` ends up tagging `CurrentStream.pid` and `server_url`
+    // is what ffmpeg fetches from.
     if !is_local {
-        // Disk check: Only required if we are going to start a NEW download
+        // Disk check: only required if we are going to start a NEW download
         if let Ok(Some(err)) = disk::check_space(&media_dir) {
             return Json(json!({"error": err}));
         }
 
-        let log_path = state.state_dir.join("webtorrent.log");
-        let result = match torrent::start_webtorrent(
-            &magnet, req.file_index, &media_dir, &state.config.stream_host, &log_path
-        ).await {
+        let result = match start_torrent_for_backend(state, &magnet, req.file_index, &media_dir).await {
             Ok(r) => r,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
         pid = result.0;
         server_url = result.1;
-        let _ = torrent::save_pid(&state.state_dir.join("webtorrent.pid"), pid);
 
         // Self-healing: check download progress
-        if !torrent::check_progress(&log_path, 12).await {
+        if !check_torrent_progress(state, pid, 12).await {
             tracing::warn!("Torrent has no download progress after 12s — dead seeds");
-            torrent::kill_pid(pid);
-            torrent::kill_all_webtorrent();
+            stop_torrent_for_backend(state, pid, true).await;
             disk::prune_disk(&media_dir, ""); // Clean up any dead attempt
             return Json(json!({"error": "Torrent has no active seeds (0% after 12s)"}));
         }
@@ -883,17 +1138,13 @@ async fn do_play(
                     }
                 }
 
-                // Local Bypass plays use webtorrent_pid=0 (no torrent worker).
-                // libc::kill(0, 0) signals the calling process's process group
-                // and always succeeds, so kill_check(0) returns `true` even
-                // though there's no real worker. Special-case pid=0 as
-                // "perpetually alive" so the reaper relies entirely on
-                // ffmpeg liveness for Local Bypass plays.
-                let wt_alive = if webtorrent_pid == 0 {
-                    true
-                } else {
-                    unsafe { torrent::kill_check(webtorrent_pid) }
-                };
+                // Backend-aware "is the torrent worker still alive?" check.
+                // For Local Bypass plays (`webtorrent_pid == 0`) the helper
+                // returns `true` so the reaper relies entirely on ffmpeg
+                // liveness — preserves the legacy behavior. For webtorrent:
+                // process-existence via `libc::kill(pid, 0)`. For librqbit:
+                // still-managed-by-Session check.
+                let wt_alive = is_torrent_alive(&state, webtorrent_pid);
                 let ffmpeg_alive = state.ffmpeg_pid.lock().unwrap()
                     .map(|p| unsafe { torrent::kill_check(p) })
                     .unwrap_or(false);
@@ -984,10 +1235,32 @@ async fn do_play(
     }))
 }
 
-/// Shared cleanup logic: kill webtorrent + ffmpeg, delete transcoded file, update state.
+/// Shared cleanup logic: stop torrent worker (backend-aware) + kill ffmpeg,
+/// delete transcoded file, update state.
+///
+/// Backend dispatch: when `torrent_engine` is configured, the previous
+/// torrent's id is read from `app_state.current.pid` and routed through
+/// `engine.stop(id, false)` (keep files on disk for Local Bypass reuse).
+/// When on legacy webtorrent, the `webtorrent.pid` file is consumed by
+/// `stop_by_pid_file`. `do_cleanup` is sync; the librqbit stop is async,
+/// so we fan it out via `tokio::spawn` — the reaper / handle_stop already
+/// expect cleanup to complete in the background, this matches that contract.
 fn do_cleanup(state: &SharedState) {
-    let pid_path = state.state_dir.join("webtorrent.pid");
-    torrent::stop_by_pid_file(&pid_path);
+    let app_state = crate::state::AppState::load(&state.state_dir);
+    let prev_pid = app_state.current.as_ref().map(|c| c.pid).unwrap_or(0);
+
+    if state.torrent_engine.is_some() && prev_pid != 0 {
+        let state = state.clone();
+        tokio::spawn(async move {
+            stop_torrent_for_backend(&state, prev_pid, false).await;
+        });
+    } else {
+        // Legacy webtorrent path. `stop_by_pid_file` is sync (kills the Node
+        // process) and is also a no-op safety net for librqbit (the pid_path
+        // file is empty in that mode).
+        let pid_path = state.state_dir.join("webtorrent.pid");
+        torrent::stop_by_pid_file(&pid_path);
+    }
 
     if let Some(pid) = state.ffmpeg_pid.lock().unwrap().take() {
         torrent::kill_pid(pid);

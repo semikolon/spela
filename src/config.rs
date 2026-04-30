@@ -82,6 +82,19 @@ pub struct Config {
     ///      appears.
     #[serde(default)]
     pub vod_manifest_padded: bool,
+    /// Apr 30, 2026: torrent client backend selector. `"webtorrent"` (default)
+    /// runs the legacy Node.js `webtorrent-cli` subprocess on `:8888`;
+    /// `"librqbit"` runs the embedded pure-Rust client (`librqbit::Session`),
+    /// streaming over the same axum router on `:7890`. Migration plan and
+    /// hard-won-lesson context: spela CLAUDE.md § "webtorrent-cli weak peer
+    /// discovery" + commit `a583c05` (Phase 1 foundation).
+    ///
+    /// Switch per-deployment by setting `torrent_backend = "librqbit"` in
+    /// `~/.config/spela/config.toml`. Phase 3 will flip this default once
+    /// Phase 2's live validation passes; for now `webtorrent` keeps existing
+    /// deployments untouched.
+    #[serde(default = "default_torrent_backend")]
+    pub torrent_backend: String,
 }
 
 fn default_server() -> String { "localhost:7890".into() }
@@ -90,6 +103,7 @@ fn default_quality() -> String { "1080p".into() }
 fn default_media_dir() -> String { "~/media".into() }
 fn default_port() -> u16 { 7890 }
 fn default_host() -> String { "0.0.0.0".into() }
+fn default_torrent_backend() -> String { "webtorrent".into() }
 
 impl Default for Config {
     fn default() -> Self {
@@ -108,6 +122,7 @@ impl Default for Config {
             rich_metadata_in_load: false,
             experimental_endlist_hack: false,
             vod_manifest_padded: false,
+            torrent_backend: default_torrent_backend(),
         }
     }
 }
