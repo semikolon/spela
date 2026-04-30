@@ -2472,6 +2472,69 @@ fn parse_size_to_bytes(size_str: &str) -> Option<u64> {
     Some((val * factor as f64) as u64)
 }
 
+/// Apr 30, 2026 (M7): validate IMDb ID format before saving to
+/// resume_positions. Real IMDb IDs are `tt` followed by 7-9 digits;
+/// our per-episode TV key extension appends `_sNNeMM`. Reject anything
+/// that doesn't look like one of those — defends against state.json
+/// growth via attacker-flood of bogus keys.
+pub(crate) fn is_valid_imdb_id(s: &str) -> bool {
+    let after_tt = match s.strip_prefix("tt") {
+        Some(rest) => rest,
+        None => return false,
+    };
+    // Numeric prefix (the IMDb digits) — at least 1, at most 12 digits.
+    let mut digits = 0usize;
+    let mut chars = after_tt.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        digits += 1;
+        chars.next();
+    }
+    if digits == 0 || digits > 12 {
+        return false;
+    }
+    // Optional per-episode suffix `_sNNeMM` (1-3 digit season, 1-4 digit episode).
+    if let Some(c) = chars.next() {
+        if c != '_' {
+            return false;
+        }
+        if chars.next() != Some('s') {
+            return false;
+        }
+        let mut season_digits = 0;
+        while let Some(&c) = chars.peek() {
+            if !c.is_ascii_digit() {
+                break;
+            }
+            season_digits += 1;
+            chars.next();
+        }
+        if season_digits == 0 || season_digits > 3 {
+            return false;
+        }
+        if chars.next() != Some('e') {
+            return false;
+        }
+        let mut episode_digits = 0;
+        while let Some(&c) = chars.peek() {
+            if !c.is_ascii_digit() {
+                break;
+            }
+            episode_digits += 1;
+            chars.next();
+        }
+        if episode_digits == 0 || episode_digits > 4 {
+            return false;
+        }
+        if chars.next().is_some() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Apr 30, 2026 (L7): validate poster_url before sending to Chromecast.
 /// `req.poster_url` flows into cast metadata which the Chromecast then
 /// fetches directly. An attacker controlling the field could point it
@@ -2484,6 +2547,19 @@ pub(crate) fn is_valid_poster_url(url: &str) -> bool {
 }
 
 fn local_bypass_file_is_healthy(path: &std::path::Path, has_done_marker: bool, expected_bytes: u64) -> bool {
+    // Apr 30, 2026 (M8 TOCTOU defense): refuse symlinks. A symlink in
+    // ~/media/ that points to a sensitive file (e.g. /etc/shadow on a
+    // shared host, or a co-tenant's data on an NFS-mounted media_dir)
+    // would otherwise let ffmpeg probe + transcode it into the HLS
+    // stream the Chromecast renders.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            tracing::warn!("local_bypass: refusing symlinked path {:?}", path);
+            return false;
+        }
+        Ok(_) => {}
+        Err(_) => return false,
+    }
     if expected_bytes > 0 {
         return is_physically_full(path, expected_bytes);
     }
@@ -2703,16 +2779,27 @@ async fn handle_set_config(
     State(state): State<SharedState>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
+    // Apr 30, 2026 (M3): cap each preference field to a reasonable length.
+    // Pre-fix, an attacker (per-LAN, per-Host-allowlist) could flood
+    // state.json by setting multi-megabyte preference strings — small
+    // amplification but persistent across restarts.
+    const MAX_PREF_LEN: usize = 256;
     let mut app_state = AppState::load(&state.state_dir);
     if let Some(obj) = body.as_object() {
         if let Some(v) = obj.get("default_target").and_then(|v| v.as_str()) {
-            app_state.preferences.default_target = v.into();
+            if v.len() <= MAX_PREF_LEN {
+                app_state.preferences.default_target = v.into();
+            }
         }
         if let Some(v) = obj.get("chromecast_name").and_then(|v| v.as_str()) {
-            app_state.preferences.chromecast_name = Some(v.into());
+            if v.len() <= MAX_PREF_LEN {
+                app_state.preferences.chromecast_name = Some(v.into());
+            }
         }
         if let Some(v) = obj.get("preferred_quality").and_then(|v| v.as_str()) {
-            app_state.preferences.preferred_quality = v.into();
+            if v.len() <= MAX_PREF_LEN {
+                app_state.preferences.preferred_quality = v.into();
+            }
         }
     }
     let _ = app_state.save(&state.state_dir);
@@ -3599,8 +3686,25 @@ async fn handle_save_position(
     State(state): State<SharedState>,
     Json(req): Json<PositionRequest>,
 ) -> Json<Value> {
+    // Apr 30, 2026 (M7): validate inputs before they reach state.json.
+    // - imdb_id must look like a real IMDb ID (or its per-episode form)
+    // - title must be reasonably sized (cap 256 chars)
+    // - t must be finite (NaN/inf would silently corrupt save_position_smart)
     if req.imdb_id.is_none() && req.title.is_none() {
         return Json(json!({"error": "Missing imdb_id and title"}));
+    }
+    if let Some(id) = req.imdb_id.as_deref() {
+        if !is_valid_imdb_id(id) {
+            return Json(json!({"error": "Invalid imdb_id format"}));
+        }
+    }
+    if let Some(t) = req.title.as_deref() {
+        if t.len() > 256 {
+            return Json(json!({"error": "Title too long (max 256 chars)"}));
+        }
+    }
+    if !req.t.is_finite() {
+        return Json(json!({"error": "Position must be finite"}));
     }
     let mut app_state = AppState::load(&state.state_dir);
     let (key, saved) = app_state.save_position_smart(req.imdb_id.clone(), req.title.clone(), req.t, req.duration);
@@ -3721,6 +3825,39 @@ mod tests {
         assert_eq!(parse_size_to_bytes("abc"), None);
         assert_eq!(parse_size_to_bytes("4.6"), None); // missing unit
         assert_eq!(parse_size_to_bytes("GB 4.6"), None); // wrong order
+    }
+
+    #[test]
+    fn is_valid_imdb_id_accepts_canonical_movie_id() {
+        assert!(is_valid_imdb_id("tt1190634"));
+        assert!(is_valid_imdb_id("tt0903747"));
+    }
+
+    #[test]
+    fn is_valid_imdb_id_accepts_per_episode_form() {
+        assert!(is_valid_imdb_id("tt1190634_s05e05"));
+        assert!(is_valid_imdb_id("tt19854762_s02e08"));
+        // Allow up to 3-digit season + 4-digit episode
+        assert!(is_valid_imdb_id("tt1234567_s100e1234"));
+    }
+
+    #[test]
+    fn is_valid_imdb_id_rejects_garbage() {
+        // M7 defense: state.json size cap via input validation
+        assert!(!is_valid_imdb_id("attacker_string_no_tt_prefix"));
+        assert!(!is_valid_imdb_id("tt"));            // no digits
+        assert!(!is_valid_imdb_id("tt12345abc"));    // non-numeric
+        assert!(!is_valid_imdb_id("tt1234567890123")); // > 12 digits
+        assert!(!is_valid_imdb_id(""));
+    }
+
+    #[test]
+    fn is_valid_imdb_id_rejects_malformed_episode_suffix() {
+        assert!(!is_valid_imdb_id("tt1234_s05"));        // missing e
+        assert!(!is_valid_imdb_id("tt1234_s05e"));       // empty episode
+        assert!(!is_valid_imdb_id("tt1234_s05e1234567")); // > 4-digit episode
+        assert!(!is_valid_imdb_id("tt1234_s5e1abc"));    // trailing garbage
+        assert!(!is_valid_imdb_id("tt1234x_s5e1"));      // wrong separator
     }
 
     #[test]

@@ -133,6 +133,17 @@ pub fn prune_disk(media_dir: &Path, active_title: &str) {
             continue;
         }
 
+        // Apr 30, 2026 (M9): refuse to delete symlinks. media_dir is
+        // canonicalized at do_play but symlinks WITHIN can still escape
+        // (a symlink at ~/media/foo -> ~/Documents would let prune nuke
+        // user data). Skip symlinks entirely; remove_dir_all only acts on
+        // physical entries owned by the torrent client.
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_symlink() {
+                tracing::debug!("prune_disk: skipping symlink {:?}", path);
+                continue;
+            }
+        }
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
