@@ -204,72 +204,112 @@ pub fn prune_disk(media_dir: &Path, active_title: &str) {
 /// were under the 24h/7d age thresholds. LRU pressure eviction breaks both
 /// of those stalemates.
 pub fn prune_to_fit(media_dir: &Path, active_title: &str, target_mb: u64) {
-    if !media_dir.exists() { return; }
+    if !media_dir.exists() {
+        return;
+    }
     // Phase 1: age-based cleanup (fast, removes obviously stale entries).
     prune_disk(media_dir, active_title);
 
-    // Phase 2: if still over target, LRU-evict until under cap.
-    loop {
+    // Phase 2: if still over target, LRU-evict.
+    //
+    // Apr 30, 2026 (M2 perf): pre-fix this re-read + re-sorted on every
+    // iteration → O(N² log N) for N entries. Now collects+sorts once,
+    // iterates the sorted list evicting until under cap, with dir_size
+    // recheck per eviction (the recheck is cheap; the read_dir+sort were
+    // the costly steps). Trade-off: candidates added DURING the eviction
+    // loop aren't seen this pass — fine because prune_to_fit is best-effort
+    // and runs on every do_play.
+    let initial_mb = match dir_size(media_dir) {
+        Ok(bytes) => bytes / (1024 * 1024),
+        Err(_) => return,
+    };
+    if initial_mb <= target_mb {
+        return;
+    }
+
+    let entries_iter = match std::fs::read_dir(media_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut candidates: Vec<(SystemTime, std::path::PathBuf)> = entries_iter
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if title_matches_active(&name, active_title) {
+                return None;
+            }
+            // M9 (Apr 30): refuse to evict symlinks — same defense as
+            // prune_disk, prevents escape from media_dir.
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_symlink() {
+                    return None;
+                }
+            }
+            // Preserve tiny subtitle / helper files — they aren't meaningful
+            // cache pressure and their mtime can be misleading.
+            if !path.is_dir() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.len() < 5 * 1024 * 1024 {
+                        return None;
+                    }
+                }
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        tracing::warn!(
+            "prune_to_fit: media_dir {}MB > target {}MB but no prunable entries left",
+            initial_mb,
+            target_mb
+        );
+        return;
+    }
+    candidates.sort_by_key(|(t, _)| *t);
+
+    // Evict oldest-first until under cap or candidates exhausted.
+    for (mtime, path) in candidates {
         let current_mb = match dir_size(media_dir) {
             Ok(bytes) => bytes / (1024 * 1024),
             Err(_) => return,
         };
-        if current_mb <= target_mb { return; }
-
-        // Collect prunable entries (non-active, non-subtitle-files) sorted
-        // by mtime ascending (oldest first).
-        let entries_iter = match std::fs::read_dir(media_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let mut candidates: Vec<(SystemTime, std::path::PathBuf)> = entries_iter
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                if title_matches_active(&name, active_title) {
-                    return None;
-                }
-                // Preserve tiny subtitle / helper files — they aren't
-                // meaningful cache pressure and their mtime can be
-                // misleading.
-                if !path.is_dir() {
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.len() < 5 * 1024 * 1024 {
-                            return None;
-                        }
-                    }
-                }
-                let modified = entry.metadata().ok()?.modified().ok()?;
-                Some((modified, path))
-            })
-            .collect();
-        if candidates.is_empty() {
-            tracing::warn!(
-                "prune_to_fit: media_dir {}MB > target {}MB but no prunable entries left",
-                current_mb, target_mb
-            );
+        if current_mb <= target_mb {
             return;
         }
-        candidates.sort_by_key(|(t, _)| *t);
-
-        // Evict one entry per pass, re-check size afterward. This keeps
-        // the eviction granular so we never delete more than we need.
-        let (mtime, path) = &candidates[0];
         let age_h = SystemTime::now()
-            .duration_since(*mtime)
+            .duration_since(mtime)
             .ok()
             .map(|d| d.as_secs() / 3600)
             .unwrap_or(0);
-        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         tracing::info!(
             "prune_to_fit: LRU-evicting '{}' (age {}h) to bring media_dir under {}MB cap",
-            name, age_h, target_mb
+            name,
+            age_h,
+            target_mb
         );
         if path.is_dir() {
-            let _ = std::fs::remove_dir_all(path);
+            let _ = std::fs::remove_dir_all(&path);
         } else {
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // After exhausting candidates, re-check and warn if still over.
+    if let Ok(bytes) = dir_size(media_dir) {
+        let final_mb = bytes / (1024 * 1024);
+        if final_mb > target_mb {
+            tracing::warn!(
+                "prune_to_fit: exhausted candidates with media_dir at {}MB > target {}MB",
+                final_mb,
+                target_mb
+            );
         }
     }
 }

@@ -101,7 +101,9 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     .await
     .context("librqbit engine bootstrap failed")?;
     tracing::info!(
-        "librqbit engine ready; stream URLs route through {}:{}/torrent/...",
+        "librqbit engine ready; ffmpeg fetches /torrent/... via loopback (127.0.0.1:{}), \
+         Chromecast fetches /hls/... via stream_host ({}:{})",
+        config.port,
         config.stream_host,
         config.port
     );
@@ -549,14 +551,17 @@ async fn handle_play(
                         let next_rid = rid + 1;
                         if next_rid <= search.results.len() {
                             tracing::warn!("Play failed ({}), auto-trying result #{}", v["error"], next_rid);
-                            // Clean up partial files from failed attempt
-                            let transcoded = state.media_dir.join("transcoded_aac.mp4");
-                            if transcoded.exists() {
-                                let _ = std::fs::remove_file(&transcoded);
-                            }
-                            if let Some(pid) = lock_recover(&state.ffmpeg_pid).take() {
-                                torrent::kill_pid(pid);
-                            }
+                            // Apr 30, 2026 (M11): consolidated — do_play's
+                            // own cast-failure path (server.rs:~902 in the
+                            // current version, "Cast-failure cleanup defense"
+                            // shipped Apr 15 / commit 8735ea4) already kills
+                            // ffmpeg, deletes transcoded artifacts, and stops
+                            // the torrent before returning the error. The
+                            // retry loop only needs to bump result_id and
+                            // re-enter — duplicating cleanup here racetimes
+                            // do_play's own cleanup AND can SIGTERM a
+                            // transient ffmpeg PID that the next do_play
+                            // attempt has just spawned.
                             req.result_id = Some(next_rid);
                             req.magnet = None;
                             req.file_index = None;
@@ -2811,6 +2816,12 @@ async fn handle_cast_info(
     Json(req): Json<CastInfoRequest>,
 ) -> Json<Value> {
     let device = req.device.unwrap_or_else(|| get_current_device(&state));
+    // Apr 30, 2026 (M4): cap device-name length before flowing into mDNS
+    // resolution. mdns-sd is reasonably hardened but unauthenticated weird
+    // input flowing into mDNS lookups is unnecessary surface.
+    if device.len() > 256 {
+        return Json(json!({"error": "device name too long (max 256 chars)"}));
+    }
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut cast = lock_recover(&state_clone.cast);
@@ -3624,6 +3635,12 @@ async fn handle_seek_restart(
     State(state): State<SharedState>,
     Json(req): Json<SeekRestartRequest>,
 ) -> Json<Value> {
+    // Apr 30, 2026 (M6): reject non-finite seek values BEFORE clamping.
+    // f64::NaN.max(0.0) returns NaN (preserves NaN), and the value would
+    // flow into ffmpeg's -ss arg if/when this stub gets implemented.
+    if !req.t.is_finite() {
+        return Json(json!({"error": "seek position must be finite"}));
+    }
     let seek_seconds = req.t.max(0.0);
 
     // Kill current ffmpeg
