@@ -107,6 +107,20 @@ Took the wiser path: extracted the three highest-leverage sub-decisions (whose c
 
 ---
 
+## Appendix — archived from CLAUDE.md (no longer load-bearing)
+
+**webtorrent `-s` patch (our PR #3011, fixes #331)** — pre-v3.3.0, spela ran a patched
+webtorrent because of a piece-verification bug: `_markUnverified` re-selected ALL pieces
+on certain workflows, downloading the entire torrent despite the `-s <fileIdx>` flag.
+Fix: `Selections.contains()` guard preventing re-selection of deselected pieces. Patched
+in-place on Darwin at `~/.local/share/mise/installs/node/24.14.0/lib/node_modules/webtorrent-cli/node_modules/webtorrent/lib/`.
+Verified: 27-file season pack → only target file + 1.7MB boundary pieces downloaded
+(sparse files, no actual disk waste). Smart ranking preferred single-file torrents
+as belt-and-suspenders. **No longer in the runtime path** since v3.3.0 — librqbit's
+clean-implementation piece tracker doesn't need this defense.
+
+---
+
 ## Part 3 — adjacent fix that started the day
 
 The morning's session began with the spela CLI broken on Mac because the Apr 30 04:00 nightly-sweep had run `cargo clean` on spela's `target/` (it had grown to 3050 MB after librqbit was added, exceeding the 1 GB per-project cap). The symlink `~/.local/bin/spela` then pointed at nothing.
