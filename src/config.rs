@@ -82,6 +82,15 @@ pub struct Config {
     ///      appears.
     #[serde(default)]
     pub vod_manifest_padded: bool,
+    /// Apr 30, 2026 (security audit H2): additional Host-header values
+    /// accepted by the allowlist middleware. Loopback (`localhost`,
+    /// `127.0.0.1`), the canonical fleet hostname `darwin.home`, and
+    /// `stream_host` (if non-empty) are always allowed; this list adds
+    /// custom hostnames for non-default deployments (Tailscale IPs, custom
+    /// LAN aliases, etc.). Each entry is the bare hostname or IP — port is
+    /// stripped from the incoming Host header before comparison.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 fn default_server() -> String { "localhost:7890".into() }
@@ -108,6 +117,7 @@ impl Default for Config {
             rich_metadata_in_load: false,
             experimental_endlist_hack: false,
             vod_manifest_padded: false,
+            allowed_hosts: Vec::new(),
         }
     }
 }

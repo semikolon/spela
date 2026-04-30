@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use axum::extract::{Query, State};
-use axum::http::{HeaderMap, Method};
+use axum::extract::{Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
@@ -38,6 +39,11 @@ pub struct ServerState {
     /// engine is in-process; torrent streams are served on the same axum
     /// router as `/hls/master.m3u8`, no separate :8888 HTTP server.
     pub torrent_engine: Arc<TorrentEngine>,
+    /// Apr 30, 2026 (security audit H2): precomputed Host-header allowlist
+    /// for the require_host_header middleware. Built once at startup from
+    /// `Config` via `compute_host_allowlist`. Loopback + `darwin.home` +
+    /// stream_host + config.allowed_hosts.
+    pub host_allowlist: std::collections::HashSet<String>,
 }
 
 type SharedState = Arc<ServerState>;
@@ -106,6 +112,11 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     let cast = Mutex::new(CastController::new(&state_dir, config.known_devices.clone()));
     let port = config.port;
     let host = config.host.clone();
+    let host_allowlist = compute_host_allowlist(&config);
+    tracing::info!(
+        "Host-header allowlist active: {} entries",
+        host_allowlist.len()
+    );
 
     let state = Arc::new(ServerState {
         config,
@@ -115,11 +126,27 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         media_dir,
         ffmpeg_pid: Mutex::new(None),
         torrent_engine,
+        host_allowlist,
     });
 
+    // Apr 30, 2026 (H2): tightened CORS — explicit LAN-origin allowlist,
+    // dropped the wildcard. Browser-based tooling against spela has to
+    // come from a known origin or get no CORS preflight ack. Most spela
+    // consumers (CLI, voice tool, Chromecast) are NOT browsers and don't
+    // care about CORS, so this is only a defense against DNS-rebinding
+    // attacks via a malicious page making fetch() calls.
+    let cors_origins: Vec<HeaderValue> = [
+        "http://localhost:7890",
+        "http://127.0.0.1:7890",
+        "http://darwin.home:7890",
+        &format!("http://{}:{}", state.config.stream_host, port),
+    ]
+    .iter()
+    .filter_map(|s| s.parse().ok())
+    .collect();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_origin(cors_origins)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::DELETE])
         .allow_headers(Any);
 
     let app = Router::new()
@@ -176,6 +203,14 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
             "/torrent/{id}/stream/{file_idx}",
             get(handle_torrent_stream),
         )
+        // Apr 30, 2026 (H2): Host-header allowlist applied to ALL routes.
+        // Order matters: middleware runs in reverse (CORS-then-host means
+        // host check runs first per request). DNS-rebinding attacks set
+        // a non-allowlisted Host; rejected with 403 before any handler.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_host_header,
+        ))
         .layer(cors)
         .with_state(state);
 
@@ -186,6 +221,72 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Apr 30, 2026 (security audit H2): compute the effective Host-header
+/// allowlist for the server. Always includes loopback (`localhost`,
+/// `127.0.0.1`) and the canonical fleet hostname (`darwin.home`); adds
+/// `stream_host` if non-empty (Chromecast LAN endpoint); appends
+/// `config.allowed_hosts` for custom deployments. Returned as a HashSet
+/// for O(1) lookup in the per-request middleware. Pure function so the
+/// allowlist composition is testable.
+pub(crate) fn compute_host_allowlist(config: &Config) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    set.insert("localhost".into());
+    set.insert("127.0.0.1".into());
+    set.insert("darwin.home".into());
+    if !config.stream_host.is_empty() {
+        set.insert(config.stream_host.clone());
+    }
+    for h in &config.allowed_hosts {
+        if !h.is_empty() {
+            set.insert(h.clone());
+        }
+    }
+    set
+}
+
+/// Strip the `:port` suffix (if any) from a Host header value. Pure helper
+/// so the parsing is unit-testable.
+pub(crate) fn parse_host_header(raw: &str) -> &str {
+    // IPv6 form: `[::1]:7890`. Keep the bracketed address; only strip the
+    // trailing `:port` after the closing bracket. `end` is the index of `]`
+    // within `rest` (after stripping the leading `[`); add 1 to account for
+    // the stripped `[`, then +1 again to include `]` in the substring.
+    if let Some(rest) = raw.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &raw[..end + 2];
+        }
+    }
+    match raw.rfind(':') {
+        Some(idx) => &raw[..idx],
+        None => raw,
+    }
+}
+
+/// Host-header allowlist middleware. Rejects requests whose Host header
+/// (with port stripped) isn't in the configured allowlist. The primary
+/// defense against DNS rebinding from any browser tab on the LAN.
+async fn require_host_header(
+    State(state): State<SharedState>,
+    req: Request,
+    next: Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let host_header = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(StatusCode::FORBIDDEN)?;
+    let host_only = parse_host_header(host_header);
+    if state.host_allowlist.contains(host_only) {
+        Ok(next.run(req).await)
+    } else {
+        tracing::warn!(
+            "Host-header rejected: {:?} not in allowlist",
+            host_only
+        );
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 /// Clear stale `current` stream entries on startup. The librqbit Session
@@ -3479,6 +3580,83 @@ fn cast_result_to_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Host-header allowlist (Apr 30, 2026 — H2 security audit) ---
+
+    #[test]
+    fn parse_host_header_strips_port() {
+        assert_eq!(parse_host_header("darwin.home:7890"), "darwin.home");
+        assert_eq!(parse_host_header("192.168.4.1:7890"), "192.168.4.1");
+        assert_eq!(parse_host_header("localhost:7890"), "localhost");
+    }
+
+    #[test]
+    fn parse_host_header_no_port() {
+        assert_eq!(parse_host_header("darwin.home"), "darwin.home");
+        assert_eq!(parse_host_header("localhost"), "localhost");
+    }
+
+    #[test]
+    fn parse_host_header_handles_ipv6_loopback_with_port() {
+        // RFC 7230 § 5.4 — IPv6 in Host headers is bracketed: `[::1]:7890`.
+        // Strip the trailing `:port` after the closing bracket; keep `[::1]`.
+        assert_eq!(parse_host_header("[::1]:7890"), "[::1]");
+    }
+
+    #[test]
+    fn parse_host_header_handles_ipv6_no_port() {
+        assert_eq!(parse_host_header("[::1]"), "[::1]");
+    }
+
+    #[test]
+    fn compute_host_allowlist_includes_canonical_defaults() {
+        let mut config = Config::default();
+        config.stream_host = String::new();
+        let allow = compute_host_allowlist(&config);
+        assert!(allow.contains("localhost"));
+        assert!(allow.contains("127.0.0.1"));
+        assert!(allow.contains("darwin.home"));
+    }
+
+    #[test]
+    fn compute_host_allowlist_includes_stream_host_when_set() {
+        let mut config = Config::default();
+        config.stream_host = "192.168.4.1".into();
+        let allow = compute_host_allowlist(&config);
+        assert!(allow.contains("192.168.4.1"));
+    }
+
+    #[test]
+    fn compute_host_allowlist_includes_user_additions() {
+        let mut config = Config::default();
+        config.allowed_hosts = vec!["my-tailscale-name".into(), "100.64.1.5".into()];
+        let allow = compute_host_allowlist(&config);
+        assert!(allow.contains("my-tailscale-name"));
+        assert!(allow.contains("100.64.1.5"));
+    }
+
+    #[test]
+    fn compute_host_allowlist_skips_empty_user_additions() {
+        // A `allowed_hosts = ["", "real"]` config (typo or accidental empty
+        // entry) shouldn't allow empty Host headers (which is what some
+        // attackers send).
+        let mut config = Config::default();
+        config.allowed_hosts = vec!["".into(), "real".into()];
+        let allow = compute_host_allowlist(&config);
+        assert!(!allow.contains(""));
+        assert!(allow.contains("real"));
+    }
+
+    #[test]
+    fn compute_host_allowlist_rejects_unknown_wan_ip() {
+        // Defense-in-depth pin: Darwin's public WAN IP must NOT be in the
+        // default allowlist. iptables is the first line; the host-header
+        // middleware is the second. Verify the second doesn't spontaneously
+        // accept the public IP if iptables ever lets it through.
+        let config = Config::default();
+        let allow = compute_host_allowlist(&config);
+        assert!(!allow.contains("94.254.88.116"));
+    }
 
     // --- Reaper grace period math (Apr 15, 2026 regression guards) ---
     //
