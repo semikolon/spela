@@ -959,6 +959,35 @@ mod tests {
     }
 
     #[test]
+    fn test_shift_srt_normalizes_crlf_line_endings() {
+        // Apr 18, 2026 incident: OpenSubtitles SRT files use Windows-style
+        // \r\n separators, but `split("\n\n")` doesn't match `\r\n\r\n`.
+        // Without the .replace("\r\n", "\n") at line 91, the entire file
+        // collapses into one block and parsing returns 0 entries → ffmpeg
+        // crashes on empty subtitle file → cast fails with blue-icon.
+        // Pin the normalization with a CRLF-only fixture.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let input_path = tmp_dir.path().join("in.srt");
+        let output_path = tmp_dir.path().join("out.srt");
+        // CRLF line endings throughout — what OpenSubtitles ships.
+        std::fs::write(
+            &input_path,
+            "1\r\n00:00:05,000 --> 00:00:07,000\r\nHello\r\n\r\n2\r\n00:00:15,000 --> 00:00:18,000\r\nWorld\r\n\r\n",
+        )
+        .unwrap();
+
+        let kept = shift_srt(&input_path, &output_path, 0.0).unwrap();
+        assert_eq!(
+            kept, 2,
+            "CRLF SRT must parse to 2 entries; pre-Apr-18-fix returned 0"
+        );
+
+        let result = std::fs::read_to_string(&output_path).unwrap();
+        assert!(result.contains("Hello"));
+        assert!(result.contains("World"));
+    }
+
+    #[test]
     fn test_shift_srt_simple_forward_shift() {
         // Write a tiny SRT, shift by 10s, check output.
         let tmp_dir = std::env::temp_dir().join("spela_srt_test_1");

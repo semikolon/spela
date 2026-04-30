@@ -275,6 +275,20 @@ pub(crate) fn build_stream_url(host: &str, port: u16, id: u32, file_idx: usize) 
     format!("http://{}:{}/torrent/{}/stream/{}", host, port, id, file_idx)
 }
 
+/// Parse the leading-number portion of librqbit's `Speed` Display impl.
+/// librqbit currently formats as `"3.2 MB/s"` etc.; we want the numeric
+/// `3.2` for our internal bytes-per-second math. Pure helper so the format
+/// dependency is testable — if librqbit ever changes the Display impl
+/// (e.g. drops the space, switches units), our regression pin will catch
+/// it immediately rather than silently breaking the 12s self-healing
+/// progress check.
+pub(crate) fn parse_mbps_string(s: &str) -> f64 {
+    s.split_whitespace()
+        .next()
+        .and_then(|t| t.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
 /// Maps librqbit's `TorrentStats` into spela's flatter shape. Pure function so
 /// the mapping is unit-testable without spinning up a real session.
 fn stats_to_progress(stats: &TorrentStats) -> TorrentProgress {
@@ -283,15 +297,11 @@ fn stats_to_progress(stats: &TorrentStats) -> TorrentProgress {
     let (peers_connected, speed_bps) = match &stats.live {
         Some(live) => {
             // `peer_stats` lives inside `snapshot` per librqbit 8.1.x.
-            // The Speed type's `.mbps()` returns a number; multiplying by
-            // 1_000_000 / 8 to turn megabit/sec into bytes/sec is the rough
-            // conversion. We only use this for "is download making progress?"
-            // self-healing — exact precision doesn't matter.
-            let mbps: f64 = format!("{}", live.download_speed)
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0);
+            // The Speed type's Display formats as e.g. "3.2 MB/s"; multiply
+            // by 1_000_000 / 8 to turn megabit/sec into bytes/sec. We only
+            // use this for "is download making progress?" self-healing —
+            // exact precision doesn't matter, but format-stability does.
+            let mbps = parse_mbps_string(&format!("{}", live.download_speed));
             let bps = (mbps * 125_000.0) as u64; // mbps * 1e6 / 8
             (
                 live.snapshot.peer_stats.live as usize,
@@ -321,6 +331,37 @@ fn stats_to_progress(stats: &TorrentStats) -> TorrentProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_mbps_string_handles_typical_librqbit_format() {
+        // librqbit 8.1.x Display impl yields "3.2 MB/s", "0 B/s", "10.5 KB/s".
+        // Our parser takes the leading number; the units string is for human
+        // display only. Pin the leading-number extraction.
+        assert_eq!(parse_mbps_string("3.2 MB/s"), 3.2);
+        assert_eq!(parse_mbps_string("10.5 KB/s"), 10.5);
+        assert_eq!(parse_mbps_string("0 B/s"), 0.0);
+    }
+
+    #[test]
+    fn parse_mbps_string_returns_zero_on_malformed() {
+        // If librqbit ever changes the Display format and we can't parse,
+        // we want to gracefully report 0 bytes/s rather than panic. The
+        // 12s self-healing check uses (peers > 0 || bytes > 0 || speed > 0)
+        // as its OR clause, so a 0-speed report is recoverable as long as
+        // peers/bytes are non-zero.
+        assert_eq!(parse_mbps_string(""), 0.0);
+        assert_eq!(parse_mbps_string("abc"), 0.0);
+        assert_eq!(parse_mbps_string("∞"), 0.0);
+    }
+
+    #[test]
+    fn parse_mbps_string_handles_no_unit_suffix() {
+        // Defensive: if librqbit drops the unit suffix (some Display
+        // implementations do this for terse logging), still parse the
+        // leading number.
+        assert_eq!(parse_mbps_string("3.2"), 3.2);
+        assert_eq!(parse_mbps_string("100"), 100.0);
+    }
 
     #[test]
     fn validate_magnet_uri_accepts_canonical_form() {
