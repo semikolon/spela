@@ -3844,6 +3844,49 @@ mod tests {
         assert_eq!(parse_size_to_bytes("GB 4.6"), None); // wrong order
     }
 
+    // --- Local Bypass top-level file health (Apr 15, 2026 FLUX-file fix) ---
+
+    #[test]
+    fn test_top_level_file_is_healthy_rejects_below_100mb() {
+        // Apr 15 fix: tiny partial files (e.g. a 5 MB stub from a failed
+        // download) must NOT be Bypass candidates. Pin the 100 MB floor.
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("tiny.mkv");
+        std::fs::write(&small, vec![0u8; 50 * 1024 * 1024]).unwrap(); // 50 MB
+        assert!(!top_level_file_is_healthy(&small));
+    }
+
+    #[test]
+    fn test_top_level_file_is_healthy_accepts_dense_full_file() {
+        // A non-sparse file ≥ 100 MB should pass. Use 110 MB so we're past
+        // the floor. Standard write produces a fully-allocated file (no holes).
+        let dir = tempfile::tempdir().unwrap();
+        let healthy = dir.path().join("full.mkv");
+        std::fs::write(&healthy, vec![0u8; 110 * 1024 * 1024]).unwrap();
+        assert!(top_level_file_is_healthy(&healthy));
+    }
+
+    #[test]
+    fn test_top_level_file_is_healthy_rejects_sparse_below_95pct() {
+        // Sparse file: logical 200 MB, physical near-zero (just the inode).
+        // Pre-fix Local Bypass would happily probe this, ffmpeg reads zeros,
+        // cast hangs at blue-icon. Pin the 0.95 sparse-detection threshold.
+        let dir = tempfile::tempdir().unwrap();
+        let sparse = dir.path().join("sparse.mkv");
+        let f = std::fs::File::create(&sparse).unwrap();
+        f.set_len(200 * 1024 * 1024).unwrap(); // 200 MB logical, 0 physical
+        drop(f);
+        assert!(!top_level_file_is_healthy(&sparse));
+    }
+
+    #[test]
+    fn test_top_level_file_is_healthy_rejects_nonexistent_path() {
+        // Symptom of stale Local Bypass cache reference; must return false
+        // not panic.
+        let nonexistent = std::path::Path::new("/tmp/spela-nonexistent-fixture-xxxxyyyyzzzz");
+        assert!(!top_level_file_is_healthy(nonexistent));
+    }
+
     #[test]
     fn is_valid_imdb_id_accepts_canonical_movie_id() {
         assert!(is_valid_imdb_id("tt1190634"));
