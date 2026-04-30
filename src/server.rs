@@ -223,6 +223,25 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Apr 30, 2026 (security audit H3): acquire a Mutex guard, recovering
+/// from `PoisonError` rather than panicking. The original `.lock().unwrap()`
+/// pattern caused today's rustls-panic cascade — a librqbit thread panicked
+/// while holding the cast Mutex (PoisonError-poisoned it) → every
+/// subsequent `.lock().unwrap()` on the same Mutex panicked too → cascade
+/// across all axum tasks until the user restarted spela. With recovery,
+/// post-panic state is treated as "potentially inconsistent but accessible"
+/// (the contract `PoisonError::into_inner` provides). Callers MAY observe
+/// stale state, which is strictly better than the entire server cascading
+/// down.
+fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| {
+        tracing::error!(
+            "Mutex poisoned, recovering — a prior thread panicked while holding it"
+        );
+        e.into_inner()
+    })
+}
+
 /// Apr 30, 2026 (security audit H2): compute the effective Host-header
 /// allowlist for the server. Always includes loopback (`localhost`,
 /// `127.0.0.1`) and the canonical fleet hostname (`darwin.home`); adds
@@ -496,7 +515,7 @@ async fn handle_play(
                             if transcoded.exists() {
                                 let _ = std::fs::remove_file(&transcoded);
                             }
-                            if let Some(pid) = state.ffmpeg_pid.lock().unwrap().take() {
+                            if let Some(pid) = lock_recover(&state.ffmpeg_pid).take() {
                                 torrent::kill_pid(pid);
                             }
                             req.result_id = Some(next_rid);
@@ -717,7 +736,7 @@ async fn do_play(
     if prev_pid != 0 {
         stop_torrent(state, prev_pid, false).await;
     }
-    if let Some(old_fb_pid) = state.ffmpeg_pid.lock().unwrap().take() {
+    if let Some(old_fb_pid) = lock_recover(&state.ffmpeg_pid).take() {
         tracing::info!("do_play: killing existing ffmpeg zombie (PID {})", old_fb_pid);
         torrent::kill_pid(old_fb_pid);
     }
@@ -879,7 +898,7 @@ async fn do_play(
         match transcode::transcode_hls(&server_url, &media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to, audio_index).await {
                 Ok((manifest_path, ffmpeg_pid)) => {
                     // Track ffmpeg PID for the post-playback reaper + cleanup
-                    *state.ffmpeg_pid.lock().unwrap() = Some(ffmpeg_pid);
+                    *lock_recover(&state.ffmpeg_pid) = Some(ffmpeg_pid);
 
                     // HLS pre-buffer: wait for the manifest + enough segments
                     // to survive the Chromecast's initial read-ahead burst.
@@ -995,7 +1014,7 @@ async fn do_play(
         };
         let cast_metadata_clone = cast_metadata.clone();
         let cast_result = tokio::task::spawn_blocking(move || {
-            let mut cast = state_clone.cast.lock().unwrap();
+            let mut cast = lock_recover(&state_clone.cast);
             cast.cast_url(
                 &cast_name_clone,
                 &url_clone,
@@ -1042,7 +1061,7 @@ async fn do_play(
                 let state_clone = state.clone();
                 let cast_name_clone = cast_name.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let mut cast = state_clone.cast.lock().unwrap();
+                    let mut cast = lock_recover(&state_clone.cast);
                     cast.seek(&cast_name_clone, pos)
                 }).await;
             }
@@ -1126,7 +1145,7 @@ async fn do_play(
                 // process-existence via `libc::kill(pid, 0)`. For librqbit:
                 // still-managed-by-Session check.
                 let wt_alive = is_torrent_alive(&state, webtorrent_pid);
-                let ffmpeg_alive = state.ffmpeg_pid.lock().unwrap()
+                let ffmpeg_alive = lock_recover(&state.ffmpeg_pid)
                     .map(|p| unsafe { torrent::kill_check(p) })
                     .unwrap_or(false);
 
@@ -1234,7 +1253,7 @@ fn do_cleanup(state: &SharedState) {
         });
     }
 
-    if let Some(pid) = state.ffmpeg_pid.lock().unwrap().take() {
+    if let Some(pid) = lock_recover(&state.ffmpeg_pid).take() {
         torrent::kill_pid(pid);
     }
     // Kill any lingering ffmpeg or python http servers
@@ -1602,7 +1621,7 @@ async fn attempt_cast_recast(
     let content_type_clone = content_type.to_string();
     let recast_metadata_clone = recast_metadata.clone();
     let load_outcome = tokio::task::spawn_blocking(move || {
-        let mut cast = state_clone.cast.lock().unwrap();
+        let mut cast = lock_recover(&state_clone.cast);
         cast.cast_url(
             &cast_name_clone,
             &url_clone,
@@ -1626,7 +1645,7 @@ async fn attempt_cast_recast(
         let state_clone = state.clone();
         let cast_name_clone = cast_name.to_string();
         let seek_outcome = tokio::task::spawn_blocking(move || {
-            let mut cast = state_clone.cast.lock().unwrap();
+            let mut cast = lock_recover(&state_clone.cast);
             cast.seek(&cast_name_clone, seek_within_hls)
         })
         .await;
@@ -1766,7 +1785,7 @@ async fn cast_health_monitor(
         let state_clone = state.clone();
         let cast_name_clone = cast_name.clone();
         let probe_result = tokio::task::spawn_blocking(move || {
-            let mut cast = state_clone.cast.lock().unwrap();
+            let mut cast = lock_recover(&state_clone.cast);
             cast.get_info(&cast_name_clone)
         })
         .await;
@@ -2240,7 +2259,7 @@ async fn handle_pause(State(state): State<SharedState>) -> Json<Value> {
     let device = get_current_device(&state);
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut cast = state_clone.cast.lock().unwrap();
+        let mut cast = lock_recover(&state_clone.cast);
         cast.pause(&device)
     }).await;
     cast_result_to_json(result)
@@ -2250,7 +2269,7 @@ async fn handle_resume(State(state): State<SharedState>) -> Json<Value> {
     let device = get_current_device(&state);
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut cast = state_clone.cast.lock().unwrap();
+        let mut cast = lock_recover(&state_clone.cast);
         cast.resume(&device)
     }).await;
     cast_result_to_json(result)
@@ -2267,7 +2286,7 @@ async fn handle_seek(
     let device = get_current_device(&state);
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut cast = state_clone.cast.lock().unwrap();
+        let mut cast = lock_recover(&state_clone.cast);
         cast.seek(&device, seconds)
     }).await;
     cast_result_to_json(result)
@@ -2284,7 +2303,7 @@ async fn handle_volume(
     let device = get_current_device(&state);
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut cast = state_clone.cast.lock().unwrap();
+        let mut cast = lock_recover(&state_clone.cast);
         cast.set_volume(&device, level)
     }).await;
     cast_result_to_json(result)
@@ -2447,7 +2466,7 @@ fn top_level_file_is_healthy(path: &std::path::Path) -> bool {
 async fn handle_targets(State(state): State<SharedState>) -> Json<Value> {
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut cast = state_clone.cast.lock().unwrap();
+        let mut cast = lock_recover(&state_clone.cast);
         cast.discover()
     }).await;
     match result {
@@ -2620,7 +2639,7 @@ async fn handle_cast_info(
     let device = req.device.unwrap_or_else(|| get_current_device(&state));
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut cast = state_clone.cast.lock().unwrap();
+        let mut cast = lock_recover(&state_clone.cast);
         cast.get_info(&device)
     }).await;
     match result {
@@ -2654,7 +2673,7 @@ async fn handle_transcode_stream(
     }
     let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
     let path = media_dir.join("transcoded_aac.mp4");
-    let ffmpeg_pid = *state.ffmpeg_pid.lock().unwrap();
+    let ffmpeg_pid = *lock_recover(&state.ffmpeg_pid);
 
     let start_offset = parse_range_start(headers.get("range").and_then(|v| v.to_str().ok()));
 
@@ -3434,7 +3453,7 @@ async fn handle_seek_restart(
     let seek_seconds = req.t.max(0.0);
 
     // Kill current ffmpeg
-    if let Some(pid) = state.ffmpeg_pid.lock().unwrap().take() {
+    if let Some(pid) = lock_recover(&state.ffmpeg_pid).take() {
         torrent::kill_pid(pid);
     }
     // Delete old transcoded file
@@ -3580,6 +3599,38 @@ fn cast_result_to_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Mutex poison recovery (Apr 30, 2026 — H3 security audit) ---
+
+    #[test]
+    fn lock_recover_returns_guard_after_poisoning() {
+        // Poison the mutex by panicking in a thread that holds the guard.
+        // After the panic, std::sync::Mutex::lock() returns PoisonError;
+        // .unwrap() on that error is what burned us in the rustls cascade.
+        // lock_recover MUST return a usable guard via PoisonError::into_inner.
+        let m = std::sync::Arc::new(Mutex::new(42_i32));
+        let m_clone = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = m_clone.lock().unwrap();
+            panic!("intentional poisoning for test");
+        })
+        .join();
+
+        // Sanity: bare .lock() returns Err on the poisoned mutex.
+        assert!(m.lock().is_err());
+
+        // The recovery path: lock_recover returns a usable guard.
+        let guard = lock_recover(&m);
+        assert_eq!(*guard, 42);
+    }
+
+    #[test]
+    fn lock_recover_works_on_healthy_mutex() {
+        // Smoke test: zero-impact on the healthy path.
+        let m = Mutex::new(String::from("hello"));
+        let guard = lock_recover(&m);
+        assert_eq!(*guard, "hello");
+    }
 
     // --- Host-header allowlist (Apr 30, 2026 — H2 security audit) ---
 
