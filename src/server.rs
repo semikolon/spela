@@ -665,106 +665,32 @@ async fn do_play(
     // full rationale + Apr 15 2026 incident context.
     disk::prune_to_fit(&media_dir, &title, disk::MAX_MEDIA_MB);
 
-    // Local Bypass System: Check if the movie already exists on disk
+    // Local Bypass System: Check if the movie already exists on disk.
+    //
+    // Apr 30, 2026: ~100 lines of file-scan + match-decision logic
+    // extracted into the pure `find_local_bypass_match` helper, which
+    // pins the title/year/quality/health decision matrix in 8 unit tests.
+    // do_play just consumes the helper's Option<PathBuf> result.
     let mut server_url = String::new();
     let mut pid: u32 = 0;
     let mut is_local = false;
 
-    if let Some(title) = &req.title {
-        // Search for the file in media_dir (YTS format: "Movie Title (Year) [Quality] ...")
-        if let Ok(entries) = std::fs::read_dir(&media_dir) {
-            for entry in entries.flatten() {
-                if let Ok(file_type) = entry.file_type() {
-                    let folder_name = entry.file_name().to_string_lossy().to_string();
-                    let matches_title = title_tokens_match(&folder_name, title);
-
-                    if !matches_title {
-                        tracing::debug!("Bypass Mismatch: '{}' vs '{}'", sanitize_title(title), sanitize_title(&folder_name));
-                    }
-                    let matches_year = if title.contains("2026") {
-                        folder_name.contains("2026")
-                    } else if title.contains("2025") {
-                        folder_name.contains("2025")
-                    } else {
-                        true // No year in query, trust title match
-                    };
-
-                    // CRITICAL: Check Quality-Awareness to prevent downgrades (e.g., 4k vs 1080p)
-                    let matches_quality = if let Some(q) = &req.quality {
-                        let q_lower = q.to_lowercase();
-                        if q_lower.contains("2160p") || q_lower.contains("4k") {
-                            folder_name.contains("2160p") || folder_name.contains("4k") || folder_name.contains("2160")
-                        } else if q_lower.contains("1080p") {
-                            folder_name.contains("1080p") || folder_name.contains("1080")
-                        } else {
-                            true // Generic match
-                        }
-                    } else {
-                        true // No quality specified
-                    };
-
-                    let expected_bytes = req.size.as_deref().and_then(parse_size_to_bytes).unwrap_or(0);
-                    let has_done_marker = entry.path().join(".spela_done").exists();
-
-                    if file_type.is_dir() && matches_title && matches_year && matches_quality {
-                        // Found a matching directory, look for mp4/mkv inside
-                        if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
-                            for sub_entry in sub_entries.flatten() {
-                                let path = sub_entry.path();
-                                let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                                // Only match actual movie files, not transcode artifacts
-                                if (ext == "mp4" || ext == "mkv") && !fname.starts_with("transcoded") {
-                                    // Known expected size wins over any completion marker.
-                                    if local_bypass_file_is_healthy(&path, has_done_marker, expected_bytes) {
-                                        tracing::info!("Local Bypass: Found healthy file (done_marker: {}, physical_match: true): {:?}", has_done_marker, path);
-                                        server_url = format!("file://{}", path.to_string_lossy());
-                                        is_local = true;
-                                        break;
-                                    } else {
-                                        tracing::info!("Local Bypass: Found file but failed health check (size: {}B, expected: {}B). Delegating to Torrent Engine.", path.metadata().map_or(0, |m| m.len()), expected_bytes);
-                                    }
-                                }
-                            }
-                        }
-                    } else if file_type.is_file() && matches_title && matches_year && matches_quality {
-                        // Top-level single-file release living directly in media_dir
-                        // (e.g. webtorrent finishes a single-file torrent into
-                        // ~/media/Some.Movie.1080p.x264.mkv with no parent folder).
-                        // Without this branch, fully-downloaded top-level files
-                        // would never be recognized for Local Bypass and every
-                        // play call would re-fetch the torrent — the exact bug
-                        // that left a 4.2 GB FLUX file invisible to Bypass on
-                        // Apr 15, 2026.
-                        let path = entry.path();
-                        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                        if (ext == "mp4" || ext == "mkv") && !fname.starts_with("transcoded") {
-                            // Trust the title/year/quality match for content identity
-                            // and only sanity-check the file via top_level_file_is_healthy
-                            // (≥100 MB, non-sparse). See the function's doc for why we
-                            // don't enforce strict size matching against the search
-                            // result's expected_bytes here.
-                            if top_level_file_is_healthy(&path) {
-                                tracing::info!(
-                                    "Local Bypass: Found healthy top-level file (logical {}B, expected {}B, title-trust): {:?}",
-                                    path.metadata().map_or(0, |m| m.len()),
-                                    expected_bytes,
-                                    path
-                                );
-                                server_url = format!("file://{}", path.to_string_lossy());
-                                is_local = true;
-                            } else {
-                                tracing::info!(
-                                    "Local Bypass: Top-level file failed sanity check (size: {}B, sparse-or-tiny). Delegating to Torrent Engine.",
-                                    path.metadata().map_or(0, |m| m.len())
-                                );
-                            }
-                        }
-                    }
-                }
-                if is_local { break; }
-            }
+    if req.title.is_some() {
+        let expected_bytes = req
+            .size
+            .as_deref()
+            .and_then(parse_size_to_bytes)
+            .unwrap_or(0);
+        if let Some(local_path) =
+            find_local_bypass_match(&media_dir, &title, req.quality.as_deref(), expected_bytes)
+        {
+            tracing::info!(
+                "Local Bypass: matched on disk: {:?} (expected {}B)",
+                local_path,
+                expected_bytes
+            );
+            server_url = format!("file://{}", local_path.to_string_lossy());
+            is_local = true;
         }
     }
 
@@ -2551,6 +2477,105 @@ pub(crate) fn is_valid_poster_url(url: &str) -> bool {
         || url.starts_with("https://www.themoviedb.org/")
 }
 
+/// Apr 30, 2026: pure helper extracted from do_play's ~100-line Local
+/// Bypass scan. Walks `media_dir` looking for a healthy on-disk match for
+/// the requested play. Returns the path to a matching media file
+/// (`.mp4` or `.mkv`, excluding `transcoded*` artifacts), or None if no
+/// candidate passes the title/year/quality filters and health checks.
+///
+/// Decision matrix (Apr 8/15/18/19/25/28/29 incident-cluster):
+///   1. Title-token match — folder/file name must match enough words from
+///      the request title (via `title_tokens_match`).
+///   2. Year filter — if request title contains "2025" or "2026", entry
+///      must contain the same year. No-year requests skip this filter.
+///   3. Quality filter — 2160p/4K requests only match 2160-named entries;
+///      1080p requests only match 1080-named entries; other qualities are
+///      generic.
+///   4. Directory entries are descended; first internal `.mkv`/`.mp4`
+///      passing `local_bypass_file_is_healthy` (with `.spela_done` marker
+///      check) wins.
+///   5. Top-level file entries pass `top_level_file_is_healthy`
+///      (≥100 MB + non-sparse), no expected-size match — the FLUX
+///      regression case.
+///
+/// Pure (filesystem-only) — testable via tempfile fixtures.
+pub(crate) fn find_local_bypass_match(
+    media_dir: &std::path::Path,
+    title: &str,
+    quality: Option<&str>,
+    expected_bytes: u64,
+) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(media_dir).ok()?;
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        let folder_name = entry.file_name().to_string_lossy().to_string();
+
+        if !title_tokens_match(&folder_name, title) {
+            continue;
+        }
+        let matches_year = if title.contains("2026") {
+            folder_name.contains("2026")
+        } else if title.contains("2025") {
+            folder_name.contains("2025")
+        } else {
+            true
+        };
+        if !matches_year {
+            continue;
+        }
+        let matches_quality = match quality {
+            Some(q) => {
+                let q_lower = q.to_lowercase();
+                if q_lower.contains("2160p") || q_lower.contains("4k") {
+                    folder_name.contains("2160p")
+                        || folder_name.contains("4k")
+                        || folder_name.contains("2160")
+                } else if q_lower.contains("1080p") {
+                    folder_name.contains("1080p") || folder_name.contains("1080")
+                } else {
+                    true
+                }
+            }
+            None => true,
+        };
+        if !matches_quality {
+            continue;
+        }
+
+        let path = entry.path();
+        let has_done_marker = path.join(".spela_done").exists();
+
+        if file_type.is_dir() {
+            if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                for sub_entry in sub_entries.flatten() {
+                    let sub_path = sub_entry.path();
+                    let fname = sub_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    let ext = sub_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                    if (ext == "mp4" || ext == "mkv") && !fname.starts_with("transcoded") {
+                        if local_bypass_file_is_healthy(&sub_path, has_done_marker, expected_bytes)
+                        {
+                            return Some(sub_path);
+                        }
+                    }
+                }
+            }
+        } else if file_type.is_file() {
+            let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if (ext == "mp4" || ext == "mkv")
+                && !fname.starts_with("transcoded")
+                && top_level_file_is_healthy(&path)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 fn local_bypass_file_is_healthy(path: &std::path::Path, has_done_marker: bool, expected_bytes: u64) -> bool {
     // Apr 30, 2026 (M8 TOCTOU defense): refuse symlinks. A symlink in
     // ~/media/ that points to a sensitive file (e.g. /etc/shadow on a
@@ -3842,6 +3867,112 @@ mod tests {
         assert_eq!(parse_size_to_bytes("abc"), None);
         assert_eq!(parse_size_to_bytes("4.6"), None); // missing unit
         assert_eq!(parse_size_to_bytes("GB 4.6"), None); // wrong order
+    }
+
+    // --- Local Bypass match decision (Apr 30, 2026 — extracted from do_play) ---
+    //
+    // The find_local_bypass_match helper extracts do_play's ~100-line
+    // file-scan-and-match logic into a pure function. Tests cover the
+    // decision matrix that was previously only exercised live (Apr 8,
+    // 15, 18, 19, 25, 28, 29 incident-cluster). Any future refactor
+    // that breaks any of these cases will fail here first.
+
+    fn make_dense_mkv(parent: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = parent.join(name);
+        std::fs::write(&p, vec![0u8; 110 * 1024 * 1024]).unwrap();
+        p
+    }
+
+    fn make_sparse_mkv(parent: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = parent.join(name);
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(200 * 1024 * 1024).unwrap();
+        drop(f);
+        p
+    }
+
+    #[test]
+    fn find_local_bypass_directory_match_with_done_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = root.path().join("The.Boys.S05E03.1080p.FLUX");
+        std::fs::create_dir_all(&inner).unwrap();
+        let mkv = make_dense_mkv(&inner, "The.Boys.S05E03.1080p.FLUX.mkv");
+        std::fs::write(inner.join(".spela_done"), b"").unwrap();
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("1080p"), 0);
+        assert_eq!(result.as_deref(), Some(mkv.as_path()));
+    }
+
+    #[test]
+    fn find_local_bypass_top_level_file_match() {
+        // The Apr 15 FLUX-file regression case.
+        let root = tempfile::tempdir().unwrap();
+        let mkv = make_dense_mkv(root.path(), "The.Boys.S05E03.1080p.FLUX.mkv");
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("1080p"), 0);
+        assert_eq!(result.as_deref(), Some(mkv.as_path()));
+    }
+
+    #[test]
+    fn find_local_bypass_returns_none_on_no_match() {
+        let root = tempfile::tempdir().unwrap();
+        make_dense_mkv(root.path(), "Different.Show.S01E01.mkv");
+        assert!(find_local_bypass_match(root.path(), "The Boys S05E03", None, 0).is_none());
+    }
+
+    #[test]
+    fn find_local_bypass_quality_mismatch_4k_target_skips_1080p() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = root.path().join("The.Boys.S05E03.1080p");
+        std::fs::create_dir_all(&inner).unwrap();
+        make_dense_mkv(&inner, "The.Boys.S05E03.1080p.mkv");
+        std::fs::write(inner.join(".spela_done"), b"").unwrap();
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("2160p"), 0);
+        assert!(result.is_none(), "4K request must not match 1080p disk content");
+    }
+
+    #[test]
+    fn find_local_bypass_skips_transcoded_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = root.path().join("The.Boys.S05E03");
+        std::fs::create_dir_all(&inner).unwrap();
+        // Only file inside is the transcode artifact — must NOT be picked.
+        std::fs::write(inner.join("transcoded_aac.mp4"), vec![0u8; 110 * 1024 * 1024]).unwrap();
+        std::fs::write(inner.join(".spela_done"), b"").unwrap();
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_local_bypass_rejects_sparse_top_level_file() {
+        let root = tempfile::tempdir().unwrap();
+        make_sparse_mkv(root.path(), "The.Boys.S05E03.mkv");
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0);
+        assert!(result.is_none(), "sparse top-level must be rejected");
+    }
+
+    #[test]
+    fn find_local_bypass_year_filter_2026_excludes_2025() {
+        // When request title contains 2026, only entries containing 2026
+        // can match. Pin the year-filter behavior added Apr 15.
+        let root = tempfile::tempdir().unwrap();
+        let inner_2025 = root.path().join("The.Boys.S05E03.2025");
+        std::fs::create_dir_all(&inner_2025).unwrap();
+        make_dense_mkv(&inner_2025, "a.mkv");
+        std::fs::write(inner_2025.join(".spela_done"), b"").unwrap();
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03 2026", None, 0);
+        assert!(result.is_none(), "2025 entry must not match 2026 request");
+    }
+
+    #[test]
+    fn find_local_bypass_no_year_in_request_matches_anything() {
+        // When title has no year token, any title-matching entry is a
+        // candidate. Pin the year-filter's defensive default.
+        let root = tempfile::tempdir().unwrap();
+        let inner = root.path().join("The.Boys.S05E03.2025");
+        std::fs::create_dir_all(&inner).unwrap();
+        let mkv = make_dense_mkv(&inner, "a.mkv");
+        std::fs::write(inner.join(".spela_done"), b"").unwrap();
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0);
+        assert_eq!(result.as_deref(), Some(mkv.as_path()));
     }
 
     // --- Local Bypass top-level file health (Apr 15, 2026 FLUX-file fix) ---
