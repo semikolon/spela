@@ -107,6 +107,125 @@ Took the wiser path: extracted the three highest-leverage sub-decisions (whose c
 
 ---
 
+## Part 4 — older-TODO closures shipped same day (commit `3ac88bc`)
+
+After the audit follow-through, two long-standing TODOs got actioned in one
+small commit. Bundled here because they shipped on the same day as the
+migration + audit and follow the same focused-doc-with-references pattern.
+
+### Intro concat HLS fix (Apr 18 hypothesis → shipped Apr 30)
+
+**Symptom**: with `intro.mp4` enabled, Chromecast (CrKey 1.56) buffered indefinitely
+at ~segment 5 (30-36s into playback). Workaround was `--no-intro` and renaming
+`intro.mp4 → intro.mp4.disabled` on Darwin.
+
+**Hypothesis** (Apr 19 session, recorded in TODO.md): NVENC's scene-change detection
+fires an unscheduled IDR at the intro→main concat seam (a hard visual transition
+from the 5s intro clip to the movie opening). That desyncs NVENC's GOP cadence
+from the HLS segmenter's 6s clock. Segments 1-4 land on keyframes by luck;
+by segment 5 the accumulated drift causes either (a) a non-keyframe segment
+start, or (b) an EXTINF-vs-actual-duration mismatch beyond CrKey 1.56 Shaka
+Player's tolerance. The seam itself is INSIDE segment 0 (0-6s = intro 0-5 + main 5-6),
+not at the segment-5 boundary — failure is a *downstream consequence* of the seam,
+not the seam directly.
+
+**Fix**: four ffmpeg args added to the `has_intro` h264_nvenc branch in both
+`transcode()` and `transcode_hls()`:
+
+```
+-g 180 -keyint_min 180             # fixed 6s GOP at the 30fps the filter pipes
+-sc_threshold 0                    # disable scene-change IDR injection
+                                   # (x264-flavored; NVENC may ignore but harmless)
+-force_key_frames expr:gte(t,n_forced*6)  # guarantees IDR at every 6s boundary
+                                          # regardless of encoder cadence
+```
+
+Belt-and-suspenders. The `-force_key_frames` alone would suffice; the others
+constrain encoder choice for predictability.
+
+**Validation pending live test**: `ssh darwin 'mv ~/.config/spela/intro.mp4.disabled ~/.config/spela/intro.mp4'`
+then play any title; smooth playback past segment 5 = hypothesis confirmed.
+Hard-verification recipe (per Apr 19 TODO note):
+```
+ssh darwin 'for i in 00000 00001 00004 00005 00006; do
+  ffprobe -v error -select_streams v -show_frames -read_intervals "%+#1" \
+    ~/media/transcoded_hls/seg_${i}.ts | grep -E "key_frame|pict_type"
+done'
+```
+Every segment's first frame must be `key_frame=1 pict_type=I`.
+
+### Corrupt-source-file auto-detection (Apr 29 Hijack S02E05 incident → shipped Apr 30)
+
+**Original incident** (Apr 29, recorded in CLAUDE.md "Corrupt source files defeat
+auto-recast" hard-won lesson): Hijack S02E05 MeGusta release had a corrupted
+Matroska container at byte 417 MB (`invalid as first byte of an EBML number`).
+HEVC decoder couldn't find reference frames; NVENC silently filled the gap with
+~5 min of duplicated frames; ffmpeg "completed" producing junk segments past
+33:42. Receiver wedged at `time=2022s` on every recast attempt because the bug
+was on disk, not on the Chromecast. Manual recovery: `spela stop` + `rm` broken
+file + retry with different release.
+
+**Three corruption signals** identified during the incident (per the Apr 29
+hard-won lesson):
+1. `invalid as first byte of an EBML number` — Matroska container corruption
+2. `Could not find ref with POC` — HEVC reference frame missing
+3. `dup=N` on the final summary line where N > 100 — NVENC fill from missing refs
+
+**Automation shape**:
+
+```rust
+// transcode.rs
+pub fn inspect_ffmpeg_log_for_corruption(log: &str) -> Option<&'static str> { ... }
+
+// state.rs — AppState gains:
+#[serde(default)]
+pub corrupt_files: HashSet<String>,
+
+// server.rs do_cleanup — after every cast ends:
+if let Ok(log) = std::fs::read_to_string(~/.spela/ffmpeg.log) {
+    if let Some(reason) = inspect_ffmpeg_log_for_corruption(&log) {
+        if let Some(source_path) = current.url.strip_prefix("file://") {
+            app_state.corrupt_files.insert(source_path);
+            app_state.save(...);
+        }
+    }
+}
+
+// server.rs find_local_bypass_match — added &corrupt_files: &HashSet<String>
+// parameter; skips entries in the set with a warn log.
+```
+
+**Threshold tuning**: `dup>100` (exclusive) was chosen to avoid false positives
+from normal short scenes (a few duplicated frames at scene changes is fine).
+Pinned via `inspect_ffmpeg_log_dup_threshold_is_exclusive_at_100` test.
+
+**8 unit tests** pin: parser semantics for each signal, threshold boundary,
+empty-log defensive behavior, top-level vs directory-internal corrupt-skip in
+`find_local_bypass_match`.
+
+**Effect**: first failed cast on a borked file → log inspection finds signal
+→ `corrupt_files.insert(source_path)` → next play with the same title-tokens
+match auto-picks a different release. Manual `rm` no longer needed.
+
+### Generic lesson (worth surfacing in global CLAUDE.md)
+
+The **post-process artifact inspection → mark-bad-input → skip on retry** pattern
+generalizes beyond ffmpeg.log:
+- **Failed-build retry-suppression**: parse `cargo build` output for `error[E\d+]:`,
+  mark the offending source file as needing-attention.
+- **Bad-test-fixture skip**: parse test output for `panicked at` / sigfault markers,
+  mark the fixture as broken.
+- **Partial-API-response retry**: parse response for truncation markers
+  (`X-Truncated: true`, missing-required-field errors), mark the API endpoint
+  as flaky for a cool-off window.
+
+The unifying shape: any pipeline where a *downstream artifact reliably surfaces
+a known failure-class signal* should parse the artifact at the pipeline boundary,
+mark the offending input in a persistent skip-set, and integrate the skip-set
+into the existing decision helper.
+
+---
+
 ## Appendix — archived from CLAUDE.md (no longer load-bearing)
 
 **webtorrent `-s` patch (our PR #3011, fixes #331)** — pre-v3.3.0, spela ran a patched
