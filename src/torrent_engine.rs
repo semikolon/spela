@@ -169,7 +169,13 @@ impl TorrentEngine {
 
         Ok(TorrentStartInfo {
             id: id_u32,
-            url: build_stream_url(&self.stream_host, self.stream_port, id_u32, file_idx_usize),
+            // Apr 30, 2026 (H4 alignment): /torrent/{id}/stream/* is restricted
+            // to loopback by the require_loopback_source middleware. ffmpeg
+            // is the only legitimate consumer and runs in-process, so use
+            // 127.0.0.1 in the URL we hand to ffmpeg — that way ffmpeg's
+            // source IP is loopback (passes the middleware) regardless of
+            // how stream_host is configured for Chromecast targets.
+            url: build_stream_url("127.0.0.1", self.stream_port, id_u32, file_idx_usize),
             file_index: file_idx_usize,
         })
     }
