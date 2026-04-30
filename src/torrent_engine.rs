@@ -160,8 +160,7 @@ impl TorrentEngine {
             }
         };
 
-        let id_u32 = u32::try_from(torrent_id)
-            .map_err(|_| anyhow!("torrent_id {} exceeds u32 range", torrent_id))?;
+        let id_u32 = shift_librqbit_id(torrent_id)?;
         let file_idx_usize = file_index.unwrap_or(0) as usize;
 
         self.started_count.fetch_add(1, Ordering::Relaxed);
@@ -173,13 +172,11 @@ impl TorrentEngine {
         })
     }
 
-    /// Poll a torrent's current state. Returns None if the torrent has been
-    /// removed from the session. The legacy `check_progress` parsed
-    /// webtorrent's stdout log; this is a direct in-process call (~microseconds).
+    /// Poll a torrent's current state. Returns None for the Local Bypass
+    /// sentinel id (0) or if the torrent has been removed from the session.
     pub fn progress(&self, id: u32) -> Option<TorrentProgress> {
-        let handle = self
-            .session
-            .get(TorrentIdOrHash::Id(id as usize))?;
+        let librqbit_id = unshift_librqbit_id(id)?;
+        let handle = self.session.get(TorrentIdOrHash::Id(librqbit_id))?;
         let stats: TorrentStats = handle.stats();
         Some(stats_to_progress(&stats))
     }
@@ -187,21 +184,26 @@ impl TorrentEngine {
     /// Get a `ManagedTorrent` Arc handle. The streaming endpoint calls this
     /// then `.stream(file_idx)` on the handle to obtain a `FileStream` (whose
     /// concrete type can't be named in our crate but is usable through its
-    /// `AsyncRead + AsyncSeek + .len()` surface). Returns `None` if the
-    /// torrent has been removed from the session.
+    /// `AsyncRead + AsyncSeek + .len()` surface). Returns `None` for the
+    /// Local Bypass sentinel id (0) or if the torrent has been removed.
     pub fn handle(&self, id: u32) -> Option<Arc<ManagedTorrent>> {
-        self.session.get(TorrentIdOrHash::Id(id as usize))
+        let librqbit_id = unshift_librqbit_id(id)?;
+        self.session.get(TorrentIdOrHash::Id(librqbit_id))
     }
 
-    /// Stop a torrent and optionally delete its on-disk files. The legacy
-    /// `kill_pid(webtorrent_pid)` becomes `engine.stop(id, delete_files)`.
-    /// `delete_files=false` is the equivalent of webtorrent's "keep seeding"
-    /// removal — drops from the session's active set but leaves bytes on disk
-    /// for Local Bypass to reuse. `delete_files=true` is post-failure cleanup
-    /// (zero-peer torrents leave only sparse placeholders worth deleting).
+    /// Stop a torrent and optionally delete its on-disk files. `delete_files=false`
+    /// drops from the session's active set but leaves bytes on disk for Local
+    /// Bypass to reuse. `delete_files=true` is post-failure cleanup (zero-peer
+    /// torrents leave only sparse placeholders worth deleting). The Local Bypass
+    /// sentinel id (0) is a no-op (caller already checks `pid != 0` but defense
+    /// in depth — would otherwise mistarget librqbit's TorrentId 0 if not for
+    /// the +1 shift).
     pub async fn stop(&self, id: u32, delete_files: bool) -> Result<()> {
+        let Some(librqbit_id) = unshift_librqbit_id(id) else {
+            return Ok(());
+        };
         self.session
-            .delete(TorrentIdOrHash::Id(id as usize), delete_files)
+            .delete(TorrentIdOrHash::Id(librqbit_id), delete_files)
             .await
             .context("session.delete failed")
     }
@@ -211,6 +213,35 @@ impl TorrentEngine {
     /// that).
     pub fn started_count(&self) -> u32 {
         self.started_count.load(Ordering::Relaxed)
+    }
+}
+
+/// Shift librqbit's `TorrentId` (which starts at 0 and increments) by +1 to
+/// produce spela's `pid`. Apr 30, 2026 (v3.3.0+1 fix): librqbit allocates the
+/// first torrent of a session as `TorrentId = 0`, which collides with spela's
+/// `pid == 0` "Local Bypass" sentinel. Without this shift, the post-playback
+/// reaper's `is_torrent_alive(state, 0)` returns `true` perpetually for the
+/// first librqbit-served torrent, dead-coding the "ffmpeg AND torrent both
+/// dead" cleanup branch. Shift+1 restores the invariant: `pid == 0` always
+/// means Local Bypass; `pid >= 1` is a real torrent.
+pub(crate) fn shift_librqbit_id(librqbit_id: usize) -> Result<u32> {
+    u32::try_from(librqbit_id + 1).map_err(|_| {
+        anyhow!(
+            "librqbit torrent_id {} exceeds u32 range after +1 Local-Bypass-sentinel shift",
+            librqbit_id
+        )
+    })
+}
+
+/// Reverse of `shift_librqbit_id`. Returns `None` for the Local Bypass
+/// sentinel (0) so callers naturally skip the librqbit lookup. Used by
+/// `progress`, `handle`, and `stop` so spela's pid==0 sentinel never reaches
+/// `session.get` / `session.delete`.
+pub(crate) fn unshift_librqbit_id(spela_id: u32) -> Option<usize> {
+    if spela_id == 0 {
+        None
+    } else {
+        Some((spela_id - 1) as usize)
     }
 }
 
@@ -266,6 +297,54 @@ fn stats_to_progress(stats: &TorrentStats) -> TorrentProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shift_librqbit_id_avoids_local_bypass_sentinel() {
+        // librqbit's first torrent is TorrentId=0; spela's pid==0 means
+        // Local Bypass. The +1 shift moves librqbit's id space into pid >= 1
+        // so the two namespaces never collide. Apr 30, 2026 fix.
+        assert_eq!(shift_librqbit_id(0).unwrap(), 1);
+        assert_eq!(shift_librqbit_id(1).unwrap(), 2);
+        assert_eq!(shift_librqbit_id(99).unwrap(), 100);
+    }
+
+    #[test]
+    fn unshift_librqbit_id_zero_is_local_bypass() {
+        // The reverse operation MUST return None for spela id=0 so that
+        // engine.handle / engine.progress / engine.stop never accidentally
+        // dispatch to librqbit's TorrentId 0 when the caller passed the
+        // Local Bypass sentinel. Reaper semantics (`is_torrent_alive(state, 0)
+        // returns true` perpetually) relies on this.
+        assert_eq!(unshift_librqbit_id(0), None);
+    }
+
+    #[test]
+    fn unshift_librqbit_id_one_maps_to_first_torrent() {
+        assert_eq!(unshift_librqbit_id(1), Some(0));
+        assert_eq!(unshift_librqbit_id(2), Some(1));
+        assert_eq!(unshift_librqbit_id(100), Some(99));
+    }
+
+    #[test]
+    fn shift_unshift_roundtrip() {
+        for librqbit_id in [0_usize, 1, 42, 1000, (u32::MAX - 1) as usize] {
+            let spela_id = shift_librqbit_id(librqbit_id).unwrap();
+            assert_ne!(spela_id, 0, "shifted id must never be the Local Bypass sentinel");
+            let recovered = unshift_librqbit_id(spela_id).unwrap();
+            assert_eq!(
+                recovered, librqbit_id,
+                "roundtrip for librqbit_id={}",
+                librqbit_id
+            );
+        }
+    }
+
+    #[test]
+    fn shift_overflow_at_u32_max() {
+        // u32::MAX as usize -> +1 = u32::MAX + 1 which doesn't fit in u32.
+        // Surfaces as an Err so callers can refuse rather than wrap.
+        assert!(shift_librqbit_id(u32::MAX as usize).is_err());
+    }
 
     #[test]
     fn build_stream_url_formats_known_inputs() {
