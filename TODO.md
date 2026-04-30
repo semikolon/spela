@@ -1,36 +1,46 @@
 # Spela TODOs 🎬🍿
 
-### librqbit migration — replace webtorrent-cli (open, Phase 1 ✅) 🦀
+### v3.3.0 — librqbit migration (SHIPPED Apr 29-30, 2026) ✅
 
-**Driver**: Apr 29, 2026 — three Torrentio results reporting 419/79/39 seeds attached to ZERO reachable peers under webtorrent-cli; one fourth (FLUX 720p, 30 reported seeds) attached to 31-57 peers at 10 MB/s on the same Darwin host within minutes. Same-host, same-network, only-the-magnet-changed test isolated the variable to webtorrent's peer-connection behavior. Pattern matches well-documented webtorrent-cli weakness ([webtorrent/webtorrent-cli #175](https://github.com/webtorrent/webtorrent-cli/issues/175), [#241](https://github.com/webtorrent/webtorrent-cli/issues/241)) — Node implementation's peer discovery is meaningfully weaker than libtorrent-class clients across magnets with quirky tracker subsets. Full diagnosis chain captured in commit `a583c05` message; deeper write-up belongs in spela's own `docs/` if/when written.
+Replaced the Node.js `webtorrent-cli` subprocess with embedded `librqbit = "8.1"`. End state: single Rust binary, no Node dep, torrent streams served through spela's existing axum router on `:7890` (the legacy `:8888` separate HTTP server is gone). HLS chain + DNAT hijack unchanged. Empirical proof of the migration's hypothesis — same Darwin host, same network, librqbit attached 12 peers + 208 KB/s on the magnet that webtorrent-cli got 0 peers on the previous night.
 
-**Target architecture**: replace the Node.js `webtorrent-cli` subprocess + separate `:8888` HTTP server with embedded `librqbit = "8.1"` (pure-Rust libtorrent-class client). End state: single Rust binary, no Node dep, torrent streams served through spela's existing axum router on `:7890`. HLS chain + DNAT hijack unchanged.
+- [x] **Phase 1 — Foundation** (Apr 29, `a583c05`): `src/torrent_engine.rs` + `src/torrent_stream.rs` with 25 new tests (`parse_range_header` RFC 7233 coverage, URL builder, state mapping).
+- [x] **Phase 2 — Wire-up** (Apr 29, `435f2ca`): config-flagged backend dispatch, ServerState gains `Option<Arc<TorrentEngine>>`, helpers (`start_torrent_for_play`, `check_torrent_progress`, `stop_torrent`, `is_torrent_alive`), `handle_torrent_stream` axum handler.
+- [x] **rustls fix** (Apr 30, `8d35a78`): live-test caught `CryptoProvider::install_default()` requirement that was silently panicking and poisoning the cast Mutex. Pinned `rustls = "0.23"` direct dep + `aws_lc_rs::default_provider().install_default().ok()` in main.
+- [x] **Phase 3 — Drop fallback** (Apr 30, `e1eeb75`): removed `torrent_backend` config field + webtorrent dispatch helpers + 200+ lines of legacy code from torrent.rs. ServerState.torrent_engine became non-Optional. Version 3.1.0 → 3.3.0.
+- [x] **TorrentId+1 shift fix** (Apr 30, `6c040de`): librqbit allocates `TorrentId = 0` for the first torrent, colliding with spela's `pid == 0 = Local Bypass` sentinel. `shift_librqbit_id` / `unshift_librqbit_id` pure helpers preserve the invariant; 5 regression tests.
 
-#### Phase 1 — Foundation (✅ Apr 29, 2026)
-- [x] Add `librqbit = "8.1"` (rust-tls feature only, default-features off) + `tokio-util` deps to Cargo.toml.
-- [x] `src/torrent_engine.rs` — `TorrentEngine` wrapper around `librqbit::Session` with start/progress/handle/stop API. spela-shaped types (`TorrentStartInfo`, `TorrentProgress`, `TorrentState`) so callers don't depend on librqbit types.
-- [x] `src/torrent_stream.rs` — axum-compatible HTTP Range handler. Pure `parse_range_header()` function with full RFC 7233 coverage (open-ended, bounded, suffix, multi-range, malformed, unsatisfiable, EOF clamps). 19 unit tests including ffmpeg's typical probe + resume-seek patterns.
-- [x] `cargo test` 203/203 passing (25 new + 178 existing).
-- [x] Compile-clean against axum 0.8 + librqbit 8.1.1 + the existing spela tree.
+### Apr 30 security + coverage audit follow-through ✅
 
-#### Phase 2 — Wire-up + live validation (next session, NOT during running cast)
-- [ ] Add `torrent_backend: Option<String>` to `Config` (`~/.config/spela/config.toml`). Default `"webtorrent"`, switch to `"librqbit"` per-deploy.
-- [ ] Add `Option<Arc<TorrentEngine>>` field to `ServerState`. Lazy-init only when backend = "librqbit" (saves DHT bootstrap on legacy deployments).
-- [ ] Register axum route `GET /torrent/{id}/stream/{file_idx}` calling `torrent_stream::serve_torrent_stream`.
-- [ ] Refactor `do_play` (server.rs ~lines 503-528) to switch on `config.torrent_backend`:
-  - `"webtorrent"` → existing `torrent::start_webtorrent` path
-  - `"librqbit"` → `engine.start(magnet, file_index)` + poll `engine.progress(id)` for the 12s self-healing check
-- [ ] Refactor cleanup paths (`do_cleanup`, post-playback reaper, `reconcile_webtorrent_workers_on_startup`) to be backend-aware. The reaper's `webtorrent_pid` semantics carry over for librqbit (use `id` as the lookup key into the session); `engine.stop(id, delete_files)` is the analog of `kill_pid` + the `--keep-seeding` torrent removal.
-- [ ] Live test on Darwin: deploy with `torrent_backend = "librqbit"`, search a known-low-seed-on-webtorrent magnet (the NTb releases that failed Apr 29 are perfect regression cases), verify ≥10 peers attached.
-- [ ] Validate self-healing: simulate dead-seed scenario, verify the 0%-progress fall-through still works against librqbit's progress polling.
-- [ ] Validate Local Bypass: verify librqbit's file layout matches what `disk.rs::top_level_file_is_healthy` + `dir_size` expect (sparse-aware via `metadata.blocks() * 512`). Per the librarian's research it should be identical, but confirm with a real download.
+Two-agent audit (oracle for security/bugs, general-purpose for test gaps) surfaced 5 high + 11 medium + 9 low security findings and ~22 coverage gaps. Triaged + actioned in 13 commits over the same day:
 
-#### Phase 3 — Default flip + cleanup (after Phase 2 validation)
-- [ ] Flip `Config::torrent_backend` default to `"librqbit"`.
-- [ ] Delete the legacy `start_webtorrent` / `check_progress` / webtorrent-specific kill paths from `src/torrent.rs`. Keep the generic `kill_pid` / process-pattern utilities used by ffmpeg cleanup.
-- [ ] Drop `webtorrent` from Darwin's mise tools list. Remove `NODE_OPTIONS=--max-old-space-size=4096` and the webtorrent-cli PATH dependency from spela's systemd unit.
-- [ ] Update [CLAUDE.md](CLAUDE.md) § "Hard-Won Lessons": archive the webtorrent `-s` PR #3011 entry (still valuable history, no longer load-bearing) and add a new entry pinning librqbit's `only_files` semantics.
-- [ ] Bump version to v3.3.0 ("Pure-Rust torrent engine") in Cargo.toml.
+#### Security tier 0 (HIGH)
+- [x] **H1 SSRF magnet validator** (`7445530`): `validate_magnet_uri()` rejects non-magnet URIs at the HTTP boundary. librqbit's `AddTorrent::Url` accepts http(s):// and fetches them — would have turned POST /play into an SSRF pivot against Darwin's internal services. Defense in depth: applied in `do_play`, `handle_queue_add`, AND inside `TorrentEngine::start`. 8 tests.
+- [x] **H2 Host-header allowlist + tightened CORS** (`14671d4`): `require_host_header` middleware + `compute_host_allowlist` (loopback + darwin.home + stream_host + user additions). DNS-rebinding defense. CORS narrowed to LAN origins (no wildcard). 9 tests.
+- [x] **H3 Mutex panic-cascade recovery** (`61d18e2`): `lock_recover<T>` helper using `PoisonError::into_inner`. Sweep replaced 18 `.lock().unwrap()` sites in server.rs. 2 tests including actual mutex-poisoning.
+- [x] **H4 /torrent/* loopback-only** (`edc4e90` + `610f7a8`): `require_loopback_source` middleware via sub-router. URL builder uses `127.0.0.1` so ffmpeg's source IP is loopback (otherwise the LAN-bind IP would 403 itself).
+
+#### Security tier 3 + perf + hygiene
+- [x] **M1, M5, L2, L7, L9** (`1dc79fd`): empty-target filter, NaN/inf seek_to guard, parse_size unknown-unit returns None, poster_url TMDB-CDN allowlist, drop magnet 300-char truncation. 8 tests.
+- [x] **M3, M7, M8, M9** (`ec57280`): config string length caps, imdb_id format validator, Local Bypass + prune_disk symlink defenses. 4 tests.
+- [x] **L1 librqbit timeouts** (`d1d324f`): 15s connect / 60s read-write / 120s keepalive + concurrent_init_limit=4. Defends against rqbit issue #525 long-running embed FD-exhaustion. (Note: librqbit 8.1.1 has no hard peer-count cap; what we tuned is what's available.)
+- [x] **M2, M4, M6, M11, cosmetic** (`3a3e1f9`): prune_to_fit O(N²)→O(N log N), cast_info device cap, seek_restart NaN guard, retry-loop cleanup consolidation, startup log accuracy.
+
+#### Test gap pins + RGR refactors
+- [x] **shift_srt CRLF + parse_mbps_string** (`d5e86e9`): regression pins for the Apr 18 incident + librqbit Display-format fragility. 4 tests.
+- [x] **top_level_file_is_healthy** (`997607a`): Apr 15 FLUX-fix regression pins. 4 tests covering <100MB, dense full, sparse, nonexistent.
+- [x] **find_local_bypass_match RGR** (`552b49e`): extracted ~100 lines of do_play's Local Bypass scan into a pure helper. 8 tests covering the title/year/quality/health decision matrix (Apr 8/15/18/19/25/28/29 incident-cluster).
+- [x] **cast_health_monitor sub-decision RGR** (`05631cc`): partial extraction (the wiser path — full state-machine rewrite was too risky for one session). `evaluate_buffering_state` (Apr 18+29 pin), `is_natural_eof` (Apr 19 Send-Help pin), `should_save_position` (Apr 15 throttle). 11 tests.
+
+**Test count delta this session arc**: 207 → **266** (+59 audit-driven tests on top of v3.3.0's +20 = +79 total today).
+
+### Deferred (audit items NOT actioned, with reasons)
+- **H5** Cast-receiver IP allowlist — LAN-IP-config friction without much marginal value over iptables-INPUT-DROP + Host-header + LAN-trust layers already in place. User explicit decision.
+- **M10** `do_cleanup` race lock — analyzed: librqbit's `session.delete` is idempotent on missing IDs; the race produces a spurious warning log but no actual leak. Adding sync primitives that aren't strictly needed is bad design.
+- **L3-L8** polish items (urlencoded check, magnet logging audit, history date-cap, body-builder unwrap code-smell, CORS preflight, etc.) — low-impact; spot-checked during the H1 work, no concrete leaks.
+- **Bearer-token auth** — would require plumbing through spela CLI + Ruby's `run_spela` tool. Future-session item if/when WAN exposure happens (Tailscale, port-forward).
+- **Full cast_health_monitor `CastMonitorAction` extraction** — 200+ LOC interacting state across 8 mutable variables; high regression risk for a critical path. Sub-decision extraction captured the most-likely-to-drift constants. Future-session candidate.
+- **Test-hygiene `tempfile::TempDir` migration for the existing fixed-label tempdirs** — process-id-namespaced fixed-label dirs are parallel-safe; only loss is RAII cleanup on panic, not a real bug we've hit.
 
 ### Corrupt-source-file detection (open) 🔧
 - [ ] **Auto-detect corrupt source files via ffmpeg.log post-mortem** — Apr 29 incident (Hijack S02E05 MeGusta) silently produced ~5 min of NVENC-duplicated junk past byte 417 MB Matroska corruption. Local Bypass treated the broken file as good on every subsequent play; recast loop wedged 5x at the same `time=2022s` before manual rm. Implementation: after each transcode_hls completion, parse `~/.spela/ffmpeg.log` for (a) `dup=<N>` on final summary line where N>100, (b) any `Could not find ref with POC` lines, (c) any `invalid as first byte of an EBML number` lines. If any match, mark the source file path in `state.json::corrupt_files` and have Local Bypass skip it on subsequent matches. Hard-won lesson context in [CLAUDE.md](CLAUDE.md) § "Corrupt source files defeat auto-recast — wedge isn't on the receiver".
