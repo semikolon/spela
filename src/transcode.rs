@@ -2,6 +2,49 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+/// Apr 30, 2026: scan ffmpeg's stderr log for symptoms of source-file
+/// corruption (Hijack S02E05 MeGusta incident class). Returns Some(reason)
+/// if any of three signals is present, None if the log is clean.
+///
+/// Three signals (per Apr 29 incident in CLAUDE.md § "Corrupt source files
+/// defeat auto-recast — wedge isn't on the receiver"):
+///   1. `invalid as first byte of an EBML number` — Matroska container
+///      corruption; ffmpeg's parser hit a byte outside the EBML alphabet.
+///   2. `Could not find ref with POC` — HEVC reference-frame missing,
+///      decoder can't reconstruct subsequent frames.
+///   3. `dup=N` on a final summary line where N > 100 — NVENC silently
+///      duplicated >100 frames, almost always because of (1) or (2)
+///      upstream corrupting the input pipeline. Threshold tuned at 100
+///      to avoid false positives from normal decode hiccups (a few dropped
+///      frames at scene changes is fine).
+///
+/// Used by `do_cleanup` to mark the source path in `AppState.corrupt_files`,
+/// so subsequent Local Bypass scans skip the broken file instead of looping
+/// the same recast→broken-frames→recast cycle the Apr 29 incident exhibited.
+pub fn inspect_ffmpeg_log_for_corruption(log: &str) -> Option<&'static str> {
+    if log.contains("invalid as first byte of an EBML number") {
+        return Some("Matroska container corruption (EBML parse error)");
+    }
+    if log.contains("Could not find ref with POC") {
+        return Some("HEVC reference frame missing (decoder couldn't reconstruct)");
+    }
+    // dup=N on a summary line. Walk recent lines (the summary's near the end)
+    // and find the first dup= occurrence. Threshold: N > 100.
+    for line in log.lines().rev().take(50) {
+        if let Some(idx) = line.find("dup=") {
+            let after = &line[idx + 4..];
+            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = num_str.parse::<u32>() {
+                if n > 100 {
+                    return Some("excessive frame duplication (NVENC fill from missing refs)");
+                }
+            }
+            return None; // first dup= we hit is the load-bearing one
+        }
+    }
+    None
+}
+
 /// Apr 29, 2026: rotate `ffmpeg.log` ring-buffer style before truncating.
 ///
 /// Both `transcode()` and `transcode_hls()` open `~/.spela/ffmpeg.log` with
@@ -495,6 +538,24 @@ pub async fn transcode(
             "-c:v".into(), "h264_nvenc".into(),
             "-preset".into(), "p4".into(),
             "-cq".into(), "23".into(),
+            // Apr 30, 2026 — intro-concat fix (Apr 18 hypothesis, Apr 19 proposal).
+            // The intro→main seam is a hard scene change; NVENC's default
+            // scene-detection inserts an unscheduled IDR there, desyncing GOP
+            // cadence from the HLS segmenter's 6s clock. By segment 5 the
+            // accumulated drift causes either (a) a non-keyframe segment start,
+            // or (b) EXTINF-vs-actual-duration mismatch beyond Shaka's tolerance
+            // → CrKey 1.56 buffers indefinitely. Belt-and-suspenders fix:
+            //   -g 180 -keyint_min 180 — fixed 6s GOP at the 30fps the filter pipes
+            //   -sc_threshold 0          — disable scene-change IDR injection (x264-flavored,
+            //                              NVENC may ignore but harmless)
+            //   -force_key_frames expr:gte(t,n_forced*6) — guarantees an IDR at every
+            //                              6s boundary regardless of encoder cadence;
+            //                              this alone would suffice but the others
+            //                              constrain encoder choice for predictability.
+            "-g".into(), "180".into(),
+            "-keyint_min".into(), "180".into(),
+            "-sc_threshold".into(), "0".into(),
+            "-force_key_frames".into(), "expr:gte(t,n_forced*6)".into(),
         ]);
     } else {
         // No intro: explicitly map video + preferred audio track.
@@ -713,6 +774,12 @@ pub async fn transcode_hls(
             "-c:v".into(), "h264_nvenc".into(),
             "-preset".into(), "p4".into(),
             "-cq".into(), "23".into(),
+            // Apr 30, 2026 intro-concat fix — see transcode() above for the
+            // full rationale. Same four args, same hypothesis.
+            "-g".into(), "180".into(),
+            "-keyint_min".into(), "180".into(),
+            "-sc_threshold".into(), "0".into(),
+            "-force_key_frames".into(), "expr:gte(t,n_forced*6)".into(),
         ]);
     } else {
         // No intro: explicitly map video + preferred audio track.
@@ -830,6 +897,62 @@ pub async fn transcode_hls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Apr 30, 2026: corrupt-source-file detection (Hijack S02E05 incident) ---
+
+    #[test]
+    fn inspect_ffmpeg_log_detects_ebml_corruption() {
+        let log = "frame= 100 fps=23 size= 500kB time=00:00:04 bitrate= 983kbits/s speed=0.95x\n\
+            [matroska,webm @ 0x55a8b8b3e780] 0x00 at pos 417448081 (0x18e1c091) invalid as first byte of an EBML number\n\
+            frame= 500 fps=24 size= 2000kB time=00:00:20 bitrate= 786kbits/s speed=1.0x\n";
+        assert_eq!(
+            inspect_ffmpeg_log_for_corruption(log),
+            Some("Matroska container corruption (EBML parse error)")
+        );
+    }
+
+    #[test]
+    fn inspect_ffmpeg_log_detects_missing_hevc_ref() {
+        let log = "[hevc @ 0x7f8c40000000] Could not find ref with POC 54458, 54456, 54452\n";
+        assert_eq!(
+            inspect_ffmpeg_log_for_corruption(log),
+            Some("HEVC reference frame missing (decoder couldn't reconstruct)")
+        );
+    }
+
+    #[test]
+    fn inspect_ffmpeg_log_detects_excessive_duplication() {
+        let log = "frame= 9000 fps=24 q=23.0 size= 450000kB time=00:06:15.00 \
+            bitrate=9805.4kbits/s dup=1500 drop=0 speed=1.5x\n";
+        assert_eq!(
+            inspect_ffmpeg_log_for_corruption(log),
+            Some("excessive frame duplication (NVENC fill from missing refs)")
+        );
+    }
+
+    #[test]
+    fn inspect_ffmpeg_log_clean_returns_none() {
+        let log = "frame= 9000 fps=24 q=23.0 size= 450000kB time=00:06:15 \
+            bitrate=9805kbits/s dup=5 drop=0 speed=1.5x\n";
+        assert_eq!(inspect_ffmpeg_log_for_corruption(log), None);
+    }
+
+    #[test]
+    fn inspect_ffmpeg_log_dup_threshold_is_exclusive_at_100() {
+        // Threshold is N > 100. dup=100 should NOT trigger; dup=101 should.
+        // Defensive against false positives from normal short scenes.
+        let at = "frame= 1000 fps=24 dup=100 drop=0 speed=1x\n";
+        let just_above = "frame= 1000 fps=24 dup=101 drop=0 speed=1x\n";
+        assert_eq!(inspect_ffmpeg_log_for_corruption(at), None);
+        assert!(inspect_ffmpeg_log_for_corruption(just_above).is_some());
+    }
+
+    #[test]
+    fn inspect_ffmpeg_log_empty_input_returns_none() {
+        // Defensive: empty log (e.g. transcode never started) shouldn't
+        // panic or false-positive.
+        assert_eq!(inspect_ffmpeg_log_for_corruption(""), None);
+    }
 
     // Apr 29, 2026: rotate_ffmpeg_log preserves debug evidence across stream
     // restarts. Apr 28 incident: lost the H.264 5-min-freeze ffmpeg.log when

@@ -681,9 +681,14 @@ async fn do_play(
             .as_deref()
             .and_then(parse_size_to_bytes)
             .unwrap_or(0);
-        if let Some(local_path) =
-            find_local_bypass_match(&media_dir, &title, req.quality.as_deref(), expected_bytes)
-        {
+        let corrupt_files = AppState::load(&state.state_dir).corrupt_files;
+        if let Some(local_path) = find_local_bypass_match(
+            &media_dir,
+            &title,
+            req.quality.as_deref(),
+            expected_bytes,
+            &corrupt_files,
+        ) {
             tracing::info!(
                 "Local Bypass: matched on disk: {:?} (expected {}B)",
                 local_path,
@@ -1258,6 +1263,33 @@ fn do_cleanup(state: &SharedState) {
     let _ = std::process::Command::new("pkill")
         .args(["-f", "python3 -m http.server 8889"])
         .output();
+
+    // --- CORRUPT-SOURCE DETECTION ---
+    // Apr 30, 2026: scan ffmpeg.log for corruption symptoms (Hijack S02E05
+    // MeGusta-class incident). If a Local-Bypass play just finished and the
+    // log shows EBML / HEVC-ref / excessive-dup signals, mark the source
+    // path so future Local Bypass scans skip it.
+    if let Some(home) = dirs::home_dir() {
+        let log_path = home.join(".spela").join("ffmpeg.log");
+        if let Ok(log) = std::fs::read_to_string(&log_path) {
+            if let Some(reason) = transcode::inspect_ffmpeg_log_for_corruption(&log) {
+                let mut app_state = AppState::load(&state.state_dir);
+                if let Some(current) = &app_state.current {
+                    if let Some(source_path) = current.url.strip_prefix("file://") {
+                        let source_path = source_path.to_string();
+                        if app_state.corrupt_files.insert(source_path.clone()) {
+                            tracing::warn!(
+                                "Marking source as corrupt — {}: {}",
+                                reason,
+                                source_path
+                            );
+                            let _ = app_state.save(&state.state_dir);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // --- AUTO-VERIFICATION MARKER ---
     // If the movie is physically full on disk, mark it as .spela_done
@@ -2576,6 +2608,7 @@ pub(crate) fn find_local_bypass_match(
     title: &str,
     quality: Option<&str>,
     expected_bytes: u64,
+    corrupt_files: &std::collections::HashSet<String>,
 ) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(media_dir).ok()?;
     for entry in entries.flatten() {
@@ -2629,6 +2662,15 @@ pub(crate) fn find_local_bypass_match(
                     if (ext == "mp4" || ext == "mkv") && !fname.starts_with("transcoded") {
                         if local_bypass_file_is_healthy(&sub_path, has_done_marker, expected_bytes)
                         {
+                            // Apr 30, 2026: skip paths flagged corrupt by a
+                            // prior transcode's ffmpeg.log inspection.
+                            if corrupt_files.contains(&sub_path.to_string_lossy().to_string()) {
+                                tracing::warn!(
+                                    "Local Bypass: skipping known-corrupt source {:?}",
+                                    sub_path
+                                );
+                                continue;
+                            }
                             return Some(sub_path);
                         }
                     }
@@ -2641,6 +2683,13 @@ pub(crate) fn find_local_bypass_match(
                 && !fname.starts_with("transcoded")
                 && top_level_file_is_healthy(&path)
             {
+                if corrupt_files.contains(&path.to_string_lossy().to_string()) {
+                    tracing::warn!(
+                        "Local Bypass: skipping known-corrupt top-level source {:?}",
+                        path
+                    );
+                    continue;
+                }
                 return Some(path);
             }
         }
@@ -4062,7 +4111,7 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap();
         let mkv = make_dense_mkv(&inner, "The.Boys.S05E03.1080p.FLUX.mkv");
         std::fs::write(inner.join(".spela_done"), b"").unwrap();
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("1080p"), 0);
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("1080p"), 0, &std::collections::HashSet::new());
         assert_eq!(result.as_deref(), Some(mkv.as_path()));
     }
 
@@ -4071,7 +4120,7 @@ mod tests {
         // The Apr 15 FLUX-file regression case.
         let root = tempfile::tempdir().unwrap();
         let mkv = make_dense_mkv(root.path(), "The.Boys.S05E03.1080p.FLUX.mkv");
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("1080p"), 0);
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("1080p"), 0, &std::collections::HashSet::new());
         assert_eq!(result.as_deref(), Some(mkv.as_path()));
     }
 
@@ -4079,7 +4128,7 @@ mod tests {
     fn find_local_bypass_returns_none_on_no_match() {
         let root = tempfile::tempdir().unwrap();
         make_dense_mkv(root.path(), "Different.Show.S01E01.mkv");
-        assert!(find_local_bypass_match(root.path(), "The Boys S05E03", None, 0).is_none());
+        assert!(find_local_bypass_match(root.path(), "The Boys S05E03", None, 0, &std::collections::HashSet::new()).is_none());
     }
 
     #[test]
@@ -4089,7 +4138,7 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap();
         make_dense_mkv(&inner, "The.Boys.S05E03.1080p.mkv");
         std::fs::write(inner.join(".spela_done"), b"").unwrap();
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("2160p"), 0);
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("2160p"), 0, &std::collections::HashSet::new());
         assert!(result.is_none(), "4K request must not match 1080p disk content");
     }
 
@@ -4101,7 +4150,7 @@ mod tests {
         // Only file inside is the transcode artifact — must NOT be picked.
         std::fs::write(inner.join("transcoded_aac.mp4"), vec![0u8; 110 * 1024 * 1024]).unwrap();
         std::fs::write(inner.join(".spela_done"), b"").unwrap();
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0);
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0, &std::collections::HashSet::new());
         assert!(result.is_none());
     }
 
@@ -4109,7 +4158,7 @@ mod tests {
     fn find_local_bypass_rejects_sparse_top_level_file() {
         let root = tempfile::tempdir().unwrap();
         make_sparse_mkv(root.path(), "The.Boys.S05E03.mkv");
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0);
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0, &std::collections::HashSet::new());
         assert!(result.is_none(), "sparse top-level must be rejected");
     }
 
@@ -4122,8 +4171,42 @@ mod tests {
         std::fs::create_dir_all(&inner_2025).unwrap();
         make_dense_mkv(&inner_2025, "a.mkv");
         std::fs::write(inner_2025.join(".spela_done"), b"").unwrap();
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03 2026", None, 0);
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03 2026", None, 0, &std::collections::HashSet::new());
         assert!(result.is_none(), "2025 entry must not match 2026 request");
+    }
+
+    #[test]
+    fn find_local_bypass_skips_known_corrupt_top_level_file() {
+        // Apr 30, 2026: corrupt-source-detection integration test.
+        // A path flagged in `corrupt_files` (because a previous transcode's
+        // ffmpeg.log surfaced corruption signals) MUST be skipped on
+        // subsequent Local Bypass scans, even if the file otherwise
+        // passes health checks.
+        let root = tempfile::tempdir().unwrap();
+        let mkv = make_dense_mkv(root.path(), "The.Boys.S05E03.FLUX.mkv");
+        let mut corrupt = std::collections::HashSet::new();
+        corrupt.insert(mkv.to_string_lossy().to_string());
+        let result =
+            find_local_bypass_match(root.path(), "The Boys S05E03", Some("1080p"), 0, &corrupt);
+        assert!(
+            result.is_none(),
+            "marked-corrupt top-level file must be skipped"
+        );
+    }
+
+    #[test]
+    fn find_local_bypass_skips_known_corrupt_directory_file() {
+        // Same defense for directory-internal media files.
+        let root = tempfile::tempdir().unwrap();
+        let inner = root.path().join("The.Boys.S05E03.1080p.FLUX");
+        std::fs::create_dir_all(&inner).unwrap();
+        let mkv = make_dense_mkv(&inner, "The.Boys.S05E03.1080p.FLUX.mkv");
+        std::fs::write(inner.join(".spela_done"), b"").unwrap();
+        let mut corrupt = std::collections::HashSet::new();
+        corrupt.insert(mkv.to_string_lossy().to_string());
+        let result =
+            find_local_bypass_match(root.path(), "The Boys S05E03", Some("1080p"), 0, &corrupt);
+        assert!(result.is_none(), "marked-corrupt directory file must be skipped");
     }
 
     #[test]
@@ -4135,7 +4218,7 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap();
         let mkv = make_dense_mkv(&inner, "a.mkv");
         std::fs::write(inner.join(".spela_done"), b"").unwrap();
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0);
+        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0, &std::collections::HashSet::new());
         assert_eq!(result.as_deref(), Some(mkv.as_path()));
     }
 

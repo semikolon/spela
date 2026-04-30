@@ -38,6 +38,13 @@ pub struct AppState {
     /// Resume positions by IMDB ID (seconds). Used by Custom Cast Receiver.
     #[serde(default)]
     pub resume_positions: HashMap<String, f64>,
+    /// Apr 30, 2026: source-file paths flagged as corrupt by
+    /// `transcode::inspect_ffmpeg_log_for_corruption` (Hijack S02E05
+    /// MeGusta-class incident). `do_cleanup` populates; Local Bypass
+    /// skips matches that are in this set. Set, not Vec, so dedup is
+    /// free and lookup is O(1).
+    #[serde(default)]
+    pub corrupt_files: std::collections::HashSet<String>,
 }
 
 /// Apr 29, 2026: a queued play request for auto-firing when the current
@@ -166,6 +173,7 @@ impl Default for AppState {
             preferences: Preferences::default(),
             resume_positions: HashMap::new(),
             queue: Vec::new(),
+            corrupt_files: std::collections::HashSet::new(),
         }
     }
 }
