@@ -789,7 +789,16 @@ async fn do_play(
     app_state.current = None;
     let _ = app_state.save(&state.state_dir);
 
-    let target = req.target.as_deref().unwrap_or(&app_state.preferences.default_target).to_string();
+    // Apr 30, 2026 (M1): treat empty-string target the same as None.
+    // Without this filter, a caller passing `{"target": ""}` would
+    // bypass the cast block AND skip cast_health_monitor spawn AND
+    // save `current.target = ":<cast_name>"` — silent broken-state.
+    let target = req
+        .target
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&app_state.preferences.default_target)
+        .to_string();
     let cast_name = req.cast_name.clone()
         .or_else(|| app_state.preferences.chromecast_name.clone())
         .unwrap_or_else(|| state.config.default_device.clone());
@@ -866,8 +875,13 @@ async fn do_play(
     // restart an episode would silently resume at a saved 2236s position
     // because `save_position_smart`'s HWM logic preserved the old value.
     // The ONLY clean restart was `spela clear <imdb>` then `spela play 3`.
-    let user_explicitly_set_seek = req.seek_to.is_some();
-    let mut seek_to = req.seek_to;
+    // Apr 30, 2026 (M5): reject non-finite seek_to (NaN, ±infinity).
+    // These flow through to ffmpeg's -ss arg AND to ss_offset which
+    // cast_health_monitor uses for `absolute = current_time + ss_offset`
+    // arithmetic. NaN comparisons are always false, silently corrupting
+    // every HWM save thereafter. Filter at the do_play boundary.
+    let user_explicitly_set_seek = req.seek_to.is_some_and(|t| t.is_finite());
+    let mut seek_to = req.seek_to.filter(|t| t.is_finite());
     let mut auto_resumed_from: Option<f64> = None;
     if user_explicitly_set_seek {
         let mut app_state = AppState::load(&state.state_dir);
@@ -1120,8 +1134,18 @@ async fn do_play(
         }
     }
 
+    // Apr 30, 2026 (L9): drop the historic 300-char magnet truncation —
+    // magnets are typically 400-600 chars (multiple trackers), and the
+    // truncation silently produced an unparseable saved-magnet on
+    // restart. Memory cost of the full magnet in CurrentStream is
+    // negligible.
+    //
+    // Apr 30, 2026 (L7): scrub poster_url to a known-safe TMDB CDN
+    // origin before saving. The cast metadata is fetched by the
+    // Chromecast directly, so an attacker-controlled URL becomes a
+    // probe vector via the TV's request log.
     app_state.current = Some(CurrentStream {
-        magnet: magnet.chars().take(300).collect(),
+        magnet: magnet.clone(),
         title: title.clone(),
         show: req.show.clone(),
         season: req.season,
@@ -1136,7 +1160,11 @@ async fn do_play(
         duration,
         quality: req.quality.clone(),
         size: req.size.clone(),
-        poster_url: req.poster_url.clone(),
+        poster_url: req
+            .poster_url
+            .as_deref()
+            .filter(|u| is_valid_poster_url(u))
+            .map(String::from),
         // Remember the -ss offset so cast_health_monitor can translate the
         // Chromecast's 0-based current_time into absolute source-timeline
         // position when it periodically calls save_position_smart.
@@ -2423,16 +2451,36 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
 fn parse_size_to_bytes(size_str: &str) -> Option<u64> {
     let lower = size_str.to_lowercase();
     let parts: Vec<&str> = lower.split_whitespace().collect();
-    if parts.len() < 2 { return None; }
+    if parts.len() < 2 {
+        return None;
+    }
     let val: f64 = parts[0].parse().ok()?;
     let unit = parts[1];
-    let factor = match unit {
-        "gb" | "gib" => 1024 * 1024 * 1024,
-        "mb" | "mib" => 1024 * 1024,
+    // Apr 30, 2026 (L2): unknown units (e.g. "PB", garbage) used to fall
+    // through to a 1-byte multiplier, so "1.5 PB" parsed as 1.5 bytes —
+    // silently broken Local Bypass size matching for any unit we don't
+    // recognize. Return None on unknown unit so the caller treats the
+    // input as invalid rather than wildly-wrong.
+    let factor: u64 = match unit {
+        "tb" | "tib" => 1024_u64.pow(4),
+        "gb" | "gib" => 1024_u64.pow(3),
+        "mb" | "mib" => 1024_u64.pow(2),
         "kb" | "kib" => 1024,
-        _ => 1,
+        "b" | "bytes" => 1,
+        _ => return None,
     };
     Some((val * factor as f64) as u64)
+}
+
+/// Apr 30, 2026 (L7): validate poster_url before sending to Chromecast.
+/// `req.poster_url` flows into cast metadata which the Chromecast then
+/// fetches directly. An attacker controlling the field could point it
+/// at any URL — including internal-network endpoints — to learn IP
+/// reachability via the TV's request behavior. Constrain to TMDB image
+/// CDN (the legitimate source — search.rs always uses this prefix).
+pub(crate) fn is_valid_poster_url(url: &str) -> bool {
+    url.starts_with("https://image.tmdb.org/")
+        || url.starts_with("https://www.themoviedb.org/")
 }
 
 fn local_bypass_file_is_healthy(path: &std::path::Path, has_done_marker: bool, expected_bytes: u64) -> bool {
@@ -3638,6 +3686,74 @@ fn cast_result_to_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Input validation (Apr 30, 2026 — security audit cluster) ---
+
+    #[test]
+    fn parse_size_to_bytes_handles_known_units() {
+        assert_eq!(parse_size_to_bytes("4.6 GB"), Some(4_939_212_390)); // 4.6 * 1024^3
+        assert_eq!(parse_size_to_bytes("100 MB"), Some(104_857_600));
+        assert_eq!(parse_size_to_bytes("500 KB"), Some(512_000));
+    }
+
+    #[test]
+    fn parse_size_to_bytes_handles_tb_suffix_post_l2_fix() {
+        // L2 fix: unknown units returned 1-byte multiplier; TB was unsupported.
+        // Now explicitly handled. 1.5 * 1024^4 (rounded down by f64->u64).
+        let v = parse_size_to_bytes("1.5 TB").unwrap();
+        // Allow ±1 LSB tolerance for f64 rounding.
+        let expected = 1.5 * 1024_f64.powi(4);
+        assert!((v as f64 - expected).abs() < 2.0, "got {}, expected ~{}", v, expected);
+    }
+
+    #[test]
+    fn parse_size_to_bytes_returns_none_on_unknown_unit_post_l2_fix() {
+        // L2 fix pin: pre-fix this returned `Some((1.5 * 1.0) as u64) = Some(1)`,
+        // silently breaking Local Bypass size matching. Post-fix returns None.
+        assert_eq!(parse_size_to_bytes("1.5 PB"), None);
+        assert_eq!(parse_size_to_bytes("4.6 garbage"), None);
+        assert_eq!(parse_size_to_bytes("3.2 ZB"), None);
+    }
+
+    #[test]
+    fn parse_size_to_bytes_returns_none_on_malformed() {
+        assert_eq!(parse_size_to_bytes(""), None);
+        assert_eq!(parse_size_to_bytes("abc"), None);
+        assert_eq!(parse_size_to_bytes("4.6"), None); // missing unit
+        assert_eq!(parse_size_to_bytes("GB 4.6"), None); // wrong order
+    }
+
+    #[test]
+    fn is_valid_poster_url_accepts_tmdb_cdn() {
+        assert!(is_valid_poster_url(
+            "https://image.tmdb.org/t/p/w500/in1R2dDc421JxsoRWaIIAqVI2KE.jpg"
+        ));
+    }
+
+    #[test]
+    fn is_valid_poster_url_rejects_internal_targets() {
+        // L7: defends against attacker-controlled poster_url that the
+        // Chromecast would fetch directly, leaking IP reachability info.
+        assert!(!is_valid_poster_url("http://192.168.4.1:6379/"));
+        assert!(!is_valid_poster_url("http://localhost:80/"));
+        assert!(!is_valid_poster_url("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn is_valid_poster_url_rejects_http_insecure() {
+        // Even on TMDB hostname — must be https.
+        assert!(!is_valid_poster_url("http://image.tmdb.org/foo.jpg"));
+    }
+
+    #[test]
+    fn is_valid_poster_url_rejects_subdomain_lookalike() {
+        // Defense: `image.tmdb.org.evil.com` would match a naive substring
+        // check. Our check uses `starts_with` on the full URL prefix
+        // including `://` and trailing slash, which forbids this.
+        assert!(!is_valid_poster_url(
+            "https://image.tmdb.org.evil.com/foo.jpg"
+        ));
+    }
 
     // --- Mutex poison recovery (Apr 30, 2026 — H3 security audit) ---
 
