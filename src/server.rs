@@ -20,7 +20,7 @@ use crate::search::SearchEngine;
 use crate::state::{AppState, CurrentStream, HWM_CLEAR_FRACTION};
 use crate::subtitles;
 use crate::torrent;
-use crate::torrent_engine::TorrentEngine;
+use crate::torrent_engine::{self, TorrentEngine};
 use crate::torrent_stream;
 use crate::transcode;
 
@@ -481,6 +481,14 @@ async fn do_play(
         Some(m) if !m.is_empty() => m.clone(),
         _ => return Json(json!({"error": "Missing magnet. Use 'spela play <N>' with a result number, or pass a magnet link."})),
     };
+    // Apr 30, 2026 SSRF defense: librqbit's add_torrent fetches
+    // http(s):// URLs as .torrent files. With the unauthenticated HTTP
+    // surface, that's an SSRF pivot — see torrent_engine::validate_magnet_uri.
+    // Reject at the HTTP boundary so the rejection error reaches the caller
+    // cleanly (not buried in a librqbit error).
+    if let Err(e) = torrent_engine::validate_magnet_uri(&magnet) {
+        return Json(json!({"error": format!("Invalid magnet: {}", e)}));
+    }
 
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
 
@@ -2432,6 +2440,10 @@ async fn handle_queue_add(
             })),
         }
     } else if let Some(magnet) = req.magnet {
+        // Apr 30, 2026 SSRF defense — see torrent_engine::validate_magnet_uri.
+        if let Err(e) = torrent_engine::validate_magnet_uri(&magnet) {
+            return Json(json!({"error": format!("Invalid magnet: {}", e)}));
+        }
         // Direct payload — caller fully populated.
         crate::state::QueuedItem {
             magnet,

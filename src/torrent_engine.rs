@@ -130,6 +130,8 @@ impl TorrentEngine {
         magnet: &str,
         file_index: Option<u32>,
     ) -> Result<TorrentStartInfo> {
+        // Apr 30, 2026 SSRF defense — see `validate_magnet_uri` doc.
+        validate_magnet_uri(magnet).map_err(|e| anyhow!("{}", e))?;
         let opts = AddTorrentOptions {
             // BEP-53: explicit file selection. Single-element vec for
             // single-file selection (matches spela's existing `--file-index N`
@@ -216,6 +218,28 @@ impl TorrentEngine {
     }
 }
 
+/// Reject anything that isn't a magnet URI. Apr 30, 2026 — security audit
+/// caught that `librqbit::AddTorrent::Url` accepts `http://` / `https://`
+/// URLs and fetches them as `.torrent` files via reqwest. With spela's HTTP
+/// API unauthenticated and `default_host = "0.0.0.0"`, that turns `/play`
+/// into an SSRF pivot against Darwin's internal services (Postgres :5433,
+/// Redis :6379, FalkorDB :6380, Temporal :7233, llama.cpp :8080,
+/// restic-rest :8001, AdGuard :3000, kamal-proxy admin). Same vector via
+/// Ruby's `run_spela` voice-tool if Gemini gets prompt-injected. Defense in
+/// depth: `do_play` and `handle_queue_add` validate at the HTTP boundary,
+/// the engine validates again before crossing into librqbit.
+pub(crate) fn validate_magnet_uri(s: &str) -> Result<&str, &'static str> {
+    // Canonical magnet URIs are `magnet:?xt=urn:btih:HASH[&...]`. We accept
+    // `magnet:` followed by anything — the strict parsing is librqbit's job.
+    // What we MUST forbid is any other scheme (http/https/ftp/file/etc.)
+    // because librqbit will treat those as torrent-file URLs and fetch them.
+    if s.starts_with("magnet:") {
+        Ok(s)
+    } else {
+        Err("magnet URI must start with 'magnet:'")
+    }
+}
+
 /// Shift librqbit's `TorrentId` (which starts at 0 and increments) by +1 to
 /// produce spela's `pid`. Apr 30, 2026 (v3.3.0+1 fix): librqbit allocates the
 /// first torrent of a session as `TorrentId = 0`, which collides with spela's
@@ -297,6 +321,56 @@ fn stats_to_progress(stats: &TorrentStats) -> TorrentProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_magnet_uri_accepts_canonical_form() {
+        let m = "magnet:?xt=urn:btih:dc4b8c7c6ef6e5314c294280b7b7d106d452a1e8&dn=foo";
+        assert_eq!(validate_magnet_uri(m), Ok(m));
+    }
+
+    #[test]
+    fn validate_magnet_uri_accepts_no_query_slug() {
+        // Some hashes-only test inputs use `magnet:HASH` form.
+        let m = "magnet:dc4b8c7c6ef6e5314c294280b7b7d106d452a1e8";
+        assert_eq!(validate_magnet_uri(m), Ok(m));
+    }
+
+    #[test]
+    fn validate_magnet_uri_rejects_http_ssrf_attempt() {
+        // The canonical SSRF pivot — librqbit fetches http URLs as torrent files.
+        assert!(validate_magnet_uri("http://192.168.4.1:6379/").is_err());
+        assert!(validate_magnet_uri("http://localhost:80/admin").is_err());
+    }
+
+    #[test]
+    fn validate_magnet_uri_rejects_https_ssrf_attempt() {
+        assert!(validate_magnet_uri("https://internal-service:8080/").is_err());
+    }
+
+    #[test]
+    fn validate_magnet_uri_rejects_file_url() {
+        // Defense in depth: even though librqbit may not honor file://, a future
+        // version might. Reject at our boundary.
+        assert!(validate_magnet_uri("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_magnet_uri_rejects_empty_string() {
+        assert!(validate_magnet_uri("").is_err());
+    }
+
+    #[test]
+    fn validate_magnet_uri_rejects_torrent_file_path() {
+        assert!(validate_magnet_uri("/path/to/foo.torrent").is_err());
+        assert!(validate_magnet_uri("foo.torrent").is_err());
+    }
+
+    #[test]
+    fn validate_magnet_uri_rejects_close_misspell() {
+        // Defense against `magnet :` (with space) or `magnet` (no colon).
+        assert!(validate_magnet_uri("magnet ?xt=urn:btih:abc").is_err());
+        assert!(validate_magnet_uri("magnetxt=urn:btih:abc").is_err());
+    }
 
     #[test]
     fn shift_librqbit_id_avoids_local_bypass_sentinel() {
