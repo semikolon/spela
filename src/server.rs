@@ -1549,6 +1549,74 @@ pub fn should_attempt_recast(
         }
 }
 
+/// Apr 30, 2026: BUFFERING-state decision (Apr 29 incident-pin).
+///
+/// "BUFFERING is transient" (Apr 18) but bound the transient claim
+/// (Apr 29 PM): permanent BUFFERING past `max_buffering_secs` past the
+/// startup window is a stall, escalate to recast/cleanup. During the
+/// startup window, just reset the timer (cold-start patience —
+/// recovering from cold start by killing the stream defeats the point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BufferingDecision {
+    /// Still under threshold — keep waiting.
+    Transient,
+    /// Crossed threshold during startup window — reset timer, no escalate.
+    InStartupWindow,
+    /// Crossed threshold past startup — escalate to cleanup/recast path.
+    EscalateToCleanup,
+}
+
+pub(crate) fn evaluate_buffering_state(
+    buffering_for_secs: u64,
+    stream_age_secs: u64,
+    max_buffering_secs: u64,
+    min_stream_age_for_recast: u64,
+) -> BufferingDecision {
+    if buffering_for_secs >= max_buffering_secs {
+        if stream_age_secs >= min_stream_age_for_recast {
+            BufferingDecision::EscalateToCleanup
+        } else {
+            BufferingDecision::InStartupWindow
+        }
+    } else {
+        BufferingDecision::Transient
+    }
+}
+
+/// Apr 30, 2026: detect natural end-of-stream from playback position.
+/// Used at IDLE-driven cleanup time to decide whether to clear the
+/// saved HWM (next play of this title starts fresh, not at credits).
+/// Returns false defensively if duration is unknown — bound for HLS
+/// live (no ENDLIST) where we can't tell where the end is.
+///
+/// Apr 19 incident-pin: pre-fix the threshold was 0.92 which killed
+/// Send Help (113 min, 1:43:54) with 8:42 of climax left. Current
+/// HWM_CLEAR_FRACTION = 0.96 covers credits onset on modern features.
+pub(crate) fn is_natural_eof(
+    duration: Option<f64>,
+    last_known_absolute: Option<f64>,
+    hwm_clear_fraction: f64,
+) -> bool {
+    match (duration, last_known_absolute) {
+        (Some(dur), Some(abs_pos)) if dur > 0.0 => abs_pos >= dur * hwm_clear_fraction,
+        _ => false,
+    }
+}
+
+/// Apr 30, 2026: position-save throttle. cast_health_monitor polls
+/// every POLL_INTERVAL_SECS but persists state.json only every
+/// `save_interval_secs`, gated on the absolute position being past
+/// `minimum_position_secs` (matches do_play's auto-resume threshold —
+/// no point saving a position the next play would ignore).
+pub(crate) fn should_save_position(
+    absolute: f64,
+    last_saved: f64,
+    save_interval_secs: f64,
+    minimum_position_secs: f64,
+) -> bool {
+    absolute > minimum_position_secs && (absolute - last_saved).abs() >= save_interval_secs
+}
+
 /// Try to re-LOAD the current stream to the Chromecast and seek to the saved HWM.
 ///
 /// Apr 25, 2026. This is the muscle behind `should_attempt_recast`. Sequence:
@@ -1828,13 +1896,11 @@ async fn cast_health_monitor(
                     // buffering anymore, it's dead.
                     buffering_started_at = None;
                 } else if is_buffering {
-                    // Apr 18: BUFFERING is a TRANSIENT state — receiver
-                    // is alive and waiting for HLS segments. Do NOT
-                    // increment failure counter on a single poll.
-                    // Apr 29, 2026: but bound the "transient" claim. Track
-                    // when BUFFERING started; when it persists past
-                    // MAX_BUFFERING_DURATION_SECS, escalate to the
-                    // recast/cleanup path (it stalled, not "transient").
+                    // Apr 30, 2026 (RGR): BUFFERING decision via the pure
+                    // helper `evaluate_buffering_state`. The 3-way decision
+                    // (Transient / InStartupWindow / EscalateToCleanup) is
+                    // unit-tested at the boundary values; this match is just
+                    // dispatch + logging.
                     let now = std::time::Instant::now();
                     let started = *buffering_started_at.get_or_insert(now);
                     let buffering_for_secs = now.duration_since(started).as_secs();
@@ -1842,42 +1908,39 @@ async fn cast_health_monitor(
                         .signed_duration_since(started_at)
                         .num_seconds()
                         .max(0) as u64;
-                    if buffering_for_secs >= MAX_BUFFERING_DURATION_SECS
-                        && stream_age_secs >= MIN_STREAM_AGE_FOR_RECAST_SECS
-                    {
-                        tracing::warn!(
-                            "cast_health_monitor: '{}' STALLED — BUFFERING for {}s (≥ {}s threshold, stream_age={}s); escalating to recast/cleanup path",
-                            title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS, stream_age_secs
-                        );
-                        // Force the cleanup gate (consecutive_failures >=
-                        // IDLE_FAILURE_THRESHOLD) to trigger recast. Set the
-                        // exact threshold so the PRE-CLEANUP log shows a
-                        // legible "3" rather than an ever-growing count.
-                        consecutive_failures = IDLE_FAILURE_THRESHOLD;
-                        // Reset so a successful recast → BUFFERING again
-                        // gets its own fresh threshold timer.
-                        buffering_started_at = None;
-                    } else if buffering_for_secs >= MAX_BUFFERING_DURATION_SECS {
-                        // Apr 29, 2026 PM: BUFFERING crossed the threshold
-                        // BUT we're still in startup window (stream_age <
-                        // MIN_STREAM_AGE_FOR_RECAST_SECS). Cold-start cases
-                        // legitimately buffer for 20-30+s while the receiver
-                        // pre-fills. Don't escalate — recast wouldn't fire
-                        // (rejected by startup gate) and we'd just kill the
-                        // stream prematurely. Reset the timer and keep
-                        // waiting; mid-stream stalls catch on the next
-                        // accumulation.
-                        tracing::info!(
-                            "cast_health_monitor: '{}' BUFFERING crossed threshold ({}s ≥ {}s) but stream still in startup window ({}s < {}s) — not escalating",
-                            title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS,
-                            stream_age_secs, MIN_STREAM_AGE_FOR_RECAST_SECS
-                        );
-                        buffering_started_at = None;
-                    } else {
-                        tracing::info!(
-                            "cast_health_monitor: '{}' BUFFERING (transient — {}s elapsed, threshold {}s)",
-                            title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS
-                        );
+                    match evaluate_buffering_state(
+                        buffering_for_secs,
+                        stream_age_secs,
+                        MAX_BUFFERING_DURATION_SECS,
+                        MIN_STREAM_AGE_FOR_RECAST_SECS,
+                    ) {
+                        BufferingDecision::EscalateToCleanup => {
+                            tracing::warn!(
+                                "cast_health_monitor: '{}' STALLED — BUFFERING for {}s (≥ {}s threshold, stream_age={}s); escalating to recast/cleanup path",
+                                title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS, stream_age_secs
+                            );
+                            // Force cleanup gate to threshold so the
+                            // PRE-CLEANUP log shows a legible "3" rather
+                            // than an ever-growing count.
+                            consecutive_failures = IDLE_FAILURE_THRESHOLD;
+                            // Successful recast → BUFFERING again gets
+                            // its own fresh timer.
+                            buffering_started_at = None;
+                        }
+                        BufferingDecision::InStartupWindow => {
+                            tracing::info!(
+                                "cast_health_monitor: '{}' BUFFERING crossed threshold ({}s ≥ {}s) but stream still in startup window ({}s < {}s) — not escalating",
+                                title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS,
+                                stream_age_secs, MIN_STREAM_AGE_FOR_RECAST_SECS
+                            );
+                            buffering_started_at = None;
+                        }
+                        BufferingDecision::Transient => {
+                            tracing::info!(
+                                "cast_health_monitor: '{}' BUFFERING (transient — {}s elapsed, threshold {}s)",
+                                title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS
+                            );
+                        }
                     }
                 } else {
                     if consecutive_failures > 0 {
@@ -1928,9 +1991,14 @@ async fn cast_health_monitor(
                         }
                     });
 
-                    if absolute > 30.0
-                        && (absolute - last_saved_position).abs() >= POSITION_SAVE_INTERVAL_SECS
-                    {
+                    // Apr 30, 2026 (RGR): position-save throttle via the
+                    // pure helper. Pinned at the boundary by tests.
+                    if should_save_position(
+                        absolute,
+                        last_saved_position,
+                        POSITION_SAVE_INTERVAL_SECS,
+                        30.0,
+                    ) {
                         // Apr 15, 2026 sanity check: reject physically-impossible
                         // position jumps (stale Chromecast state surviving a spela
                         // restart, etc.). See `is_position_jump_suspicious` for
@@ -2036,10 +2104,14 @@ async fn cast_health_monitor(
                 .signed_duration_since(started_at)
                 .num_seconds()
                 .max(0) as u64;
-            let is_natural_eof = match (duration_snapshot, last_known_absolute) {
-                (Some(dur), Some(abs_pos)) if dur > 0.0 => abs_pos >= dur * HWM_CLEAR_FRACTION,
-                _ => false,
-            };
+            // Apr 30, 2026 (RGR): natural-EOF detection via the pure
+            // helper. Apr 19 incident-pin: 0.96 threshold (was 0.92,
+            // killed Send Help mid-climax) is regression-tested.
+            let is_natural_eof = is_natural_eof(
+                duration_snapshot,
+                last_known_absolute,
+                HWM_CLEAR_FRACTION,
+            );
             let secs_since_last_recast = last_recast_at
                 .map(|t| t.elapsed().as_secs());
             // Apr 29, 2026 PM: surface the cooldown-rejected case in logs.
@@ -3867,6 +3939,98 @@ mod tests {
         assert_eq!(parse_size_to_bytes("abc"), None);
         assert_eq!(parse_size_to_bytes("4.6"), None); // missing unit
         assert_eq!(parse_size_to_bytes("GB 4.6"), None); // wrong order
+    }
+
+    // --- cast_health_monitor sub-decisions (Apr 30, 2026 RGR) ---
+    //
+    // Three pure helpers extracted from cast_health_monitor's per-poll
+    // loop. Each pins an incident-class constant that was previously
+    // load-bearing magic-number-in-code with no regression test.
+
+    #[test]
+    fn evaluate_buffering_transient_under_threshold() {
+        // Apr 18: "BUFFERING is transient" — under threshold, just wait.
+        let d = evaluate_buffering_state(15, 200, 60, 60);
+        assert_eq!(d, BufferingDecision::Transient);
+    }
+
+    #[test]
+    fn evaluate_buffering_escalates_when_stalled_mid_stream() {
+        // Apr 29: bound the transient claim. 60s+ BUFFERING past startup
+        // window → escalate to cleanup/recast.
+        let d = evaluate_buffering_state(60, 200, 60, 60);
+        assert_eq!(d, BufferingDecision::EscalateToCleanup);
+    }
+
+    #[test]
+    fn evaluate_buffering_in_startup_window_does_not_escalate() {
+        // Apr 29 PM refinement: 60s+ BUFFERING during the first 60s of
+        // playback is a legitimate cold-start cost. Don't escalate
+        // (recast wouldn't fire anyway), reset and wait.
+        let d = evaluate_buffering_state(60, 30, 60, 60);
+        assert_eq!(d, BufferingDecision::InStartupWindow);
+    }
+
+    #[test]
+    fn evaluate_buffering_at_exactly_thresholds_escalates() {
+        // Boundary: stream_age == min_stream_age (exactly past startup
+        // window) and buffering == max_buffering. The >= comparisons
+        // mean this is the first ESCALATE moment.
+        let d = evaluate_buffering_state(60, 60, 60, 60);
+        assert_eq!(d, BufferingDecision::EscalateToCleanup);
+    }
+
+    #[test]
+    fn is_natural_eof_live_stream_no_duration() {
+        // HLS live (duration unknown / <=0) — no EOF detection from
+        // position. Returns false defensively.
+        assert!(!is_natural_eof(None, Some(3000.0), 0.96));
+        assert!(!is_natural_eof(Some(0.0), Some(3000.0), 0.96));
+        assert!(!is_natural_eof(Some(-1.0), Some(3000.0), 0.96));
+    }
+
+    #[test]
+    fn is_natural_eof_no_position_yet() {
+        // Receiver hasn't reported a position yet (LOAD transient).
+        // Can't decide — return false.
+        assert!(!is_natural_eof(Some(3000.0), None, 0.96));
+    }
+
+    #[test]
+    fn is_natural_eof_past_threshold_is_eof() {
+        // 2900s of 3000s duration = 96.66% > 0.96 → natural EOF.
+        assert!(is_natural_eof(Some(3000.0), Some(2900.0), 0.96));
+    }
+
+    #[test]
+    fn is_natural_eof_below_threshold_not_eof() {
+        // Apr 19 incident: 92% threshold killed Send Help (113 min) at
+        // 1:43:54 with 8:42 of climax remaining. Pin that 92% is BELOW
+        // current 96% threshold — i.e. mid-stream, not EOF.
+        assert!(!is_natural_eof(Some(6780.0), Some(6240.0), 0.96)); // 92%
+        // Actually-near-credits at 96.5% IS EOF.
+        assert!(is_natural_eof(Some(6780.0), Some(6543.0), 0.96)); // 96.5%
+    }
+
+    #[test]
+    fn should_save_position_skips_too_early() {
+        // <30s into playback — don't save, mirrors do_play's auto-resume
+        // threshold.
+        assert!(!should_save_position(15.0, 0.0, 30.0, 30.0));
+        assert!(!should_save_position(30.0, 0.0, 30.0, 30.0)); // exactly 30 fails (not >)
+    }
+
+    #[test]
+    fn should_save_position_skips_too_recent() {
+        // Position only advanced by <30s since last save — skip to keep
+        // state.json writes to ~1/30s instead of ~1/poll.
+        assert!(!should_save_position(120.0, 100.0, 30.0, 30.0));
+    }
+
+    #[test]
+    fn should_save_position_ok_after_threshold_and_interval() {
+        assert!(should_save_position(120.0, 60.0, 30.0, 30.0));
+        assert!(should_save_position(35.0, 0.0, 30.0, 30.0));
     }
 
     // --- Local Bypass match decision (Apr 30, 2026 — extracted from do_play) ---
