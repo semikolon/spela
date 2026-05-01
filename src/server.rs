@@ -299,6 +299,38 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// `config.allowed_hosts` for custom deployments. Returned as a HashSet
 /// for O(1) lookup in the per-request middleware. Pure function so the
 /// allowlist composition is testable.
+/// May 1, 2026 (Wilderpeople movie-night fallout, second bug): pure helper
+/// for cold-start IDLE protection in `cast_health_monitor`. Returns true
+/// when an IDLE state should be treated as "cast LOAD still in progress"
+/// rather than "media died." Three conditions all required:
+///   1. `media_session_id == None` — receiver hasn't acknowledged LOAD
+///      with a session ID yet, so playback hasn't actually begun
+///   2. `prev_player_state_upper` is None or another IDLE-class state —
+///      we've never seen the stream in PLAYING/BUFFERING, so this can't
+///      be a post-playing death
+///   3. `stream_age_secs < cold_start_window_secs` — within the budget
+///      for legitimate Default Media Receiver cold-start (25-60s observed)
+///
+/// Mirrors the existing `evaluate_buffering_state` startup-window protection
+/// — applies the same Apr 18 philosophy ("don't auto-kill transient states")
+/// to the IDLE path. Without this, the cast_health_monitor kills cold-
+/// starting Chromecasts at stream_age=20s, well before the receiver has
+/// finished initializing the HLS pipeline.
+pub(crate) fn is_idle_in_cold_start_window(
+    media_session_id: Option<i32>,
+    prev_player_state_upper: Option<&str>,
+    stream_age_secs: u64,
+    cold_start_window_secs: u64,
+) -> bool {
+    let prev_is_idle_class = match prev_player_state_upper {
+        None => true,
+        Some(s) => s == "IDLE" || s == "UNKNOWN" || s.is_empty(),
+    };
+    media_session_id.is_none()
+        && prev_is_idle_class
+        && stream_age_secs < cold_start_window_secs
+}
+
 /// May 1, 2026 (Wilderpeople movie-night fallout): compute the set of TCP
 /// addresses the HTTP listener should bind to. Always includes loopback
 /// (`127.0.0.1`) when `host` is a specific non-loopback address, so internal
@@ -1984,11 +2016,44 @@ async fn cast_health_monitor(
                 }
 
                 if is_dead {
-                    consecutive_failures += 1;
-                    tracing::warn!(
-                        "cast_health_monitor: '{}' player_state={} idle_reason={:?} media_session={:?} ({}/{} consecutive idle polls before cleanup)",
-                        title_for_log, info.player_state, info.idle_reason, info.media_session_id, consecutive_failures, IDLE_FAILURE_THRESHOLD
+                    // May 1, 2026 (Wilderpeople movie-night fallout, second
+                    // bug after the loopback fix): cold-start grace for
+                    // IDLE. When `media_session_id` is None, the cast LOAD
+                    // hasn't completed yet — the Chromecast is still
+                    // initializing the receiver app, fetching the master
+                    // playlist, parsing it, and allocating a session. This
+                    // can take 25-60s on a cold Default Media Receiver.
+                    // Treating that IDLE as a failure replicates the Apr 18
+                    // anti-pattern of auto-killing transient states (the
+                    // "fix" becomes the failure, per CLAUDE.md). Mirror the
+                    // BUFFERING startup-window protection: no failure
+                    // increment until either the LOAD completes
+                    // (media_session_id becomes Some(_)) OR stream_age
+                    // crosses MIN_STREAM_AGE_FOR_RECAST_SECS=60s. After
+                    // that, IDLE is treated as a real death signal as
+                    // before.
+                    let stream_age_secs = Utc::now()
+                        .signed_duration_since(started_at)
+                        .num_seconds()
+                        .max(0) as u64;
+                    let in_cold_start = is_idle_in_cold_start_window(
+                        info.media_session_id,
+                        prev_player_state_upper.as_deref(),
+                        stream_age_secs,
+                        MIN_STREAM_AGE_FOR_RECAST_SECS,
                     );
+                    if in_cold_start {
+                        tracing::info!(
+                            "cast_health_monitor: '{}' IDLE during cold-start (stream_age={}s < {}s, no media_session yet) — not counting as failure (LOAD still in progress)",
+                            title_for_log, stream_age_secs, MIN_STREAM_AGE_FOR_RECAST_SECS
+                        );
+                    } else {
+                        consecutive_failures += 1;
+                        tracing::warn!(
+                            "cast_health_monitor: '{}' player_state={} idle_reason={:?} media_session={:?} ({}/{} consecutive idle polls before cleanup)",
+                            title_for_log, info.player_state, info.idle_reason, info.media_session_id, consecutive_failures, IDLE_FAILURE_THRESHOLD
+                        );
+                    }
                     // Apr 29, 2026: an IDLE poll definitively ends the
                     // BUFFERING regime if there was one — receiver isn't
                     // buffering anymore, it's dead.
@@ -4506,6 +4571,69 @@ mod tests {
         // server while the operator investigates the LAN failure.
         let addrs = compute_bind_addresses("192.168.4.1", 7890);
         assert_eq!(addrs[0], "127.0.0.1:7890");
+    }
+
+    // --- is_idle_in_cold_start_window: protects Chromecast cold-start
+    //     from being killed at stream_age=20s when DMR takes 25-60s ---
+
+    #[test]
+    fn is_idle_in_cold_start_window_protects_fresh_load_with_no_session() {
+        // Wilderpeople second bug: cast_health_monitor's first poll sees
+        // IDLE + media_session=None at stream_age=10-20s. Must NOT count
+        // as failure; the receiver is still initializing.
+        assert!(is_idle_in_cold_start_window(None, None, 10, 60));
+        assert!(is_idle_in_cold_start_window(None, None, 20, 60));
+        assert!(is_idle_in_cold_start_window(None, None, 59, 60));
+    }
+
+    #[test]
+    fn is_idle_in_cold_start_window_releases_grace_at_window_boundary() {
+        // After 60s with no session ever, the receiver is genuinely stuck.
+        // Stop protecting; let cleanup proceed.
+        assert!(!is_idle_in_cold_start_window(None, None, 60, 60));
+        assert!(!is_idle_in_cold_start_window(None, None, 120, 60));
+    }
+
+    #[test]
+    fn is_idle_in_cold_start_window_releases_grace_when_session_appears() {
+        // Once Chromecast allocates a session ID, LOAD has acknowledged.
+        // From then on, IDLE is real death (post-playing or LOAD-rejected).
+        assert!(!is_idle_in_cold_start_window(Some(1), None, 5, 60));
+        assert!(!is_idle_in_cold_start_window(Some(42), Some("IDLE"), 30, 60));
+    }
+
+    #[test]
+    fn is_idle_in_cold_start_window_releases_grace_after_playing() {
+        // If we ever saw PLAYING / BUFFERING / PAUSED, this is mid-stream.
+        // IDLE here is real death — receiver dropped the stream.
+        assert!(!is_idle_in_cold_start_window(None, Some("PLAYING"), 10, 60));
+        assert!(!is_idle_in_cold_start_window(None, Some("BUFFERING"), 10, 60));
+        assert!(!is_idle_in_cold_start_window(None, Some("PAUSED"), 10, 60));
+    }
+
+    #[test]
+    fn is_idle_in_cold_start_window_handles_idle_class_prev_states() {
+        // IDLE / UNKNOWN / "" are all "still warming up" — keep grace.
+        // Only non-IDLE-class prev states (PLAYING/BUFFERING/PAUSED) end it.
+        assert!(is_idle_in_cold_start_window(None, Some("IDLE"), 10, 60));
+        assert!(is_idle_in_cold_start_window(None, Some("UNKNOWN"), 10, 60));
+        assert!(is_idle_in_cold_start_window(None, Some(""), 10, 60));
+    }
+
+    #[test]
+    fn is_idle_in_cold_start_window_pinning_test_for_wilderpeople_repro() {
+        // Pin against regression: the EXACT log conditions from the
+        // May 1 repro (10:46:46 cast_health_monitor started → 10:46:57
+        // PRE-CLEANUP at stream_age=20s). With this helper applied, the
+        // first-poll conditions resolve to in_cold_start=true and no
+        // failure increment. Movie night never gets killed at 20s again.
+        let stream_age_at_pre_cleanup = 20u64;
+        assert!(is_idle_in_cold_start_window(
+            None, // media_session=None throughout the failure
+            None, // prev_state="<init>" before first poll
+            stream_age_at_pre_cleanup,
+            MIN_STREAM_AGE_FOR_RECAST_SECS, // 60s budget
+        ));
     }
 
     #[test]
