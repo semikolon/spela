@@ -3696,15 +3696,33 @@ async fn handle_hls_master(
             .unwrap();
     }
 
-    // CODECS string for spela's standard transcode pipeline:
-    //   - avc1.640028 = H.264 High profile, level 4.0 (1080p30 well within)
-    //   - mp4a.40.2   = MPEG-4 AAC LC
-    // BANDWIDTH is a hint for ABR; for a single-rendition stream it doesn't
-    // need to be exact. 6 Mbps matches the typical NVENC preset p4 cq 23
-    // output for 1080p H.264 + AAC stereo 192 kbps.
+    // May 1, 2026 (Wilderpeople movie-night fourth bug): mimic Apple's
+    // BipBop reference master playlist EXACTLY, since BipBop plays on
+    // CrKey 1.56 in 6s while a structurally-divergent master gets
+    // `idle_reason=ERROR`. Diagnosed via pychromecast direct LOAD test:
+    // Apple's master → BUFFERING in 6s; spela's old master → IDLE/ERROR
+    // immediately. Differences eliminated:
+    //   - DROP `EXT-X-VERSION:3` — Apple's master has no version tag
+    //     (implicit v1), and CrKey 1.56's parser appears to choke on
+    //     `EXT-X-VERSION:3` + single-variant + non-Apple-style format.
+    //   - DROP `RESOLUTION` — was a lie anyway (claimed 1920x1080 for
+    //     720x304 content); Apple's master omits it. RESOLUTION is a
+    //     hint per spec, not required.
+    //   - ADD `PROGRAM-ID=1` — Apple includes it (deprecated in HLS v6
+    //     but harmless and matches the working format).
+    //   - SWAP CODECS order to audio-then-video and add a space after
+    //     the comma — `"mp4a.40.2, avc1.640028"` matches Apple's exact
+    //     format `"mp4a.40.2, avc1.4d4015"`. Whether this matters is
+    //     unproven, but mimicking eliminates one variable.
+    //   - ADD blank lines around the STREAM-INF entry — Apple's master
+    //     uses these as separators.
+    // The avc1.640028 string still matches what NVENC produces (forced
+    // by `-profile:v high -level:v 4.0` in transcode_hls); the prior
+    // commit ensured CODECS isn't a lie. This commit ensures the rest
+    // of the master format isn't a stumbling block either.
     let master = "#EXTM3U\n\
-                  #EXT-X-VERSION:3\n\
-                  #EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS=\"avc1.640028,mp4a.40.2\"\n\
+                  \n\
+                  #EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=6000000,CODECS=\"mp4a.40.2, avc1.640028\"\n\
                   playlist.m3u8\n";
 
     axum::response::Response::builder()
