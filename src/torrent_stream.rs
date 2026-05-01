@@ -149,15 +149,56 @@ pub async fn serve_torrent_stream(
     // module that owns it is private at the crate root). We use it through
     // `AsyncRead + AsyncSeek + .len()` only, which is fine — the value never
     // crosses our function boundary.
-    let mut stream = handle.stream(file_idx).map_err(|err| {
-        tracing::warn!(
-            "torrent_stream: handle.stream({}, {}) failed: {}",
-            id,
-            file_idx,
-            err
-        );
-        StatusCode::NOT_FOUND
-    })?;
+    //
+    // May 1, 2026 (Wilderpeople movie-night fifth bug): retry on
+    // "initializing" state. librqbit's `start()` returns when the torrent
+    // is *added to the session*, but the storage/file backing isn't ready
+    // until initial-checksum-validation completes (1-3s for cached files,
+    // longer for fresh downloads). spela's do_play kicks off ffmpeg
+    // immediately after start() returns; if ffmpeg's first HTTP GET
+    // arrives during the init window, librqbit returns
+    // `with_storage_and_file: invalid state: initializing`, which this
+    // function previously translated to 404. ffmpeg treats 404 as fatal
+    // (no -reconnect retry on HTTP error codes), so the transcode
+    // crashed and HLS pre-buffer timed out at 60s with zero segments —
+    // exactly the original Wilderpeople movie-night failure mode after
+    // a fresh spela restart. Fix: poll librqbit every 250ms for up to
+    // 30s while it's in the initializing state, then return 503 (so
+    // ffmpeg's `-reconnect` IS triggered as a last resort if init takes
+    // even longer).
+    let mut stream = {
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(30);
+        loop {
+            match handle.clone().stream(file_idx) {
+                Ok(s) => break s,
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.contains("initializing")
+                        && tokio::time::Instant::now() < deadline
+                    {
+                        tokio::time::sleep(
+                            tokio::time::Duration::from_millis(250),
+                        )
+                        .await;
+                        continue;
+                    }
+                    tracing::warn!(
+                        "torrent_stream: handle.stream({}, {}) failed: {}",
+                        id,
+                        file_idx,
+                        err
+                    );
+                    let status = if msg.contains("initializing") {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::NOT_FOUND
+                    };
+                    return Err(status);
+                }
+            }
+        }
+    };
 
     let total = stream.len();
     let range = parse_range_header(headers.get(header::RANGE), total)
