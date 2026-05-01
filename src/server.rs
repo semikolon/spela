@@ -151,7 +151,33 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS, Method::DELETE])
         .allow_headers(Any);
 
-    let app = Router::new()
+    // May 1, 2026 (Wilderpeople movie-night final root cause): split the
+    // router so CORS layer wraps ONLY browser-targeted control endpoints,
+    // NOT the media-receiver endpoints (/hls/*, /torrent/*, /cast-receiver/*).
+    //
+    // The H2 commit (Apr 30, 14671d4) tightened CORS to a specific-origin
+    // allowlist. tower_http's CorsLayer adds a `Vary: origin,
+    // access-control-request-method, access-control-request-headers` header
+    // to every response when the allowlist isn't `Any`. CrKey 1.56's Shaka
+    // Player parser explicitly rejects HLS manifests served with that Vary
+    // header on m3u8 responses, returning `LOAD_FAILED` immediately and
+    // surfacing as `idle_reason=ERROR` to the sender. Diagnosed via:
+    //   - Apple BipBop HTTPS (no Vary) → BUFFERING in 6s on Fredriks TV
+    //   - Spela master post-H2 (Vary present) → LOAD_FAILED instantly
+    //   - Spela master pre-H2 (Vary absent) → BUFFERING in 2s
+    // Bisect commit: pre-H2 (`7445530`) plays, H2 (`14671d4`) fails.
+    //
+    // Why this split is safe for security:
+    //   - Host-header allowlist (the PRIMARY DNS-rebinding defense per H2's
+    //     own design comment) stays applied to ALL routes, control and media.
+    //   - CORS is browser-only protection. Cast receivers, ffmpeg, the spela
+    //     CLI, and the voice tool are NOT browsers; they ignore CORS entirely.
+    //   - Browser DNS-rebinding attacks could only hit /hls/* or /torrent/*
+    //     to exfiltrate decoded video frames — bounded by what the receiver-
+    //     facing endpoints expose, NONE of which is sensitive (publicly-
+    //     downloadable torrent content + transcoded frames thereof).
+    //   - /torrent/* still has require_loopback_source (defense layer 3).
+    let control_routes = Router::new()
         .route("/search", get(handle_search))
         .route("/play", post(handle_play))
         .route("/stop", post(handle_stop))
@@ -168,6 +194,17 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/config", get(handle_get_config).post(handle_set_config))
         .route("/cast-info", post(handle_cast_info))
         .route("/stream/transcode", get(handle_transcode_stream))
+        .route("/api/cast-config", get(handle_cast_config))
+        .route("/api/seek-restart", post(handle_seek_restart))
+        .route("/api/position", get(handle_get_position).post(handle_save_position))
+        .route("/api/position/reset", post(handle_reset_position))
+        .route("/api/retry", post(handle_retry))
+        .layer(cors); // CORS scoped to control endpoints only.
+
+    // Media routes — receiver-facing, NO CORS layer (Vary header breaks
+    // CrKey 1.56 HLS parser). Host-header allowlist still applied below
+    // via the merge, so DNS-rebinding defense is preserved.
+    let media_routes = Router::new()
         // HLS streaming endpoints (Apr 15, 2026 rework — proper Chromecast support).
         // The route layout MUST match the URLs the HLS manifest produces:
         // ffmpeg's HLS muxer emits relative segment paths (e.g. `seg_00000.ts`),
@@ -189,42 +226,33 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         // Custom Cast Receiver endpoints
         .route("/cast-receiver.html", get(handle_cast_receiver_html))
         .route("/cast-receiver/intro.mp4", get(handle_cast_receiver_intro))
-        .route("/cast-receiver/subs.vtt", get(handle_cast_receiver_subs))
-        .route("/api/cast-config", get(handle_cast_config))
-        .route("/api/seek-restart", post(handle_seek_restart))
-        .route("/api/position", get(handle_get_position).post(handle_save_position))
-        .route("/api/position/reset", post(handle_reset_position))
-        .route("/api/retry", post(handle_retry))
-        // Apr 30, 2026: librqbit-backed torrent streaming. Replaces webtorrent's
-        // separate :8888 HTTP server with a route on spela's existing axum
-        // router. ffmpeg is the only consumer; it issues `Range: bytes=N-`
-        // requests as it transcodes, and librqbit re-prioritizes pieces around
-        // the requested offset. See `torrent_stream.rs` for the Range parser
-        // (full RFC 7233 coverage, 19 unit tests).
-        // Apr 30, 2026 (security audit H4): librqbit stream endpoint
-        // restricted to loopback via a sub-router. The only legitimate
-        // consumer is ffmpeg, which always runs on the same host as spela.
-        // Chromecast hits /hls/* (the transcoded output), NEVER /torrent/*
-        // (the raw librqbit-served bytes). DoS via Range-flooding and
-        // exfiltration of in-progress torrent contents both require
-        // non-loopback access; the per-route layer closes that surface.
-        .merge(
-            Router::new()
-                .route(
-                    "/torrent/{id}/stream/{file_idx}",
-                    get(handle_torrent_stream),
-                )
-                .layer(axum::middleware::from_fn(require_loopback_source)),
+        .route("/cast-receiver/subs.vtt", get(handle_cast_receiver_subs));
+
+    // Torrent route — receiver-internal-subprocess only (ffmpeg via loopback).
+    // Apr 30, 2026 (security audit H4): /torrent/* restricted to loopback
+    // source via per-route middleware. Chromecast hits /hls/* (transcoded
+    // output), NEVER /torrent/*. DoS via Range-flooding and exfiltration of
+    // in-progress torrent contents both require non-loopback access; the
+    // per-route layer closes that surface.
+    let torrent_routes = Router::new()
+        .route(
+            "/torrent/{id}/stream/{file_idx}",
+            get(handle_torrent_stream),
         )
-        // Apr 30, 2026 (H2): Host-header allowlist applied to ALL routes.
-        // Order matters: middleware runs in reverse (CORS-then-host means
-        // host check runs first per request). DNS-rebinding attacks set
-        // a non-allowlisted Host; rejected with 403 before any handler.
+        .layer(axum::middleware::from_fn(require_loopback_source));
+
+    let app = control_routes
+        .merge(media_routes)
+        .merge(torrent_routes)
+        // Apr 30, 2026 (H2): Host-header allowlist applied to ALL routes
+        // (control + media + torrent). DNS-rebinding defense stays intact.
+        // Rejected requests get 403 before any handler. This is the
+        // PRIMARY defense per H2's own design — CORS was only belt-and-
+        // suspenders, and we keep it on control endpoints where it matters.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_host_header,
         ))
-        .layer(cors)
         .with_state(state);
 
     let bind_addresses = compute_bind_addresses(&host, port);
