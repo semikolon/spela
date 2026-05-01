@@ -774,6 +774,23 @@ pub async fn transcode_hls(
             "-c:v".into(), "h264_nvenc".into(),
             "-preset".into(), "p4".into(),
             "-cq".into(), "23".into(),
+            // May 1, 2026 (Wilderpeople movie-night CODECS-mismatch fix):
+            // FORCE H.264 High@4.0 to match the static CODECS string
+            // `avc1.640028` advertised in /hls/master.m3u8. Without this,
+            // NVENC picks profile based on input characteristics — Main
+            // for low-resolution input (720x304 XviD HDRip → Main),
+            // High for 1080p input — so the master's CODECS announcement
+            // was sometimes a lie. Default Media Receiver / Shaka Player
+            // on CrKey 1.56 validates announced CODECS via MSE; mismatch
+            // → receiver fetches master 4× and bails (idle_reason=None,
+            // never allocates a media session). Forcing High@4.0 makes
+            // the announcement always accurate. Level 4.0 covers up to
+            // 1080p30 @ 25 Mbps which dwarfs spela's typical 6 Mbps, so
+            // no practical content gets clipped. See Apr 15 master
+            // playlist commit `ebab5e5` for why CODECS must be set;
+            // see this commit for why it must be ACCURATE.
+            "-profile:v".into(), "high".into(),
+            "-level:v".into(), "4.0".into(),
             // Apr 30, 2026 intro-concat fix — see transcode() above for the
             // full rationale. Same four args, same hypothesis.
             "-g".into(), "180".into(),
@@ -798,6 +815,9 @@ pub async fn transcode_hls(
                 "-c:v".into(), "h264_nvenc".into(),
                 "-preset".into(), "p4".into(),
                 "-cq".into(), "23".into(),
+                // May 1, 2026: CODECS-truth — see intro branch above.
+                "-profile:v".into(), "high".into(),
+                "-level:v".into(), "4.0".into(),
             ]);
         } else if video_reencode {
             args.extend([
@@ -807,8 +827,18 @@ pub async fn transcode_hls(
                 "-c:v".into(), "h264_nvenc".into(),
                 "-preset".into(), "p4".into(),
                 "-cq".into(), "23".into(),
+                // May 1, 2026: CODECS-truth — see intro branch above.
+                "-profile:v".into(), "high".into(),
+                "-level:v".into(), "4.0".into(),
             ]);
         } else {
+            // Direct copy path: source is already H.264 and we're
+            // passing it through. The master's hardcoded CODECS may
+            // not match perfectly, but in practice DMR is more lenient
+            // about copy-streamed content than re-encoded streams (the
+            // reencode path was the one observed to fail Wilderpeople-
+            // style). If a regression appears here, switch this path
+            // to a forced reencode at High@4.0.
             args.extend(["-c:v".into(), "copy".into()]);
         }
     }
