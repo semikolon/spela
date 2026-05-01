@@ -227,21 +227,49 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .layer(cors)
         .with_state(state);
 
-    let addr = format!("{}:{}", host, port);
-    tracing::info!("spela server listening on http://{}", addr);
-    tracing::info!("Endpoints: /search /play /stop /status /pause /resume /seek /volume /next /prev /targets /history /config");
+    let bind_addresses = compute_bind_addresses(&host, port);
+    tracing::info!(
+        "Endpoints: /search /play /stop /status /pause /resume /seek /volume /next /prev /targets /history /config"
+    );
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    // Apr 30, 2026 (H4): use into_make_service_with_connect_info so the
-    // require_loopback_source middleware can extract `ConnectInfo<SocketAddr>`
-    // and check the source IP. axum's default `Router::into_make_service`
-    // doesn't expose ConnectInfo; without this swap the middleware would
-    // 500 on every request to /torrent/*.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    // May 1, 2026: dual-bind when `host` is a specific non-loopback address
+    // (e.g. `192.168.4.1` per Darwin's systemd unit). See
+    // `compute_bind_addresses` doc-comment for the full rationale. Without
+    // this, ffmpeg's hardcoded `http://127.0.0.1:7890/torrent/...` URL gets
+    // connection-refused when admin pins the listener to a LAN IP only,
+    // which silently breaks every cast (Wilderpeople movie-night incident).
+    //
+    // Apr 30, 2026 (H4): `into_make_service_with_connect_info` is required
+    // so the `require_loopback_source` middleware can extract
+    // `ConnectInfo<SocketAddr>` and check the source IP. axum's default
+    // `Router::into_make_service` doesn't expose ConnectInfo; without this
+    // swap the middleware would 500 on every request to /torrent/*.
+    let make_service =
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    let mut listeners = Vec::with_capacity(bind_addresses.len());
+    for addr in &bind_addresses {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("failed to bind {}", addr))?;
+        tracing::info!("spela server listening on http://{}", addr);
+        listeners.push(listener);
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let svc = make_service.clone();
+        tasks.spawn(async move { axum::serve(listener, svc).await });
+    }
+    // If any listener task exits (error or shutdown), surface the result.
+    // Movie-night-affecting failures should be visible, not silent.
+    while let Some(res) = tasks.join_next().await {
+        match res {
+            Ok(Ok(())) => {} // clean shutdown of one listener; others may continue
+            Ok(Err(e)) => return Err(e.into()),
+            Err(e) => return Err(anyhow::anyhow!("listener task panicked: {}", e)),
+        }
+    }
     Ok(())
 }
 
@@ -271,6 +299,44 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// `config.allowed_hosts` for custom deployments. Returned as a HashSet
 /// for O(1) lookup in the per-request middleware. Pure function so the
 /// allowlist composition is testable.
+/// May 1, 2026 (Wilderpeople movie-night fallout): compute the set of TCP
+/// addresses the HTTP listener should bind to. Always includes loopback
+/// (`127.0.0.1`) when `host` is a specific non-loopback address, so internal
+/// subprocesses (ffmpeg's torrent fetch via `/torrent/...`, queue auto-fire's
+/// self-call to `/play`) can reach the server regardless of how `--host` is
+/// configured. Skips the loopback bind when `host` is itself loopback or the
+/// wildcard (already covers loopback).
+///
+/// Why this design: when admin runs `spela server --host 192.168.4.1` to
+/// keep the LAN-only bind explicit (Darwin is the router; `0.0.0.0` would
+/// bind WAN too and rely solely on iptables to drop it), a single-bind
+/// listener leaves `/torrent/*` unreachable from spela's own ffmpeg
+/// subprocess — which calls `http://127.0.0.1:7890/torrent/...` per
+/// `torrent_engine.rs`. Dual-bind preserves the LAN-only intent (no WAN
+/// exposure) AND makes loopback URLs work without per-call-site host
+/// rewriting. The `/torrent/*` route already has a `require_loopback_source`
+/// middleware (defense layer 3) so the LAN-bound side cannot leak torrent
+/// bytes; this function only enables the loopback side that middleware
+/// presupposes.
+pub(crate) fn compute_bind_addresses(host: &str, port: u16) -> Vec<String> {
+    let primary = format!("{}:{}", host, port);
+    let h = host.trim();
+    // Already loopback or wildcard → single bind covers loopback.
+    if h.is_empty()
+        || h == "127.0.0.1"
+        || h == "0.0.0.0"
+        || h == "localhost"
+        || h == "::"
+        || h == "::1"
+        || h == "[::]"
+        || h == "[::1]"
+    {
+        return vec![primary];
+    }
+    // Specific non-loopback address → also bind loopback.
+    vec![format!("127.0.0.1:{}", port), primary]
+}
+
 pub(crate) fn compute_host_allowlist(config: &Config) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     set.insert("localhost".into());
@@ -4387,6 +4453,70 @@ mod tests {
     #[test]
     fn parse_host_header_handles_ipv6_no_port() {
         assert_eq!(parse_host_header("[::1]"), "[::1]");
+    }
+
+    #[test]
+    fn compute_bind_addresses_dual_binds_on_specific_lan_ip() {
+        // The Wilderpeople movie-night regression: --host 192.168.4.1 alone
+        // left ffmpeg's loopback URL connection-refused. We MUST also bind
+        // 127.0.0.1 in this case.
+        let addrs = compute_bind_addresses("192.168.4.1", 7890);
+        assert_eq!(addrs.len(), 2, "expected dual bind, got {:?}", addrs);
+        assert!(addrs.contains(&"127.0.0.1:7890".to_string()));
+        assert!(addrs.contains(&"192.168.4.1:7890".to_string()));
+    }
+
+    #[test]
+    fn compute_bind_addresses_single_binds_on_loopback() {
+        // --host 127.0.0.1 → single bind, not duplicated.
+        let addrs = compute_bind_addresses("127.0.0.1", 7890);
+        assert_eq!(addrs, vec!["127.0.0.1:7890".to_string()]);
+    }
+
+    #[test]
+    fn compute_bind_addresses_single_binds_on_wildcard() {
+        // --host 0.0.0.0 already covers loopback; don't add a second
+        // 127.0.0.1 bind that would collide.
+        let addrs = compute_bind_addresses("0.0.0.0", 7890);
+        assert_eq!(addrs, vec!["0.0.0.0:7890".to_string()]);
+    }
+
+    #[test]
+    fn compute_bind_addresses_single_binds_on_localhost_alias() {
+        let addrs = compute_bind_addresses("localhost", 7890);
+        assert_eq!(addrs, vec!["localhost:7890".to_string()]);
+    }
+
+    #[test]
+    fn compute_bind_addresses_single_binds_on_ipv6_loopback_and_wildcard() {
+        for h in ["::1", "::", "[::1]", "[::]"] {
+            let addrs = compute_bind_addresses(h, 7890);
+            assert_eq!(
+                addrs.len(),
+                1,
+                "ipv6 loopback/wildcard {h:?} should single-bind"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_bind_addresses_loopback_is_always_first_when_dual() {
+        // Bind order matters: a panic during the LAN bind should still
+        // leave loopback up so that internal subprocesses can reach the
+        // server while the operator investigates the LAN failure.
+        let addrs = compute_bind_addresses("192.168.4.1", 7890);
+        assert_eq!(addrs[0], "127.0.0.1:7890");
+    }
+
+    #[test]
+    fn compute_bind_addresses_does_not_expose_wan() {
+        // The whole point of dual-bind: --host stays specific to LAN, so
+        // WAN is never bound. This test is the canonical pin against a
+        // future "convenient" change to bind 0.0.0.0 silently.
+        let addrs = compute_bind_addresses("192.168.4.1", 7890);
+        assert!(!addrs.iter().any(|a| a.starts_with("0.0.0.0:")));
+        assert!(!addrs.iter().any(|a| a.contains("94.254.")), // Darwin's WAN /24
+            "WAN IP must never appear in bind addresses, got {:?}", addrs);
     }
 
     #[test]
