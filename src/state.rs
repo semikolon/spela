@@ -75,6 +75,8 @@ pub struct QueuedItem {
     pub quality: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
+    #[serde(default)]
+    pub smooth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +126,8 @@ pub struct CurrentStream {
     /// Media Receiver path.
     #[serde(default)]
     pub ss_offset: f64,
+    #[serde(default)]
+    pub smooth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -519,6 +523,7 @@ mod tests {
             size: Some("4.5 GB".into()),
             poster_url: None,
             ss_offset: 1800.0,
+            smooth: false,
         };
         let serialized = serde_json::to_string(&stream).expect("serialize");
         assert!(

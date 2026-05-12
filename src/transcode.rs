@@ -81,17 +81,13 @@ pub fn rotate_ffmpeg_log(current: &Path) {
         let dst = with_n(n + 1);
         if src.exists() {
             if let Err(e) = std::fs::rename(&src, &dst) {
-                tracing::warn!(
-                    "rotate_ffmpeg_log: rename {src:?}→{dst:?} failed: {e}"
-                );
+                tracing::warn!("rotate_ffmpeg_log: rename {src:?}→{dst:?} failed: {e}");
             }
         }
     }
     let dst = with_n(1);
     if let Err(e) = std::fs::rename(current, &dst) {
-        tracing::warn!(
-            "rotate_ffmpeg_log: rename {current:?}→{dst:?} failed: {e}"
-        );
+        tracing::warn!("rotate_ffmpeg_log: rename {current:?}→{dst:?} failed: {e}");
     }
 }
 
@@ -130,8 +126,7 @@ pub fn rotate_ffmpeg_log(current: &Path) {
 /// Returns the number of subtitle entries written to the output file.
 /// Apr 15, 2026 fix for the "subtitles out of sync on resume" regression.
 pub fn shift_srt(input: &Path, output: &Path, offset_seconds: f64) -> Result<usize> {
-    let content = std::fs::read_to_string(input)?
-        .replace("\r\n", "\n");  // Normalize CRLF → LF (OpenSubtitles often uses Windows line endings)
+    let content = std::fs::read_to_string(input)?.replace("\r\n", "\n"); // Normalize CRLF → LF (OpenSubtitles often uses Windows line endings)
     let mut result = String::new();
     let mut kept = 0usize;
     let mut new_index = 1usize;
@@ -316,10 +311,14 @@ pub struct CodecInfo {
 pub async fn detect_codecs(url: &str) -> Result<CodecInfo> {
     let output = Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-show_entries", "stream=codec_type,codec_name,index",
-            "-show_entries", "stream_tags=language",
-            "-show_entries", "format=duration",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,index",
+            "-show_entries",
+            "stream_tags=language",
+            "-show_entries",
+            "format=duration",
             url,
         ])
         .output()
@@ -336,7 +335,11 @@ pub async fn detect_codecs(url: &str) -> Result<CodecInfo> {
     let mut current_lang: Option<String> = None;
 
     // Collect all audio streams with their language tags
-    struct AudioStream { audio_index: usize, codec: String, lang: String }
+    struct AudioStream {
+        audio_index: usize,
+        codec: String,
+        lang: String,
+    }
     let mut audio_streams: Vec<AudioStream> = Vec::new();
     let mut audio_count = 0usize;
 
@@ -392,13 +395,19 @@ pub async fn detect_codecs(url: &str) -> Result<CodecInfo> {
     }
 
     // Pick preferred audio: first English track, else first track
-    let preferred = audio_streams.iter()
+    let preferred = audio_streams
+        .iter()
         .find(|a| a.lang == "eng" || a.lang == "en")
         .or_else(|| audio_streams.first());
 
     let (audio_index, preferred_codec) = match preferred {
         Some(a) => {
-            tracing::info!("Preferred audio: stream a:{} lang={} codec={}", a.audio_index, a.lang, a.codec);
+            tracing::info!(
+                "Preferred audio: stream a:{} lang={} codec={}",
+                a.audio_index,
+                a.lang,
+                a.codec
+            );
             (a.audio_index, Some(a.codec.clone()))
         }
         None => (0, audio_codec.clone()),
@@ -432,6 +441,50 @@ pub fn find_intro() -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+/// Build the no-intro HLS video filter for NVENC re-encode paths.
+///
+/// May 12, 2026: normalize ALL HLS NVENC output to 30 fps so the
+/// hard-coded High@4.0 Chromecast contract stays valid even for 1080p50
+/// / HFR sources. Without the fps clamp, subtitle-burn or HEVC-reencode
+/// paths can feed 50 fps frames into `h264_nvenc -level:v 4.0`, and
+/// NVENC aborts before writing the first segment:
+/// `InitializeEncoder failed: invalid param (8): Invalid Level`.
+///
+/// This is deliberately conservative. Chromecast playback values a stable
+/// HLS startup over preserving HFR output, and 30 fps keeps the synthetic
+/// `/hls/master.m3u8` CODECS string (`avc1.640028`) truthful.
+fn build_hls_nvenc_video_filter(subtitle_path: Option<&Path>) -> String {
+    match subtitle_path {
+        Some(path) => {
+            let srt_str = path.to_string_lossy().to_string().replace(':', "\\:");
+            format!("subtitles='{}',fps=30,format=yuv420p", srt_str)
+        }
+        None => "fps=30,format=yuv420p".to_string(),
+    }
+}
+
+/// Append the fixed-GOP arguments that keep HLS segment boundaries aligned
+/// to the 6-second muxer clock on Chromecast.
+///
+/// Apr 30, 2026 introduced this for the intro concat path after CrKey 1.56
+/// stalled once segment boundaries drifted away from keyframes. May 12,
+/// 2026 extends the same policy to the plain no-intro HLS re-encode paths:
+/// subtitle burn-in and codec-conversion streams were still leaving GOP
+/// cadence up to NVENC, which produced ~8.33s segments on episode-4 tests
+/// and left the receiver looping on `seg_00000.ts`.
+fn append_hls_fixed_gop_args(args: &mut Vec<String>) {
+    args.extend([
+        "-g".into(),
+        "180".into(),
+        "-keyint_min".into(),
+        "180".into(),
+        "-sc_threshold".into(),
+        "0".into(),
+        "-force_key_frames".into(),
+        "expr:gte(t,n_forced*6)".into(),
+    ]);
 }
 
 /// Transcode media from an HTTP URL (progressive/streaming input) into a
@@ -475,11 +528,16 @@ pub async fn transcode(
     let is_local_file = input_url.starts_with("file://") || input_url.starts_with("/");
     if !is_local_file {
         args.extend([
-            "-reconnect".into(), "1".into(),
-            "-reconnect_at_eof".into(), "1".into(),
-            "-reconnect_streamed".into(), "1".into(),
-            "-reconnect_delay_max".into(), "30".into(),
-            "-rw_timeout".into(), "60000000".into(),
+            "-reconnect".into(),
+            "1".into(),
+            "-reconnect_at_eof".into(),
+            "1".into(),
+            "-reconnect_streamed".into(),
+            "1".into(),
+            "-reconnect_delay_max".into(),
+            "30".into(),
+            "-rw_timeout".into(),
+            "60000000".into(),
         ]);
     }
     // Strip file:// prefix for FFmpeg (it expects bare paths for local files)
@@ -510,11 +568,14 @@ pub async fn transcode(
 
         // Intro: scale + ensure compatible format
         filter.push_str("[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v0]; ");
-        filter.push_str("[0:a:0]aresample=48000[a0]; ");  // Intro always has one audio track
+        filter.push_str("[0:a:0]aresample=48000[a0]; "); // Intro always has one audio track
 
         // Main stream: scale + optional subtitles
         if has_subs {
-            let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
+            let srt_str = subtitle_path
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
                 .replace(':', "\\:");
             filter.push_str(&format!(
                 "[{}:v]subtitles='{}',scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v1]; ",
@@ -526,18 +587,27 @@ pub async fn transcode(
                 main_idx
             ));
         }
-        filter.push_str(&format!("[{}:a:{}]aresample=48000[a1]; ", main_idx, audio_index));
+        filter.push_str(&format!(
+            "[{}:a:{}]aresample=48000[a1]; ",
+            main_idx, audio_index
+        ));
 
         // Concat
         filter.push_str("[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]");
 
         args.extend([
-            "-filter_complex".into(), filter,
-            "-map".into(), "[v]".into(),
-            "-map".into(), "[a]".into(),
-            "-c:v".into(), "h264_nvenc".into(),
-            "-preset".into(), "p4".into(),
-            "-cq".into(), "23".into(),
+            "-filter_complex".into(),
+            filter,
+            "-map".into(),
+            "[v]".into(),
+            "-map".into(),
+            "[a]".into(),
+            "-c:v".into(),
+            "h264_nvenc".into(),
+            "-preset".into(),
+            "p4".into(),
+            "-cq".into(),
+            "23".into(),
             // Apr 30, 2026 — intro-concat fix (Apr 18 hypothesis, Apr 19 proposal).
             // The intro→main seam is a hard scene change; NVENC's default
             // scene-detection inserts an unscheduled IDR there, desyncing GOP
@@ -552,36 +622,53 @@ pub async fn transcode(
             //                              6s boundary regardless of encoder cadence;
             //                              this alone would suffice but the others
             //                              constrain encoder choice for predictability.
-            "-g".into(), "180".into(),
-            "-keyint_min".into(), "180".into(),
-            "-sc_threshold".into(), "0".into(),
-            "-force_key_frames".into(), "expr:gte(t,n_forced*6)".into(),
+            "-g".into(),
+            "180".into(),
+            "-keyint_min".into(),
+            "180".into(),
+            "-sc_threshold".into(),
+            "0".into(),
+            "-force_key_frames".into(),
+            "expr:gte(t,n_forced*6)".into(),
         ]);
     } else {
         // No intro: explicitly map video + preferred audio track.
         // Without -map, ffmpeg picks the DEFAULT audio (could be Russian).
         args.extend([
-            "-map".into(), "0:v:0".into(),
-            "-map".into(), format!("0:a:{}", audio_index),
+            "-map".into(),
+            "0:v:0".into(),
+            "-map".into(),
+            format!("0:a:{}", audio_index),
         ]);
 
         if has_subs {
-            let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
+            let srt_str = subtitle_path
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
                 .replace(':', "\\:");
             args.extend([
                 // format=yuv420p forces 8-bit before NVENC — see comment above.
-                "-vf".into(), format!("subtitles='{}',format=yuv420p", srt_str),
-                "-c:v".into(), "h264_nvenc".into(),
-                "-preset".into(), "p4".into(),
-                "-cq".into(), "23".into(),
+                "-vf".into(),
+                format!("subtitles='{}',format=yuv420p", srt_str),
+                "-c:v".into(),
+                "h264_nvenc".into(),
+                "-preset".into(),
+                "p4".into(),
+                "-cq".into(),
+                "23".into(),
             ]);
         } else if video_reencode {
             args.extend([
                 // format=yuv420p forces 8-bit before NVENC — see comment above.
-                "-vf".into(), "format=yuv420p".into(),
-                "-c:v".into(), "h264_nvenc".into(),
-                "-preset".into(), "p4".into(),
-                "-cq".into(), "23".into(),
+                "-vf".into(),
+                "format=yuv420p".into(),
+                "-c:v".into(),
+                "h264_nvenc".into(),
+                "-preset".into(),
+                "p4".into(),
+                "-cq".into(),
+                "23".into(),
             ]);
         } else {
             args.extend(["-c:v".into(), "copy".into()]);
@@ -589,12 +676,17 @@ pub async fn transcode(
     }
 
     args.extend([
-        "-c:a".into(), "aac".into(),
-        "-ac".into(), "2".into(),
-        "-b:a".into(), "192k".into(),
-        "-dn".into(),                // Strip data streams (bin_data) — Chromecast rejects them
-        "-map_metadata".into(), "-1".into(), // Strip metadata tracks
-        "-movflags".into(), "frag_keyframe+empty_moov+default_base_moof".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-ac".into(),
+        "2".into(),
+        "-b:a".into(),
+        "192k".into(),
+        "-dn".into(), // Strip data streams (bin_data) — Chromecast rejects them
+        "-map_metadata".into(),
+        "-1".into(), // Strip metadata tracks
+        "-movflags".into(),
+        "frag_keyframe+empty_moov+default_base_moof".into(),
         "-y".into(),
         output_path.to_str().unwrap_or("transcoded_aac.mp4").into(),
     ]);
@@ -608,13 +700,15 @@ pub async fn transcode(
     // first stream's log gets overwritten when the second stream starts.
     // (Apr 28 incident: lost the H.264 5-min freeze evidence by switching
     // to HEVC mid-investigation.)
-    let ffmpeg_log_path = media_dir.parent()
+    let ffmpeg_log_path = media_dir
+        .parent()
         .and_then(|_| dirs::home_dir())
         .map(|h| h.join(".spela").join("ffmpeg.log"))
         .unwrap_or_else(|| media_dir.join("ffmpeg.log"));
     rotate_ffmpeg_log(&ffmpeg_log_path);
-    let stderr_file = std::fs::File::create(&ffmpeg_log_path)
-        .unwrap_or_else(|_| std::fs::File::create("/tmp/spela-ffmpeg.log").expect("Cannot create any log file"));
+    let stderr_file = std::fs::File::create(&ffmpeg_log_path).unwrap_or_else(|_| {
+        std::fs::File::create("/tmp/spela-ffmpeg.log").expect("Cannot create any log file")
+    });
     tracing::info!("FFmpeg stderr → {:?}", ffmpeg_log_path);
 
     let mut child = Command::new("ffmpeg")
@@ -667,6 +761,13 @@ pub async fn transcode(
 /// burn-in + NVENC video re-encode + AAC audio. The only difference from
 /// `transcode()` is the muxer: `-f hls -hls_segment_type fmp4 ...` instead
 /// of `-movflags frag_keyframe+empty_moov+default_base_moof`.
+pub struct HlsTranscodeInfo {
+    pub manifest_path: PathBuf,
+    pub ffmpeg_pid: u32,
+    pub adaptive: bool,
+    pub primary_segment_prefix: String,
+}
+
 pub async fn transcode_hls(
     input_url: &str,
     media_dir: &Path,
@@ -675,66 +776,40 @@ pub async fn transcode_hls(
     video_reencode: bool,
     seek_to: Option<f64>,
     audio_index: usize,
-) -> Result<(PathBuf, u32)> {
+    adaptive: bool,
+) -> Result<HlsTranscodeInfo> {
     let hls_dir = media_dir.join("transcoded_hls");
-
-    // Fresh play, fresh segments. Old segments + manifest get wiped here
-    // rather than waiting for `do_cleanup` so we never serve stale content
-    // from a prior play that didn't reach `do_cleanup`.
     let _ = std::fs::remove_dir_all(&hls_dir);
     std::fs::create_dir_all(&hls_dir)?;
 
-    // Subtitle sync fix (Apr 15, 2026): if we're seeking AND we have a
-    // subtitle file, physically shift the SRT so its "time 0" lines up
-    // with the frame content at the seek offset. See shift_srt() for
-    // rationale. Extracted into resolve_subtitle_path_for_seek() so
-    // unit tests can validate the shift-or-passthrough decision without
-    // launching ffmpeg.
-    let effective_subtitle_path = resolve_subtitle_path_for_seek(
-        subtitle_path,
-        &hls_dir,
-        seek_to,
-    );
+    let effective_subtitle_path = resolve_subtitle_path_for_seek(subtitle_path, &hls_dir, seek_to);
     let subtitle_path = effective_subtitle_path.as_deref();
-
-    let manifest_path = hls_dir.join("playlist.m3u8");
-    // MPEG-TS segments instead of fmp4 (Apr 15, 2026): Default Media Receiver
-    // (CAF) requires `media.hlsSegmentFormat = "fmp4"` in the LOAD message
-    // for fmp4-HLS to play, but rust_cast's Media struct doesn't expose
-    // hlsSegmentFormat — only contentId / contentType / streamType /
-    // duration / metadata. Without that signaling, the receiver doesn't
-    // know how to parse the .m4s segments and silently stays IDLE. MPEG-TS
-    // segments are auto-detected from the manifest's
-    // `#EXT-X-PLAYLIST-TYPE` line and don't require any extra LOAD-message
-    // fields. ~3% more bandwidth overhead vs fmp4, fully supported.
-    let segment_pattern = hls_dir.join("seg_%05d.ts");
-
     let has_intro = intro_path.is_some();
     let has_subs = subtitle_path.map_or(false, |p| p.exists());
+    let main_idx = if has_intro { 1 } else { 0 };
 
     let mut args: Vec<String> = Vec::new();
-
-    // Input 0: intro clip (if present)
     if let Some(intro) = intro_path {
         args.extend(["-i".into(), intro.to_string_lossy().to_string()]);
     }
-
-    // Seek BEFORE the main input. Cheap seek for keyframe-aligned positions.
     if let Some(seek) = seek_to {
         if seek > 0.0 {
             args.extend(["-ss".into(), seek.to_string()]);
         }
     }
-
-    // Reconnect flags are HTTP-only — they cause FFmpeg to error on file:// URLs
     let is_local_file = input_url.starts_with("file://") || input_url.starts_with("/");
     if !is_local_file {
         args.extend([
-            "-reconnect".into(), "1".into(),
-            "-reconnect_at_eof".into(), "1".into(),
-            "-reconnect_streamed".into(), "1".into(),
-            "-reconnect_delay_max".into(), "30".into(),
-            "-rw_timeout".into(), "60000000".into(),
+            "-reconnect".into(),
+            "1".into(),
+            "-reconnect_at_eof".into(),
+            "1".into(),
+            "-reconnect_streamed".into(),
+            "1".into(),
+            "-reconnect_delay_max".into(),
+            "30".into(),
+            "-rw_timeout".into(),
+            "60000000".into(),
         ]);
     }
     let ffmpeg_input = if let Some(path) = input_url.strip_prefix("file://") {
@@ -744,16 +819,138 @@ pub async fn transcode_hls(
     };
     args.extend(["-i".into(), ffmpeg_input]);
 
-    // Filter chain mirrors `transcode()`: intro concat / subs burn-in / video
-    // re-encode all happen the same way, only the muxer differs.
-    let main_idx = if has_intro { 1 } else { 0 };
+    let manifest_path = if adaptive {
+        hls_dir.join("stream_0.m3u8")
+    } else {
+        hls_dir.join("playlist.m3u8")
+    };
 
-    if has_intro {
+    if adaptive {
+        let mut filter = String::new();
+        if has_intro {
+            filter.push_str("[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v0]; ");
+            filter.push_str("[0:a:0]aresample=48000[a0]; ");
+            if has_subs {
+                let srt_str = subtitle_path
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+                    .replace(':', "\\:");
+                filter.push_str(&format!(
+                    "[{}:v]subtitles='{}',scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v1]; ",
+                    main_idx, srt_str
+                ));
+            } else {
+                filter.push_str(&format!(
+                    "[{}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v1]; ",
+                    main_idx
+                ));
+            }
+            filter.push_str(&format!(
+                "[{}:a:{}]aresample=48000[a1]; ",
+                main_idx, audio_index
+            ));
+            filter.push_str("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vcat][acat]; ");
+            filter.push_str("[vcat]split=2[vhi_src][vlo_src]; ");
+            filter.push_str("[vhi_src]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[vhi]; ");
+            filter.push_str("[vlo_src]scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2,setsar=1[vlo]; ");
+            filter.push_str("[acat]asplit=2[ahi][alo]");
+        } else {
+            let video_filter = build_hls_nvenc_video_filter(subtitle_path);
+            filter.push_str(&format!("[0:v]{},split=2[vhi_src][vlo_src]; ", video_filter));
+            filter.push_str("[vhi_src]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[vhi]; ");
+            filter.push_str("[vlo_src]scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2,setsar=1[vlo]; ");
+            filter.push_str(&format!(
+                "[0:a:{}]aresample=48000,asplit=2[ahi][alo]",
+                audio_index
+            ));
+        }
+
+        args.extend([
+            "-filter_complex".into(),
+            filter,
+            "-map".into(),
+            "[vhi]".into(),
+            "-map".into(),
+            "[ahi]".into(),
+            "-map".into(),
+            "[vlo]".into(),
+            "-map".into(),
+            "[alo]".into(),
+            "-c:v:0".into(),
+            "h264_nvenc".into(),
+            "-preset:v:0".into(),
+            "p4".into(),
+            "-profile:v:0".into(),
+            "high".into(),
+            "-level:v:0".into(),
+            "4.0".into(),
+            "-b:v:0".into(),
+            "5000k".into(),
+            "-maxrate:v:0".into(),
+            "6000k".into(),
+            "-bufsize:v:0".into(),
+            "10000k".into(),
+            "-c:v:1".into(),
+            "h264_nvenc".into(),
+            "-preset:v:1".into(),
+            "p4".into(),
+            "-profile:v:1".into(),
+            "high".into(),
+            "-level:v:1".into(),
+            "3.1".into(),
+            "-b:v:1".into(),
+            "1200k".into(),
+            "-maxrate:v:1".into(),
+            "1500k".into(),
+            "-bufsize:v:1".into(),
+            "3000k".into(),
+        ]);
+        append_hls_fixed_gop_args(&mut args);
+        args.extend([
+            "-c:a:0".into(),
+            "aac".into(),
+            "-ac:a:0".into(),
+            "2".into(),
+            "-b:a:0".into(),
+            "128k".into(),
+            "-c:a:1".into(),
+            "aac".into(),
+            "-ac:a:1".into(),
+            "2".into(),
+            "-b:a:1".into(),
+            "96k".into(),
+            "-dn".into(),
+            "-map_metadata".into(),
+            "-1".into(),
+            "-f".into(),
+            "hls".into(),
+            "-hls_time".into(),
+            "6".into(),
+            "-hls_list_size".into(),
+            "0".into(),
+            "-hls_segment_type".into(),
+            "mpegts".into(),
+            "-hls_segment_filename".into(),
+            hls_dir.join("seg_%v_%05d.ts").to_string_lossy().to_string(),
+            "-hls_flags".into(),
+            "temp_file".into(),
+            "-master_pl_name".into(),
+            "master.m3u8".into(),
+            "-var_stream_map".into(),
+            "v:0,a:0 v:1,a:1".into(),
+            "-y".into(),
+            hls_dir.join("stream_%v.m3u8").to_string_lossy().to_string(),
+        ]);
+    } else if has_intro {
         let mut filter = String::new();
         filter.push_str("[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v0]; ");
-        filter.push_str("[0:a:0]aresample=48000[a0]; ");  // Intro always has one audio track
+        filter.push_str("[0:a:0]aresample=48000[a0]; ");
         if has_subs {
-            let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
+            let srt_str = subtitle_path
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
                 .replace(':', "\\:");
             filter.push_str(&format!(
                 "[{}:v]subtitles='{}',scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v1]; ",
@@ -765,147 +962,122 @@ pub async fn transcode_hls(
                 main_idx
             ));
         }
-        filter.push_str(&format!("[{}:a:{}]aresample=48000[a1]; ", main_idx, audio_index));
+        filter.push_str(&format!(
+            "[{}:a:{}]aresample=48000[a1]; ",
+            main_idx, audio_index
+        ));
         filter.push_str("[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]");
         args.extend([
-            "-filter_complex".into(), filter,
-            "-map".into(), "[v]".into(),
-            "-map".into(), "[a]".into(),
-            "-c:v".into(), "h264_nvenc".into(),
-            "-preset".into(), "p4".into(),
-            "-cq".into(), "23".into(),
-            // May 1, 2026 (Wilderpeople movie-night CODECS-mismatch fix):
-            // FORCE H.264 High@4.0 to match the static CODECS string
-            // `avc1.640028` advertised in /hls/master.m3u8. Without this,
-            // NVENC picks profile based on input characteristics — Main
-            // for low-resolution input (720x304 XviD HDRip → Main),
-            // High for 1080p input — so the master's CODECS announcement
-            // was sometimes a lie. Default Media Receiver / Shaka Player
-            // on CrKey 1.56 validates announced CODECS via MSE; mismatch
-            // → receiver fetches master 4× and bails (idle_reason=None,
-            // never allocates a media session). Forcing High@4.0 makes
-            // the announcement always accurate. Level 4.0 covers up to
-            // 1080p30 @ 25 Mbps which dwarfs spela's typical 6 Mbps, so
-            // no practical content gets clipped. See Apr 15 master
-            // playlist commit `ebab5e5` for why CODECS must be set;
-            // see this commit for why it must be ACCURATE.
-            "-profile:v".into(), "high".into(),
-            "-level:v".into(), "4.0".into(),
-            // Apr 30, 2026 intro-concat fix — see transcode() above for the
-            // full rationale. Same four args, same hypothesis.
-            "-g".into(), "180".into(),
-            "-keyint_min".into(), "180".into(),
-            "-sc_threshold".into(), "0".into(),
-            "-force_key_frames".into(), "expr:gte(t,n_forced*6)".into(),
+            "-filter_complex".into(),
+            filter,
+            "-map".into(),
+            "[v]".into(),
+            "-map".into(),
+            "[a]".into(),
+            "-c:v".into(),
+            "h264_nvenc".into(),
+            "-preset".into(),
+            "p4".into(),
+            "-cq".into(),
+            "23".into(),
+            "-profile:v".into(),
+            "high".into(),
+            "-level:v".into(),
+            "4.0".into(),
+        ]);
+        append_hls_fixed_gop_args(&mut args);
+        args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-ac".into(),
+            "2".into(),
+            "-b:a".into(),
+            "192k".into(),
         ]);
     } else {
-        // No intro: explicitly map video + preferred audio track.
         args.extend([
-            "-map".into(), "0:v:0".into(),
-            "-map".into(), format!("0:a:{}", audio_index),
+            "-map".into(),
+            "0:v:0".into(),
+            "-map".into(),
+            format!("0:a:{}", audio_index),
         ]);
-
         if has_subs {
-            let srt_str = subtitle_path.unwrap().to_string_lossy().to_string()
-                .replace(':', "\\:");
             args.extend([
-                // format=yuv420p forces 8-bit before NVENC h264 — see Apr 28
-                // 10-bit-HEVC fix in transcode() above.
-                "-vf".into(), format!("subtitles='{}',format=yuv420p", srt_str),
-                "-c:v".into(), "h264_nvenc".into(),
-                "-preset".into(), "p4".into(),
-                "-cq".into(), "23".into(),
-                // May 1, 2026: CODECS-truth — see intro branch above.
-                "-profile:v".into(), "high".into(),
-                "-level:v".into(), "4.0".into(),
+                "-vf".into(),
+                build_hls_nvenc_video_filter(subtitle_path),
+                "-c:v".into(),
+                "h264_nvenc".into(),
+                "-preset".into(),
+                "p4".into(),
+                "-cq".into(),
+                "23".into(),
+                "-profile:v".into(),
+                "high".into(),
+                "-level:v".into(),
+                "4.0".into(),
             ]);
+            append_hls_fixed_gop_args(&mut args);
         } else if video_reencode {
             args.extend([
-                // format=yuv420p forces 8-bit before NVENC h264 — see Apr 28
-                // 10-bit-HEVC fix in transcode() above.
-                "-vf".into(), "format=yuv420p".into(),
-                "-c:v".into(), "h264_nvenc".into(),
-                "-preset".into(), "p4".into(),
-                "-cq".into(), "23".into(),
-                // May 1, 2026: CODECS-truth — see intro branch above.
-                "-profile:v".into(), "high".into(),
-                "-level:v".into(), "4.0".into(),
+                "-vf".into(),
+                build_hls_nvenc_video_filter(None),
+                "-c:v".into(),
+                "h264_nvenc".into(),
+                "-preset".into(),
+                "p4".into(),
+                "-cq".into(),
+                "23".into(),
+                "-profile:v".into(),
+                "high".into(),
+                "-level:v".into(),
+                "4.0".into(),
             ]);
+            append_hls_fixed_gop_args(&mut args);
         } else {
-            // Direct copy path: source is already H.264 and we're
-            // passing it through. The master's hardcoded CODECS may
-            // not match perfectly, but in practice DMR is more lenient
-            // about copy-streamed content than re-encoded streams (the
-            // reencode path was the one observed to fail Wilderpeople-
-            // style). If a regression appears here, switch this path
-            // to a forced reencode at High@4.0.
             args.extend(["-c:v".into(), "copy".into()]);
         }
+        args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-ac".into(),
+            "2".into(),
+            "-b:a".into(),
+            "192k".into(),
+        ]);
     }
 
-    args.extend([
-        "-c:a".into(), "aac".into(),
-        "-ac".into(), "2".into(),
-        "-b:a".into(), "192k".into(),
-        "-dn".into(),
-        "-map_metadata".into(), "-1".into(),
-    ]);
-
-    // HLS muxer — targeted at OLDER Chromecast Default Media Receivers
-    // (CrKey 1.56 firmware on 1st-gen sticks), which only support HLS v3
-    // manifests reliably. EVENT playlist type and independent_segments
-    // both bump the manifest version to v6, which the older Shaka Player
-    // can't parse — the device fetches the manifest 4 times in a row then
-    // bails to player_state=IDLE / idle_reason=ERROR without ever
-    // requesting any segment. Confirmed live on Apr 15, 2026 against
-    // Fredriks TV via direct pychromecast LOAD.
-    args.extend([
-        "-f".into(), "hls".into(),
-        // No -hls_version flag: ffmpeg's HLS muxer doesn't accept one. The
-        // manifest version is auto-determined by which features get used.
-        // Avoiding `-hls_playlist_type event` and `-hls_flags
-        // independent_segments` (both HLS v6) keeps the output at v3-v4,
-        // which CrKey 1.56 firmware can parse.
-        // 6-second segments — Apple's recommended target_duration for HLS,
-        // small enough that pre-buffer is fast (~12 seconds of encoded
-        // output gives 2 segments, enough for Chromecast to start
-        // reliably) and large enough to avoid HTTP-request overhead per
-        // second of content.
-        "-hls_time".into(), "6".into(),
-        // Keep ALL segments in the manifest — no rotation. Spela serves a
-        // finite movie, not a 24/7 broadcast, so the full manifest is fine.
-        "-hls_list_size".into(), "0".into(),
-        // No playlist_type. EVENT bumps to HLS v6 and confuses old
-        // receivers; VOD requires waiting for ffmpeg to finish before any
-        // playback. The default (no playlist_type tag) gives live
-        // behavior on the manifest while ffmpeg writes segments and is
-        // automatically marked complete with #EXT-X-ENDLIST when ffmpeg
-        // exits — exactly what we want.
-        // MPEG-TS segments (NOT fmp4) so that Default Media Receiver / CAF
-        // can play them without requiring `media.hlsSegmentFormat = "fmp4"`
-        // in the LOAD message — a field that rust_cast's high-level Media
-        // struct doesn't expose.
-        "-hls_segment_type".into(), "mpegts".into(),
-        "-hls_segment_filename".into(), segment_pattern.to_string_lossy().to_string(),
-        // temp_file ONLY: write each segment to .tmp first, then atomically
-        // rename. Avoids a partial-segment race with the HTTP serve path.
-        // No `independent_segments` — that flag bumps the manifest version
-        // and old Shaka Player on CrKey 1.56 can't handle the resulting
-        // EXT-X-INDEPENDENT-SEGMENTS tag.
-        "-hls_flags".into(), "temp_file".into(),
-        "-y".into(),
-        manifest_path.to_string_lossy().to_string(),
-    ]);
+    if !adaptive {
+        args.extend([
+            "-dn".into(),
+            "-map_metadata".into(),
+            "-1".into(),
+            "-f".into(),
+            "hls".into(),
+            "-hls_time".into(),
+            "6".into(),
+            "-hls_list_size".into(),
+            "0".into(),
+            "-hls_segment_type".into(),
+            "mpegts".into(),
+            "-hls_segment_filename".into(),
+            hls_dir.join("seg_%05d.ts").to_string_lossy().to_string(),
+            "-hls_flags".into(),
+            "temp_file".into(),
+            "-y".into(),
+            manifest_path.to_string_lossy().to_string(),
+        ]);
+    }
 
     tracing::info!("ffmpeg HLS args: {:?}", args);
 
-    // Reuse the same stderr log path as the fMP4 transcode for unified debug.
-    let ffmpeg_log_path = media_dir.parent()
+    let ffmpeg_log_path = media_dir
+        .parent()
         .and_then(|_| dirs::home_dir())
         .map(|h| h.join(".spela").join("ffmpeg.log"))
         .unwrap_or_else(|| media_dir.join("ffmpeg.log"));
-    let stderr_file = std::fs::File::create(&ffmpeg_log_path)
-        .unwrap_or_else(|_| std::fs::File::create("/tmp/spela-ffmpeg.log").expect("Cannot create any log file"));
+    let stderr_file = std::fs::File::create(&ffmpeg_log_path).unwrap_or_else(|_| {
+        std::fs::File::create("/tmp/spela-ffmpeg.log").expect("Cannot create any log file")
+    });
     tracing::info!("FFmpeg HLS stderr → {:?}", ffmpeg_log_path);
 
     let mut child = Command::new("ffmpeg")
@@ -915,13 +1087,20 @@ pub async fn transcode_hls(
         .spawn()?;
 
     let pid = child.id().unwrap_or(0);
-
-    // Reap on exit — same zombie-prevention pattern as `transcode()`.
     tokio::spawn(async move {
         let _ = child.wait().await;
     });
 
-    Ok((manifest_path, pid))
+    Ok(HlsTranscodeInfo {
+        manifest_path,
+        ffmpeg_pid: pid,
+        adaptive,
+        primary_segment_prefix: if adaptive {
+            "seg_0_".into()
+        } else {
+            "seg_".into()
+        },
+    })
 }
 
 #[cfg(test)]
@@ -997,7 +1176,10 @@ mod tests {
         std::fs::write(&log, "stream A").unwrap();
         rotate_ffmpeg_log(&log);
         assert!(!log.exists(), "current was rotated away");
-        assert_eq!(std::fs::read_to_string(log.with_extension("log.1")).unwrap(), "stream A");
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("log.1")).unwrap(),
+            "stream A"
+        );
     }
 
     #[test]
@@ -1008,9 +1190,18 @@ mod tests {
         std::fs::write(log.with_extension("log.1"), "older").unwrap();
         std::fs::write(log.with_extension("log.2"), "older2").unwrap();
         rotate_ffmpeg_log(&log);
-        assert_eq!(std::fs::read_to_string(log.with_extension("log.1")).unwrap(), "current");
-        assert_eq!(std::fs::read_to_string(log.with_extension("log.2")).unwrap(), "older");
-        assert_eq!(std::fs::read_to_string(log.with_extension("log.3")).unwrap(), "older2");
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("log.1")).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("log.2")).unwrap(),
+            "older"
+        );
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("log.3")).unwrap(),
+            "older2"
+        );
     }
 
     #[test]
@@ -1023,9 +1214,18 @@ mod tests {
         }
         rotate_ffmpeg_log(&log);
         // gen5 (the oldest) should be dropped; gen1..gen4 shifted to .2..=.5
-        assert_eq!(std::fs::read_to_string(log.with_extension("log.1")).unwrap(), "current");
-        assert_eq!(std::fs::read_to_string(log.with_extension("log.2")).unwrap(), "gen1");
-        assert_eq!(std::fs::read_to_string(log.with_extension("log.5")).unwrap(), "gen4");
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("log.1")).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("log.2")).unwrap(),
+            "gen1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("log.5")).unwrap(),
+            "gen4"
+        );
         // .6 must NOT exist — ring is bounded
         assert!(!log.with_extension("log.6").exists());
     }
@@ -1069,6 +1269,39 @@ mod tests {
         // In test env, ~/.config/spela/intro.mp4 likely doesn't exist
         // This just verifies the function doesn't panic
         let _ = find_intro();
+    }
+
+    #[test]
+    fn test_build_hls_nvenc_video_filter_without_subtitles_normalizes_fps() {
+        assert_eq!(build_hls_nvenc_video_filter(None), "fps=30,format=yuv420p");
+    }
+
+    #[test]
+    fn test_build_hls_nvenc_video_filter_with_subtitles_escapes_path_and_normalizes_fps() {
+        let path = Path::new("/tmp/Subtitles/en:forced.srt");
+        assert_eq!(
+            build_hls_nvenc_video_filter(Some(path)),
+            "subtitles='/tmp/Subtitles/en\\:forced.srt',fps=30,format=yuv420p"
+        );
+    }
+
+    #[test]
+    fn test_append_hls_fixed_gop_args_pins_six_second_cadence() {
+        let mut args = Vec::new();
+        append_hls_fixed_gop_args(&mut args);
+        assert_eq!(
+            args,
+            vec![
+                "-g",
+                "180",
+                "-keyint_min",
+                "180",
+                "-sc_threshold",
+                "0",
+                "-force_key_frames",
+                "expr:gte(t,n_forced*6)",
+            ]
+        );
     }
 
     // ===== SRT shifter (Apr 15, 2026 subtitle-sync fix) =====
@@ -1319,8 +1552,7 @@ mod tests {
         )
         .unwrap();
 
-        let resolved =
-            resolve_subtitle_path_for_seek(Some(&orig), &hls_dir, Some(1800.0)).unwrap();
+        let resolved = resolve_subtitle_path_for_seek(Some(&orig), &hls_dir, Some(1800.0)).unwrap();
         // CRITICAL: the resolved path must NOT be the original.
         assert_ne!(
             resolved, orig,

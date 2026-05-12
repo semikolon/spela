@@ -54,6 +54,25 @@ pub fn kill_spela_ffmpeg_workers() -> Vec<u32> {
     kill_matching(SPELA_FFMPEG_PROCESS_PATTERN, &[])
 }
 
+/// Liveness check: is at least one Spela-owned ffmpeg worker producing
+/// HLS segments / fMP4 right now? This is the ground truth for "user
+/// is watching something" — if ffmpeg is dead, the cast pipeline is
+/// dead regardless of what the torrent engine says or what
+/// `app_state.current.pid` claims.
+///
+/// Used by `handle_status` to replace the legacy
+/// `is_process_running(current.pid)` check, which compared a librqbit
+/// torrent ID (small u32 like 4/5/6) to the OS PID space — only
+/// "worked" when the torrent ID happened to match a live OS process,
+/// otherwise reported `process_dead` even with a perfectly healthy
+/// stream. May 6, 2026 incident: status returned `process_dead` while
+/// ffmpeg was actively encoding S05E06 to Fredriks TV. Ruby read the
+/// dead-status, narrated failure, retried, narrated success, retried,
+/// loop.
+pub fn any_spela_ffmpeg_alive() -> bool {
+    !pids_matching(SPELA_FFMPEG_PROCESS_PATTERN).is_empty()
+}
+
 /// Emergency worker-only cleanup. Sends SIGTERM and does not delete media or
 /// mutate playback state. Belt-and-suspenders for diagnostic flows
 /// (post-cast-failure, OPERATIONS.md emergency path); the normal lifecycle

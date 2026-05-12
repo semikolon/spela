@@ -95,7 +95,13 @@ impl SearchEngine {
         }
     }
 
-    pub async fn search(&self, query: &str, movie: bool, season: Option<u32>, episode: Option<u32>) -> Result<SearchResult> {
+    pub async fn search(
+        &self,
+        query: &str,
+        movie: bool,
+        season: Option<u32>,
+        episode: Option<u32>,
+    ) -> Result<SearchResult> {
         if self.tmdb_key.is_empty() {
             return Ok(SearchResult {
                 query: query.into(),
@@ -107,21 +113,45 @@ impl SearchEngine {
             });
         }
 
+        // Parse inline season/episode markers like "S05E06", "5x06", or
+        // "season 5 episode 6" out of the query string. Explicit
+        // --season/--episode CLI flags WIN over parsed markers.
+        //
+        // May 6, 2026 incident (the "endlessly proud about streaming"
+        // loop): Ruby's Gemini tool-loop issued
+        // `spela search "The Boys S05E06"` (no flags); TMDB choked on
+        // the marker; search returned empty (52 chars); Ruby narrated
+        // success anyway because she'd sometimes hit the working
+        // `--season N --episode M` form on a retry. Result: 6
+        // contradictory "now streaming" / "hasn't surfaced" claims in
+        // 97 seconds. Pre-parsing the marker on the engine side makes
+        // the natural-language form work first time, every time.
+        let (cleaned_query, parsed_season, parsed_episode) = parse_episode_markers(query);
+        let q_owned: String;
+        let q: &str = if parsed_season.is_some() || parsed_episode.is_some() {
+            q_owned = cleaned_query;
+            &q_owned
+        } else {
+            query
+        };
+        let final_season = season.or(parsed_season);
+        let final_episode = episode.or(parsed_episode);
+
         if movie {
-            self.search_movie(query).await
-        } else if season.is_some() || episode.is_some() {
+            self.search_movie(q).await
+        } else if final_season.is_some() || final_episode.is_some() {
             // Explicit season/episode = definitely TV
-            self.search_tv(query, season, episode).await
+            self.search_tv(q, final_season, final_episode).await
         } else {
             // Auto-detect: use TMDB multi-search to determine if it's a movie or TV show
-            match self.tmdb_auto_detect(query).await {
+            match self.tmdb_auto_detect(q).await {
                 Ok(media_type) if media_type == "movie" => {
-                    tracing::info!("Auto-detected '{}' as movie (TMDB multi-search)", query);
-                    self.search_movie(query).await
+                    tracing::info!("Auto-detected '{}' as movie (TMDB multi-search)", q);
+                    self.search_movie(q).await
                 }
                 _ => {
                     // Default to TV, or if auto-detect found "tv"
-                    self.search_tv(query, season, episode).await
+                    self.search_tv(q, final_season, final_episode).await
                 }
             }
         }
@@ -135,7 +165,8 @@ impl SearchEngine {
             self.tmdb_key
         );
         let resp: Value = self.client.get(&url).send().await?.json().await?;
-        let results = resp["results"].as_array()
+        let results = resp["results"]
+            .as_array()
             .ok_or_else(|| anyhow!("No multi-search results"))?;
 
         // Find the first movie or tv result (skip "person" results)
@@ -149,10 +180,17 @@ impl SearchEngine {
         Err(anyhow!("No movie or TV result found"))
     }
 
-    async fn search_tv(&self, query: &str, season: Option<u32>, episode: Option<u32>) -> Result<SearchResult> {
+    async fn search_tv(
+        &self,
+        query: &str,
+        season: Option<u32>,
+        episode: Option<u32>,
+    ) -> Result<SearchResult> {
         // Step 1: TMDB search
         let tmdb = self.tmdb_search(query, "tv").await?;
-        let tmdb_id = tmdb["id"].as_u64().ok_or_else(|| anyhow!("No TV show found for \"{}\"", query))?;
+        let tmdb_id = tmdb["id"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("No TV show found for \"{}\"", query))?;
 
         // Step 2: Get details + IMDB ID
         let detail = self.tmdb_tv_details(tmdb_id).await?;
@@ -173,14 +211,16 @@ impl SearchEngine {
 
         let imdb_id = match &show_info.imdb_id {
             Some(id) if !id.is_empty() => id.clone(),
-            _ => return Ok(SearchResult {
-                query: query.into(),
-                show: Some(show_info),
-                searching: None,
-                error: Some("No IMDB ID found for this show".into()),
-                torrent_available: false,
-                results: vec![],
-            }),
+            _ => {
+                return Ok(SearchResult {
+                    query: query.into(),
+                    show: Some(show_info),
+                    searching: None,
+                    error: Some("No IMDB ID found for this show".into()),
+                    torrent_available: false,
+                    results: vec![],
+                })
+            }
         };
 
         // Determine episode to search
@@ -188,25 +228,34 @@ impl SearchEngine {
             (Some(s), Some(e)) => (s, e),
             _ => match &show_info.latest_episode {
                 Some(ep) => (ep.season, ep.episode),
-                None => return Ok(SearchResult {
-                    query: query.into(),
-                    show: Some(show_info),
-                    searching: None,
-                    error: Some("Cannot determine episode to search".into()),
-                    torrent_available: false,
-                    results: vec![],
-                }),
+                None => {
+                    return Ok(SearchResult {
+                        query: query.into(),
+                        show: Some(show_info),
+                        searching: None,
+                        error: Some("Cannot determine episode to search".into()),
+                        torrent_available: false,
+                        results: vec![],
+                    })
+                }
             },
         };
 
         // Step 3: Torrentio lookup (filtered by show title to drop spurious
         // cross-show results — the Apr 15 "French Chef for The Boys S05E03"
         // incident).
-        let results = self.torrentio_streams(&imdb_id, &show_info.title, Some(s), Some(e)).await?;
+        let results = self
+            .torrentio_streams(&imdb_id, &show_info.title, Some(s), Some(e))
+            .await?;
         Ok(SearchResult {
             query: query.into(),
             show: Some(show_info),
-            searching: Some(EpisodeRef { season: s, episode: e, name: None, air_date: None }),
+            searching: Some(EpisodeRef {
+                season: s,
+                episode: e,
+                name: None,
+                air_date: None,
+            }),
             error: None,
             torrent_available: !results.is_empty(),
             results,
@@ -215,10 +264,13 @@ impl SearchEngine {
 
     async fn search_movie(&self, query: &str) -> Result<SearchResult> {
         let tmdb = self.tmdb_search(query, "movie").await?;
-        let tmdb_id = tmdb["id"].as_u64().ok_or_else(|| anyhow!("No movie found for \"{}\"", query))?;
+        let tmdb_id = tmdb["id"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("No movie found for \"{}\"", query))?;
 
         let detail = self.tmdb_movie_details(tmdb_id).await?;
-        let imdb_id = detail["external_ids"]["imdb_id"].as_str()
+        let imdb_id = detail["external_ids"]["imdb_id"]
+            .as_str()
             .or_else(|| detail["imdb_id"].as_str())
             .map(String::from);
 
@@ -231,23 +283,29 @@ impl SearchEngine {
             latest_episode: None,
             next_episode: None,
             release_date: detail["release_date"].as_str().map(String::from),
-            overview: detail["overview"].as_str().map(|s| s.chars().take(200).collect()),
+            overview: detail["overview"]
+                .as_str()
+                .map(|s| s.chars().take(200).collect()),
             poster_url: tmdb_poster_url(detail["poster_path"].as_str()),
         };
 
         let imdb_id = match &show_info.imdb_id {
             Some(id) if !id.is_empty() => id.clone(),
-            _ => return Ok(SearchResult {
-                query: query.into(),
-                show: Some(show_info),
-                searching: None,
-                error: Some("No IMDB ID".into()),
-                torrent_available: false,
-                results: vec![],
-            }),
+            _ => {
+                return Ok(SearchResult {
+                    query: query.into(),
+                    show: Some(show_info),
+                    searching: None,
+                    error: Some("No IMDB ID".into()),
+                    torrent_available: false,
+                    results: vec![],
+                })
+            }
         };
 
-        let results = self.torrentio_streams(&imdb_id, &show_info.title, None, None).await?;
+        let results = self
+            .torrentio_streams(&imdb_id, &show_info.title, None, None)
+            .await?;
         Ok(SearchResult {
             query: query.into(),
             show: Some(show_info),
@@ -266,7 +324,8 @@ impl SearchEngine {
             self.tmdb_key
         );
         let resp: Value = self.client.get(&url).send().await?.json().await?;
-        resp["results"].as_array()
+        resp["results"]
+            .as_array()
             .and_then(|r| r.first().cloned())
             .ok_or_else(|| anyhow!("No {} found for \"{}\"", media_type, query))
     }
@@ -287,14 +346,21 @@ impl SearchEngine {
         Ok(self.client.get(&url).send().await?.json().await?)
     }
 
-    async fn torrentio_streams(&self, imdb_id: &str, show_title: &str, season: Option<u32>, episode: Option<u32>) -> Result<Vec<TorrentResult>> {
+    async fn torrentio_streams(
+        &self,
+        imdb_id: &str,
+        show_title: &str,
+        season: Option<u32>,
+        episode: Option<u32>,
+    ) -> Result<Vec<TorrentResult>> {
         let path = match (season, episode) {
             (Some(s), Some(e)) => format!("stream/series/{}:{}:{}.json", imdb_id, s, e),
             _ => format!("stream/movie/{}.json", imdb_id),
         };
         let url = format!("{}/{}", TORRENTIO_BASE, path);
 
-        let resp: Value = self.client
+        let resp: Value = self
+            .client
             .get(&url)
             .header("User-Agent", "spela/2.0")
             .send()
@@ -303,29 +369,40 @@ impl SearchEngine {
             .await?;
 
         let streams = resp["streams"].as_array().cloned().unwrap_or_default();
-        let results: Vec<TorrentResult> = streams.iter().map(|s| {
-            let title_text = s["title"].as_str().unwrap_or("");
-            let meta = parse_torrentio_title(title_text);
-            let quality = s["name"].as_str().unwrap_or("")
-                .replace("Torrentio\n", "").trim().to_string();
-            let info_hash = s["infoHash"].as_str().unwrap_or("").to_string();
-            let filename = s["behaviorHints"]["filename"].as_str()
-                .or_else(|| title_text.split('\n').next())
-                .unwrap_or("Unknown")
-                .to_string();
+        let results: Vec<TorrentResult> = streams
+            .iter()
+            .map(|s| {
+                let title_text = s["title"].as_str().unwrap_or("");
+                let meta = parse_torrentio_title(title_text);
+                let quality = s["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .replace("Torrentio\n", "")
+                    .trim()
+                    .to_string();
+                let info_hash = s["infoHash"].as_str().unwrap_or("").to_string();
+                let filename = s["behaviorHints"]["filename"]
+                    .as_str()
+                    .or_else(|| title_text.split('\n').next())
+                    .unwrap_or("Unknown")
+                    .to_string();
 
-            TorrentResult {
-                id: 0, // assigned after sorting
-                quality,
-                title: filename,
-                seeds: meta.0,
-                size: meta.1,
-                source: meta.2,
-                magnet: build_magnet(&info_hash, s["behaviorHints"]["filename"].as_str().unwrap_or("")),
-                info_hash,
-                file_index: s["fileIdx"].as_u64().map(|n| n as u32),
-            }
-        }).collect();
+                TorrentResult {
+                    id: 0, // assigned after sorting
+                    quality,
+                    title: filename,
+                    seeds: meta.0,
+                    size: meta.1,
+                    source: meta.2,
+                    magnet: build_magnet(
+                        &info_hash,
+                        s["behaviorHints"]["filename"].as_str().unwrap_or(""),
+                    ),
+                    info_hash,
+                    file_index: s["fileIdx"].as_u64().map(|n| n as u32),
+                }
+            })
+            .collect();
 
         // Filter spurious cross-show results BEFORE ranking, so result IDs
         // assigned by rank_results_mut reflect only legitimate matches.
@@ -398,14 +475,22 @@ pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
         let a_single = a.file_index.map_or(true, |i| i == 0);
         let b_single = b.file_index.map_or(true, |i| i == 0);
         if a_single != b_single {
-            return if a_single { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+            return if a_single {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
         }
 
         // Tier 2: non-DV > DV (HARD GPU gate, fires before any quality tier)
         let a_dv = has_dolby_vision_in_title(&a.title);
         let b_dv = has_dolby_vision_in_title(&b.title);
         if a_dv != b_dv {
-            return if a_dv { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+            return if a_dv {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
         }
 
         // Tier 3: target resolution (1080p > 720p > 480p > 2160p > unknown)
@@ -413,11 +498,8 @@ pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
         let a_res = resolution_tier(&a.title);
         let b_res = resolution_tier(&b.title);
         if a_res != b_res {
-            let (higher_res_result, higher_is_a) = if a_res < b_res {
-                (a, true)
-            } else {
-                (b, false)
-            };
+            let (higher_res_result, higher_is_a) =
+                if a_res < b_res { (a, true) } else { (b, false) };
             if higher_res_result.seeds >= MIN_SEEDS_FOR_RESOLUTION_PREF {
                 return if higher_is_a {
                     std::cmp::Ordering::Less
@@ -433,7 +515,11 @@ pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
         if a_hevc != b_hevc {
             let preferred = if a_hevc { b } else { a }; // the H.264 one
             if preferred.seeds >= MIN_SEEDS_FOR_CODEC_PREF {
-                return if a_hevc { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+                return if a_hevc {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                };
             }
         }
 
@@ -466,7 +552,10 @@ pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
 ///   filter applied, returns the full list.
 /// - Filter drops everything: returns the full list with a warning,
 ///   because "some spurious results" is less bad than "no results at all".
-fn filter_results_by_show_title(results: Vec<TorrentResult>, show_title: &str) -> Vec<TorrentResult> {
+fn filter_results_by_show_title(
+    results: Vec<TorrentResult>,
+    show_title: &str,
+) -> Vec<TorrentResult> {
     let tokens = extract_significant_tokens(show_title);
     if tokens.is_empty() {
         return results;
@@ -485,7 +574,8 @@ fn filter_results_by_show_title(results: Vec<TorrentResult>, show_title: &str) -
     if !dropped.is_empty() {
         tracing::info!(
             "Show-title filter dropped {} cross-show result(s) not matching {:?}",
-            dropped.len(), tokens
+            dropped.len(),
+            tokens
         );
     }
     matching
@@ -500,9 +590,7 @@ fn filter_results_by_show_title(results: Vec<TorrentResult>, show_title: &str) -
 /// Everything else after lowercasing + splitting on non-alphanumeric is
 /// kept as a required token.
 fn extract_significant_tokens(title: &str) -> Vec<String> {
-    const STOP_WORDS: &[&str] = &[
-        "the", "a", "an", "of", "and", "in", "on", "to", "at", "is",
-    ];
+    const STOP_WORDS: &[&str] = &["the", "a", "an", "of", "and", "in", "on", "to", "at", "is"];
     title
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -534,9 +622,13 @@ fn resolution_tier(title: &str) -> u32 {
     let lower = title.to_lowercase();
     // Normalize separator before `p` so `1080 p` / `1080.p` count.
     let res_match = |needle: &str| -> bool {
-        if lower.contains(needle) { return true; }
+        if lower.contains(needle) {
+            return true;
+        }
         let with_space = needle.replace('p', " p");
-        if lower.contains(&with_space) { return true; }
+        if lower.contains(&with_space) {
+            return true;
+        }
         let with_dot = needle.replace('p', ".p");
         lower.contains(&with_dot)
     };
@@ -549,7 +641,11 @@ fn resolution_tier(title: &str) -> u32 {
     if res_match("480p") {
         return 2;
     }
-    if res_match("2160p") || lower.contains("4k") || lower.contains(" uhd") || lower.contains(".uhd") {
+    if res_match("2160p")
+        || lower.contains("4k")
+        || lower.contains(" uhd")
+        || lower.contains(".uhd")
+    {
         return 3;
     }
     4
@@ -623,7 +719,9 @@ fn has_dolby_vision_in_title(title: &str) -> bool {
 }
 
 fn extract_episode(val: &Value) -> Option<EpisodeRef> {
-    if val.is_null() { return None; }
+    if val.is_null() {
+        return None;
+    }
     Some(EpisodeRef {
         season: val["season_number"].as_u64()? as u32,
         episode: val["episode_number"].as_u64()? as u32,
@@ -664,34 +762,176 @@ fn tmdb_poster_url(poster_path: Option<&str>) -> Option<String> {
 }
 
 fn parse_torrentio_title(title: &str) -> (u32, String, String) {
-    let seeds = title.find("👤").and_then(|i| {
-        title[i..].split_whitespace().nth(1)?.parse().ok()
-    }).unwrap_or(0);
-    let size = title.find("💾").and_then(|i| {
-        let rest = &title[i + "💾".len()..];
-        let parts: Vec<&str> = rest.trim().splitn(3, ' ').collect();
-        if parts.len() >= 2 { Some(format!("{} {}", parts[0], parts[1])) } else { None }
-    }).unwrap_or_default();
-    let source = title.find("⚙️").and_then(|i| {
-        title[i + "⚙️".len()..].trim().split_whitespace().next().map(String::from)
-    }).unwrap_or_default();
+    let seeds = title
+        .find("👤")
+        .and_then(|i| title[i..].split_whitespace().nth(1)?.parse().ok())
+        .unwrap_or(0);
+    let size = title
+        .find("💾")
+        .and_then(|i| {
+            let rest = &title[i + "💾".len()..];
+            let parts: Vec<&str> = rest.trim().splitn(3, ' ').collect();
+            if parts.len() >= 2 {
+                Some(format!("{} {}", parts[0], parts[1]))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    let source = title
+        .find("⚙️")
+        .and_then(|i| {
+            title[i + "⚙️".len()..]
+                .trim()
+                .split_whitespace()
+                .next()
+                .map(String::from)
+        })
+        .unwrap_or_default();
     (seeds, size, source)
 }
 
 fn build_magnet(info_hash: &str, name: &str) -> String {
-    let trackers: String = PUBLIC_TRACKERS.iter()
+    let trackers: String = PUBLIC_TRACKERS
+        .iter()
         .map(|t| format!("&tr={}", urlencoded(t)))
         .collect();
-    format!("magnet:?xt=urn:btih:{}&dn={}{}", info_hash, urlencoded(name), trackers)
+    format!(
+        "magnet:?xt=urn:btih:{}&dn={}{}",
+        info_hash,
+        urlencoded(name),
+        trackers
+    )
 }
 
 fn urlencoded(s: &str) -> String {
-    s.bytes().map(|b| match b {
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-            String::from(b as char)
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                String::from(b as char)
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
+}
+
+/// Parse inline season/episode markers from a search query string.
+///
+/// Recognized forms (case-insensitive, ASCII-only):
+///   - `S05E06` / `s05e06` / `S5E6` / `s5e6`           (preferred — most common)
+///   - `5x06` / `5x6`                                   (alternative slash form)
+///   - `season 5 episode 6` / `Season 5 Episode 6`     (verbal)
+///   - `season 5` (no episode) / `episode 6` (no season) — captured individually
+///
+/// Returns `(cleaned_query, season, episode)` where `cleaned_query` is the
+/// original query with the marker substring stripped (and adjacent
+/// whitespace collapsed). If no marker matches, returns `(query.into(), None, None)`.
+///
+/// Defenses:
+///   - Numeric range clamped to 1..=999 — wider than realistic seasons
+///     (max real-world is ~70 e.g. The Simpsons) but tight enough that
+///     a 4-digit number isn't accidentally claimed as an episode.
+///   - The S/E and `NxN` forms must sit on token boundaries so we don't
+///     mangle codec markers like `H.265` / `1080p` / `5.1` audio.
+///   - The verbal form requires the literal words `season` or `episode`
+///     so a query like `"5 6"` isn't parsed as S5E6.
+///
+/// Why this exists: see `SearchEngine::search` for the May 6, 2026
+/// "endlessly proud about streaming" loop incident — Ruby's tool-loop
+/// issued `spela search "The Boys S05E06"` (no flags) and TMDB choked
+/// on the marker, returning empty results. Ruby narrated success
+/// anyway. Pre-parsing the marker on the engine side makes the
+/// natural-language form work first time.
+pub(crate) fn parse_episode_markers(query: &str) -> (String, Option<u32>, Option<u32>) {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+
+    // Order matters: try most specific patterns first. Each regex
+    // returns Some((season, episode)) on first match.
+    static RE_SXXEXX: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)\b[sS](\d{1,3})[eE](\d{1,3})\b").unwrap());
+    static RE_NXM: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b(\d{1,3})x(\d{1,3})\b").unwrap());
+    static RE_VERBAL_BOTH: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?i)\bseason\s+(\d{1,3})\s+(?:and\s+|,\s*)?episode\s+(\d{1,3})\b").unwrap()
+    });
+    static RE_VERBAL_SEASON_ONLY: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)\bseason\s+(\d{1,3})\b").unwrap());
+    static RE_VERBAL_EPISODE_ONLY: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)\bepisode\s+(\d{1,3})\b").unwrap());
+
+    let parse_clamped = |s: &str| -> Option<u32> {
+        let n: u32 = s.parse().ok()?;
+        if (1..=999).contains(&n) {
+            Some(n)
+        } else {
+            None
         }
-        _ => format!("%{:02X}", b),
-    }).collect()
+    };
+
+    let strip_match = |q: &str, mat: regex::Match| -> String {
+        let mut cleaned = String::with_capacity(q.len());
+        cleaned.push_str(&q[..mat.start()]);
+        cleaned.push_str(&q[mat.end()..]);
+        // Collapse runs of whitespace introduced by the strip.
+        cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+
+    // 1. SxxExx (highest specificity).
+    if let Some(caps) = RE_SXXEXX.captures(query) {
+        let s = caps.get(1).and_then(|m| parse_clamped(m.as_str()));
+        let e = caps.get(2).and_then(|m| parse_clamped(m.as_str()));
+        if s.is_some() || e.is_some() {
+            let mat = caps.get(0).unwrap();
+            return (strip_match(query, mat), s, e);
+        }
+    }
+
+    // 2. Verbal "season N (and )?episode M" — must come BEFORE NxM so
+    //    "season 5 episode 6" isn't accidentally consumed by NxM.
+    if let Some(caps) = RE_VERBAL_BOTH.captures(query) {
+        let s = caps.get(1).and_then(|m| parse_clamped(m.as_str()));
+        let e = caps.get(2).and_then(|m| parse_clamped(m.as_str()));
+        if s.is_some() || e.is_some() {
+            let mat = caps.get(0).unwrap();
+            return (strip_match(query, mat), s, e);
+        }
+    }
+
+    // 3. NxM — `5x06` / `5x6`. Lower-priority because it can match
+    //    things like resolutions in unusual filenames (rare in TMDB
+    //    queries but possible).
+    if let Some(caps) = RE_NXM.captures(query) {
+        let s = caps.get(1).and_then(|m| parse_clamped(m.as_str()));
+        let e = caps.get(2).and_then(|m| parse_clamped(m.as_str()));
+        if s.is_some() || e.is_some() {
+            let mat = caps.get(0).unwrap();
+            return (strip_match(query, mat), s, e);
+        }
+    }
+
+    // 4. Verbal "season N" or "episode M" alone.
+    let mut cleaned = query.to_string();
+    let mut season_only: Option<u32> = None;
+    let mut episode_only: Option<u32> = None;
+    if let Some(caps) = RE_VERBAL_SEASON_ONLY.captures(&cleaned) {
+        if let Some(s) = caps.get(1).and_then(|m| parse_clamped(m.as_str())) {
+            season_only = Some(s);
+            let mat = caps.get(0).unwrap();
+            cleaned = strip_match(&cleaned, mat);
+        }
+    }
+    if let Some(caps) = RE_VERBAL_EPISODE_ONLY.captures(&cleaned) {
+        if let Some(e) = caps.get(1).and_then(|m| parse_clamped(m.as_str())) {
+            episode_only = Some(e);
+            let mat = caps.get(0).unwrap();
+            cleaned = strip_match(&cleaned, mat);
+        }
+    }
+    if season_only.is_some() || episode_only.is_some() {
+        return (cleaned, season_only, episode_only);
+    }
+
+    (query.to_string(), None, None)
 }
 
 #[cfg(test)]
@@ -708,8 +948,10 @@ mod tests {
     #[test]
     fn tmdb_poster_url_typical_path() {
         let url = tmdb_poster_url(Some("/qZQqEgXgGRpC8nJa9j5ej31Ynmm.jpg"));
-        assert_eq!(url.as_deref(),
-            Some("https://image.tmdb.org/t/p/w500/qZQqEgXgGRpC8nJa9j5ej31Ynmm.jpg"));
+        assert_eq!(
+            url.as_deref(),
+            Some("https://image.tmdb.org/t/p/w500/qZQqEgXgGRpC8nJa9j5ej31Ynmm.jpg")
+        );
     }
 
     #[test]
@@ -717,8 +959,10 @@ mod tests {
         // TMDB always returns leading slash, but defend against a future
         // schema change or upstream bug where it doesn't.
         let url = tmdb_poster_url(Some("abc.jpg"));
-        assert_eq!(url.as_deref(),
-            Some("https://image.tmdb.org/t/p/w500/abc.jpg"));
+        assert_eq!(
+            url.as_deref(),
+            Some("https://image.tmdb.org/t/p/w500/abc.jpg")
+        );
     }
 
     #[test]
@@ -740,8 +984,11 @@ mod tests {
     #[test]
     fn tmdb_poster_url_empty_returns_none() {
         assert_eq!(tmdb_poster_url(Some("")), None);
-        assert_eq!(tmdb_poster_url(Some("   ")), None,
-            "Whitespace-only path must be rejected.");
+        assert_eq!(
+            tmdb_poster_url(Some("   ")),
+            None,
+            "Whitespace-only path must be rejected."
+        );
     }
 
     #[test]
@@ -749,8 +996,10 @@ mod tests {
         // TMDB poster paths are alphanumeric + dot, but defend against
         // unusual filenames (different image bucket, different content type).
         let url = tmdb_poster_url(Some("/some-name_with.dots-and_underscores.png"));
-        assert_eq!(url.as_deref(),
-            Some("https://image.tmdb.org/t/p/w500/some-name_with.dots-and_underscores.png"));
+        assert_eq!(
+            url.as_deref(),
+            Some("https://image.tmdb.org/t/p/w500/some-name_with.dots-and_underscores.png")
+        );
     }
 
     #[test]
@@ -758,10 +1007,14 @@ mod tests {
         // Pin the size choice so a future "let's use original" tweak that
         // bloats Cast LOAD messages by 20× gets caught by tests.
         let url = tmdb_poster_url(Some("/x.jpg")).unwrap();
-        assert!(url.contains("/w500/"),
-            "URL must include the w500 size descriptor: {url}");
-        assert!(!url.contains("/original/"),
-            "Original-size posters are 2-4 MB, too heavy for the LOAD msg");
+        assert!(
+            url.contains("/w500/"),
+            "URL must include the w500 size descriptor: {url}"
+        );
+        assert!(
+            !url.contains("/original/"),
+            "Original-size posters are 2-4 MB, too heavy for the LOAD msg"
+        );
     }
 
     #[test]
@@ -774,11 +1027,13 @@ mod tests {
             "tmdb_id": 12345,
             "title": "Hijack"
         }"#;
-        let info: ShowInfo = serde_json::from_str(legacy_json)
-            .expect("legacy ShowInfo must deserialize");
+        let info: ShowInfo =
+            serde_json::from_str(legacy_json).expect("legacy ShowInfo must deserialize");
         assert_eq!(info.title, "Hijack");
-        assert!(info.poster_url.is_none(),
-            "Missing poster_url field in old JSON must default to None.");
+        assert!(
+            info.poster_url.is_none(),
+            "Missing poster_url field in old JSON must default to None."
+        );
     }
 
     #[test]
@@ -789,7 +1044,9 @@ mod tests {
         assert!(is_hevc_from_title("Movie.H.265.mkv"));
         assert!(is_hevc_from_title("Movie.10Bit.DDP5.1.mkv"));
         assert!(is_hevc_from_title("Movie.10-bit.mkv"));
-        assert!(!is_hevc_from_title("Movie.2025.1080p.BluRay.x264-GROUP.mkv"));
+        assert!(!is_hevc_from_title(
+            "Movie.2025.1080p.BluRay.x264-GROUP.mkv"
+        ));
         assert!(!is_hevc_from_title("Movie.H264.AAC.mp4"));
         assert!(!is_hevc_from_title("Movie.mp4"));
     }
@@ -838,8 +1095,12 @@ mod tests {
         assert!(!has_dolby_vision_in_title("Movie.2025.DVDRip.x264.mkv"));
         assert!(!has_dolby_vision_in_title("Movie.2025.DVD9.x264.mkv"));
         // No DV markers at all
-        assert!(!has_dolby_vision_in_title("Movie.2025.1080p.BluRay.x264.mkv"));
-        assert!(!has_dolby_vision_in_title("Movie.2025.2160p.HEVC.HDR10.mkv"));
+        assert!(!has_dolby_vision_in_title(
+            "Movie.2025.1080p.BluRay.x264.mkv"
+        ));
+        assert!(!has_dolby_vision_in_title(
+            "Movie.2025.2160p.HEVC.HDR10.mkv"
+        ));
     }
 
     #[test]
@@ -891,8 +1152,8 @@ mod tests {
     #[test]
     fn test_ranking_single_file_over_pack() {
         let mut results = vec![
-            make_result(1, "Movie.x264.mkv", 100, Some(3)),   // pack
-            make_result(2, "Movie.x264.mkv", 50, Some(0)),    // single file
+            make_result(1, "Movie.x264.mkv", 100, Some(3)), // pack
+            make_result(2, "Movie.x264.mkv", 50, Some(0)),  // single file
         ];
         rank_results_mut(&mut results);
         assert_eq!(results[0].seeds, 50); // single file wins despite fewer seeds
@@ -901,8 +1162,8 @@ mod tests {
     #[test]
     fn test_ranking_h264_over_hevc_with_enough_seeds() {
         let mut results = vec![
-            make_result(1, "Movie.x265.mkv", 100, Some(0)),   // HEVC, well-seeded
-            make_result(2, "Movie.x264.mkv", 20, Some(0)),    // H.264, decent seeds
+            make_result(1, "Movie.x265.mkv", 100, Some(0)), // HEVC, well-seeded
+            make_result(2, "Movie.x264.mkv", 20, Some(0)),  // H.264, decent seeds
         ];
         rank_results_mut(&mut results);
         // v3.1.0: tier 4 (H.264 > HEVC) still applies when both are the
@@ -916,7 +1177,7 @@ mod tests {
         // Exactly 5 seeds = threshold met, H.264 should win (tier 4)
         let mut results = vec![
             make_result(1, "Movie.x265.mkv", 100, Some(0)),
-            make_result(2, "Movie.x264.mkv", 5, Some(0)),  // exactly at threshold
+            make_result(2, "Movie.x264.mkv", 5, Some(0)), // exactly at threshold
         ];
         rank_results_mut(&mut results);
         assert_eq!(results[0].title, "Movie.x264.mkv");
@@ -952,8 +1213,8 @@ mod tests {
     #[test]
     fn test_ranking_well_seeded_hevc_over_dead_h264() {
         let mut results = vec![
-            make_result(1, "Movie.x265.mkv", 100, Some(0)),  // HEVC, well-seeded
-            make_result(2, "Movie.x264.mkv", 2, Some(0)),    // H.264, nearly dead
+            make_result(1, "Movie.x265.mkv", 100, Some(0)), // HEVC, well-seeded
+            make_result(2, "Movie.x264.mkv", 2, Some(0)),   // H.264, nearly dead
         ];
         rank_results_mut(&mut results);
         // H.264 has only 2 seeds, below the tier 4 viability threshold of 5,
@@ -983,11 +1244,24 @@ mod tests {
         // immediately. Under v3.0.0 it would have won via tier 2 (H.264 > HEVC)
         // → same outcome, different reason.
         let mut results = vec![
-            make_result(1, "The.Boys.S05E01.2160p.AMZN.WEB-DL.DV.HDR.H.265-FLUX.mkv", 783, Some(0)),
-            make_result(2, "The.Boys.S05E01.1080p.WEB-DL.DUAL.5.1.H.264.mkv", 1433, Some(0)),
+            make_result(
+                1,
+                "The.Boys.S05E01.2160p.AMZN.WEB-DL.DV.HDR.H.265-FLUX.mkv",
+                783,
+                Some(0),
+            ),
+            make_result(
+                2,
+                "The.Boys.S05E01.1080p.WEB-DL.DUAL.5.1.H.264.mkv",
+                1433,
+                Some(0),
+            ),
         ];
         rank_results_mut(&mut results);
-        assert_eq!(results[0].title, "The.Boys.S05E01.1080p.WEB-DL.DUAL.5.1.H.264.mkv");
+        assert_eq!(
+            results[0].title,
+            "The.Boys.S05E01.1080p.WEB-DL.DUAL.5.1.H.264.mkv"
+        );
     }
 
     // --- Resolution preference tier (Apr 15, 2026 v3.0.0) ---
@@ -1469,6 +1743,183 @@ mod tests {
             results[0].title.contains("H 264"),
             "Regression: 1080p release not ranked first, got {:?}",
             results[0].title
+        );
+    }
+
+    // ============================================================
+    // May 7, 2026: parse_episode_markers regression suite.
+    // The May 6 "endlessly proud about streaming" Ruby loop traced
+    // back to TMDB choking on `"The Boys S05E06"` — Gemini's tool
+    // loop never figured out the --season/--episode flag form, so
+    // every retry hit empty results. Pre-parsing the marker fixes
+    // it for every shape the LLM might emit.
+    // ============================================================
+
+    #[test]
+    fn parse_markers_canonical_sxxexx() {
+        let (q, s, e) = parse_episode_markers("The Boys S05E06");
+        assert_eq!(q, "The Boys");
+        assert_eq!(s, Some(5));
+        assert_eq!(e, Some(6));
+    }
+
+    #[test]
+    fn parse_markers_lowercase_sxxexx() {
+        let (q, s, e) = parse_episode_markers("the boys s05e06");
+        assert_eq!(q, "the boys");
+        assert_eq!(s, Some(5));
+        assert_eq!(e, Some(6));
+    }
+
+    #[test]
+    fn parse_markers_one_digit_each() {
+        let (q, s, e) = parse_episode_markers("Doctor Who S5E6");
+        assert_eq!(q, "Doctor Who");
+        assert_eq!(s, Some(5));
+        assert_eq!(e, Some(6));
+    }
+
+    #[test]
+    fn parse_markers_three_digit_episode() {
+        // Some long-running TV runs (Simpsons-class) push past 99 episodes/season.
+        let (q, s, e) = parse_episode_markers("Long Show S01E123");
+        assert_eq!(q, "Long Show");
+        assert_eq!(s, Some(1));
+        assert_eq!(e, Some(123));
+    }
+
+    #[test]
+    fn parse_markers_nxm_form() {
+        let (q, s, e) = parse_episode_markers("The Boys 5x06");
+        assert_eq!(q, "The Boys");
+        assert_eq!(s, Some(5));
+        assert_eq!(e, Some(6));
+    }
+
+    #[test]
+    fn parse_markers_verbal_both() {
+        let (q, s, e) = parse_episode_markers("The Boys season 5 episode 6");
+        assert_eq!(q, "The Boys");
+        assert_eq!(s, Some(5));
+        assert_eq!(e, Some(6));
+    }
+
+    #[test]
+    fn parse_markers_verbal_with_and() {
+        let (q, s, e) = parse_episode_markers("The Boys season 5 and episode 6");
+        assert_eq!(q, "The Boys");
+        assert_eq!(s, Some(5));
+        assert_eq!(e, Some(6));
+    }
+
+    #[test]
+    fn parse_markers_verbal_capitalized() {
+        let (q, s, e) = parse_episode_markers("The Boys Season 5 Episode 6");
+        assert_eq!(q, "The Boys");
+        assert_eq!(s, Some(5));
+        assert_eq!(e, Some(6));
+    }
+
+    #[test]
+    fn parse_markers_verbal_season_only() {
+        let (q, s, e) = parse_episode_markers("The Boys season 5");
+        assert_eq!(q, "The Boys");
+        assert_eq!(s, Some(5));
+        assert_eq!(e, None);
+    }
+
+    #[test]
+    fn parse_markers_verbal_episode_only() {
+        // Rare but harmless — e.g. someone with a search context already on a show.
+        let (q, _s, e) = parse_episode_markers("Pilot episode 1");
+        // We don't try to be smart about whether "Pilot" should remain;
+        // the cleaned query just has "episode 1" stripped.
+        assert!(q.contains("Pilot"));
+        assert_eq!(e, Some(1));
+    }
+
+    #[test]
+    fn parse_markers_no_marker_passthrough() {
+        let (q, s, e) = parse_episode_markers("The Boys");
+        assert_eq!(q, "The Boys");
+        assert_eq!(s, None);
+        assert_eq!(e, None);
+    }
+
+    #[test]
+    fn parse_markers_does_not_eat_codec_tokens() {
+        // "1080p" / "h.264" / "H 265" / "5.1" audio MUST NOT be parsed
+        // as season/episode markers. None of these contain the SxxExx
+        // / NxM / verbal markers.
+        let (q, s, e) = parse_episode_markers("The Boys 1080p H.264 5.1 atmos");
+        assert!(
+            s.is_none(),
+            "False match on codec tokens: parsed season={:?}",
+            s
+        );
+        assert!(
+            e.is_none(),
+            "False match on codec tokens: parsed episode={:?}",
+            e
+        );
+        // Cleaned query may still contain the codec tokens — that's fine,
+        // TMDB tolerates extra tokens (though it'll get cleaner search).
+        assert!(q.contains("The Boys"));
+    }
+
+    #[test]
+    fn parse_markers_does_not_eat_4k_marker() {
+        // "4K" is not an episode marker. (Won't match anyway because
+        // RE_NXM requires digit-x-digit, and `4K` is digit-letter.)
+        let (q, s, e) = parse_episode_markers("Dune part 2 4K");
+        assert!(
+            s.is_none() && e.is_none(),
+            "Spurious 4K parse: q={:?} s={:?} e={:?}",
+            q,
+            s,
+            e
+        );
+    }
+
+    #[test]
+    fn parse_markers_zero_clamped_out() {
+        // "S00E00" is the pre-air / specials marker on some sites.
+        // We clamp 0 out (the API expects 1..=999); user can pass
+        // explicit --season 0 if they need it.
+        let (_q, s, e) = parse_episode_markers("Show S00E00");
+        assert!(s.is_none(), "S00 should clamp to None, got {:?}", s);
+        assert!(e.is_none(), "E00 should clamp to None, got {:?}", e);
+    }
+
+    #[test]
+    fn parse_markers_strips_marker_cleanly() {
+        // Cleaned query should have no orphan whitespace.
+        let (q, _, _) = parse_episode_markers("The Boys  S05E06  ");
+        assert_eq!(q, "The Boys");
+    }
+
+    #[test]
+    fn parse_markers_marker_in_middle() {
+        let (q, s, e) = parse_episode_markers("foo S05E06 bar");
+        assert_eq!(q, "foo bar");
+        assert_eq!(s, Some(5));
+        assert_eq!(e, Some(6));
+    }
+
+    #[test]
+    fn parse_markers_does_not_match_inside_word() {
+        // Word-boundary check: "Bs05e06show" should NOT be parsed.
+        let (_q, s, e) = parse_episode_markers("BS05E06show");
+        // Note: the `\b` boundary on the left is between 'B' and 'S'
+        // which IS a word boundary in Rust regex (transition between
+        // alphanumeric chars is NOT a boundary, so this should NOT match).
+        // Actually `B` and `S` are both alphanumeric so no boundary —
+        // pattern correctly rejects.
+        assert!(
+            s.is_none() && e.is_none(),
+            "Mid-word match: parsed season={:?} episode={:?}",
+            s,
+            e
         );
     }
 }

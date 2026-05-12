@@ -1,10 +1,10 @@
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use axum::extract::{Query, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
@@ -55,7 +55,9 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
             tracing::info!("Auto-detected stream host fallback: {}", host);
             config.stream_host = host;
         } else {
-            tracing::warn!("Could not auto-detect a stream host fallback. Set stream_host in config.toml");
+            tracing::warn!(
+                "Could not auto-detect a stream host fallback. Set stream_host in config.toml"
+            );
             config.stream_host = "127.0.0.1".into();
         }
     }
@@ -93,13 +95,9 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     // validated peer attach + end-to-end cast). Init is fail-fast: if the
     // Session can't bootstrap, surface the error and abort startup.
     tracing::info!("Initializing librqbit torrent engine");
-    let torrent_engine = TorrentEngine::new(
-        &media_dir,
-        config.stream_host.clone(),
-        config.port,
-    )
-    .await
-    .context("librqbit engine bootstrap failed")?;
+    let torrent_engine = TorrentEngine::new(&media_dir, config.stream_host.clone(), config.port)
+        .await
+        .context("librqbit engine bootstrap failed")?;
     tracing::info!(
         "librqbit engine ready; ffmpeg fetches /torrent/... via loopback (127.0.0.1:{}), \
          Chromecast fetches /hls/... via stream_host ({}:{})",
@@ -111,7 +109,10 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     reconcile_session_state_on_startup(&state_dir);
 
     let search_engine = SearchEngine::new(config.tmdb_api_key.clone());
-    let cast = Mutex::new(CastController::new(&state_dir, config.known_devices.clone()));
+    let cast = Mutex::new(CastController::new(
+        &state_dir,
+        config.known_devices.clone(),
+    ));
     let port = config.port;
     let host = config.host.clone();
     let host_allowlist = compute_host_allowlist(&config);
@@ -175,7 +176,12 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/prev", post(handle_prev))
         .route("/targets", get(handle_targets))
         .route("/history", get(handle_history))
-        .route("/queue", get(handle_queue_list).post(handle_queue_add).delete(handle_queue_clear))
+        .route(
+            "/queue",
+            get(handle_queue_list)
+                .post(handle_queue_add)
+                .delete(handle_queue_clear),
+        )
         .route("/config", get(handle_get_config).post(handle_set_config))
         .route("/cast-info", post(handle_cast_info))
         .route("/stream/transcode", get(handle_transcode_stream))
@@ -203,7 +209,10 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/cast-receiver/subs.vtt", get(handle_cast_receiver_subs))
         .route("/api/cast-config", get(handle_cast_config))
         .route("/api/seek-restart", post(handle_seek_restart))
-        .route("/api/position", get(handle_get_position).post(handle_save_position))
+        .route(
+            "/api/position",
+            get(handle_get_position).post(handle_save_position),
+        )
         .route("/api/position/reset", post(handle_reset_position))
         .route("/api/retry", post(handle_retry))
         // Apr 30, 2026: librqbit-backed torrent streaming. Replaces webtorrent's
@@ -258,8 +267,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     // `ConnectInfo<SocketAddr>` and check the source IP. axum's default
     // `Router::into_make_service` doesn't expose ConnectInfo; without this
     // swap the middleware would 500 on every request to /torrent/*.
-    let make_service =
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let make_service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     let mut listeners = Vec::with_capacity(bind_addresses.len());
     for addr in &bind_addresses {
@@ -299,9 +307,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
 /// down.
 fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| {
-        tracing::error!(
-            "Mutex poisoned, recovering — a prior thread panicked while holding it"
-        );
+        tracing::error!("Mutex poisoned, recovering — a prior thread panicked while holding it");
         e.into_inner()
     })
 }
@@ -340,9 +346,7 @@ pub(crate) fn is_idle_in_cold_start_window(
         None => true,
         Some(s) => s == "IDLE" || s == "UNKNOWN" || s.is_empty(),
     };
-    media_session_id.is_none()
-        && prev_is_idle_class
-        && stream_age_secs < cold_start_window_secs
+    media_session_id.is_none() && prev_is_idle_class && stream_age_secs < cold_start_window_secs
 }
 
 /// May 1, 2026 (Wilderpeople movie-night fallout): compute the set of TCP
@@ -428,10 +432,7 @@ async fn require_loopback_source(
     if addr.ip().is_loopback() {
         Ok(next.run(req).await)
     } else {
-        tracing::warn!(
-            "/torrent/* rejected from non-loopback source: {}",
-            addr
-        );
+        tracing::warn!("/torrent/* rejected from non-loopback source: {}", addr);
         Err(StatusCode::FORBIDDEN)
     }
 }
@@ -453,10 +454,7 @@ async fn require_host_header(
     if state.host_allowlist.contains(host_only) {
         Ok(next.run(req).await)
     } else {
-        tracing::warn!(
-            "Host-header rejected: {:?} not in allowlist",
-            host_only
-        );
+        tracing::warn!("Host-header rejected: {:?} not in allowlist", host_only);
         Err(StatusCode::FORBIDDEN)
     }
 }
@@ -507,11 +505,7 @@ async fn start_torrent_for_play(
 /// "Is the torrent making progress?" check used by do_play's 12s self-healing
 /// fall-through. Returns `true` once librqbit reports any sign of life (peers
 /// connected, bytes downloaded, or non-zero speed) before the deadline.
-async fn check_torrent_progress(
-    state: &SharedState,
-    torrent_id: u32,
-    timeout_secs: u64,
-) -> bool {
+async fn check_torrent_progress(state: &SharedState, torrent_id: u32, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -529,6 +523,64 @@ async fn check_torrent_progress(
         }
     }
     false
+}
+
+/// Explicit reliability mode for fresh torrents: wait until librqbit reports
+/// the selected file fully downloaded before we switch over to the local-file
+/// transcode path.
+///
+/// Why this is separate from the Local Bypass completion gate: a fresh remote
+/// torrent can still suffer source-throughput jitter even if we later wait for
+/// ffmpeg to finish the HLS set. "Smooth mode" means eliminate BOTH moving
+/// targets: first the torrent, then the HLS manifest.
+async fn wait_for_torrent_completion(
+    state: &SharedState,
+    torrent_id: u32,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at + tokio::time::Duration::from_secs(timeout_secs);
+    let mut last_bytes = 0_u64;
+    let mut last_progress_at = started_at;
+
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "timed out after {}s waiting for torrent download to finish",
+                timeout_secs
+            );
+        }
+
+        let Some(progress) = state.torrent_engine.progress(torrent_id) else {
+            anyhow::bail!("torrent disappeared from session before finishing");
+        };
+
+        if progress.finished
+            || (progress.bytes_total > 0 && progress.bytes_downloaded >= progress.bytes_total)
+        {
+            tracing::info!(
+                "Smooth mode: torrent {} fully downloaded ({} / {} bytes) after {:.1}s",
+                torrent_id,
+                progress.bytes_downloaded,
+                progress.bytes_total,
+                started_at.elapsed().as_secs_f64()
+            );
+            return Ok(());
+        }
+
+        if progress.bytes_downloaded > last_bytes {
+            last_bytes = progress.bytes_downloaded;
+            last_progress_at = tokio::time::Instant::now();
+        } else if last_progress_at.elapsed().as_secs() >= 300 {
+            anyhow::bail!(
+                "torrent download stalled for 300s before finishing ({} / {} bytes)",
+                progress.bytes_downloaded,
+                progress.bytes_total
+            );
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    }
 }
 
 /// Stop a torrent. `delete_files=true` for failed-start cleanup (sparse
@@ -591,6 +643,7 @@ pub struct PlayRequest {
     pub file_index: Option<u32>,
     pub no_subs: Option<bool>,
     pub no_intro: Option<bool>,
+    pub smooth: Option<bool>,
     pub subtitle_lang: Option<String>,
     pub imdb_id: Option<String>,
     pub show: Option<String>,
@@ -637,7 +690,11 @@ async fn handle_search(
         _ => return Json(json!({"error": "Missing q parameter"})),
     };
     let movie = params.movie.is_some();
-    match state.search_engine.search(&q, movie, params.season, params.episode).await {
+    match state
+        .search_engine
+        .search(&q, movie, params.season, params.episode)
+        .await
+    {
         Ok(result) => {
             // Save results so `play <N>` can reference them
             AppState::save_last_search(&state.state_dir, &result);
@@ -662,7 +719,11 @@ async fn handle_play(
                     if let Some(search) = AppState::load_last_search(&state.state_dir) {
                         let next_rid = rid + 1;
                         if next_rid <= search.results.len() {
-                            tracing::warn!("Play failed ({}), auto-trying result #{}", v["error"], next_rid);
+                            tracing::warn!(
+                                "Play failed ({}), auto-trying result #{}",
+                                v["error"],
+                                next_rid
+                            );
                             // Apr 30, 2026 (M11): consolidated — do_play's
                             // own cast-failure path (server.rs:~902 in the
                             // current version, "Cast-failure cleanup defense"
@@ -692,10 +753,7 @@ async fn handle_play(
     Json(json!({"error": "All retry attempts failed"}))
 }
 
-async fn do_play(
-    state: &SharedState,
-    req: &mut PlayRequest,
-) -> Json<Value> {
+async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     let mut media_dir = state.media_dir.clone();
     if media_dir.to_string_lossy().starts_with("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -717,7 +775,9 @@ async fn do_play(
                         if req.title.is_none() {
                             let ep = search.searching.as_ref();
                             req.title = Some(match (&search.show, ep) {
-                                (Some(show), Some(ep)) => format!("{} S{:02}E{:02}", show.title, ep.season, ep.episode),
+                                (Some(show), Some(ep)) => {
+                                    format!("{} S{:02}E{:02}", show.title, ep.season, ep.episode)
+                                }
                                 (Some(show), None) => show.title.clone(),
                                 _ => r.title.clone(),
                             });
@@ -741,21 +801,38 @@ async fn do_play(
                             req.size = Some(r.size.clone());
                         }
                         if req.poster_url.is_none() {
-                            req.poster_url = search.show.as_ref()
-                                .and_then(|s| s.poster_url.clone());
+                            req.poster_url =
+                                search.show.as_ref().and_then(|s| s.poster_url.clone());
                         }
-                        tracing::info!("Playing result #{}: {} (file_index: {:?})", rid, req.title.as_deref().unwrap_or("?"), req.file_index);
+                        tracing::info!(
+                            "Playing result #{}: {} (file_index: {:?})",
+                            rid,
+                            req.title.as_deref().unwrap_or("?"),
+                            req.file_index
+                        );
                     }
-                    None => return Json(json!({"error": format!("Result #{} not found in last search (have {})", rid, search.results.len())})),
+                    None => {
+                        return Json(
+                            json!({"error": format!("Result #{} not found in last search (have {})", rid, search.results.len())}),
+                        )
+                    }
                 }
             }
-            None => return Json(json!({"error": "No previous search results. Run 'spela search' first."})),
+            None => {
+                return Json(
+                    json!({"error": "No previous search results. Run 'spela search' first."}),
+                )
+            }
         }
     }
 
     let magnet = match &req.magnet {
         Some(m) if !m.is_empty() => m.clone(),
-        _ => return Json(json!({"error": "Missing magnet. Use 'spela play <N>' with a result number, or pass a magnet link."})),
+        _ => {
+            return Json(
+                json!({"error": "Missing magnet. Use 'spela play <N>' with a result number, or pass a magnet link."}),
+            )
+        }
     };
     // Apr 30, 2026 SSRF defense: librqbit's add_torrent fetches
     // http(s):// URLs as .torrent files. With the unauthenticated HTTP
@@ -786,14 +863,11 @@ async fn do_play(
     let mut server_url = String::new();
     let mut pid: u32 = 0;
     let mut is_local = false;
+    let smooth_mode = req.smooth.unwrap_or(false);
+    let expected_bytes = req.size.as_deref().and_then(parse_size_to_bytes).unwrap_or(0);
+    let corrupt_files = AppState::load(&state.state_dir).corrupt_files;
 
     if req.title.is_some() {
-        let expected_bytes = req
-            .size
-            .as_deref()
-            .and_then(parse_size_to_bytes)
-            .unwrap_or(0);
-        let corrupt_files = AppState::load(&state.state_dir).corrupt_files;
         if let Some(local_path) = find_local_bypass_match(
             &media_dir,
             &title,
@@ -824,7 +898,10 @@ async fn do_play(
         stop_torrent(state, prev_pid, false).await;
     }
     if let Some(old_fb_pid) = lock_recover(&state.ffmpeg_pid).take() {
-        tracing::info!("do_play: killing existing ffmpeg zombie (PID {})", old_fb_pid);
+        tracing::info!(
+            "do_play: killing existing ffmpeg zombie (PID {})",
+            old_fb_pid
+        );
         torrent::kill_pid(old_fb_pid);
     }
     // Aggressive cleanup: delete the transcode file to break any lingering connections
@@ -847,7 +924,9 @@ async fn do_play(
         .filter(|s| !s.is_empty())
         .unwrap_or(&app_state.preferences.default_target)
         .to_string();
-    let cast_name = req.cast_name.clone()
+    let cast_name = req
+        .cast_name
+        .clone()
         .or_else(|| app_state.preferences.chromecast_name.clone())
         .unwrap_or_else(|| state.config.default_device.clone());
     let no_subs = req.no_subs.unwrap_or(false);
@@ -877,6 +956,37 @@ async fn do_play(
             disk::prune_disk(&media_dir, ""); // Clean up any dead attempt
             return Json(json!({"error": "Torrent has no active seeds (0% after 12s)"}));
         }
+
+        if smooth_mode && target == "chromecast" {
+            tracing::info!(
+                "Smooth mode: waiting for torrent completion before local HLS transcode"
+            );
+            if let Err(e) = wait_for_torrent_completion(state, pid, 14_400).await {
+                stop_torrent(state, pid, false).await;
+                return Json(json!({
+                    "error": format!("Smooth mode download-first gate failed: {}", e)
+                }));
+            }
+
+            if let Some(local_path) = find_local_bypass_match(
+                &media_dir,
+                &title,
+                req.quality.as_deref(),
+                expected_bytes,
+                &corrupt_files,
+            ) {
+                tracing::info!(
+                    "Smooth mode: switching completed torrent to local-file source {:?}",
+                    local_path
+                );
+                server_url = format!("file://{}", local_path.to_string_lossy());
+                is_local = true;
+            } else {
+                return Json(json!({
+                    "error": "Smooth mode finished downloading but could not locate a healthy local source file"
+                }));
+            }
+        }
     }
 
     // Fetch subtitles FIRST (needed for burn-in during transcode)
@@ -896,14 +1006,21 @@ async fn do_play(
         if let Some(imdb_id) = &req.imdb_id {
             let client = reqwest::Client::new();
             match subtitles::fetch_subtitles(
-                &client, imdb_id, req.season, req.episode,
-                &sub_lang, &state.media_dir,
+                &client,
+                imdb_id,
+                req.season,
+                req.episode,
+                &sub_lang,
+                &state.media_dir,
                 local_source_for_subs.as_deref(),
-            ).await {
+            )
+            .await
+            {
                 Ok(Some(_vtt_path)) => {
                     has_subtitles = true;
                     // Use the SRT version for ffmpeg burn-in (ffmpeg handles SRT natively)
-                    subtitle_srt_path = Some(state.media_dir.join(format!("subtitle_{}.srt", sub_lang)));
+                    subtitle_srt_path =
+                        Some(state.media_dir.join(format!("subtitle_{}.srt", sub_lang)));
                     tracing::info!("Subtitles fetched ({})", sub_lang);
                 }
                 Ok(None) => tracing::info!("No subtitles found for {}", sub_lang),
@@ -937,13 +1054,19 @@ async fn do_play(
         let _ = app_state.save(&state.state_dir);
         tracing::info!(
             "Explicit --seek {:?} overrides saved HWM for '{}' (cleared)",
-            req.seek_to, key
+            req.seek_to,
+            key
         );
     } else {
         let app_state = AppState::load(&state.state_dir);
         let pos = app_state.get_position(req.imdb_id.clone(), req.title.clone());
-        if pos > 30.0 { // Don't bother resuming if less than 30s in
-            tracing::info!("Auto-resume: found saved position for '{}' at {:.0}s", title, pos);
+        if pos > 30.0 {
+            // Don't bother resuming if less than 30s in
+            tracing::info!(
+                "Auto-resume: found saved position for '{}' at {:.0}s",
+                title,
+                pos
+            );
             seek_to = Some(pos);
             auto_resumed_from = Some(pos);
         }
@@ -959,12 +1082,20 @@ async fn do_play(
     let mut final_url = server_url.clone();
     let mut is_transcoded = false;
     let no_intro = req.no_intro.unwrap_or(false);
-    let intro_path = if no_intro { None } else { transcode::find_intro() };
+    let intro_path = if no_intro {
+        None
+    } else {
+        transcode::find_intro()
+    };
 
-    let codec_info = transcode::detect_codecs(&server_url).await
+    let codec_info = transcode::detect_codecs(&server_url)
+        .await
         .unwrap_or(transcode::CodecInfo {
-            video_codec: None, audio_codec: None, duration: None,
-            audio_stream: "0:a:0".to_string(), audio_index: 0,
+            video_codec: None,
+            audio_codec: None,
+            duration: None,
+            audio_stream: "0:a:0".to_string(),
+            audio_index: 0,
         });
     let video_codec = codec_info.video_codec;
     let audio_codec = codec_info.audio_codec;
@@ -972,21 +1103,70 @@ async fn do_play(
     let audio_stream = codec_info.audio_stream.clone();
     let audio_index = codec_info.audio_index;
     if let Some(dur) = source_duration {
-        tracing::info!("Source duration: {:.0}s ({:.0} min), preferred audio: {} (index {})",
-                      dur, dur / 60.0, audio_stream, audio_index);
+        tracing::info!(
+            "Source duration: {:.0}s ({:.0} min), preferred audio: {} (index {})",
+            dur,
+            dur / 60.0,
+            audio_stream,
+            audio_index
+        );
     }
 
-    let need_audio_tc = audio_codec.as_deref().map_or(false, transcode::audio_needs_transcode);
-    let need_video_tc = video_codec.as_deref().map_or(false, transcode::video_needs_transcode);
-    let need_transcode = need_audio_tc || need_video_tc || intro_path.is_some() || subtitle_srt_path.is_some() || is_local;
+    let need_audio_tc = audio_codec
+        .as_deref()
+        .map_or(false, transcode::audio_needs_transcode);
+    // May 12, 2026: the old CrKey 1.56 receiver is materially happier when
+    // Chromecast-targeted HLS is a single canonical profile:
+    // H.264 High@4.0, 30 fps, fixed 6 s GOP, AAC stereo. Merely wrapping a
+    // "compatible" source in HLS still leaves too many source-dependent
+    // variables in play (50 fps H.264 levels, undetected HEVC on partial
+    // torrent probes, odd GOP cadence on copy paths). For Chromecast,
+    // canonicalize the video stream unconditionally; other targets keep the
+    // old codec-driven transcode decision.
+    let need_video_tc = if target == "chromecast" {
+        true
+    } else {
+        video_codec
+            .as_deref()
+            .map_or(false, transcode::video_needs_transcode)
+    };
+    let use_hls = should_use_hls_for_playback(
+        &target,
+        need_audio_tc,
+        need_video_tc,
+        intro_path.is_some(),
+        subtitle_srt_path.is_some(),
+        is_local,
+    );
 
-    if need_transcode {
+    if use_hls {
         let mut reasons = Vec::new();
-        if need_audio_tc { reasons.push(format!("{} -> AAC", audio_codec.as_deref().unwrap_or("?"))); }
-        if need_video_tc { reasons.push(format!("{} -> H.264 (NVENC)", video_codec.as_deref().unwrap_or("?"))); }
-        if subtitle_srt_path.is_some() { reasons.push("subtitle burn-in".into()); }
-        if intro_path.is_some() { reasons.push("intro clip".into()); }
-        tracing::info!("Transcode needed: {}", reasons.join(" + "));
+        if target == "chromecast" {
+            reasons.push("chromecast requires HLS delivery".into());
+        }
+        if need_audio_tc {
+            reasons.push(format!("{} -> AAC", audio_codec.as_deref().unwrap_or("?")));
+        }
+        if need_video_tc {
+            if target == "chromecast" {
+                reasons.push("canonical H.264 Chromecast transcode".into());
+            } else {
+                reasons.push(format!(
+                    "{} -> H.264 (NVENC)",
+                    video_codec.as_deref().unwrap_or("?")
+                ));
+            }
+        }
+        if subtitle_srt_path.is_some() {
+            reasons.push("subtitle burn-in".into());
+        }
+        if intro_path.is_some() {
+            reasons.push("intro clip".into());
+        }
+        if is_local && target != "chromecast" {
+            reasons.push("local file served via ffmpeg pipeline".into());
+        }
+        tracing::info!("Using HLS pipeline: {}", reasons.join(" + "));
 
         let sub_path = subtitle_srt_path.as_deref();
         // Apr 15, 2026: switched from `transcode::transcode` (fragmented MP4
@@ -996,30 +1176,76 @@ async fn do_play(
         // served via /hls/playlist.m3u8 with proper Content-Length + Range).
         // See ~/Projects/spela/TODO.md § "Cast Pipeline Rework" for the full
         // trade-off analysis.
-        match transcode::transcode_hls(&server_url, &media_dir, sub_path, intro_path.as_deref(), need_video_tc, seek_to, audio_index).await {
-                Ok((manifest_path, ffmpeg_pid)) => {
-                    // Track ffmpeg PID for the post-playback reaper + cleanup
-                    *lock_recover(&state.ffmpeg_pid) = Some(ffmpeg_pid);
-
-                    // HLS pre-buffer: wait for the manifest + enough segments
-                    // to survive the Chromecast's initial read-ahead burst.
+        match transcode::transcode_hls(
+            &server_url,
+            &media_dir,
+            sub_path,
+            intro_path.as_deref(),
+            need_video_tc,
+            seek_to,
+            audio_index,
+            target == "chromecast",
+        )
+        .await
+        {
+            Ok(hls_info) => {
+                let manifest_path = hls_info.manifest_path.clone();
+                let ffmpeg_pid = hls_info.ffmpeg_pid;
+                // Track ffmpeg PID for the post-playback reaper + cleanup
+                *lock_recover(&state.ffmpeg_pid) = Some(ffmpeg_pid);
+                if should_wait_for_complete_hls_before_cast(&target, is_local) {
+                    tracing::info!(
+                            "Chromecast reliability mode: waiting for completed local HLS set before LOAD"
+                        );
+                    if let Err(e) = wait_for_complete_hls_before_cast(
+                        &manifest_path,
+                        ffmpeg_pid,
+                        source_duration,
+                    )
+                    .await
+                    {
+                        do_cleanup(&state);
+                        return Json(json!({
+                            "error": format!(
+                                "Chromecast local-HLS completion gate failed before cast: {}",
+                                e
+                            )
+                        }));
+                    }
+                } else {
+                    // HLS pre-buffer: wait for the manifest + enough
+                    // segments to survive the Chromecast's initial
+                    // read-ahead burst.
                     //
-                    // Apr 18, 2026 root cause fix: waiting for just 1 segment
-                    // caused the Chromecast to catch up to the transcode
-                    // frontier after ~30s and start buffering (spinner). With
-                    // intro concat + subtitle burn-in + seek, ffmpeg produces
-                    // segments at ~1x realtime initially. The Chromecast
-                    // consumes at 1x too, so 1-segment head start = 6 seconds
-                    // of cushion, exhausted by segment 5.
+                    // Apr 18, 2026 root cause fix: waiting for just 1
+                    // segment caused the Chromecast to catch up to the
+                    // transcode frontier after ~30s and start buffering
+                    // (spinner). With intro concat + subtitle burn-in +
+                    // seek, ffmpeg produces segments at ~1x realtime
+                    // initially. The Chromecast consumes at 1x too, so
+                    // 1-segment head start = 6 seconds of cushion,
+                    // exhausted by segment 5.
                     //
-                    // Fix: wait for 10 segments (~60s of content). At NVENC's
-                    // ~3-6x realtime, this takes 10-20s of wall time. Gives
-                    // the Chromecast a 60-second buffer before it can catch
-                    // the frontier, by which time ffmpeg is well ahead.
-                    let hls_dir = manifest_path.parent().map(|p| p.to_path_buf())
+                    // Fix: wait for 10 segments (~60s of content). At
+                    // NVENC's ~3-6x realtime, this takes 10-20s of wall
+                    // time. Gives the Chromecast a 60-second buffer
+                    // before it can catch the frontier, by which time
+                    // ffmpeg is well ahead.
+                    let hls_dir = manifest_path
+                        .parent()
+                        .map(|p| p.to_path_buf())
                         .unwrap_or_else(|| media_dir.join("transcoded_hls"));
-                    let min_segments: usize = 10;
-                    let target_segment = hls_dir.join(format!("seg_{:05}.ts", min_segments));
+                    let min_segments: usize = if target == "chromecast" { 20 } else { 10 };
+                    let target_segment = hls_dir.join(format!(
+                        "{}{:05}.ts",
+                        hls_info.primary_segment_prefix,
+                        min_segments
+                    ));
+                    let target_low_segment = if hls_info.adaptive {
+                        Some(hls_dir.join(format!("seg_1_{:05}.ts", min_segments)))
+                    } else {
+                        None
+                    };
                     let prebuffer_timeout_secs: u64 = if intro_path.is_some() { 90 } else { 60 };
                     let prebuffer_deadline = tokio::time::Instant::now()
                         + tokio::time::Duration::from_secs(prebuffer_timeout_secs);
@@ -1028,47 +1254,84 @@ async fn do_play(
                             tracing::warn!(
                                 "HLS pre-buffer timeout ({}s) — casting with {} segments available",
                                 prebuffer_timeout_secs,
-                                std::fs::read_dir(&hls_dir).map(|d| d.filter(|e| {
-                                    e.as_ref().map(|e| e.path().extension().map_or(false, |ext| ext == "ts")).unwrap_or(false)
-                                }).count()).unwrap_or(0)
+                                std::fs::read_dir(&hls_dir)
+                                    .map(|d| d
+                                        .filter(|e| {
+                                            e.as_ref()
+                                                .map(|e| {
+                                                    e.path()
+                                                        .extension()
+                                                        .map_or(false, |ext| ext == "ts")
+                                                })
+                                                .unwrap_or(false)
+                                        })
+                                        .count())
+                                    .unwrap_or(0)
                             );
                             break;
                         }
-                        if manifest_path.exists() && target_segment.exists() {
-                            let seg_count = std::fs::read_dir(&hls_dir).map(|d| d.filter(|e| {
-                                e.as_ref().map(|e| e.path().extension().map_or(false, |ext| ext == "ts")).unwrap_or(false)
-                            }).count()).unwrap_or(0);
+                        if manifest_path.exists()
+                            && target_segment.exists()
+                            && target_low_segment.as_ref().map(|p| p.exists()).unwrap_or(true)
+                        {
+                            let seg_count = std::fs::read_dir(&hls_dir)
+                                .map(|d| {
+                                    d.filter(|e| {
+                                        e.as_ref()
+                                            .map(|e| {
+                                                e.path()
+                                                    .extension()
+                                                    .map_or(false, |ext| ext == "ts")
+                                            })
+                                            .unwrap_or(false)
+                                    })
+                                    .count()
+                                })
+                                .unwrap_or(0);
                             tracing::info!(
                                 "HLS pre-buffer ready: {} segments at {:?} (target was {})",
-                                seg_count, hls_dir, min_segments
+                                seg_count,
+                                hls_dir,
+                                min_segments
                             );
                             break;
                         }
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     }
-
-                    // Cast URL is the HLS MASTER playlist (not the media
-                    // playlist directly). Older Chromecast firmwares —
-                    // confirmed live on CrKey 1.56 / Fredriks TV — refuse
-                    // to load a bare media playlist without CODECS /
-                    // RESOLUTION / BANDWIDTH hints. /hls/master.m3u8 wraps
-                    // ffmpeg's media playlist with those hints synthetically.
-                    // Chromecast resolves segment URLs against the master,
-                    // and `playlist.m3u8` (relative) → `/hls/playlist.m3u8`,
-                    // and `seg_00000.ts` (relative to playlist.m3u8) →
-                    // `/hls/seg_00000.ts`.
-                    final_url = format!(
-                        "http://{}:{}/hls/master.m3u8",
-                        state.config.stream_host, state.config.port
-                    );
-                    is_transcoded = true;
-
-                    if sub_path.is_some() {
-                        tracing::info!("Subtitles burned into video stream via NVENC");
-                    }
                 }
-                Err(e) => tracing::warn!("HLS transcode failed (casting original): {}", e),
+
+                // Cast URL is the HLS MASTER playlist (not the media
+                // playlist directly). Older Chromecast firmwares —
+                // confirmed live on CrKey 1.56 / Fredriks TV — refuse
+                // to load a bare media playlist without CODECS /
+                // RESOLUTION / BANDWIDTH hints. /hls/master.m3u8 wraps
+                // ffmpeg's media playlist with those hints synthetically.
+                // Chromecast resolves segment URLs against the master,
+                // and `playlist.m3u8` (relative) → `/hls/playlist.m3u8`,
+                // and `seg_00000.ts` (relative to playlist.m3u8) →
+                // `/hls/seg_00000.ts`.
+                final_url = format!(
+                    "http://{}:{}/hls/master.m3u8",
+                    state.config.stream_host, state.config.port
+                );
+                is_transcoded = true;
+
+                if sub_path.is_some() {
+                    tracing::info!("Subtitles burned into video stream via NVENC");
+                }
             }
+            Err(e) => {
+                if target == "chromecast" {
+                    return Json(json!({
+                        "error": format!(
+                            "Chromecast playback requires HLS delivery; refusing raw fallback after HLS preparation failed: {}",
+                            e
+                        )
+                    }));
+                }
+                tracing::warn!("HLS transcode failed (casting original): {}", e);
+            }
+        }
     }
 
     // Cast to Chromecast
@@ -1086,13 +1349,12 @@ async fn do_play(
         // official IANA media type which routes Default Media Receiver
         // through Shaka Player's HLS adapter; everything else (raw MP4,
         // direct file URLs) gets video/mp4.
-        let cast_content_type: &str = if url_clone.ends_with(".m3u8")
-            || url_clone.contains("/hls/playlist.m3u8")
-        {
-            "application/vnd.apple.mpegurl"
-        } else {
-            "video/mp4"
-        };
+        let cast_content_type: &str =
+            if url_clone.ends_with(".m3u8") || url_clone.contains("/hls/playlist.m3u8") {
+                "application/vnd.apple.mpegurl"
+            } else {
+                "video/mp4"
+            };
         // Apr 28, 2026 (Apr 29 corrected): Build CastMetadata from the play
         // request. Gated by `config.rich_metadata_in_load`. When enabled,
         // DMR shows a poster + title splash on top of the playback view.
@@ -1124,7 +1386,8 @@ async fn do_play(
                 seek_to,
                 &cast_metadata_clone,
             )
-        }).await;
+        })
+        .await;
 
         match cast_result {
             Ok(Ok(_)) => {}
@@ -1151,10 +1414,10 @@ async fn do_play(
         }
 
         // --- Seek Logic ---
-        // If we are NOT transcoding, we must tell the Chromecast to seek 
+        // If we are NOT transcoding, we must tell the Chromecast to seek
         // to the correct position after the media loads.
-        // If we ARE transcoding, the stream itself already starts at the right 
-        // point (Fake Live seek), so calling an absolute seek(2843) on a 3-second 
+        // If we ARE transcoding, the stream itself already starts at the right
+        // point (Fake Live seek), so calling an absolute seek(2843) on a 3-second
         // stream would cause a hang.
         if !is_transcoded {
             if let Some(pos) = seek_to {
@@ -1164,7 +1427,8 @@ async fn do_play(
                 let _ = tokio::task::spawn_blocking(move || {
                     let mut cast = lock_recover(&state_clone.cast);
                     cast.seek(&cast_name_clone, pos)
-                }).await;
+                })
+                .await;
             }
         }
     }
@@ -1175,10 +1439,15 @@ async fn do_play(
 
     // If seeking, save the baseline position immediately to state.json
     if let Some(pos) = seek_to {
-        let (key, saved) = app_state.save_position_smart(req.imdb_id.clone(), req.title.clone(), pos, duration);
+        let (key, saved) =
+            app_state.save_position_smart(req.imdb_id.clone(), req.title.clone(), pos, duration);
         if saved {
             let _ = app_state.save(&state.state_dir);
-            tracing::info!("Auto-resume: saved baseline position for '{}' at {}s", key, pos);
+            tracing::info!(
+                "Auto-resume: saved baseline position for '{}' at {}s",
+                key,
+                pos
+            );
         }
     }
 
@@ -1226,7 +1495,12 @@ async fn do_play(
         // made cast_health_monitor declare 176% of duration and clean up
         // the stream before it could play). So: ss_offset is only ever
         // non-zero on a transcoded play whose seek was done via ffmpeg.
-        ss_offset: if is_transcoded { seek_to.unwrap_or(0.0) } else { 0.0 },
+        ss_offset: if is_transcoded {
+            seek_to.unwrap_or(0.0)
+        } else {
+            0.0
+        },
+        smooth: smooth_mode,
     });
     let _ = app_state.save(&state.state_dir);
 
@@ -1266,7 +1540,10 @@ async fn do_play(
 
                 if !ffmpeg_alive && !wt_alive {
                     // Both dead — playback fully finished
-                    tracing::info!("Reaper: all processes exited for '{}', cleaning up", title_for_log);
+                    tracing::info!(
+                        "Reaper: all processes exited for '{}', cleaning up",
+                        title_for_log
+                    );
                     do_cleanup(&state);
                     break;
                 }
@@ -1301,7 +1578,10 @@ async fn do_play(
                     let app_state = AppState::load(&state.state_dir);
                     match &app_state.current {
                         Some(c) if c.pid == webtorrent_pid => {
-                            tracing::info!("Reaper: cleaning up webtorrent + media for '{}'", title_for_log);
+                            tracing::info!(
+                                "Reaper: cleaning up webtorrent + media for '{}'",
+                                title_for_log
+                            );
                             do_cleanup(&state);
                         }
                         _ => tracing::debug!("Reaper: stream changed during grace period"),
@@ -1408,7 +1688,11 @@ fn do_cleanup(state: &SharedState) {
     // to enable instant Local Bypass for future requests.
     let app_state = crate::state::AppState::load(&state.state_dir);
     if let Some(current) = &app_state.current {
-        let expected_bytes = current.size.as_deref().and_then(parse_size_to_bytes).unwrap_or(0);
+        let expected_bytes = current
+            .size
+            .as_deref()
+            .and_then(parse_size_to_bytes)
+            .unwrap_or(0);
         if expected_bytes == 0 {
             tracing::debug!(
                 "Auto-Verification: skipping .spela_done for '{}' because expected byte size is unknown",
@@ -1422,7 +1706,7 @@ fn do_cleanup(state: &SharedState) {
             }
         }
         let target_dir = std::fs::canonicalize(&target_dir).unwrap_or(target_dir);
-        
+
         // Find the movie folder by title
         if let Ok(entries) = std::fs::read_dir(&target_dir) {
             for entry in entries.flatten() {
@@ -1911,7 +2195,10 @@ async fn cast_health_monitor(
     let started_at = match started_at {
         Some(s) => s,
         None => {
-            tracing::warn!("cast_health_monitor: no started_at recorded for '{}', exiting", title_for_log);
+            tracing::warn!(
+                "cast_health_monitor: no started_at recorded for '{}', exiting",
+                title_for_log
+            );
             return;
         }
     };
@@ -1943,9 +2230,9 @@ async fn cast_health_monitor(
 
     let mut consecutive_failures: u32 = 0;
     let mut last_saved_position: f64 = ss_offset; // Baseline = the -ss we opened with
-    // Wall-clock timestamp of the last ACCEPTED save. Used by the sanity
-    // check in `is_position_jump_suspicious` to distinguish normal playback
-    // advance from stale-Chromecast-state glitches. Apr 15, 2026.
+                                                  // Wall-clock timestamp of the last ACCEPTED save. Used by the sanity
+                                                  // check in `is_position_jump_suspicious` to distinguish normal playback
+                                                  // advance from stale-Chromecast-state glitches. Apr 15, 2026.
     let mut last_save_wall: Option<std::time::Instant> = Some(std::time::Instant::now());
     // Freshest absolute position seen while Chromecast was in a non-idle state.
     // Used at IDLE-driven cleanup time (Apr 19, 2026) to decide whether the
@@ -2003,10 +2290,7 @@ async fn cast_health_monitor(
         match probe_result {
             Ok(Ok(info)) => {
                 let player_state_upper = info.player_state.to_uppercase();
-                let is_dead = matches!(
-                    player_state_upper.as_str(),
-                    "IDLE" | "UNKNOWN" | ""
-                );
+                let is_dead = matches!(player_state_upper.as_str(), "IDLE" | "UNKNOWN" | "");
                 let is_buffering = player_state_upper == "BUFFERING";
 
                 // Apr 25, 2026: log every state transition at INFO. This is the
@@ -2132,7 +2416,10 @@ async fn cast_health_monitor(
                     buffering_started_at = None;
                     tracing::debug!(
                         "cast_health_monitor: '{}' player_state={} time={:.0}/{:.0}",
-                        title_for_log, info.player_state, info.current_time, info.duration
+                        title_for_log,
+                        info.player_state,
+                        info.current_time,
+                        info.duration
                     );
 
                     // === Periodic position save (Apr 15, 2026) ===
@@ -2251,7 +2538,8 @@ async fn cast_health_monitor(
             Err(e) => {
                 tracing::error!(
                     "cast_health_monitor: '{}' spawn_blocking panic: {}, exiting monitor",
-                    title_for_log, e
+                    title_for_log,
+                    e
                 );
                 return;
             }
@@ -2284,15 +2572,11 @@ async fn cast_health_monitor(
             // Apr 30, 2026 (RGR): natural-EOF detection via the pure
             // helper. Apr 19 incident-pin: 0.96 threshold (was 0.92,
             // killed Send Help mid-climax) is regression-tested.
-            let is_natural_eof = is_natural_eof(
-                duration_snapshot,
-                last_known_absolute,
-                HWM_CLEAR_FRACTION,
-            );
-            let secs_since_last_recast = last_recast_at
-                .map(|t| t.elapsed().as_secs());
+            let is_natural_eof =
+                is_natural_eof(duration_snapshot, last_known_absolute, HWM_CLEAR_FRACTION);
+            let secs_since_last_recast = last_recast_at.map(|t| t.elapsed().as_secs());
             // Apr 29, 2026 PM: surface the cooldown-rejected case in logs.
-                // Without this, when consecutive_failures hits the threshold but
+            // Without this, when consecutive_failures hits the threshold but
             // should_attempt_recast returns false, we'd silently fall through
             // to cleanup with no breadcrumb showing WHY recast was skipped.
             if !is_natural_eof
@@ -2322,14 +2606,8 @@ async fn cast_health_monitor(
                     title_for_log, recast_attempts + 1, secs_since_last_recast,
                     RECAST_COOLDOWN_SECS, hwm, ss_offset, stream_age_secs
                 );
-                match attempt_cast_recast(
-                    &state,
-                    &cast_name,
-                    hwm,
-                    ss_offset,
-                    duration_snapshot,
-                )
-                .await
+                match attempt_cast_recast(&state, &cast_name, hwm, ss_offset, duration_snapshot)
+                    .await
                 {
                     Ok(()) => {
                         tracing::info!(
@@ -2389,10 +2667,8 @@ async fn cast_health_monitor(
             if let (Some(dur), Some(abs_pos)) = (duration_snapshot, last_known_absolute) {
                 if dur > 0.0 && abs_pos >= dur * HWM_CLEAR_FRACTION {
                     let mut app_state = AppState::load(&state.state_dir);
-                    let cleared = app_state.reset_position(
-                        imdb_id_snapshot.clone(),
-                        title_snapshot.clone(),
-                    );
+                    let cleared =
+                        app_state.reset_position(imdb_id_snapshot.clone(), title_snapshot.clone());
                     let _ = app_state.save(&state.state_dir);
                     tracing::info!(
                         "cast_health_monitor: Chromecast IDLE past {:.0}% ({:.0}/{:.0}s) — cleared resume HWM for '{}'",
@@ -2456,20 +2732,19 @@ async fn cast_health_monitor(
                             "poster_url": item.poster_url,
                             "quality": item.quality,
                             "size": item.size,
+                            "smooth": item.smooth,
                         });
                         let client = reqwest::Client::new();
                         match client.post(&url).json(&body).send().await {
                             Ok(resp) => {
                                 tracing::info!(
                                     "queue: auto-fired '{}' on natural EOF; status={}",
-                                    title, resp.status()
+                                    title,
+                                    resp.status()
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "queue: failed to auto-fire '{}': {}",
-                                    title, e
-                                );
+                                tracing::warn!("queue: failed to auto-fire '{}': {}", title, e);
                             }
                         }
                     });
@@ -2492,11 +2767,29 @@ async fn handle_status(State(state): State<SharedState>) -> Json<Value> {
     match &app_state.current {
         None => Json(json!({"status": "idle"})),
         Some(current) => {
-            let running = is_process_running(current.pid);
+            // Liveness ground truth: ffmpeg is producing HLS segments
+            // (or transcoded_aac.mp4 for the legacy CCR path) IFF the
+            // user is actually watching something. The legacy check
+            // `is_process_running(current.pid)` compared the librqbit
+            // torrent ID (small u32 like 4/5/6) against the OS PID
+            // space and "worked" only by coincidence — May 6, 2026
+            // it reported `process_dead` while S05E06 was actively
+            // streaming to Fredriks TV. Ruby's tool-loop saw the
+            // false-dead status, narrated failure, retried, narrated
+            // success, retried, looped 6× in 97 seconds. The torrent
+            // engine handle is checked too as belt-and-suspenders so
+            // the rare case of `current` lingering after a clean stop
+            // (state file write race) doesn't claim "streaming" with
+            // no torrent backing.
+            let ffmpeg_alive = crate::torrent::any_spela_ffmpeg_alive();
+            let torrent_alive = is_torrent_alive(&state, current.pid);
+            let running = ffmpeg_alive && torrent_alive;
             Json(json!({
                 "status": if running { "streaming" } else { "process_dead" },
                 "current": current,
-                "running": running
+                "running": running,
+                "ffmpeg_alive": ffmpeg_alive,
+                "torrent_alive": torrent_alive,
             }))
         }
     }
@@ -2508,7 +2801,8 @@ async fn handle_pause(State(state): State<SharedState>) -> Json<Value> {
     let result = tokio::task::spawn_blocking(move || {
         let mut cast = lock_recover(&state_clone.cast);
         cast.pause(&device)
-    }).await;
+    })
+    .await;
     cast_result_to_json(result)
 }
 
@@ -2518,7 +2812,8 @@ async fn handle_resume(State(state): State<SharedState>) -> Json<Value> {
     let result = tokio::task::spawn_blocking(move || {
         let mut cast = lock_recover(&state_clone.cast);
         cast.resume(&device)
-    }).await;
+    })
+    .await;
     cast_result_to_json(result)
 }
 
@@ -2535,7 +2830,8 @@ async fn handle_seek(
     let result = tokio::task::spawn_blocking(move || {
         let mut cast = lock_recover(&state_clone.cast);
         cast.seek(&device, seconds)
-    }).await;
+    })
+    .await;
     cast_result_to_json(result)
 }
 
@@ -2552,7 +2848,8 @@ async fn handle_volume(
     let result = tokio::task::spawn_blocking(move || {
         let mut cast = lock_recover(&state_clone.cast);
         cast.set_volume(&device, level)
-    }).await;
+    })
+    .await;
     cast_result_to_json(result)
 }
 
@@ -2587,7 +2884,11 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         }
     };
 
-    let result = match state.search_engine.search(&show, false, Some(season), Some(episode)).await {
+    let result = match state
+        .search_engine
+        .search(&show, false, Some(season), Some(episode))
+        .await
+    {
         Ok(r) => r,
         Err(e) => return Json(json!({"error": e.to_string()})),
     };
@@ -2611,6 +2912,7 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         file_index: best.file_index,
         no_subs: None,
         no_intro: None,
+        smooth: Some(current.smooth),
         subtitle_lang: None,
         imdb_id: result.show.as_ref().and_then(|s| s.imdb_id.clone()),
         show: Some(show),
@@ -2722,8 +3024,7 @@ pub(crate) fn is_valid_imdb_id(s: &str) -> bool {
 /// reachability via the TV's request behavior. Constrain to TMDB image
 /// CDN (the legitimate source — search.rs always uses this prefix).
 pub(crate) fn is_valid_poster_url(url: &str) -> bool {
-    url.starts_with("https://image.tmdb.org/")
-        || url.starts_with("https://www.themoviedb.org/")
+    url.starts_with("https://image.tmdb.org/") || url.starts_with("https://www.themoviedb.org/")
 }
 
 /// Apr 30, 2026: pure helper extracted from do_play's ~100-line Local
@@ -2842,7 +3143,11 @@ pub(crate) fn find_local_bypass_match(
     None
 }
 
-fn local_bypass_file_is_healthy(path: &std::path::Path, has_done_marker: bool, expected_bytes: u64) -> bool {
+fn local_bypass_file_is_healthy(
+    path: &std::path::Path,
+    has_done_marker: bool,
+    expected_bytes: u64,
+) -> bool {
     // Apr 30, 2026 (M8 TOCTOU defense): refuse symlinks. A symlink in
     // ~/media/ that points to a sensitive file (e.g. /etc/shadow on a
     // shared host, or a co-tenant's data on an NFS-mounted media_dir)
@@ -2874,7 +3179,11 @@ fn is_physically_full(path: &std::path::Path, expected_bytes: u64) -> bool {
         // We allow a small margin for filesystem overhead/compression.
         let physical_size = meta.blocks() * 512;
         if physical_size < (logical_size as f64 * 0.95) as u64 {
-            tracing::warn!("Local Bypass: File is sparse (physical {} < logical {}). Rejecting.", physical_size, logical_size);
+            tracing::warn!(
+                "Local Bypass: File is sparse (physical {} < logical {}). Rejecting.",
+                physical_size,
+                logical_size
+            );
             return false;
         }
         true
@@ -2912,7 +3221,8 @@ fn top_level_file_is_healthy(path: &std::path::Path) -> bool {
         if physical_size < (logical_size as f64 * 0.95) as u64 {
             tracing::warn!(
                 "Local Bypass: Top-level file is sparse (physical {} < logical {}). Rejecting.",
-                physical_size, logical_size
+                physical_size,
+                logical_size
             );
             return false;
         }
@@ -2927,7 +3237,8 @@ async fn handle_targets(State(state): State<SharedState>) -> Json<Value> {
     let result = tokio::task::spawn_blocking(move || {
         let mut cast = lock_recover(&state_clone.cast);
         cast.discover()
-    }).await;
+    })
+    .await;
     match result {
         Ok(Ok(devices)) => Json(json!({"targets": devices})),
         Ok(Err(e)) => Json(json!({"error": e.to_string(), "targets": []})),
@@ -2963,6 +3274,7 @@ async fn handle_queue_list(State(state): State<SharedState>) -> Json<Value> {
 pub struct QueueAddRequest {
     pub result_id: Option<usize>,
     pub cast_name: Option<String>,
+    pub smooth: Option<bool>,
     // Direct-payload fields — used when result_id is None.
     pub magnet: Option<String>,
     pub title: Option<String>,
@@ -2988,9 +3300,11 @@ async fn handle_queue_add(
             Some(search) => {
                 let result = match search.results.iter().find(|r| r.id == rid) {
                     Some(r) => r,
-                    None => return Json(json!({
-                        "error": format!("Result #{} not found in last search", rid)
-                    })),
+                    None => {
+                        return Json(json!({
+                            "error": format!("Result #{} not found in last search", rid)
+                        }))
+                    }
                 };
                 let title = match (search.show.as_ref(), search.searching.as_ref()) {
                     (Some(show), Some(ep)) => {
@@ -2999,24 +3313,27 @@ async fn handle_queue_add(
                     (Some(show), None) => show.title.clone(),
                     _ => result.title.clone(),
                 };
-                crate::state::QueuedItem {
-                    magnet: result.magnet.clone(),
-                    title,
-                    show: search.show.as_ref().map(|s| s.title.clone()),
+        crate::state::QueuedItem {
+            magnet: result.magnet.clone(),
+            title,
+            show: search.show.as_ref().map(|s| s.title.clone()),
                     season: search.searching.as_ref().map(|e| e.season),
                     episode: search.searching.as_ref().map(|e| e.episode),
                     imdb_id: search.show.as_ref().and_then(|s| s.imdb_id.clone()),
                     file_index: result.file_index,
                     cast_name: req.cast_name.clone(),
                     target: None,
-                    poster_url: search.show.as_ref().and_then(|s| s.poster_url.clone()),
-                    quality: Some(result.quality.clone()),
-                    size: Some(result.size.clone()),
-                }
+            poster_url: search.show.as_ref().and_then(|s| s.poster_url.clone()),
+            quality: Some(result.quality.clone()),
+            size: Some(result.size.clone()),
+            smooth: req.smooth.unwrap_or(false),
+        }
             }
-            None => return Json(json!({
-                "error": "No previous search results — run `spela search` first."
-            })),
+            None => {
+                return Json(json!({
+                    "error": "No previous search results — run `spela search` first."
+                }))
+            }
         }
     } else if let Some(magnet) = req.magnet {
         // Apr 30, 2026 SSRF defense — see torrent_engine::validate_magnet_uri.
@@ -3037,6 +3354,7 @@ async fn handle_queue_add(
             poster_url: req.poster_url,
             quality: req.quality,
             size: req.size,
+            smooth: req.smooth.unwrap_or(false),
         }
     } else {
         return Json(json!({
@@ -3117,7 +3435,8 @@ async fn handle_cast_info(
     let result = tokio::task::spawn_blocking(move || {
         let mut cast = lock_recover(&state_clone.cast);
         cast.get_info(&device)
-    }).await;
+    })
+    .await;
     match result {
         Ok(Ok(info)) => Json(serde_json::to_value(info).unwrap_or(json!({"error": "serialize"}))),
         Ok(Err(e)) => Json(json!({"error": e.to_string()})),
@@ -3154,7 +3473,10 @@ async fn handle_transcode_stream(
     let start_offset = parse_range_start(headers.get("range").and_then(|v| v.to_str().ok()));
 
     if start_offset > 0 {
-        tracing::info!("Transcode stream: Range request, seeking to byte {}", start_offset);
+        tracing::info!(
+            "Transcode stream: Range request, seeking to byte {}",
+            start_offset
+        );
     }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(32);
@@ -3164,7 +3486,9 @@ async fn handle_transcode_stream(
 
         // Wait for file to exist (ffmpeg may not have written it yet)
         for _ in 0..30 {
-            if path.exists() { break; }
+            if path.exists() {
+                break;
+            }
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
 
@@ -3390,7 +3714,12 @@ async fn serve_static_with_range(
 
     if start > 0 {
         if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
-            tracing::error!("serve_static_with_range: seek to {} failed for {:?}: {}", start, path, e);
+            tracing::error!(
+                "serve_static_with_range: seek to {} failed for {:?}: {}",
+                start,
+                path,
+                e
+            );
             return axum::response::Response::builder()
                 .status(500)
                 .body(axum::body::Body::from("Seek error"))
@@ -3435,12 +3764,10 @@ async fn serve_static_with_range(
         .header("Cache-Control", "no-cache");
 
     if is_partial {
-        builder = builder
-            .status(206)
-            .header(
-                "Content-Range",
-                format!("bytes {}-{}/{}", start, end, total_size),
-            );
+        builder = builder.status(206).header(
+            "Content-Range",
+            format!("bytes {}-{}/{}", start, end, total_size),
+        );
     } else {
         builder = builder.status(200);
     }
@@ -3466,9 +3793,7 @@ async fn serve_static_with_range(
 ///     and padding is a no-op.
 ///
 /// Pure function. No I/O. Trivially testable.
-pub fn parse_hls_playlist_for_padding(body: &str)
-    -> (Vec<String>, Vec<(f64, String)>, bool)
-{
+pub fn parse_hls_playlist_for_padding(body: &str) -> (Vec<String>, Vec<(f64, String)>, bool) {
     let mut header_lines = Vec::new();
     let mut entries: Vec<(f64, String)> = Vec::new();
     let mut had_endlist = false;
@@ -3582,8 +3907,14 @@ async fn handle_hls_playlist(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("?");
-    let range = headers.get("range").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    let ua = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("?");
+    let range = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
     tracing::info!("HLS playlist hit: ua={:?} range={:?}", ua, range);
     let path = resolve_media_dir(&state)
         .join("transcoded_hls")
@@ -3612,7 +3943,8 @@ async fn handle_hls_playlist(
                     let padded = build_padded_vod_manifest(&body, remaining, 6.0);
                     tracing::debug!(
                         "HLS playlist: padded VOD manifest ({} bytes, remaining={:.0}s)",
-                        padded.len(), remaining
+                        padded.len(),
+                        remaining
                     );
                     return axum::response::Response::builder()
                         .status(200)
@@ -3628,7 +3960,10 @@ async fn handle_hls_playlist(
                 }
             }
             Err(e) => {
-                tracing::warn!("HLS playlist read failed: {}; falling back to file serve", e);
+                tracing::warn!(
+                    "HLS playlist read failed: {}; falling back to file serve",
+                    e
+                );
             }
         }
     }
@@ -3644,7 +3979,9 @@ async fn handle_hls_playlist(
                     body
                 } else {
                     let mut b = body;
-                    if !b.ends_with('\n') { b.push('\n'); }
+                    if !b.ends_with('\n') {
+                        b.push('\n');
+                    }
                     b.push_str("#EXT-X-ENDLIST\n");
                     tracing::debug!("HLS playlist: appended ENDLIST hack");
                     b
@@ -3658,7 +3995,10 @@ async fn handle_hls_playlist(
                     .unwrap();
             }
             Err(e) => {
-                tracing::warn!("HLS playlist read failed: {}; falling back to file serve", e);
+                tracing::warn!(
+                    "HLS playlist read failed: {}; falling back to file serve",
+                    e
+                );
                 // fall through
             }
         }
@@ -3690,8 +4030,22 @@ async fn handle_hls_master(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("?");
+    let ua = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("?");
     tracing::info!("HLS master hit: ua={:?}", ua);
+    let generated_master_path = resolve_media_dir(&state)
+        .join("transcoded_hls")
+        .join("master.m3u8");
+    if generated_master_path.exists() {
+        return serve_static_with_range(
+            generated_master_path,
+            "application/vnd.apple.mpegurl",
+            &headers,
+        )
+        .await;
+    }
     // Make sure the media playlist actually exists before claiming the
     // master is valid — otherwise the receiver will fetch the master, then
     // request playlist.m3u8 immediately, then 404, then bail.
@@ -3739,7 +4093,10 @@ async fn handle_hls_init(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("?");
+    let ua = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("?");
     tracing::info!("HLS init.mp4 hit: ua={:?}", ua);
     let path = resolve_media_dir(&state)
         .join("transcoded_hls")
@@ -3753,19 +4110,19 @@ async fn handle_hls_init(
 /// traversal: only ASCII alphanumerics, `_`, `-`, and `.` are allowed, the
 /// final extension must be `.ts`, and the total length is capped at 64 chars.
 ///
-/// Also accepts `.m4s` for the legacy fmp4 path, kept as dead code for
-/// future use if rust_cast ever exposes `media.hlsSegmentFormat`.
+/// Also accepts `.m4s` for the legacy fmp4 path and `.m3u8` for ffmpeg's
+/// per-variant playlists in the adaptive ladder path.
 async fn handle_hls_segment(
     State(state): State<SharedState>,
     axum::extract::Path(segment): axum::extract::Path<String>,
     headers: HeaderMap,
 ) -> axum::response::Response {
     // Path traversal / abuse hardening: reject anything that isn't a tame
-    // segment filename. We want only `seg_NNNNN.ts` (or `.m4s`) to be
-    // resolvable through this endpoint.
+    // segment filename. We want only `seg_NNNNN.ts` (or `.m4s` / variant
+    // `.m3u8` playlists) to be resolvable through this endpoint.
     let safe = !segment.is_empty()
         && segment.len() <= 64
-        && (segment.ends_with(".ts") || segment.ends_with(".m4s"))
+        && (segment.ends_with(".ts") || segment.ends_with(".m4s") || segment.ends_with(".m3u8"))
         && segment
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
@@ -3778,18 +4135,27 @@ async fn handle_hls_segment(
             .body(axum::body::Body::from("Forbidden"))
             .unwrap();
     }
-    // MPEG-TS segments use the official `video/mp2t` MIME type; legacy fmp4
-    // segments use `video/mp4`. Default Media Receiver accepts both.
-    let content_type: &'static str = if segment.ends_with(".ts") {
+    let content_type: &'static str = if segment.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else if segment.ends_with(".ts") {
         "video/mp2t"
     } else {
         "video/mp4"
     };
-    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("?");
-    let range = headers.get("range").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    let ua = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("?");
+    let range = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
     tracing::info!(
         "HLS segment hit: {} ({}) ua={:?} range={:?}",
-        segment, content_type, ua, range
+        segment,
+        content_type,
+        ua,
+        range
     );
     let path = resolve_media_dir(&state)
         .join("transcoded_hls")
@@ -3815,14 +4181,11 @@ async fn handle_hls_segment(
     // request burns 28 s wall, then 503 Retry-After. Receiver eventually
     // gives up and ends playback near the right spot.
     if state.config.vod_manifest_padded && !path.exists() {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(28);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(28);
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if path.exists() {
-                tracing::debug!(
-                    "HLS segment {} appeared after long-poll wait", segment
-                );
+                tracing::debug!("HLS segment {} appeared after long-poll wait", segment);
                 break;
             }
             if std::time::Instant::now() >= deadline {
@@ -3834,9 +4197,7 @@ async fn handle_hls_segment(
                     .status(503)
                     .header("Retry-After", "10")
                     .header("Content-Type", "text/plain")
-                    .body(axum::body::Body::from(
-                        "segment not yet available; retry"
-                    ))
+                    .body(axum::body::Body::from("segment not yet available; retry"))
                     .unwrap();
             }
         }
@@ -3878,8 +4239,12 @@ async fn handle_cast_config(State(state): State<SharedState>) -> Json<Value> {
     let imdb_id = current.and_then(|c| c.imdb_id.as_deref()).unwrap_or("");
 
     // Check if intro exists
-    let intro_url = crate::transcode::find_intro()
-        .map(|_| format!("http://{}:{}/cast-receiver/intro.mp4", state.config.stream_host, state.config.port));
+    let intro_url = crate::transcode::find_intro().map(|_| {
+        format!(
+            "http://{}:{}/cast-receiver/intro.mp4",
+            state.config.stream_host, state.config.port
+        )
+    });
 
     // Check if subtitles exist
     let mut media_dir = state.media_dir.clone();
@@ -3891,17 +4256,32 @@ async fn handle_cast_config(State(state): State<SharedState>) -> Json<Value> {
     let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
     let subs_vtt = media_dir.join("subtitle_eng.vtt");
     let subtitle_url = if subs_vtt.exists() {
-        Some(format!("http://{}:{}/cast-receiver/subs.vtt", state.config.stream_host, state.config.port))
+        Some(format!(
+            "http://{}:{}/cast-receiver/subs.vtt",
+            state.config.stream_host, state.config.port
+        ))
     } else {
         None
     };
 
     // Get resume position
     let resume_pos = app_state.get_position(
-        if imdb_id.is_empty() { None } else { Some(imdb_id.to_string()) },
-        if title.is_empty() { None } else { Some(title.to_string()) }
+        if imdb_id.is_empty() {
+            None
+        } else {
+            Some(imdb_id.to_string())
+        },
+        if title.is_empty() {
+            None
+        } else {
+            Some(title.to_string())
+        },
     );
-    let resume_pos = if resume_pos > 0.0 { Some(resume_pos) } else { None };
+    let resume_pos = if resume_pos > 0.0 {
+        Some(resume_pos)
+    } else {
+        None
+    };
 
     Json(json!({
         "title": title,
@@ -3963,7 +4343,10 @@ async fn handle_seek_restart(
 
     // TODO: Restart ffmpeg with -ss offset from the webtorrent source
     // This requires knowing the exact webtorrent URL, which we should store in state
-    tracing::info!("Seek-restart to {:.0}s requested (implementation pending full webtorrent URL tracking)", seek_seconds);
+    tracing::info!(
+        "Seek-restart to {:.0}s requested (implementation pending full webtorrent URL tracking)",
+        seek_seconds
+    );
 
     // For now, return the existing stream URL — full implementation needs webtorrent URL in state
     Json(json!({
@@ -4015,7 +4398,8 @@ async fn handle_save_position(
         return Json(json!({"error": "Position must be finite"}));
     }
     let mut app_state = AppState::load(&state.state_dir);
-    let (key, saved) = app_state.save_position_smart(req.imdb_id.clone(), req.title.clone(), req.t, req.duration);
+    let (key, saved) =
+        app_state.save_position_smart(req.imdb_id.clone(), req.title.clone(), req.t, req.duration);
     if saved {
         let _ = app_state.save(&state.state_dir);
     }
@@ -4075,18 +4459,159 @@ fn parse_range_start(range_header: Option<&str>) -> u64 {
 
 fn get_current_device(state: &ServerState) -> String {
     let app_state = AppState::load(&state.state_dir);
-    app_state.current
+    app_state
+        .current
         .and_then(|c| c.target.splitn(2, ':').nth(1).map(String::from))
         .or(app_state.preferences.chromecast_name)
         .unwrap_or_else(|| state.config.default_device.clone())
 }
 
-fn is_process_running(pid: u32) -> bool {
-    unsafe { torrent::kill_check(pid) }
+// Removed May 7, 2026 — `is_process_running(pid)` compared a librqbit
+// torrent ID against the OS PID space and "worked" only by coincidence.
+// `handle_status` now uses `crate::torrent::any_spela_ffmpeg_alive` +
+// `is_torrent_alive` for a real liveness signal. If you find yourself
+// reaching for the old helper, you almost certainly want one of those.
+
+/// Chromecast receivers must always load the HLS master playlist.
+///
+/// Raw `/torrent/...` and `file://` URLs are only valid from the media host's
+/// perspective; they are not a stable delivery surface for the receiver. For
+/// other targets, keep the existing "direct unless processing is needed"
+/// behavior.
+fn should_use_hls_for_playback(
+    target: &str,
+    need_audio_tc: bool,
+    need_video_tc: bool,
+    has_intro: bool,
+    has_subtitles: bool,
+    is_local: bool,
+) -> bool {
+    target == "chromecast"
+        || need_audio_tc
+        || need_video_tc
+        || has_intro
+        || has_subtitles
+        || is_local
+}
+
+/// When the source is already on local disk, Chromecast reliability is better
+/// if we cast a completed HLS VOD set instead of a still-growing playlist.
+///
+/// May 12, 2026: episode-4 debugging showed a distinct failure class where
+/// ffmpeg was healthy and segments existed, but CrKey 1.56 stalled midstream
+/// while repeatedly re-requesting the current segment from a growing HLS
+/// stream. For local-bypass plays we can eliminate that entire frontier class
+/// by letting ffmpeg finish before sending the LOAD.
+fn should_wait_for_complete_hls_before_cast(target: &str, is_local: bool) -> bool {
+    target == "chromecast" && is_local
+}
+
+/// Wait for ffmpeg to finish writing a COMPLETE HLS VOD set before sending
+/// the Chromecast LOAD.
+///
+/// Why this exists: a distinct CrKey 1.56 failure class remained even after
+/// the raw-path and codec-canonicalization fixes. The receiver could play a
+/// growing HLS stream for a few minutes, then wedge mid-episode while
+/// re-requesting the current segment forever. For Local Bypass sources we can
+/// remove that entire "frontier" class by waiting for ffmpeg to finish and
+/// for `playlist.m3u8` to contain `#EXT-X-ENDLIST`.
+///
+/// Failure policy:
+///   - If ffmpeg exits before ENDLIST appears, the transcode failed.
+///   - If the manifest stops making progress for 120s, treat it as wedged.
+///   - An overall timeout remains as a final safety net.
+async fn wait_for_complete_hls_before_cast(
+    manifest_path: &Path,
+    ffmpeg_pid: u32,
+    source_duration: Option<f64>,
+) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    const POLL_INTERVAL_MS: u64 = 500;
+    const STALL_TIMEOUT_SECS: u64 = 120;
+    const OVERALL_TIMEOUT_FLOOR_SECS: u64 = 300;
+    const OVERALL_TIMEOUT_CEILING_SECS: u64 = 14_400; // 4h hard stop
+
+    let hls_dir = manifest_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let started_at = tokio::time::Instant::now();
+    let mut last_progress_at = started_at;
+    let mut last_marker: Option<(u64, usize)> = None;
+    let overall_timeout = match source_duration {
+        Some(dur) if dur.is_finite() && dur > 0.0 => Duration::from_secs(
+            (dur.ceil() as u64).clamp(OVERALL_TIMEOUT_FLOOR_SECS, OVERALL_TIMEOUT_CEILING_SECS),
+        ),
+        _ => Duration::from_secs(3600),
+    };
+
+    loop {
+        let mut had_endlist = false;
+        let mut manifest_len = 0_u64;
+        if let Ok(body) = std::fs::read_to_string(manifest_path) {
+            had_endlist = body.contains("#EXT-X-ENDLIST");
+            manifest_len = body.len() as u64;
+        }
+
+        let seg_count = std::fs::read_dir(&hls_dir)
+            .map(|d| {
+                d.filter(|e| {
+                    e.as_ref()
+                        .map(|e| e.path().extension().map_or(false, |ext| ext == "ts"))
+                        .unwrap_or(false)
+                })
+                .count()
+            })
+            .unwrap_or(0);
+
+        let marker = (manifest_len, seg_count);
+        if last_marker != Some(marker) {
+            last_marker = Some(marker);
+            last_progress_at = tokio::time::Instant::now();
+        }
+
+        if had_endlist {
+            tracing::info!(
+                "HLS completion gate: complete VOD set ready at {:?} ({} segments, waited {:.1}s)",
+                hls_dir,
+                seg_count,
+                started_at.elapsed().as_secs_f64()
+            );
+            return Ok(());
+        }
+
+        let ffmpeg_alive = ffmpeg_pid > 0 && unsafe { torrent::kill_check(ffmpeg_pid) };
+        if ffmpeg_pid > 0 && !ffmpeg_alive {
+            anyhow::bail!(
+                "ffmpeg exited before HLS playlist was finalized with ENDLIST (segments_ready={}, waited={:.1}s)",
+                seg_count,
+                started_at.elapsed().as_secs_f64()
+            );
+        }
+
+        if started_at.elapsed() >= overall_timeout {
+            anyhow::bail!(
+                "timed out after {:.0}s waiting for a completed local HLS set (segments_ready={})",
+                overall_timeout.as_secs_f64(),
+                seg_count
+            );
+        }
+
+        if last_progress_at.elapsed() >= Duration::from_secs(STALL_TIMEOUT_SECS) {
+            anyhow::bail!(
+                "local HLS generation stalled for {:.0}s before ENDLIST (segments_ready={})",
+                STALL_TIMEOUT_SECS as f64,
+                seg_count
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
 }
 
 fn cast_result_to_json(
-    result: Result<anyhow::Result<crate::cast::CastResult>, tokio::task::JoinError>
+    result: Result<anyhow::Result<crate::cast::CastResult>, tokio::task::JoinError>,
 ) -> Json<Value> {
     match result {
         Ok(Ok(r)) => Json(serde_json::to_value(r).unwrap_or(json!({"error": "serialize"}))),
@@ -4102,6 +4627,49 @@ mod tests {
     // --- Input validation (Apr 30, 2026 — security audit cluster) ---
 
     #[test]
+    fn chromecast_always_uses_hls_even_for_compatible_remote_media() {
+        assert!(should_use_hls_for_playback(
+            "chromecast",
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn non_chromecast_compatible_remote_media_can_stay_direct() {
+        assert!(!should_use_hls_for_playback(
+            "vlc", false, false, false, false, false,
+        ));
+    }
+
+    #[test]
+    fn non_chromecast_processing_reasons_still_force_hls() {
+        assert!(should_use_hls_for_playback(
+            "vlc", false, true, false, false, false,
+        ));
+        assert!(should_use_hls_for_playback(
+            "vlc", false, false, false, true, false,
+        ));
+    }
+
+    #[test]
+    fn chromecast_local_bypass_waits_for_completed_hls_before_cast() {
+        assert!(should_wait_for_complete_hls_before_cast("chromecast", true));
+    }
+
+    #[test]
+    fn remote_or_non_chromecast_targets_keep_fast_start_behavior() {
+        assert!(!should_wait_for_complete_hls_before_cast(
+            "chromecast",
+            false
+        ));
+        assert!(!should_wait_for_complete_hls_before_cast("vlc", true));
+    }
+
+    #[test]
     fn parse_size_to_bytes_handles_known_units() {
         assert_eq!(parse_size_to_bytes("4.6 GB"), Some(4_939_212_390)); // 4.6 * 1024^3
         assert_eq!(parse_size_to_bytes("100 MB"), Some(104_857_600));
@@ -4115,7 +4683,12 @@ mod tests {
         let v = parse_size_to_bytes("1.5 TB").unwrap();
         // Allow ±1 LSB tolerance for f64 rounding.
         let expected = 1.5 * 1024_f64.powi(4);
-        assert!((v as f64 - expected).abs() < 2.0, "got {}, expected ~{}", v, expected);
+        assert!(
+            (v as f64 - expected).abs() < 2.0,
+            "got {}, expected ~{}",
+            v,
+            expected
+        );
     }
 
     #[test]
@@ -4202,7 +4775,7 @@ mod tests {
         // 1:43:54 with 8:42 of climax remaining. Pin that 92% is BELOW
         // current 96% threshold — i.e. mid-stream, not EOF.
         assert!(!is_natural_eof(Some(6780.0), Some(6240.0), 0.96)); // 92%
-        // Actually-near-credits at 96.5% IS EOF.
+                                                                    // Actually-near-credits at 96.5% IS EOF.
         assert!(is_natural_eof(Some(6780.0), Some(6543.0), 0.96)); // 96.5%
     }
 
@@ -4256,7 +4829,13 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap();
         let mkv = make_dense_mkv(&inner, "The.Boys.S05E03.1080p.FLUX.mkv");
         std::fs::write(inner.join(".spela_done"), b"").unwrap();
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("1080p"), 0, &std::collections::HashSet::new());
+        let result = find_local_bypass_match(
+            root.path(),
+            "The Boys S05E03",
+            Some("1080p"),
+            0,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(result.as_deref(), Some(mkv.as_path()));
     }
 
@@ -4265,7 +4844,13 @@ mod tests {
         // The Apr 15 FLUX-file regression case.
         let root = tempfile::tempdir().unwrap();
         let mkv = make_dense_mkv(root.path(), "The.Boys.S05E03.1080p.FLUX.mkv");
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("1080p"), 0, &std::collections::HashSet::new());
+        let result = find_local_bypass_match(
+            root.path(),
+            "The Boys S05E03",
+            Some("1080p"),
+            0,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(result.as_deref(), Some(mkv.as_path()));
     }
 
@@ -4273,7 +4858,14 @@ mod tests {
     fn find_local_bypass_returns_none_on_no_match() {
         let root = tempfile::tempdir().unwrap();
         make_dense_mkv(root.path(), "Different.Show.S01E01.mkv");
-        assert!(find_local_bypass_match(root.path(), "The Boys S05E03", None, 0, &std::collections::HashSet::new()).is_none());
+        assert!(find_local_bypass_match(
+            root.path(),
+            "The Boys S05E03",
+            None,
+            0,
+            &std::collections::HashSet::new()
+        )
+        .is_none());
     }
 
     #[test]
@@ -4283,8 +4875,17 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap();
         make_dense_mkv(&inner, "The.Boys.S05E03.1080p.mkv");
         std::fs::write(inner.join(".spela_done"), b"").unwrap();
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", Some("2160p"), 0, &std::collections::HashSet::new());
-        assert!(result.is_none(), "4K request must not match 1080p disk content");
+        let result = find_local_bypass_match(
+            root.path(),
+            "The Boys S05E03",
+            Some("2160p"),
+            0,
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            result.is_none(),
+            "4K request must not match 1080p disk content"
+        );
     }
 
     #[test]
@@ -4293,9 +4894,19 @@ mod tests {
         let inner = root.path().join("The.Boys.S05E03");
         std::fs::create_dir_all(&inner).unwrap();
         // Only file inside is the transcode artifact — must NOT be picked.
-        std::fs::write(inner.join("transcoded_aac.mp4"), vec![0u8; 110 * 1024 * 1024]).unwrap();
+        std::fs::write(
+            inner.join("transcoded_aac.mp4"),
+            vec![0u8; 110 * 1024 * 1024],
+        )
+        .unwrap();
         std::fs::write(inner.join(".spela_done"), b"").unwrap();
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0, &std::collections::HashSet::new());
+        let result = find_local_bypass_match(
+            root.path(),
+            "The Boys S05E03",
+            None,
+            0,
+            &std::collections::HashSet::new(),
+        );
         assert!(result.is_none());
     }
 
@@ -4303,7 +4914,13 @@ mod tests {
     fn find_local_bypass_rejects_sparse_top_level_file() {
         let root = tempfile::tempdir().unwrap();
         make_sparse_mkv(root.path(), "The.Boys.S05E03.mkv");
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0, &std::collections::HashSet::new());
+        let result = find_local_bypass_match(
+            root.path(),
+            "The Boys S05E03",
+            None,
+            0,
+            &std::collections::HashSet::new(),
+        );
         assert!(result.is_none(), "sparse top-level must be rejected");
     }
 
@@ -4316,7 +4933,13 @@ mod tests {
         std::fs::create_dir_all(&inner_2025).unwrap();
         make_dense_mkv(&inner_2025, "a.mkv");
         std::fs::write(inner_2025.join(".spela_done"), b"").unwrap();
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03 2026", None, 0, &std::collections::HashSet::new());
+        let result = find_local_bypass_match(
+            root.path(),
+            "The Boys S05E03 2026",
+            None,
+            0,
+            &std::collections::HashSet::new(),
+        );
         assert!(result.is_none(), "2025 entry must not match 2026 request");
     }
 
@@ -4351,7 +4974,10 @@ mod tests {
         corrupt.insert(mkv.to_string_lossy().to_string());
         let result =
             find_local_bypass_match(root.path(), "The Boys S05E03", Some("1080p"), 0, &corrupt);
-        assert!(result.is_none(), "marked-corrupt directory file must be skipped");
+        assert!(
+            result.is_none(),
+            "marked-corrupt directory file must be skipped"
+        );
     }
 
     #[test]
@@ -4363,7 +4989,13 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap();
         let mkv = make_dense_mkv(&inner, "a.mkv");
         std::fs::write(inner.join(".spela_done"), b"").unwrap();
-        let result = find_local_bypass_match(root.path(), "The Boys S05E03", None, 0, &std::collections::HashSet::new());
+        let result = find_local_bypass_match(
+            root.path(),
+            "The Boys S05E03",
+            None,
+            0,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(result.as_deref(), Some(mkv.as_path()));
     }
 
@@ -4428,19 +5060,19 @@ mod tests {
     fn is_valid_imdb_id_rejects_garbage() {
         // M7 defense: state.json size cap via input validation
         assert!(!is_valid_imdb_id("attacker_string_no_tt_prefix"));
-        assert!(!is_valid_imdb_id("tt"));            // no digits
-        assert!(!is_valid_imdb_id("tt12345abc"));    // non-numeric
+        assert!(!is_valid_imdb_id("tt")); // no digits
+        assert!(!is_valid_imdb_id("tt12345abc")); // non-numeric
         assert!(!is_valid_imdb_id("tt1234567890123")); // > 12 digits
         assert!(!is_valid_imdb_id(""));
     }
 
     #[test]
     fn is_valid_imdb_id_rejects_malformed_episode_suffix() {
-        assert!(!is_valid_imdb_id("tt1234_s05"));        // missing e
-        assert!(!is_valid_imdb_id("tt1234_s05e"));       // empty episode
+        assert!(!is_valid_imdb_id("tt1234_s05")); // missing e
+        assert!(!is_valid_imdb_id("tt1234_s05e")); // empty episode
         assert!(!is_valid_imdb_id("tt1234_s05e1234567")); // > 4-digit episode
-        assert!(!is_valid_imdb_id("tt1234_s5e1abc"));    // trailing garbage
-        assert!(!is_valid_imdb_id("tt1234x_s5e1"));      // wrong separator
+        assert!(!is_valid_imdb_id("tt1234_s5e1abc")); // trailing garbage
+        assert!(!is_valid_imdb_id("tt1234x_s5e1")); // wrong separator
     }
 
     #[test]
@@ -4613,7 +5245,12 @@ mod tests {
         // Once Chromecast allocates a session ID, LOAD has acknowledged.
         // From then on, IDLE is real death (post-playing or LOAD-rejected).
         assert!(!is_idle_in_cold_start_window(Some(1), None, 5, 60));
-        assert!(!is_idle_in_cold_start_window(Some(42), Some("IDLE"), 30, 60));
+        assert!(!is_idle_in_cold_start_window(
+            Some(42),
+            Some("IDLE"),
+            30,
+            60
+        ));
     }
 
     #[test]
@@ -4621,7 +5258,12 @@ mod tests {
         // If we ever saw PLAYING / BUFFERING / PAUSED, this is mid-stream.
         // IDLE here is real death — receiver dropped the stream.
         assert!(!is_idle_in_cold_start_window(None, Some("PLAYING"), 10, 60));
-        assert!(!is_idle_in_cold_start_window(None, Some("BUFFERING"), 10, 60));
+        assert!(!is_idle_in_cold_start_window(
+            None,
+            Some("BUFFERING"),
+            10,
+            60
+        ));
         assert!(!is_idle_in_cold_start_window(None, Some("PAUSED"), 10, 60));
     }
 
@@ -4657,8 +5299,11 @@ mod tests {
         // future "convenient" change to bind 0.0.0.0 silently.
         let addrs = compute_bind_addresses("192.168.4.1", 7890);
         assert!(!addrs.iter().any(|a| a.starts_with("0.0.0.0:")));
-        assert!(!addrs.iter().any(|a| a.contains("94.254.")), // Darwin's WAN /24
-            "WAN IP must never appear in bind addresses, got {:?}", addrs);
+        assert!(
+            !addrs.iter().any(|a| a.contains("94.254.")), // Darwin's WAN /24
+            "WAN IP must never appear in bind addresses, got {:?}",
+            addrs
+        );
     }
 
     #[test]
@@ -4990,8 +5635,14 @@ mod tests {
 
     #[test]
     fn test_title_tokens_match_sanitized_folder_names() {
-        assert!(title_tokens_match("Some.Movie.Title.2026.1080p.WEB-DL", "Some Movie Title"));
-        assert!(!title_tokens_match("Some Other Movie 2026 1080p", "Some Movie Title"));
+        assert!(title_tokens_match(
+            "Some.Movie.Title.2026.1080p.WEB-DL",
+            "Some Movie Title"
+        ));
+        assert!(!title_tokens_match(
+            "Some Other Movie 2026 1080p",
+            "Some Movie Title"
+        ));
     }
 
     #[test]
@@ -5007,7 +5658,11 @@ mod tests {
         ));
         std::fs::write(&path, [0u8; 4096]).unwrap();
 
-        assert!(!local_bypass_file_is_healthy(&path, true, 1024 * 1024 * 1024));
+        assert!(!local_bypass_file_is_healthy(
+            &path,
+            true,
+            1024 * 1024 * 1024
+        ));
         assert!(local_bypass_file_is_healthy(&path, true, 0));
         assert!(!local_bypass_file_is_healthy(&path, false, 0));
 
@@ -5054,7 +5709,11 @@ mod tests {
         // infinite LOAD/IDLE loop on a truly wedged device.
         assert!(!should_attempt_recast(Some(0), 720, true));
         assert!(!should_attempt_recast(Some(10), 720, true));
-        assert!(!should_attempt_recast(Some(RECAST_COOLDOWN_SECS - 1), 720, true));
+        assert!(!should_attempt_recast(
+            Some(RECAST_COOLDOWN_SECS - 1),
+            720,
+            true
+        ));
     }
 
     #[test]
@@ -5066,7 +5725,11 @@ mod tests {
         assert!(!should_attempt_recast(None, 30, true));
         assert!(!should_attempt_recast(None, 59, true));
         // Exactly at the threshold → attempt.
-        assert!(should_attempt_recast(None, MIN_STREAM_AGE_FOR_RECAST_SECS, true));
+        assert!(should_attempt_recast(
+            None,
+            MIN_STREAM_AGE_FOR_RECAST_SECS,
+            true
+        ));
     }
 
     #[test]
@@ -5109,8 +5772,8 @@ mod tests {
         // This case BREAKS at the OLD value (90s) but works at the NEW
         // value (60s), so it's a regression pin against future cooldown
         // tightening.
-        let _healthy_for = 70;  // CrKey holds Playing for ~70s before next freeze
-        let _freeze_for = 63;   // then freezes for 63s before recast can fire
+        let _healthy_for = 70; // CrKey holds Playing for ~70s before next freeze
+        let _freeze_for = 63; // then freezes for 63s before recast can fire
         let cycle = 133; // sec — full Playing+Frozen cycle observed Apr 29 AM
 
         // First recast: no prior history, allowed (assuming stream age met)
@@ -5126,8 +5789,10 @@ mod tests {
         // The actual Apr 29 AM 3rd recast: 72s gap (between healthy_for=70
         // and the next stall threshold of 60s in BUFFERING-stall logic).
         // OLD (90s cooldown): rejected. NEW (60s cooldown): accepted.
-        assert!(should_attempt_recast(Some(72), 200, true),
-            "3rd recast at 72s gap MUST be allowed at the new 60s cooldown");
+        assert!(
+            should_attempt_recast(Some(72), 200, true),
+            "3rd recast at 72s gap MUST be allowed at the new 60s cooldown"
+        );
     }
 
     #[test]
@@ -5162,10 +5827,15 @@ seg_00001.ts
 ";
         let (header, entries, had_endlist) = parse_hls_playlist_for_padding(body);
         assert!(!had_endlist);
-        assert_eq!(header, vec![
-            "#EXTM3U", "#EXT-X-VERSION:3",
-            "#EXT-X-TARGETDURATION:10", "#EXT-X-MEDIA-SEQUENCE:0",
-        ]);
+        assert_eq!(
+            header,
+            vec![
+                "#EXTM3U",
+                "#EXT-X-VERSION:3",
+                "#EXT-X-TARGETDURATION:10",
+                "#EXT-X-MEDIA-SEQUENCE:0",
+            ]
+        );
         assert_eq!(entries.len(), 2);
         assert!((entries[0].0 - 10.427089).abs() < 1e-6);
         assert_eq!(entries[0].1, "seg_00000.ts");
@@ -5266,7 +5936,7 @@ seg_00002.ts
         // (e.g., user paused far past predicted). Output must include all
         // emitted entries — never truncate ffmpeg's actual output.
         let mut body = String::from(
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n"
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n",
         );
         for i in 0..100 {
             body.push_str(&format!("#EXTINF:10.0,\nseg_{:05}.ts\n", i));
@@ -5283,7 +5953,7 @@ seg_00002.ts
         // pre-buffered (avg ~10.4s), the receiver fetches the playlist for
         // the first time and needs to see total ≈ 2920s of content.
         let mut body = String::from(
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:11\n#EXT-X-MEDIA-SEQUENCE:0\n"
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:11\n#EXT-X-MEDIA-SEQUENCE:0\n",
         );
         for i in 0..10 {
             body.push_str(&format!("#EXTINF:10.4,\nseg_{:05}.ts\n", i));
@@ -5292,9 +5962,11 @@ seg_00002.ts
 
         // Expected: ceil(2920 / 10.4) = 281 + 2 buffer = 283 segments
         let segment_count = out.matches("seg_").count();
-        assert!((283..=285).contains(&segment_count),
+        assert!(
+            (283..=285).contains(&segment_count),
             "Expected ~283 segments for full Hijack S2E2 episode, got {}",
-            segment_count);
+            segment_count
+        );
 
         // Total declared duration ≈ 2920s (within tolerance — placeholder
         // EXTINF uses the avg so total ≈ count * 10.4 ≈ 2940-2960s).
@@ -5316,15 +5988,19 @@ seg_00002.ts
         // Stream age 32 min when first IDLE hit, no prior recast.
         let first_idle_secs_since_recast = None;
         let first_idle_stream_age = 32 * 60;
-        assert!(should_attempt_recast(first_idle_secs_since_recast, first_idle_stream_age, true),
-            "First IDLE → recast permitted under both old and new logic");
+        assert!(
+            should_attempt_recast(first_idle_secs_since_recast, first_idle_stream_age, true),
+            "First IDLE → recast permitted under both old and new logic"
+        );
 
         // ~3 min later, second IDLE hits. Old logic rejected (cap=1);
         // new logic permits because cooldown is satisfied (180s >= 90s).
         let second_idle_secs_since_recast = Some(180);
         let second_idle_stream_age = 32 * 60 + 180;
-        assert!(should_attempt_recast(second_idle_secs_since_recast, second_idle_stream_age, true),
-            "Second IDLE 3 min later → recast permitted with cooldown (was blocked by cap-of-1)");
+        assert!(
+            should_attempt_recast(second_idle_secs_since_recast, second_idle_stream_age, true),
+            "Second IDLE 3 min later → recast permitted with cooldown (was blocked by cap-of-1)"
+        );
     }
 
     #[test]
@@ -5335,7 +6011,8 @@ seg_00002.ts
         let mut elapsed_since_recast: u64 = 0;
         let stream_age: u64 = 120;
         let mut recast_count = 0;
-        for _tick in 0..40 { // simulate 40 IDLE batches @ 15s apart
+        for _tick in 0..40 {
+            // simulate 40 IDLE batches @ 15s apart
             if should_attempt_recast(Some(elapsed_since_recast), stream_age, true) {
                 recast_count += 1;
                 elapsed_since_recast = 0;
@@ -5347,21 +6024,29 @@ seg_00002.ts
         // theoretical recasts = ceil(600 / 30) = 20, plus the initial
         // recast at tick 0. Set the cap at 22 for a small margin against
         // tick-arithmetic rounding.
-        assert!(recast_count <= 22,
+        assert!(
+            recast_count <= 22,
             "Expected ≤ 22 recasts in 600s of 15s-period wedge at 30s cooldown; got {}",
-            recast_count);
+            recast_count
+        );
         // But it must fire at least 1 — otherwise we've broken normal recovery.
-        assert!(recast_count >= 1, "Wedge protection must not block the FIRST recast");
+        assert!(
+            recast_count >= 1,
+            "Wedge protection must not block the FIRST recast"
+        );
         // And it must NOT fire on every tick — that's the wedge spam we
         // were guarding against.
-        assert!(recast_count < 40,
-            "Recast firing on every tick = wedge protection broken");
+        assert!(
+            recast_count < 40,
+            "Recast firing on every tick = wedge protection broken"
+        );
     }
 }
 
 /// Sanitize title for fuzzy matching (lowercase, no symbols, KEEP SPACES)
 fn sanitize_title(title: &str) -> String {
-    title.to_lowercase()
+    title
+        .to_lowercase()
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
         .collect::<String>()
@@ -5374,5 +6059,8 @@ fn title_tokens_match(candidate: &str, title: &str) -> bool {
     let s_candidate = sanitize_title(candidate);
     let s_title = sanitize_title(title);
     let title_tokens: Vec<&str> = s_title.split_whitespace().collect();
-    !title_tokens.is_empty() && title_tokens.iter().all(|&token| s_candidate.contains(token))
+    !title_tokens.is_empty()
+        && title_tokens
+            .iter()
+            .all(|&token| s_candidate.contains(token))
 }

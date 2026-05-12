@@ -2750,6 +2750,8 @@ dependencies = [
  "filetime",
  "librqbit",
  "mdns-sd",
+ "once_cell",
+ "regex",
  "reqwest",
  "rust_cast",
  "rustls",

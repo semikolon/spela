@@ -172,3 +172,7 @@ Hardcoded fallback IPs in `src/cast.rs`:
 - Vardagsrum: 192.168.4.58
 
 DNS: `darwin.home` → darwin.home (AdGuard Home rewrite, configured Mar 18)
+
+## See also
+
+- [`~/dotfiles/docs/shannon_bedroom_kiosk_plan_2026_05_06.md`](~/dotfiles/docs/shannon_bedroom_kiosk_plan_2026_05_06.md) — bedroom Shannon as local renderer + kiosk. Picks up the "Shannon could run mpv/Kodi/spela-as-local-player to bypass the wedge class entirely" thread from this doc's CrKey 1.56 EOL section. Spela local-renderer mode is Phase 7 of that plan.
