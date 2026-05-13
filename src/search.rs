@@ -466,9 +466,57 @@ impl SearchEngine {
 ///    HEVC (no transcode).
 /// 5. **More seeds > fewer seeds** — final tiebreak within the same
 ///    resolution + codec bucket.
+/// May 13, 2026 v3.4.1 — composite resolution-with-viability tier value.
+///
+/// v3.4.0's tier 3 used an asymmetric seed-viability gate (≥50 seeds on the
+/// HIGHER-resolution operand to fire). That produced a non-transitive
+/// comparator — the May 13 PM Night Manager S02E05 fixture exposed a 3-way
+/// cycle (1080p HEVC 65 > 720p H.264 51 via tier 3; 1080p H.264 17 > 1080p
+/// HEVC 65 via tier 4; 720p H.264 51 > 1080p H.264 17 via tier 5 because
+/// tier 3 fell through on insufficient seeds). Rust's `sort_by` requires a
+/// total order; non-transitive input produces undefined output.
+///
+/// v3.4.1 fix: bake viability into the resolution-tier value itself, so tier 3
+/// always provides a STRICT total order on `effective_res_tier`. An unviable
+/// 1080p (e.g. 17 seeds) demotes to bucket 3 — below any viable 720p (bucket
+/// 1) and any viable 480p (bucket 2). Tier 4 then only fires within the same
+/// effective bucket (i.e. both viable 1080p, both viable 720p, etc.) where
+/// the H.264-over-HEVC tiebreak is well-defined.
+///
+/// **Bucket mapping** (lower = ranked higher):
+///   0 → 1080p with ≥50 seeds (target, fully viable)
+///   1 →  720p with ≥50 seeds
+///   2 →  480p with ≥50 seeds
+///   3 → 1080p with <50 seeds (unviable, demoted below all viable lower tiers)
+///   4 →  720p with <50 seeds
+///   5 →  480p with <50 seeds
+///   6 → 2160p / 4K / UHD (any seed count — Sarpetorp policy demotes 4K)
+///   7 → unknown / unclassified resolution
+///
+/// **Generic lesson** (consider when designing other multi-criteria
+/// comparators): pairwise threshold-fallthrough rules ("if operand X >
+/// threshold do this, else fall to next tier") are a classic source of
+/// non-transitive comparators. Bake all per-operand attributes into a SINGLE
+/// per-operand value, then compare values directly — total order is then
+/// structurally guaranteed.
+pub(crate) fn effective_res_tier(r: &TorrentResult) -> u32 {
+    const MIN_SEEDS_FOR_RESOLUTION_PREF: u32 = 50;
+    let base = resolution_tier(&r.title);
+    let viable = r.seeds >= MIN_SEEDS_FOR_RESOLUTION_PREF;
+    match (base, viable) {
+        (0, true) => 0,  // 1080p viable
+        (1, true) => 1,  // 720p viable
+        (2, true) => 2,  // 480p viable
+        (0, false) => 3, // 1080p unviable → demoted
+        (1, false) => 4, // 720p unviable
+        (2, false) => 5, // 480p unviable
+        (3, _) => 6,     // 2160p — always demoted per Sarpetorp policy
+        _ => 7,          // unknown / unclassified
+    }
+}
+
 pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
     const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
-    const MIN_SEEDS_FOR_RESOLUTION_PREF: u32 = 50;
     // May 13, 2026 v3.4.0: when the HEVC alternative has ≥SEED_DISPARITY_OVERRIDE×
     // the seeds of the H.264 tier-4 winner, override the codec preference. See
     // tier 4 body below for the full rationale + Apr/May 2026 anchoring incident.
@@ -497,20 +545,15 @@ pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
             };
         }
 
-        // Tier 3: target resolution (1080p > 720p > 480p > 2160p > unknown)
-        // with ≥50-seed viability gate on the higher-preference option.
-        let a_res = resolution_tier(&a.title);
-        let b_res = resolution_tier(&b.title);
-        if a_res != b_res {
-            let (higher_res_result, higher_is_a) =
-                if a_res < b_res { (a, true) } else { (b, false) };
-            if higher_res_result.seeds >= MIN_SEEDS_FOR_RESOLUTION_PREF {
-                return if higher_is_a {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Greater
-                };
-            }
+        // Tier 3 (v3.4.1): composite `effective_res_tier` value that bakes
+        // seed-viability into the resolution bucket. See `effective_res_tier`
+        // doc for the full mapping + the non-transitive-comparator history
+        // that motivated the redesign. Direct `cmp` on the bucket guarantees
+        // total ordering; tier 4 only fires within the same bucket.
+        let a_eff = effective_res_tier(a);
+        let b_eff = effective_res_tier(b);
+        if a_eff != b_eff {
+            return a_eff.cmp(&b_eff);
         }
 
         // Tier 4: H.264 > HEVC within same resolution + DV status (insta-play tiebreak).
@@ -1379,6 +1422,108 @@ mod tests {
             "HEVC with any positive seeds beats H.264 with 0 seeds — got {:?}",
             results[0].title
         );
+    }
+
+    // --- Transitivity guard (May 13, 2026 v3.4.1) ---
+    //
+    // The May 13 PM Night Manager S02E05 search exposed a non-transitive sort
+    // comparator in v3.4.0's `rank_results_mut`. With three results:
+    //   A = (1080p, HEVC, 65 seeds)  — single-file
+    //   B = (720p,  H.264, 51 seeds) — single-file
+    //   C = (1080p, H.264, 17 seeds) — single-file
+    //
+    // The pairwise tier decisions form a 3-cycle:
+    //   A > B  (tier 3: 1080p > 720p, A has ≥50-seed viability)
+    //   C > A  (tier 4: H.264 > HEVC, 17 ≥ 5, disparity 3.8× < 30×)
+    //   B > C  (tier 3 skips — C is 1080p but only 17 seeds, below viability;
+    //            tier 4 skips — same codec; tier 5: 51 > 17)
+    //
+    // Rust's `sort_by` requires a TOTAL order from the comparator; non-transitive
+    // input → undefined output. v3.4.0 happened to land on [A, B, C] which
+    // violates tier 4 between A and C.
+    //
+    // Root cause: tier 3's seed-viability gate is asymmetric — it ONLY checks
+    // the higher-resolution operand's seeds. When the higher-res operand is
+    // below the viability floor, tier 3 falls through entirely, and tier 5
+    // can let a lower-res-but-better-seeded result outrank it. But tier 3
+    // doesn't "remember" that fall-through when comparing two SAME-resolution
+    // results where one is viable and one isn't.
+    //
+    // Fix (v3.4.1): collapse "resolution_tier + viability" into a single
+    // `effective_res_tier` value at tier 3. Unviable seeds at a target
+    // resolution are demoted into a lower bucket so they sort BELOW any viable
+    // lower-resolution result. Total ordering restored.
+
+    #[test]
+    fn test_ranking_no_cycle_on_may13_s02e05_fixture() {
+        // The exact 3-way comparator cycle from the May 13 PM
+        // Night Manager S02E05 incident. After v3.4.1, the sort must
+        // produce a TRANSITIVE ordering — A > B > C is the deterministic
+        // total-order result because C (17 seeds at 1080p) demotes below
+        // viable 720p (B) via `effective_res_tier`.
+        let a = make_result(0, "NM.S02E05.1080p.HEVC.10bit.mkv", 65, Some(0));
+        let b = make_result(0, "NM.S02E05.720p.H.264.mkv", 51, Some(0));
+        let c = make_result(0, "NM.S02E05.1080p.H.264.mkv", 17, Some(0));
+
+        // Validate pairwise consistency: if X > Y and Y > Z, then X > Z.
+        for (perm_a, perm_b, perm_c) in [
+            (a.clone(), b.clone(), c.clone()),
+            (a.clone(), c.clone(), b.clone()),
+            (b.clone(), a.clone(), c.clone()),
+            (b.clone(), c.clone(), a.clone()),
+            (c.clone(), a.clone(), b.clone()),
+            (c.clone(), b.clone(), a.clone()),
+        ] {
+            let mut results = vec![perm_a, perm_b, perm_c];
+            rank_results_mut(&mut results);
+            // The deterministic transitive result must be A first (1080p HEVC,
+            // viable seeds), B second (720p H.264, viable), C last (1080p H.264
+            // demoted because 17 seeds < 50 viability floor).
+            assert!(
+                results[0].title.contains("HEVC.10bit"),
+                "Expected A (1080p HEVC viable) first; got {:?}",
+                results[0].title
+            );
+            assert!(
+                results[1].title.contains("720p"),
+                "Expected B (720p viable) second; got {:?}",
+                results[1].title
+            );
+            assert!(
+                results[2].title.contains("1080p.H.264"),
+                "Expected C (1080p H.264 unviable) last; got {:?}",
+                results[2].title
+            );
+        }
+    }
+
+    #[test]
+    fn test_effective_res_tier_classification() {
+        // Pin the effective_res_tier value mapping. Lower = ranked higher.
+        // 0..=2: 1080p/720p/480p with ≥50 seeds (target-resolution viable)
+        // 3..=5: 1080p/720p/480p with <50 seeds (demoted below viable 480p)
+        // 6: 2160p / 4K / UHD (always deprioritized — Sarpetorp policy)
+        // 7: unknown / not classified
+        let r1080_viable = make_result(0, "X.1080p.x264.mkv", 50, Some(0));
+        let r1080_unviable = make_result(0, "X.1080p.x264.mkv", 49, Some(0));
+        let r720_viable = make_result(0, "X.720p.x264.mkv", 100, Some(0));
+        let r720_unviable = make_result(0, "X.720p.x264.mkv", 5, Some(0));
+        let r480_viable = make_result(0, "X.480p.x264.mkv", 50, Some(0));
+        let r2160 = make_result(0, "X.2160p.x265.mkv", 500, Some(0));
+        let r_unknown = make_result(0, "X.no.resolution.tag.mkv", 1000, Some(0));
+
+        assert_eq!(effective_res_tier(&r1080_viable), 0);
+        assert_eq!(effective_res_tier(&r720_viable), 1);
+        assert_eq!(effective_res_tier(&r480_viable), 2);
+        assert_eq!(effective_res_tier(&r1080_unviable), 3);
+        assert_eq!(effective_res_tier(&r720_unviable), 4);
+        assert_eq!(effective_res_tier(&r2160), 6);
+        assert_eq!(effective_res_tier(&r_unknown), 7);
+
+        // Critical invariant: viable lower resolution beats unviable higher.
+        assert!(effective_res_tier(&r720_viable) < effective_res_tier(&r1080_unviable));
+        // 2160p with great seeds STILL ranks below any viable 1080p/720p/480p.
+        assert!(effective_res_tier(&r2160) > effective_res_tier(&r480_viable));
     }
 
     #[test]
