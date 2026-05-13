@@ -97,10 +97,21 @@ enum Commands {
     Pause,
     /// Resume playback
     Resume,
-    /// Seek to position (seconds)
+    /// Seek to absolute episode position in seconds. Omit to resume from saved
+    /// HWM (the last position cast_health_monitor recorded for this stream).
+    ///
+    /// **v3.4.3 (May 14, 2026) semantics change**: the argument is the
+    /// position you'd think of in the episode timeline, NOT the position
+    /// within the transcoded HLS stream. So on a play that resumed at 14:30
+    /// (`ss_offset=870`), `spela seek 870` jumps to 14:30 (stream-relative
+    /// 0); `spela seek 0` errors with a hint pointing at `spela play --seek 0`
+    /// because cast.seek can't reach before the current transcode's
+    /// window. Pre-v3.4.3 `seek` took stream-relative position — that
+    /// behavior is gone, and `spela seek 0` no longer "resets to start of
+    /// stream". Use `spela seek` (no arg) for HWM-based resume instead.
     Seek {
-        /// Position in seconds
-        seconds: f64,
+        /// Absolute episode position in seconds. Omit to resume from saved HWM.
+        position: Option<f64>,
     },
     /// Set volume (0-100)
     Volume {
@@ -447,13 +458,15 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             .await?
             .json()
             .await?),
-        Commands::Seek { seconds } => {
-            // Server's /seek route is POST + JSON body (SeekRequest { t, seconds }).
-            // Previously this CLI sent `GET /seek?t=N` which hit a 405 Method Not
-            // Allowed → reqwest tried to parse the 405 body as JSON → user saw
-            // "error decoding response body" with no indication the endpoint shape
-            // was wrong. Apr 15, 2026 regression — fixed by matching the server.
-            let body = serde_json::json!({"t": seconds});
+        Commands::Seek { position } => {
+            // v3.4.3: `position` is absolute episode position. Omit to
+            // resume from saved HWM. Server-side `handle_seek` converts to
+            // stream-relative via `compute_cast_seek_target` (see its doc
+            // for full semantics + error variants).
+            let body = match position {
+                Some(p) => serde_json::json!({"t": p}),
+                None => serde_json::json!({}), // empty body → server looks up HWM
+            };
             Ok(client
                 .post(format!("{}/seek", base))
                 .json(&body)

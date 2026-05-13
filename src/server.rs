@@ -2202,6 +2202,116 @@ pub fn should_attempt_recast(
 /// instead of a manual recovery.
 pub const FAIL_FAST_STREAM_START_SECS: u64 = 20;
 
+/// May 14, 2026 v3.4.3 — `spela seek` semantics: absolute-episode-position
+/// vs stream-relative-position.
+///
+/// # Background
+///
+/// Pre-v3.4.3, `spela seek N` called `cast.seek(N)` directly on the rust_cast
+/// handle. Chromecast's Default Media Receiver interprets `cast.seek(N)` as
+/// "set `current_time = N` within the loaded media". For TRANSCODED plays
+/// (the common case — every Chromecast play is transcoded), the loaded
+/// media is a HLS stream whose internal timeline starts at 0 — even when
+/// ffmpeg was invoked with `-ss 870` to start the transcode 14:30 into the
+/// source episode. The Chromecast doesn't know about that 870s shift; it
+/// only knows its own stream timeline.
+///
+/// Net effect: `spela seek N` meant "jump to N seconds into the transcoded
+/// stream", which translates to "jump to N + ss_offset seconds into the
+/// source episode". User says `spela seek 0` expecting to go to the start
+/// of the episode; instead they jump to the start of the *transcode* —
+/// which is 14:30 absolute on a play that resumed there. Confusing.
+///
+/// # Fix
+///
+/// `spela seek N` takes ABSOLUTE EPISODE POSITION. The server translates to
+/// stream-relative `N - ss_offset` before calling `cast.seek`. This helper
+/// owns that translation and the boundary-case errors:
+///
+/// - `absolute_pos < ss_offset`: can't seek backwards before the current
+///   transcode's start window — `cast.seek` is bounded by the loaded
+///   media. The fix points the user at `spela play --seek N` which
+///   re-transcodes from the new offset (costs the re-transcode wait but
+///   gets there).
+/// - `absolute_pos > duration` (when known): past the end of the episode.
+///   Refuses with an error.
+/// - Negative or NaN/inf inputs: same defensive guard the playback path
+///   uses for `seek_to` request fields.
+///
+/// On success: returns the stream-relative position (`absolute_pos -
+/// ss_offset`) that `cast.seek` should be called with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SeekTargetError {
+    /// Requested position is before the current transcode's start (the
+    /// `-ss` value passed to ffmpeg). Native `cast.seek` can't reach it;
+    /// caller must restart with new `-ss` (server-side restart).
+    BeforeStreamStart {
+        requested_absolute: f64,
+        ss_offset: f64,
+    },
+    /// Requested position is past the known episode duration.
+    PastEnd {
+        requested_absolute: f64,
+        duration: f64,
+    },
+    /// Input was negative, NaN, or infinite. Caller passed garbage.
+    InvalidInput { requested_absolute: f64 },
+}
+
+impl SeekTargetError {
+    /// Short user-facing message (one line, suitable for JSON error field).
+    pub fn message(&self) -> String {
+        match self {
+            SeekTargetError::BeforeStreamStart {
+                requested_absolute,
+                ss_offset,
+            } => format!(
+                "Cannot seek to {:.0}s — current transcode starts at {:.0}s. \
+                 Use `spela play <id> --seek {:.0}` to re-transcode from the new offset.",
+                requested_absolute, ss_offset, requested_absolute
+            ),
+            SeekTargetError::PastEnd {
+                requested_absolute,
+                duration,
+            } => format!(
+                "Cannot seek to {:.0}s — past episode duration ({:.0}s).",
+                requested_absolute, duration
+            ),
+            SeekTargetError::InvalidInput { requested_absolute } => format!(
+                "Invalid seek target: {:?} (must be finite and non-negative).",
+                requested_absolute
+            ),
+        }
+    }
+}
+
+pub fn compute_cast_seek_target(
+    absolute_pos: f64,
+    ss_offset: f64,
+    duration: Option<f64>,
+) -> Result<f64, SeekTargetError> {
+    if !absolute_pos.is_finite() || absolute_pos < 0.0 {
+        return Err(SeekTargetError::InvalidInput {
+            requested_absolute: absolute_pos,
+        });
+    }
+    if absolute_pos < ss_offset {
+        return Err(SeekTargetError::BeforeStreamStart {
+            requested_absolute: absolute_pos,
+            ss_offset,
+        });
+    }
+    if let Some(dur) = duration {
+        if dur > 0.0 && absolute_pos > dur {
+            return Err(SeekTargetError::PastEnd {
+                requested_absolute: absolute_pos,
+                duration: dur,
+            });
+        }
+    }
+    Ok(absolute_pos - ss_offset)
+}
+
 /// Decision: should we declare a stream-start failure and return an error
 /// for `handle_play`'s auto-retry loop to handle?
 ///
@@ -3137,18 +3247,80 @@ async fn handle_seek(
     State(state): State<SharedState>,
     Json(req): Json<SeekRequest>,
 ) -> Json<Value> {
-    let seconds = match req.t.or(req.seconds) {
-        Some(s) => s,
-        None => return Json(json!({"error": "Missing t (seconds) parameter"})),
+    // v3.4.3 — `t` / `seconds` is ABSOLUTE EPISODE POSITION (not
+    // stream-relative). Omit both fields to resume from the saved HWM
+    // (cast_health_monitor's last position-save for this stream). See
+    // `compute_cast_seek_target` doc for the full semantics + the
+    // pre-v3.4.3 wart that motivated the change.
+    let app_state = AppState::load(&state.state_dir);
+    let current = match &app_state.current {
+        Some(c) => c.clone(),
+        None => {
+            return Json(json!({
+                "error": "No active stream to seek. Start a play first with `spela play <N>`."
+            }))
+        }
     };
+
+    let absolute_pos = match req.t.or(req.seconds) {
+        Some(p) => p,
+        None => {
+            // No-arg case: resume from saved HWM. `get_position` returns
+            // 0.0 when no HWM is saved — distinguish that from "user asked
+            // to seek to absolute 0" by treating 0.0 as "not saved".
+            let hwm = app_state.get_position(current.imdb_id.clone(), Some(current.title.clone()));
+            if hwm <= 0.0 {
+                return Json(json!({
+                    "error": "No saved resume position for current stream. Pass an absolute position: `spela seek <secs>`."
+                }));
+            }
+            hwm
+        }
+    };
+
+    let stream_target =
+        match compute_cast_seek_target(absolute_pos, current.ss_offset, current.duration) {
+            Ok(t) => t,
+            Err(e) => {
+                return Json(json!({
+                    "error": e.message(),
+                    "absolute_target_secs": absolute_pos,
+                    "ss_offset": current.ss_offset,
+                    "duration": current.duration,
+                }))
+            }
+        };
+
     let device = get_current_device(&state);
+    let device_for_log = device.clone();
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut cast = lock_recover(&state_clone.cast);
-        cast.seek(&device, seconds)
+        cast.seek(&device, stream_target)
     })
     .await;
-    cast_result_to_json(result)
+
+    match result {
+        Ok(Ok(_)) => {
+            tracing::info!(
+                "Seek: '{}' on '{}' to absolute {:.0}s (stream {:.0}s, ss_offset={:.0}s)",
+                current.title,
+                device_for_log,
+                absolute_pos,
+                stream_target,
+                current.ss_offset
+            );
+            Json(json!({
+                "status": "seeked",
+                "device": device_for_log,
+                "absolute_target_secs": absolute_pos,
+                "stream_target_secs": stream_target,
+                "ss_offset": current.ss_offset,
+            }))
+        }
+        Ok(Err(e)) => Json(json!({"error": format!("cast.seek failed: {}", e)})),
+        Err(e) => Json(json!({"error": format!("spawn_blocking failed: {}", e)})),
+    }
 }
 
 async fn handle_volume(
@@ -6213,6 +6385,110 @@ mod tests {
         // unrecoverable config failures. If this assertion needs to change,
         // update the doc comment on MIN_STREAM_AGE_FOR_RECAST_SECS too.
         assert_eq!(MIN_STREAM_AGE_FOR_RECAST_SECS, 60);
+    }
+
+    // --- v3.4.3 cast-seek target computation ---
+    //
+    // `compute_cast_seek_target` translates the user-facing
+    // absolute-episode-position into the stream-relative position that
+    // `cast.seek` expects. Boundary cases are pinned so the
+    // BeforeStreamStart / PastEnd / InvalidInput error variants stay
+    // semantically distinct.
+
+    #[test]
+    fn test_seek_target_in_range() {
+        // Standard case: stream started with ss_offset=870 (resumed at 14:30);
+        // user wants to seek to absolute 900s (15:00). Stream-relative = 30s.
+        let target = compute_cast_seek_target(900.0, 870.0, Some(3700.0)).unwrap();
+        assert!((target - 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_seek_target_at_ss_offset_boundary_is_zero() {
+        // User asks to seek exactly to ss_offset → stream-relative 0.
+        let target = compute_cast_seek_target(870.0, 870.0, Some(3700.0)).unwrap();
+        assert!(target.abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_seek_target_ss_offset_zero_passes_through() {
+        // Non-transcoded play (ss_offset == 0): seek N is just N.
+        let target = compute_cast_seek_target(1200.0, 0.0, Some(3700.0)).unwrap();
+        assert!((target - 1200.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_seek_target_before_stream_start_errors() {
+        // User wants to rewind before the transcode's start window.
+        // Native `cast.seek` can't reach it; error tells them to re-transcode.
+        let err = compute_cast_seek_target(600.0, 870.0, Some(3700.0)).unwrap_err();
+        assert!(matches!(err, SeekTargetError::BeforeStreamStart { .. }));
+        let msg = err.message();
+        assert!(msg.contains("re-transcode") || msg.contains("--seek"));
+    }
+
+    #[test]
+    fn test_seek_target_zero_when_stream_starts_later_errors() {
+        // The exact wart case: `spela seek 0` on a play that resumed at 14:30.
+        let err = compute_cast_seek_target(0.0, 870.0, Some(3700.0)).unwrap_err();
+        assert!(matches!(err, SeekTargetError::BeforeStreamStart { .. }));
+    }
+
+    #[test]
+    fn test_seek_target_past_end_errors() {
+        // Beyond episode duration → error, regardless of ss_offset.
+        let err = compute_cast_seek_target(4000.0, 870.0, Some(3700.0)).unwrap_err();
+        assert!(matches!(err, SeekTargetError::PastEnd { .. }));
+    }
+
+    #[test]
+    fn test_seek_target_at_exact_duration_is_allowed() {
+        // Exactly duration is treated as in-range (last instant of playback).
+        // Past duration is the error.
+        let target = compute_cast_seek_target(3700.0, 0.0, Some(3700.0)).unwrap();
+        assert!((target - 3700.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_seek_target_unknown_duration_skips_past_end_check() {
+        // When duration is unknown, we can't bound the past-end case. Allow
+        // the seek through; cast.seek will fail if it's genuinely past end.
+        let target = compute_cast_seek_target(10_000.0, 870.0, None).unwrap();
+        assert!((target - 9130.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_seek_target_rejects_negative_input() {
+        let err = compute_cast_seek_target(-5.0, 870.0, Some(3700.0)).unwrap_err();
+        assert!(matches!(err, SeekTargetError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn test_seek_target_rejects_nan_and_infinity() {
+        let err = compute_cast_seek_target(f64::NAN, 870.0, Some(3700.0)).unwrap_err();
+        assert!(matches!(err, SeekTargetError::InvalidInput { .. }));
+        let err = compute_cast_seek_target(f64::INFINITY, 870.0, Some(3700.0)).unwrap_err();
+        assert!(matches!(err, SeekTargetError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn test_seek_target_zero_duration_skips_past_end_check() {
+        // Duration of 0 isn't a real value (uninitialized) — should not
+        // trigger PastEnd. Behaves like duration=None.
+        let target = compute_cast_seek_target(100.0, 50.0, Some(0.0)).unwrap();
+        assert!((target - 50.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_seek_target_error_messages_are_actionable() {
+        // BeforeStreamStart must point the user at the recovery path.
+        let err = compute_cast_seek_target(100.0, 500.0, None).unwrap_err();
+        let msg = err.message();
+        assert!(
+            msg.contains("--seek"),
+            "BeforeStreamStart message must point at `spela play --seek` recovery; got: {}",
+            msg
+        );
     }
 
     // --- v3.4.2 user-pause hard gate ---
