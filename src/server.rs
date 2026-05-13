@@ -1517,10 +1517,11 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     let _ = app_state.save(&state.state_dir);
 
     // Spawn post-playback reaper: monitors pipeline, auto-cleans when movie ends.
-    // Frees webtorrent's ~1.5GB RAM and cleans up media files.
+    // Releases the librqbit-managed torrent (and reclaims its RAM) plus
+    // cleans up the on-disk transcoded HLS segments.
     {
         let state = state.clone();
-        let webtorrent_pid = pid;
+        let torrent_pid = pid;
         let title_for_log = title.clone();
         tokio::spawn(async move {
             // Wait for playback to establish before monitoring
@@ -1532,20 +1533,20 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 // Check if this stream is still the current one (user may have started another)
                 let app_state = AppState::load(&state.state_dir);
                 match &app_state.current {
-                    Some(c) if c.pid == webtorrent_pid => {} // Still our stream
+                    Some(c) if c.pid == torrent_pid => {} // Still our stream
                     _ => {
                         tracing::debug!("Reaper: stream replaced or stopped, exiting");
                         break;
                     }
                 }
 
-                // Backend-aware "is the torrent worker still alive?" check.
-                // For Local Bypass plays (`webtorrent_pid == 0`) the helper
-                // returns `true` so the reaper relies entirely on ffmpeg
-                // liveness — preserves the legacy behavior. For webtorrent:
-                // process-existence via `libc::kill(pid, 0)`. For librqbit:
-                // still-managed-by-Session check.
-                let wt_alive = is_torrent_alive(&state, webtorrent_pid);
+                // "Is the torrent worker still alive?" check.
+                // For Local Bypass plays (`torrent_pid == 0`) the helper returns
+                // `true` so the reaper relies entirely on ffmpeg liveness —
+                // preserves the legacy behavior. For librqbit-managed torrents,
+                // the helper does a still-managed-by-Session lookup via
+                // `TorrentEngine::handle(id)`.
+                let wt_alive = is_torrent_alive(&state, torrent_pid);
                 let ffmpeg_alive = lock_recover(&state.ffmpeg_pid)
                     .map(|p| unsafe { torrent::kill_check(p) })
                     .unwrap_or(false);
@@ -1561,7 +1562,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 }
 
                 if !ffmpeg_alive && wt_alive {
-                    // ffmpeg done, webtorrent still seeding. Compute a
+                    // ffmpeg done, torrent still seeding. Compute a
                     // duration-aware grace period via the extracted helper
                     // `compute_reaper_grace_secs` — see its docs + tests for the
                     // full rationale and edge-case coverage.
@@ -1589,9 +1590,9 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                     // Re-check we're still the active stream
                     let app_state = AppState::load(&state.state_dir);
                     match &app_state.current {
-                        Some(c) if c.pid == webtorrent_pid => {
+                        Some(c) if c.pid == torrent_pid => {
                             tracing::info!(
-                                "Reaper: cleaning up webtorrent + media for '{}'",
+                                "Reaper: cleaning up torrent + media for '{}'",
                                 title_for_log
                             );
                             do_cleanup(&state);

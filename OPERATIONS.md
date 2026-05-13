@@ -183,10 +183,11 @@ over verbatim to ffmpeg workers and any future torrent backend.
    transcoding into the void and `spela status` reports
    `running: true, status: streaming` while the TV shows the wallpaper.
    Identity is keyed off `app_state.current.started_at` (DateTime<Utc>),
-   not webtorrent_pid, because Local Bypass plays use pid=0 and back-to-
-   back local plays would otherwise be indistinguishable from the
-   monitor's perspective. Worst-case detection latency: 10s grace + 3 ×
-   5s polls = 25s.
+   not `torrent_pid` (the post-playback reaper's stream-identity variable
+   in `do_play`), because Local Bypass plays use pid=0 and back-to-back
+   local plays would otherwise be indistinguishable from the monitor's
+   perspective. Worst-case detection latency: 10s grace + 3 × 5s polls =
+   25s.
 
 ## Systemd Drop-In
 

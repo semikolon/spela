@@ -88,7 +88,7 @@ enum Commands {
     },
     /// Stop current stream
     Stop,
-    /// Terminate local WebTorrent/Spela ffmpeg workers without deleting media
+    /// Terminate spela's ffmpeg transcode workers + orphan pre-v3.3.0 webtorrent-cli processes without deleting media
     KillWorkers,
     /// Show playback status
     Status,
