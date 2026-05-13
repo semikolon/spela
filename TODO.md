@@ -1,5 +1,28 @@
 # Spela TODOs 🎬🍿
 
+### v3.5.0 — HLS cache foundation (SHIPPED May 13, 2026 PM, OPT-IN) ✅
+### v3.5.1 — HLS cache hit-side wiring (OPEN) 🔧
+
+Cache fully-transcoded HLS sets across plays so resumes/replays skip the
+~150-200 s "Chromecast reliability mode" pre-buffer wait. v3.5.0 ships the
+foundation; v3.5.1 wires the hit-side short-circuit. Default opt-in
+(`hls_cache_cap_mb = 0` disabled); set to 20480 (20 GB ≈ 60 episodes) to
+enable. Full design + lifecycle: `src/hls_cache.rs` module docstring +
+[CLAUDE.md](CLAUDE.md) § Hard-Won Lessons "v3.5.0 — HLS cache foundation".
+
+- [x] **Module** (`src/hls_cache.rs`, 27 tests): cache key builder, on-disk layout, complete-marker semantics, sparse-aware size accounting, LRU age ordering, prune-to-fit eviction. All pure helpers; no integration with active play paths.
+- [x] **Config**: `Config.hls_cache_cap_mb: u64` (default 0). 0 disables the feature entirely (cache-fill skipped + cache-hit never recorded).
+- [x] **State**: `CurrentStream.cache_key: Option<String>` (set in `do_play` when caching is enabled + metadata sufficient + `ss_offset == 0.0`). Read by cache-fill to know where to promote `transcoded_hls/`.
+- [x] **Cache-fill on `do_cleanup`**: `try_promote_to_hls_cache` atomic-renames `transcoded_hls/` → `<media_dir>/hls_cache/<key>/` when all guards hold (cap > 0, cache_key set, ss_offset == 0.0, `#EXT-X-ENDLIST` present in any candidate playlist, cache dir not already populated). Best-effort; any I/O error logs warn + skips. LRU prune-to-fit runs on success.
+- [ ] **Cache-HIT short-circuit in `do_play`** (v3.5.1): when `is_cache_hit` returns true, skip torrent + ffmpeg entirely. Cast the cached HLS directly with `cast.seek(resume_pos)` post-LOAD. Blocker: reconcile `handle_hls_master`'s synthetic master playlist (references `playlist.m3u8`, single-variant) with ffmpeg's real `-var_stream_map` multi-variant master (`stream_0.m3u8` + `stream_1.m3u8`). Options: (a) dedicated `/hls_cache/{key}/{file}` axum route that serves cached files unchanged (Chromecast sees ffmpeg's real master), (b) make `handle_hls_master` aware of cache-served plays and emit a master variant that references stream_0/stream_1 directly. Option (a) is cleaner — separate code path, no impact on live-edge handlers. Test plan: full Chromecast LOAD + `cast.seek` integration against a populated cache dir on Darwin.
+- [ ] **Startup LRU pass** (v3.5.1): one-shot `prune_cache_to_fit` on `spela server` startup, defending against cap-shrink edge cases (user lowered `hls_cache_cap_mb` between runs).
+- [ ] **Default bump to 20480** (v3.5.1, after hit-side validated): make the cache opt-OUT instead of opt-IN once the hit path is proven on real plays.
+- [ ] **Background transcode-ahead** (v3.6.0): when user stops at minute 5, finish transcoding the rest in the background to populate the cache. Useful for episodes that get re-watched without ever being fully watched the first time. Deferred — adds an ffmpeg subprocess + GPU contention concerns.
+
+### v3.4.1 — Ranker root-fix: transitivity-safe `effective_res_tier` (SHIPPED May 13, 2026 PM) ✅
+
+Fixed a non-transitive `sort_by` comparator in v3.4.0's `rank_results_mut` exposed by the May 13 Night Manager S02E05 search — three results formed a 3-way cycle through asymmetric seed-viability gating at tier 3. New `effective_res_tier(&TorrentResult) -> u32` helper bakes seed-viability into the resolution bucket itself, so tier 3 does direct `cmp` on a single per-operand value and total ordering is structurally guaranteed. Generic lesson encoded in the helper's docstring: **pairwise threshold-fallthrough rules are a classic source of non-transitive comparators; bake all per-operand attributes into a SINGLE per-operand value, then compare values directly.** Tests: +2 (cycle replay across all 6 permutations of the fixture; bucket classification pin). 339 total tests green; commit `c3b41a0`. Full case study: [CLAUDE.md](CLAUDE.md) § "v3.4.1 — ranker root-fix".
+
 ### v3.4.0 — Bad-source resilience trio (SHIPPED May 13, 2026) ✅
 
 The Boys S05E07 incident: Cinecalidad H.264 (99 seeds, 5 GB) ranked above MeGusta HEVC (7596 seeds); librqbit truncated at 50 bytes + EBML parse fail; 0 segments; 75 s blue-cast icon. Three orthogonal defenses, single commit `7cd71c6`, +21 tests (329 → 337). Full hard-won lesson + ranker tier-table update in [CLAUDE.md](CLAUDE.md).
