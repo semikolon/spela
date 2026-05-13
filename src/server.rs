@@ -1484,7 +1484,11 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         started_at: Utc::now(),
         pid,
         has_subtitles,
-        subtitle_lang: if has_subtitles { Some(sub_lang) } else { None },
+        subtitle_lang: if has_subtitles {
+            Some(sub_lang.clone())
+        } else {
+            None
+        },
         duration,
         quality: req.quality.clone(),
         size: req.size.clone(),
@@ -1513,6 +1517,27 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         },
         smooth: smooth_mode,
         prepared_hls: is_transcoded && should_wait_for_complete_hls_before_cast(&target, is_local),
+        // v3.5.0 HLS cache key — populated when caching is enabled AND this
+        // play has metadata for a stable key AND it's an offset-zero
+        // transcode (resumed plays don't produce a "full episode" output, so
+        // they can't seed the cache). `do_cleanup` reads this back to decide
+        // whether to atomically promote `transcoded_hls/` into the cache
+        // root on ffmpeg natural-exit. See `hls_cache` module docs.
+        cache_key: if state.config.hls_cache_cap_mb > 0 && seek_to.is_none() {
+            crate::hls_cache::build_cache_key(
+                req.imdb_id.as_deref(),
+                req.season,
+                req.episode,
+                if has_subtitles {
+                    Some(sub_lang.as_str())
+                } else {
+                    None
+                },
+                intro_path.is_some(),
+            )
+        } else {
+            None
+        },
     });
     let _ = app_state.save(&state.state_dir);
 
@@ -1764,14 +1789,146 @@ fn do_cleanup(state: &SharedState) {
     // content if the manifest from the previous run survives.
     let hls_dir = media_dir.join("transcoded_hls");
     if hls_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&hls_dir) {
-            tracing::warn!("do_cleanup: failed to remove HLS dir {:?}: {}", hls_dir, e);
+        // May 13, 2026 (v3.5.0 HLS cache): atomically promote the transcoded
+        // HLS dir into the persistent cache when this play was an offset-zero
+        // transcode and ffmpeg natural-exited (manifest has #EXT-X-ENDLIST).
+        // On success the transcoded_hls dir is RENAMED away (so the
+        // subsequent remove_dir_all becomes a no-op). On any failure, the
+        // existing delete proceeds as before — cache is best-effort.
+        try_promote_to_hls_cache(state, &media_dir, &app_state, &hls_dir);
+
+        if hls_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&hls_dir) {
+                tracing::warn!("do_cleanup: failed to remove HLS dir {:?}: {}", hls_dir, e);
+            }
         }
     }
 
     let mut app_state = AppState::load(&state.state_dir);
     app_state.stop_current();
     let _ = app_state.save(&state.state_dir);
+}
+
+/// May 13, 2026 (v3.5.0): atomic promotion of a successfully-transcoded HLS
+/// dir into the persistent cache. Called from `do_cleanup` BEFORE the
+/// transcoded_hls/ delete.
+///
+/// Required preconditions (any false → no-op, normal delete proceeds):
+///   - cache cap is enabled (`config.hls_cache_cap_mb > 0`)
+///   - current play has a `cache_key` (set in `do_play` only for resumable,
+///     identifiable plays)
+///   - the play was an offset-zero transcode (`ss_offset == 0.0`) — resumed
+///     plays produce partial output that can't seed the cache
+///   - ffmpeg actually completed the transcode: the media playlist file
+///     contains `#EXT-X-ENDLIST` (this is the cheapest "did it finish?"
+///     signal; partial transcodes never have the marker)
+///   - the cache dir for this key doesn't already exist (avoid clobbering
+///     a previous successful cache fill; LRU handles staleness over time)
+///
+/// On success: atomic `rename(hls_dir → cache_root/<key>)`, marker file
+/// written, LRU prune runs to keep total cache size ≤ cap. Caller's
+/// existing `remove_dir_all` becomes a no-op because the source path is
+/// gone.
+///
+/// Best-effort throughout: all I/O errors log + skip. Failure is fine —
+/// cache stays empty for this key, next play of the same episode will
+/// re-transcode and try again.
+fn try_promote_to_hls_cache(
+    state: &SharedState,
+    media_dir: &std::path::Path,
+    app_state: &AppState,
+    hls_dir: &std::path::Path,
+) {
+    let cap_mb = state.config.hls_cache_cap_mb;
+    if cap_mb == 0 {
+        return;
+    }
+    let Some(current) = app_state.current.as_ref() else {
+        return;
+    };
+    if current.ss_offset != 0.0 {
+        return;
+    }
+    let Some(key) = current.cache_key.as_deref() else {
+        return;
+    };
+
+    // ENDLIST gate: ffmpeg writes `#EXT-X-ENDLIST` only when its input EOFs
+    // naturally. SIGTERM'd / crashed ffmpegs leave the playlist without it.
+    // We check both variant playlists (multi-variant ladder) AND the
+    // synthetic master location (single-variant legacy). Either marker
+    // present = transcode completed for that variant.
+    let candidate_playlists = [
+        hls_dir.join("stream_0.m3u8"),
+        hls_dir.join("stream_1.m3u8"),
+        hls_dir.join("playlist.m3u8"),
+    ];
+    let endlist_seen = candidate_playlists.iter().any(|p| {
+        std::fs::read_to_string(p)
+            .map(|s| s.contains("#EXT-X-ENDLIST"))
+            .unwrap_or(false)
+    });
+    if !endlist_seen {
+        tracing::debug!(
+            "HLS cache fill skipped for key {:?}: no #EXT-X-ENDLIST in any candidate playlist (transcode incomplete or user-stopped early)",
+            key
+        );
+        return;
+    }
+
+    let cache_dir = crate::hls_cache::cache_dir_for_key(media_dir, key);
+    if cache_dir.exists() {
+        tracing::debug!(
+            "HLS cache fill skipped for key {:?}: cache dir already exists",
+            key
+        );
+        return;
+    }
+    if let Some(parent) = cache_dir.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                "HLS cache fill: failed to create cache root {:?}: {}",
+                parent,
+                e
+            );
+            return;
+        }
+    }
+
+    match std::fs::rename(hls_dir, &cache_dir) {
+        Ok(()) => {
+            if let Err(e) = crate::hls_cache::mark_complete(&cache_dir) {
+                tracing::warn!(
+                    "HLS cache fill: rename ok but mark_complete failed for {:?}: {}",
+                    cache_dir,
+                    e
+                );
+                // Without the marker, this cache dir won't be hit on future
+                // plays — LRU will evict it eventually. Don't undo the
+                // rename; just log and move on.
+            } else {
+                tracing::info!(
+                    "HLS cache: promoted transcode to {:?} ({} MB on disk)",
+                    cache_dir,
+                    crate::hls_cache::cache_dir_size_bytes(&cache_dir) / 1024 / 1024
+                );
+                let cap_bytes = cap_mb.saturating_mul(1024).saturating_mul(1024);
+                let cache_root = crate::hls_cache::cache_root(media_dir);
+                let evicted = crate::hls_cache::prune_cache_to_fit(&cache_root, cap_bytes);
+                if evicted > 0 {
+                    tracing::info!("HLS cache: LRU evicted {} entries", evicted);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "HLS cache fill: rename {:?} → {:?} failed: {}",
+                hls_dir,
+                cache_dir,
+                e
+            );
+        }
+    }
 }
 
 /// Background task that polls the Chromecast media session AFTER cast_url
@@ -4904,6 +5061,7 @@ mod tests {
             ss_offset: 0.0,
             smooth: true,
             prepared_hls: true,
+            cache_key: None,
         };
         assert_eq!(
             buffering_timeout_for_current_stream(Some(&current)),
@@ -4933,6 +5091,7 @@ mod tests {
             ss_offset: 0.0,
             smooth: false,
             prepared_hls: false,
+            cache_key: None,
         };
         assert_eq!(
             buffering_timeout_for_current_stream(Some(&current)),
@@ -4962,6 +5121,7 @@ mod tests {
             ss_offset: 0.0,
             smooth: false,
             prepared_hls: false,
+            cache_key: None,
         };
         assert_eq!(
             buffering_timeout_for_current_stream(Some(&current)),

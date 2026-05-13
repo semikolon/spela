@@ -1,6 +1,7 @@
 mod cast;
 mod config;
 mod disk;
+mod hls_cache;
 mod search;
 mod server;
 mod state;

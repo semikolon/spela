@@ -91,6 +91,13 @@ pub struct Config {
     /// stripped from the incoming Host header before comparison.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// May 13, 2026 (v3.5.0 HLS cache): maximum bytes of transcoded HLS sets
+    /// kept on disk for cache-hit fast resume. When the cache exceeds this,
+    /// LRU eviction runs (`hls_cache::prune_cache_to_fit`). 20 GB = ~60
+    /// average-size episodes at the current 1080p+480p ladder. Set to 0 to
+    /// disable the cache (fills are skipped + hits never recorded).
+    #[serde(default = "default_hls_cache_cap_mb")]
+    pub hls_cache_cap_mb: u64,
 }
 
 fn default_server() -> String {
@@ -111,6 +118,18 @@ fn default_port() -> u16 {
 fn default_host() -> String {
     "0.0.0.0".into()
 }
+fn default_hls_cache_cap_mb() -> u64 {
+    // v3.5.0 foundation default: disabled. The cache module + cache-fill in
+    // `do_cleanup` are shipped, but the cache-HIT short-circuit in `do_play`
+    // (which would actually return value from cached entries) is deferred to
+    // v3.5.1 — it requires reconciling spela's synthetic master playlist
+    // (`handle_hls_master`) with ffmpeg's real multi-variant master, and
+    // shouldn't ship without integration test coverage of the cast path.
+    // Setting this to 0 keeps disk usage flat for default users; adventurous
+    // users can opt in (e.g. `hls_cache_cap_mb = 20480`) to populate the
+    // cache against the future hit-side wiring.
+    0
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -130,6 +149,7 @@ impl Default for Config {
             experimental_endlist_hack: false,
             vod_manifest_padded: false,
             allowed_hosts: Vec::new(),
+            hls_cache_cap_mb: default_hls_cache_cap_mb(),
         }
     }
 }

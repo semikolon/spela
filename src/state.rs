@@ -130,6 +130,22 @@ pub struct CurrentStream {
     pub smooth: bool,
     #[serde(default)]
     pub prepared_hls: bool,
+    /// May 13, 2026 (v3.5.0 HLS cache): the cache key for this play, computed
+    /// at `do_play` start time from `imdb_id + season + episode + subtitle_lang
+    /// + has_intro`. Present when caching is enabled AND the play has enough
+    /// metadata to identify the episode (raw-magnet plays leave this `None`).
+    ///
+    /// Two purposes:
+    ///   1. **Cache-fill on cleanup**: `do_cleanup` reads this back from
+    ///      `current` to know where to rename `transcoded_hls/` when
+    ///      `ss_offset == 0.0` and ffmpeg completed naturally (manifest has
+    ///      `#EXT-X-ENDLIST`).
+    ///   2. **Cache-hit observability**: `spela status` reflects whether the
+    ///      active play is hitting the cache (`cache_key` set + ffmpeg_alive
+    ///      false) vs miss (`cache_key` set + ffmpeg_alive true) vs disabled
+    ///      / un-cachable (`cache_key` None).
+    #[serde(default)]
+    pub cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,6 +604,7 @@ mod tests {
             ss_offset: 1800.0,
             smooth: false,
             prepared_hls: false,
+            cache_key: None,
         };
         let serialized = serde_json::to_string(&stream).expect("serialize");
         assert!(
