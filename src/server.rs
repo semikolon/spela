@@ -2128,8 +2128,31 @@ pub const PREPARED_HLS_CHROMECAST_MAX_BUFFERING_DURATION_SECS: u64 = 15;
 /// the Chromecast just needs a new LOAD message.
 ///
 /// Apr 29, 2026 — replaced lifetime cap-of-1 with rate limit. See
-/// `RECAST_COOLDOWN_SECS` doc for rationale. Returns true only when ALL of
-/// these hold:
+/// `RECAST_COOLDOWN_SECS` doc for rationale.
+///
+/// May 13, 2026 v3.4.2 — added `paused_in_session` HARD GATE. Anchored to the
+/// Night Manager S02E05 incident the same evening: user paused at minute
+/// 15:19, walked away for pee-break+sandwich (~20 min), the CrKey 1.56
+/// Default Media Receiver unloaded its receiver app to save memory
+/// (Paused → IDLE transition observed at 22:32:02), cast_health_monitor's
+/// 3-poll IDLE-failure threshold fired, and the Apr 25 auto-recast logic
+/// kicked in — issuing a fresh LOAD + seek(HWM) to "recover" what it
+/// interpreted as a wedge. From the user's perspective: the episode
+/// resumed playing while they were AFK; they returned to find content had
+/// advanced past where they paused. Strongly stated preference: "I never
+/// want that to happen."
+///
+/// The fix is structural: any session in which the user EVER pressed pause
+/// disables auto-recast for the remainder of that session. User intent is
+/// honored over receiver-flake heuristics. Manual recovery (TV remote play
+/// button or `spela play` re-issue) remains available.
+///
+/// Returns true only when ALL of these hold:
+///   - `paused_in_session == false` — user has NOT pressed pause this
+///     session. Once pause is observed, recast is disabled for the whole
+///     session (cleared by stream replacement, not by Playing-state
+///     recovery — the Chromecast can transition Paused→Playing via several
+///     paths that don't reflect user intent).
 ///   - `have_valid_hwm` — no point recasting if we can't restore position.
 ///   - `stream_age_secs >= MIN_STREAM_AGE_FOR_RECAST_SECS` — see constant doc.
 ///   - Either `secs_since_last_recast` is `None` (first recast this stream)
@@ -2140,7 +2163,11 @@ pub fn should_attempt_recast(
     secs_since_last_recast: Option<u64>,
     stream_age_secs: u64,
     have_valid_hwm: bool,
+    paused_in_session: bool,
 ) -> bool {
+    if paused_in_session {
+        return false;
+    }
     have_valid_hwm
         && stream_age_secs >= MIN_STREAM_AGE_FOR_RECAST_SECS
         && match secs_since_last_recast {
@@ -2510,6 +2537,14 @@ async fn cast_health_monitor(
     // to the recast/cleanup path the same way IDLE does.
     let mut buffering_started_at: Option<std::time::Instant> = None;
     let mut prev_player_state_upper: Option<String> = None;
+    // v3.4.2 — sticky pause-in-session tracker. Set true when player_state
+    // ever transitions to Paused; NEVER cleared by recovery back to Playing
+    // because Chromecast can transition Paused→Playing via paths that don't
+    // reflect user intent (cast_url-driven recast, app reload). Cleared only
+    // by stream replacement (new `do_play` spawns a fresh monitor with this
+    // back to false). Anchored to May 13 PM NM S02E05 incident — see
+    // `should_attempt_recast` doc for full diagnosis.
+    let mut paused_seen_in_session = false;
     tracing::info!(
         "cast_health_monitor: started for '{}' on '{}' (poll every {}s, fail after {} consecutive idle/error, ss_offset={:.0}s, save every {}s)",
         title_for_log, cast_name, POLL_INTERVAL_SECS, IDLE_FAILURE_THRESHOLD,
@@ -2548,6 +2583,11 @@ async fn cast_health_monitor(
                 let player_state_upper = info.player_state.to_uppercase();
                 let is_dead = matches!(player_state_upper.as_str(), "IDLE" | "UNKNOWN" | "");
                 let is_buffering = player_state_upper == "BUFFERING";
+                // v3.4.2 — once observed, stays true for the rest of this
+                // session. See `paused_seen_in_session` declaration above.
+                if player_state_upper == "PAUSED" {
+                    paused_seen_in_session = true;
+                }
 
                 // Apr 25, 2026: log every state transition at INFO. This is the
                 // cheap half of the diagnostic upgrade — with `idle_reason`
@@ -2840,20 +2880,40 @@ async fn cast_health_monitor(
                     secs_since_last_recast,
                     stream_age_secs,
                     last_known_absolute.is_some(),
+                    paused_seen_in_session,
                 )
                 && stream_age_secs >= MIN_STREAM_AGE_FOR_RECAST_SECS
                 && last_known_absolute.is_some()
+                && !paused_seen_in_session
             {
                 tracing::warn!(
                     "cast_health_monitor: '{}' — recast SKIPPED (cooldown not satisfied: secs_since_last_recast={:?}, cooldown={}s) — falling through to cleanup",
                     title_for_log, secs_since_last_recast, RECAST_COOLDOWN_SECS
                 );
             }
+            // v3.4.2 — pause-gated recast: when the user has pressed pause
+            // earlier in this session, the CrKey 1.56 receiver's Paused → IDLE
+            // unload (after ~16 min of pause) must NOT trigger auto-recast.
+            // The recast logic was designed for receiver-flake cases where
+            // IDLE = wedge; pause-induced IDLE is the user's intent, not a
+            // wedge. Skip recast + cleanup entirely; let the user manually
+            // resume via TV remote or `spela play`. Reset consecutive_failures
+            // so we don't re-fire this branch every poll.
+            if paused_seen_in_session {
+                tracing::info!(
+                    "cast_health_monitor: '{}' IDLE-after-pause detected (Paused→IDLE pattern, CrKey 1.56 receiver-app unload). NOT auto-recasting — user pressed pause this session. Manually resume via TV remote or `spela play`.",
+                    title_for_log
+                );
+                consecutive_failures = 0;
+                sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                continue;
+            }
             if !is_natural_eof
                 && should_attempt_recast(
                     secs_since_last_recast,
                     stream_age_secs,
                     last_known_absolute.is_some(),
+                    paused_seen_in_session,
                 )
             {
                 let hwm = last_known_absolute.unwrap_or(last_saved_position);
@@ -6085,7 +6145,7 @@ mod tests {
     fn test_recast_normal_mid_stream_death() {
         // Vardagsrum-style failure: ~12 min in, we have an HWM, no prior recast.
         // This is the primary recovery case — must attempt.
-        assert!(should_attempt_recast(None, 720, true));
+        assert!(should_attempt_recast(None, 720, true, false));
     }
 
     #[test]
@@ -6097,9 +6157,9 @@ mod tests {
         // user with permanently dead streams after the first recovery.
         // Cooldown satisfied → attempt regardless of attempt history depth.
         let just_above = RECAST_COOLDOWN_SECS;
-        assert!(should_attempt_recast(Some(just_above), 720, true));
-        assert!(should_attempt_recast(Some(600), 720, true));
-        assert!(should_attempt_recast(Some(u64::MAX), 720, true));
+        assert!(should_attempt_recast(Some(just_above), 720, true, false));
+        assert!(should_attempt_recast(Some(600), 720, true, false));
+        assert!(should_attempt_recast(Some(u64::MAX), 720, true, false));
     }
 
     #[test]
@@ -6109,12 +6169,13 @@ mod tests {
         // seconds of LOAD must NOT trigger another recast immediately;
         // wait at least RECAST_COOLDOWN_SECS to confirm we're not in an
         // infinite LOAD/IDLE loop on a truly wedged device.
-        assert!(!should_attempt_recast(Some(0), 720, true));
-        assert!(!should_attempt_recast(Some(10), 720, true));
+        assert!(!should_attempt_recast(Some(0), 720, true, false));
+        assert!(!should_attempt_recast(Some(10), 720, true, false));
         assert!(!should_attempt_recast(
             Some(RECAST_COOLDOWN_SECS - 1),
             720,
-            true
+            true,
+            false
         ));
     }
 
@@ -6123,14 +6184,15 @@ mod tests {
         // Stream < 60 s old → the Chromecast failed the initial LOAD, not a
         // mid-stream flake. Re-LOAD won't help; those failures need stream_host
         // / transcode / manifest fixes. Don't waste the user's patience.
-        assert!(!should_attempt_recast(None, 0, true));
-        assert!(!should_attempt_recast(None, 30, true));
-        assert!(!should_attempt_recast(None, 59, true));
+        assert!(!should_attempt_recast(None, 0, true, false));
+        assert!(!should_attempt_recast(None, 30, true, false));
+        assert!(!should_attempt_recast(None, 59, true, false));
         // Exactly at the threshold → attempt.
         assert!(should_attempt_recast(
             None,
             MIN_STREAM_AGE_FOR_RECAST_SECS,
-            true
+            true,
+            false
         ));
     }
 
@@ -6139,8 +6201,8 @@ mod tests {
         // No HWM → nothing sensible to seek to. Playback from ss_offset is a
         // worse UX than a clean cleanup + manual replay, because the user
         // loses their place silently.
-        assert!(!should_attempt_recast(None, 720, false));
-        assert!(!should_attempt_recast(Some(120), 720, false));
+        assert!(!should_attempt_recast(None, 720, false, false));
+        assert!(!should_attempt_recast(Some(120), 720, false, false));
     }
 
     #[test]
@@ -6151,6 +6213,54 @@ mod tests {
         // unrecoverable config failures. If this assertion needs to change,
         // update the doc comment on MIN_STREAM_AGE_FOR_RECAST_SECS too.
         assert_eq!(MIN_STREAM_AGE_FOR_RECAST_SECS, 60);
+    }
+
+    // --- v3.4.2 user-pause hard gate ---
+    //
+    // Anchored to the May 13 PM Night Manager S02E05 incident: user paused at
+    // 15:19, walked away ~20 min, the CrKey 1.56 receiver app unloaded
+    // (Paused→IDLE), cast_health_monitor's 3-poll IDLE-failure threshold
+    // fired, and the Apr 25 auto-recast logic resumed playback from HWM
+    // without user consent. User-stated preference verbatim: "I never want
+    // that to happen". Fix: any session in which Paused was ever observed
+    // disables auto-recast for the remainder.
+
+    #[test]
+    fn test_recast_blocked_by_user_pause_in_session() {
+        // Even with all other guards green, paused_in_session=true must
+        // unconditionally return false. This is the structural fix for the
+        // May 13 PM incident.
+        assert!(!should_attempt_recast(None, 720, true, true));
+        assert!(!should_attempt_recast(Some(600), 720, true, true));
+        assert!(!should_attempt_recast(Some(u64::MAX), 720, true, true));
+    }
+
+    #[test]
+    fn test_recast_pause_gate_overrides_cooldown() {
+        // The pause gate takes precedence over the cooldown-satisfied case
+        // — even an "ideal" recast candidate is rejected when the user has
+        // pressed pause this session.
+        assert!(should_attempt_recast(
+            Some(RECAST_COOLDOWN_SECS),
+            720,
+            true,
+            false
+        ));
+        assert!(!should_attempt_recast(
+            Some(RECAST_COOLDOWN_SECS),
+            720,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_recast_pause_gate_orthogonal_to_other_guards() {
+        // Each guard remains independently load-bearing. With
+        // paused_in_session=false, the other 3 guards still apply as before.
+        assert!(!should_attempt_recast(None, 0, true, false)); // stream_age < min
+        assert!(!should_attempt_recast(None, 720, false, false)); // no HWM
+        assert!(!should_attempt_recast(Some(0), 720, true, false)); // cooldown
     }
 
     #[test]
@@ -6270,20 +6380,25 @@ mod tests {
         let cycle = 133; // sec — full Playing+Frozen cycle observed Apr 29 AM
 
         // First recast: no prior history, allowed (assuming stream age met)
-        assert!(should_attempt_recast(None, 120, true));
+        assert!(should_attempt_recast(None, 120, true, false));
 
         // Second recast: a full cycle later (133s gap, well above cooldown)
-        assert!(should_attempt_recast(Some(cycle), 120 + cycle, true));
+        assert!(should_attempt_recast(Some(cycle), 120 + cycle, true, false));
 
         // Third recast: another cycle later. Time gap from PRIOR recast.
         // Same as second — 133s gap.
-        assert!(should_attempt_recast(Some(cycle), 120 + 2 * cycle, true));
+        assert!(should_attempt_recast(
+            Some(cycle),
+            120 + 2 * cycle,
+            true,
+            false
+        ));
 
         // The actual Apr 29 AM 3rd recast: 72s gap (between healthy_for=70
         // and the next stall threshold of 60s in BUFFERING-stall logic).
         // OLD (90s cooldown): rejected. NEW (60s cooldown): accepted.
         assert!(
-            should_attempt_recast(Some(72), 200, true),
+            should_attempt_recast(Some(72), 200, true, false),
             "3rd recast at 72s gap MUST be allowed at the new 60s cooldown"
         );
     }
@@ -6482,7 +6597,12 @@ seg_00002.ts
         let first_idle_secs_since_recast = None;
         let first_idle_stream_age = 32 * 60;
         assert!(
-            should_attempt_recast(first_idle_secs_since_recast, first_idle_stream_age, true),
+            should_attempt_recast(
+                first_idle_secs_since_recast,
+                first_idle_stream_age,
+                true,
+                false
+            ),
             "First IDLE → recast permitted under both old and new logic"
         );
 
@@ -6491,7 +6611,12 @@ seg_00002.ts
         let second_idle_secs_since_recast = Some(180);
         let second_idle_stream_age = 32 * 60 + 180;
         assert!(
-            should_attempt_recast(second_idle_secs_since_recast, second_idle_stream_age, true),
+            should_attempt_recast(
+                second_idle_secs_since_recast,
+                second_idle_stream_age,
+                true,
+                false
+            ),
             "Second IDLE 3 min later → recast permitted with cooldown (was blocked by cap-of-1)"
         );
     }
@@ -6506,7 +6631,7 @@ seg_00002.ts
         let mut recast_count = 0;
         for _tick in 0..40 {
             // simulate 40 IDLE batches @ 15s apart
-            if should_attempt_recast(Some(elapsed_since_recast), stream_age, true) {
+            if should_attempt_recast(Some(elapsed_since_recast), stream_age, true, false) {
                 recast_count += 1;
                 elapsed_since_recast = 0;
             } else {
