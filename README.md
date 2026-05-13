@@ -9,7 +9,7 @@ spela pause                            # go grab a snack
 spela resume                           # back to zombies
 ```
 
-spela is a single Rust binary that searches for torrents, streams them via webtorrent, transcodes incompatible audio/video on the fly with ffmpeg, fetches subtitles, and casts to your Chromecast. No media library to maintain. No 15-app Docker stack. Just say what you want to watch.
+spela is a single Rust binary that searches for torrents, streams them through an embedded BitTorrent client (librqbit), transcodes incompatible audio/video on the fly with ffmpeg, fetches subtitles, and casts to your Chromecast. No media library to maintain. No 15-app Docker stack. No Node subprocess. Just say what you want to watch.
 
 ## Why?
 
@@ -19,15 +19,15 @@ Because "I want to watch a movie" shouldn't require Sonarr + Radarr + Prowlarr +
 
 - **Instant torrent streaming** -- search by name, play by number. No downloads, no waiting
 - **Auto-detect movie vs TV** -- TMDB figures out what you're searching for
-- **Smart torrent ranking** -- 4 tiers: single-file > H.264 > non-Dolby-Vision > well-seeded. Dolby Vision profile 5/7 is demoted because NVENC can't parse RPU NAL units cleanly
+- **Smart torrent ranking** -- 5 tiers tuned for 1080p TVs: single-file > non-Dolby-Vision (HARD GPU gate, RPU NAL parsing fails on consumer NVENC) > target resolution (1080p > 720p > 480p > 2160p; 4K demoted below 480p because 1080p TVs can't display the extra pixels) > H.264 > more seeds. **Seed-disparity override**: when a HEVC alternative has ≥30× the seeds of the H.264 tier-4 winner, the HEVC wins — NVENC absorbs HEVC→H.264 transcode in 5-10 s, whereas a starved swarm can block forever
 - **Chromecast native** -- rust_cast + mDNS discovery, no Python dependencies
 - **Transparent transcoding** -- HEVC to H.264, AC3/DTS to AAC, all via NVENC on your GPU. Output is HLS (MPEG-TS segments) which Chromecast's Default Media Receiver plays natively
 - **Subtitles** -- auto-fetched from OpenSubtitles, burned into the stream
 - **Intro clip** -- your own Netflix-style bumper before every stream (drop an `intro.mp4` in config)
 - **Pause/resume** -- tested up to 10-minute pauses. No timeouts, no dropped connections
-- **Post-playback cleanup** -- kills webtorrent and cleans temp files after the movie ends
+- **Post-playback cleanup** -- terminates the active torrent and any ffmpeg transcode workers, cleans temp files after playback ends
 - **Voice-ready** -- works with voice assistants via CLI or HTTP API. Our assistant Ruby (Gemini + MCP) uses `spela search` and `spela play` directly
-- **Self-healing** -- dead torrents auto-retry the next result. Failed casts retry 3x with backoff
+- **Self-healing** -- 20 s stream-start fail-fast detects starved swarms (zero HLS segments produced) and auto-retries with the next search result. Failed casts retry up to 3× with backoff. Head-of-stream probe rejects a play before LOAD if librqbit hasn't fetched piece 0 yet, so the Chromecast never sees a half-formed manifest
 
 ## Architecture
 
@@ -36,7 +36,9 @@ You → spela CLI (thin HTTP client)
         ↓
 spela server (axum, runs on your LAN)
         ↓
-TMDB (metadata) → Torrentio (torrents) → webtorrent-cli (download + HTTP serve)
+TMDB (metadata) → Torrentio (torrents) → librqbit (embedded BitTorrent, in-process)
+        ↓
+/torrent/{id}/stream/{file_idx} (loopback-only Range-supporting HTTP route)
         ↓
 ffmpeg (transcode if needed: HEVC→H.264, AC3→AAC, subtitle burn-in, intro concat)
         ↓
@@ -49,14 +51,14 @@ The CLI is a thin HTTP client. The server does everything. Run both on the same 
 
 ## Worker Safety
 
-spela's most important operational rule is that WebTorrent and ffmpeg are owned workers, not disposable background noise. Worker cleanup and media cleanup must stay separate:
+spela's most important operational rule is that ffmpeg transcode workers and librqbit's torrent session are owned resources, not disposable background noise. Worker cleanup and media cleanup must stay separate:
 
-- emergency cleanup should terminate WebTorrent/ffmpeg workers only;
+- emergency cleanup should terminate transcode workers only;
 - playback cleanup may remove temporary transcode files, but only through explicit playback paths;
-- startup should reconcile stale workers from previous sessions;
+- startup should reconcile stale resources from previous sessions (librqbit torrents that outlived a crash, ffmpeg orphans, and — as a one-shot transition aid — webtorrent-cli processes left behind by pre-v3.3.0 installs);
 - production deployments should add systemd/cgroup limits so a media worker cannot exhaust the host.
 
-Run `spela kill-workers` on the media host for emergency worker-only cleanup. It sends `SIGTERM` to local WebTorrent workers and Spela-owned ffmpeg transcode workers; it does not remove media files or update playback history.
+Run `spela kill-workers` on the media host for emergency worker-only cleanup. It sends `SIGTERM` to spela-owned ffmpeg transcode workers (and any orphan pre-v3.3.0 webtorrent-cli processes) without removing media files or updating playback history. The librqbit session is in-process, so a full `systemctl restart spela` is the equivalent operation for the torrent side.
 
 See [OPERATIONS.md](OPERATIONS.md) for the defense-in-depth plan and emergency checklist.
 
@@ -64,8 +66,7 @@ See [OPERATIONS.md](OPERATIONS.md) for the defense-in-depth plan and emergency c
 
 ### Prerequisites
 
-- **Rust** (for building spela)
-- **webtorrent-cli** (`npm install -g webtorrent-cli`)
+- **Rust** (for building spela; the BitTorrent client is embedded, no Node dependency)
 - **ffmpeg** (NVENC GPU transcoding if available, CPU fallback works fine — just slower startup)
 - A **TMDB API key** (free at [themoviedb.org](https://www.themoviedb.org/settings/api))
 - A **Chromecast** on the same network

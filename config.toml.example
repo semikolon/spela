@@ -18,7 +18,8 @@ tmdb_api_key = ""
 # Hostname or IP that Cast clients can fetch from (never localhost)
 stream_host = "media.local"
 
-# Media directory (temporary downloads, 5GB cap)
+# Media directory (temporary downloads, 10 GB cap; 20 GB host-filesystem
+# free-space floor checked separately — see OPERATIONS.md "Invariants").
 media_dir = "~/media"
 
 # Server listen port
