@@ -1252,26 +1252,43 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                         None
                     };
                     let prebuffer_timeout_secs: u64 = if intro_path.is_some() { 90 } else { 60 };
-                    let prebuffer_deadline = tokio::time::Instant::now()
-                        + tokio::time::Duration::from_secs(prebuffer_timeout_secs);
+                    let prebuffer_start = tokio::time::Instant::now();
+                    let prebuffer_deadline =
+                        prebuffer_start + tokio::time::Duration::from_secs(prebuffer_timeout_secs);
                     loop {
+                        // May 13, 2026 v3.4.0: stream-start fail-fast. If ffmpeg
+                        // has produced 0 segments after FAIL_FAST_STREAM_START_SECS
+                        // (20 s), declare stream-start failure and return an error
+                        // — `handle_play`'s existing auto-retry loop will bump
+                        // result_id and re-enter do_play with the next search
+                        // candidate. See `should_fail_fast_stream_start` doc for
+                        // root cause + Apr/May 2026 incident anchor.
+                        let elapsed_secs = prebuffer_start.elapsed().as_secs();
+                        let seg_count = count_hls_segments(&hls_dir);
+                        if should_fail_fast_stream_start(elapsed_secs, seg_count) {
+                            tracing::error!(
+                                "HLS stream-start fail-fast: {}s elapsed with 0 segments. \
+                                 Likely starved swarm or bad source — returning error so \
+                                 handle_play's auto-retry loop can fall back to the next \
+                                 result if one is available.",
+                                elapsed_secs
+                            );
+                            do_cleanup(state);
+                            // Error message intentionally describes only what
+                            // happened (not what will happen next); handle_play
+                            // decides retry vs surface based on attempts remaining.
+                            return Json(json!({
+                                "error": format!(
+                                    "Stream-start fail-fast: ffmpeg produced no HLS segments \
+                                     in {elapsed_secs}s (likely starved swarm or bad source)."
+                                )
+                            }));
+                        }
                         if tokio::time::Instant::now() > prebuffer_deadline {
                             tracing::warn!(
                                 "HLS pre-buffer timeout ({}s) — casting with {} segments available",
                                 prebuffer_timeout_secs,
-                                std::fs::read_dir(&hls_dir)
-                                    .map(|d| d
-                                        .filter(|e| {
-                                            e.as_ref()
-                                                .map(|e| {
-                                                    e.path()
-                                                        .extension()
-                                                        .map_or(false, |ext| ext == "ts")
-                                                })
-                                                .unwrap_or(false)
-                                        })
-                                        .count())
-                                    .unwrap_or(0)
+                                seg_count
                             );
                             break;
                         }
@@ -1282,20 +1299,6 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                                 .map(|p| p.exists())
                                 .unwrap_or(true)
                         {
-                            let seg_count = std::fs::read_dir(&hls_dir)
-                                .map(|d| {
-                                    d.filter(|e| {
-                                        e.as_ref()
-                                            .map(|e| {
-                                                e.path()
-                                                    .extension()
-                                                    .map_or(false, |ext| ext == "ts")
-                                            })
-                                            .unwrap_or(false)
-                                    })
-                                    .count()
-                                })
-                                .unwrap_or(0);
                             tracing::info!(
                                 "HLS pre-buffer ready: {} segments at {:?} (target was {})",
                                 seg_count,
@@ -1986,6 +1989,77 @@ pub fn should_attempt_recast(
             None => true, // first recast of this stream — always allowed
             Some(s) => s >= RECAST_COOLDOWN_SECS,
         }
+}
+
+/// May 13, 2026 v3.4.0 — stream-start fail-fast deadline.
+///
+/// If ffmpeg has been running this many seconds without producing a single
+/// HLS segment, declare stream-start failure and abort so
+/// `handle_play`'s existing auto-retry loop can fall back to the next
+/// search result. Empirically calibrated:
+///   - Well-seeded torrents (MeGusta-class, 1000+ seeds) produce the first
+///     HLS segment within 5-10 s on Darwin's GTX 1650 NVENC (HEVC→H.264
+///     transcode at ~3-6× realtime, first 6 s segment ready at ~1-2 s
+///     wall once piece 0 lands).
+///   - 20 s = 2-3× safety margin for slow-but-recoverable cases (HEVC
+///     10-bit format detection adds CPU pixfmt convert; Chromecast adaptive
+///     ladder needs both v0 + v1 streams).
+///   - Faster fail-fast (e.g. 10 s) risks false-positives on legitimately
+///     slow-but-eventual swarms; slower (e.g. 45 s) gives up too much of
+///     the user's patience on the common bad-torrent case.
+///
+/// Companion to the existing 60 s pre-buffer timeout: that timeout
+/// previously casted to the Chromecast with 0 segments (producing the
+/// 75 s blue-cast icon failure mode), counting on `cast_health_monitor`
+/// to reap the dead stream. Fail-fast replaces that with proactive
+/// auto-fallback — same total user-facing wait dropped from 75 s to
+/// ~20-25 s, AND the user gets a working stream from the next result
+/// instead of a manual recovery.
+pub const FAIL_FAST_STREAM_START_SECS: u64 = 20;
+
+/// Decision: should we declare a stream-start failure and return an error
+/// for `handle_play`'s auto-retry loop to handle?
+///
+/// Anchored to the May 13 2026 Apr/May incident: Cinecalidad H.264 torrent
+/// with 99 seeds blocked librqbit's first-piece fetch past ffmpeg's
+/// reconnect budget; ffmpeg read 50 bytes + EOF + EBML parse failure →
+/// 0 segments → 75 s blue-cast icon. Triggers when BOTH:
+///   - `elapsed_secs >= FAIL_FAST_STREAM_START_SECS` (20 s)
+///   - `segments_count == 0` (ffmpeg has produced nothing)
+///
+/// Two failure modes this catches together:
+///   - **Torrent-side**: librqbit can't fetch the first piece (starved
+///     swarm, bad source, dead peers). ffmpeg sees EOF/corrupt input,
+///     no segments produced.
+///   - **Encoder-side**: ffmpeg crashed during startup (bad EBML, broken
+///     codec, NVENC pixel-format mismatch). 0 segments forever.
+///
+/// Both classes benefit equally from auto-fallback to the next search
+/// result: different swarm AND different file, sidestepping both root
+/// causes. The seed-disparity ranker (May 13 v3.4.0, search.rs) also
+/// reduces incidence at the ranker layer; this fail-fast catches the
+/// residue when the ranker's top pick still has issues.
+pub fn should_fail_fast_stream_start(elapsed_secs: u64, segments_count: usize) -> bool {
+    elapsed_secs >= FAIL_FAST_STREAM_START_SECS && segments_count == 0
+}
+
+/// Count `.ts` HLS segment files in the transcoded output directory.
+/// Returns 0 on any filesystem error — the count is used for progress
+/// logging and fail-fast gating, neither of which needs perfect accuracy.
+/// Pulled out as a helper because the inline `read_dir`-and-filter pattern
+/// appeared in 3 call sites in the pre-buffer loop (timeout log, success
+/// log, fail-fast check); DRY also makes the call sites readable.
+pub(crate) fn count_hls_segments(hls_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(hls_dir)
+        .map(|d| {
+            d.filter(|e| {
+                e.as_ref()
+                    .map(|e| e.path().extension().is_some_and(|ext| ext == "ts"))
+                    .unwrap_or(false)
+            })
+            .count()
+        })
+        .unwrap_or(0)
 }
 
 /// Apr 30, 2026: BUFFERING-state decision (Apr 29 incident-pin).
@@ -5928,6 +6002,97 @@ mod tests {
         // bug; tightening below ~20s risks rapid-fire LOAD spam on a
         // wedged device.
         assert_eq!(RECAST_COOLDOWN_SECS, 30);
+    }
+
+    // --- Stream-start fail-fast (May 13, 2026 v3.4.0) ---
+    //
+    // `should_fail_fast_stream_start` is the upstream complement to
+    // `cast_health_monitor`'s cold-start IDLE protection. cast_health_monitor
+    // handles "receiver acked LOAD but player_state stuck IDLE" — a
+    // receiver-side wedge recoverable via recast. This helper handles the
+    // upstream case: ffmpeg never produced a single HLS segment because
+    // the torrent's first piece can't be fetched (starved swarm) or the
+    // encoder crashed on bad source. The receiver hasn't even been told
+    // about it yet at this point — fail-fast aborts the play before LOAD.
+    //
+    // These tests pin every aspect of the decision so the 20s threshold
+    // can't drift silently and the truth table stays unambiguous.
+
+    #[test]
+    fn test_fail_fast_at_exact_20s_with_zero_segments_triggers() {
+        // The boundary case: at exactly the threshold, with no progress,
+        // we MUST trigger. The May 13 Cinecalidad-99-seeds case had 0
+        // segments at the 60s pre-buffer timeout — this would have caught
+        // it 40s earlier and auto-fallback to MeGusta-7116-seeds.
+        assert!(should_fail_fast_stream_start(20, 0));
+    }
+
+    #[test]
+    fn test_fail_fast_just_below_20s_does_not_trigger() {
+        // Cold-start patience: 19 s with 0 segments is normal for HEVC →
+        // H.264 NVENC transcode bootstrap. Triggering at <20 s would
+        // create false-positive auto-fallbacks on healthy slow-starting
+        // streams.
+        assert!(!should_fail_fast_stream_start(19, 0));
+        assert!(!should_fail_fast_stream_start(10, 0));
+        assert!(!should_fail_fast_stream_start(0, 0));
+    }
+
+    #[test]
+    fn test_fail_fast_any_segments_means_healthy() {
+        // Once ffmpeg has produced even one segment, the encoder + torrent
+        // are confirmed working. Don't fail-fast even past the 20 s
+        // deadline — let the existing 60 s pre-buffer timeout handle
+        // segment-count gating from there.
+        assert!(!should_fail_fast_stream_start(20, 1));
+        assert!(!should_fail_fast_stream_start(45, 5));
+        assert!(!should_fail_fast_stream_start(60, 10));
+        assert!(!should_fail_fast_stream_start(120, 100));
+    }
+
+    #[test]
+    fn test_fail_fast_past_deadline_still_triggers_until_segments_appear() {
+        // After 60s with 0 segments (existing pre-buffer timeout case),
+        // fail-fast still applies — return error rather than cast with
+        // 0 segments (the legacy 75s-blue-cast-icon failure mode).
+        assert!(should_fail_fast_stream_start(30, 0));
+        assert!(should_fail_fast_stream_start(60, 0));
+        assert!(should_fail_fast_stream_start(120, 0));
+    }
+
+    #[test]
+    fn test_fail_fast_deadline_is_stable() {
+        // Pinned: 20 s. Calibrated against MeGusta-class swarms (1000+
+        // seeds) producing first segment within 5-10 s on Darwin's GTX
+        // 1650. Loosening risks burning user patience; tightening risks
+        // false-positives on healthy-but-slow startup. If this assertion
+        // needs to change, also update the FAIL_FAST_STREAM_START_SECS
+        // doc comment AND the seed-disparity-ranker docstring (Layer 1
+        // and Layer 2 are co-calibrated).
+        assert_eq!(FAIL_FAST_STREAM_START_SECS, 20);
+    }
+
+    #[test]
+    fn test_fail_fast_replays_may13_2026_apr_may_incident() {
+        // The exact failure trajectory of the May 13 incident: Cinecalidad
+        // 99-seed H.264 → librqbit truncated stream at 50 bytes → ffmpeg
+        // EBML parse failure → 0 segments produced for the entire 60 s
+        // pre-buffer window. With fail-fast at 20 s, the play would have
+        // errored out and handle_play's existing auto-retry loop would
+        // have bumped to result_id=2 (MeGusta 7116 seeds) automatically.
+        let observed_log_progression = &[
+            (5, 0, false),  // 5s: still in cold start, OK
+            (15, 0, false), // 15s: still in cold start, OK
+            (20, 0, true),  // 20s: fail-fast NOW
+            (60, 0, true),  // 60s: legacy timeout would have fired here
+        ];
+        for (elapsed, segments, expected_trigger) in observed_log_progression {
+            assert_eq!(
+                should_fail_fast_stream_start(*elapsed, *segments),
+                *expected_trigger,
+                "elapsed={elapsed}s segments={segments} expected trigger={expected_trigger}"
+            );
+        }
     }
 
     #[test]

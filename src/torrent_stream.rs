@@ -18,10 +18,62 @@ use std::io::SeekFrom;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
 
 use crate::torrent_engine::TorrentEngine;
+
+/// May 13, 2026 v3.4.0 — head-of-stream probe size.
+///
+/// Before constructing the axum response Body, we synchronously read this
+/// many bytes from the FileStream to confirm the stream is actually
+/// producing data. The probed bytes are then prepended to the response
+/// body via stream-chain so no double-read / re-seek is needed.
+///
+/// 64 KB is calibrated for what HTTP video clients need to sniff a
+/// container format:
+///   - Matroska (`.mkv`) EBML header is in the first ~64 bytes
+///   - MP4 `moov` atom in fast-start files is typically ≤32 KB
+///   - WebM/TS share Matroska/MPEG-TS framing in the first few KB
+///
+/// The probe DOES NOT pre-buffer the entire stream — it only confirms the
+/// HEAD is readable. After this many bytes are confirmed, hyper's body
+/// streaming + librqbit's piece prioritization handle the rest.
+pub(crate) const PROBE_BYTES: usize = 64 * 1024;
+
+/// Maximum wall-clock seconds the head-of-stream probe is allowed to take.
+/// If we can't accumulate `PROBE_BYTES` (or hit natural EOF on a tiny range)
+/// within this window, the underlying torrent is starved (piece 0 not yet
+/// downloaded after this much time) — return 503 so ffmpeg's `-reconnect`
+/// retries instead of accepting a half-formed response we can't deliver.
+///
+/// 30 s coordinates with the May 13 v3.4.0 stream-start fail-fast in
+/// `server.rs` (20 s deadline there): the probe gives librqbit's piece
+/// prioritization an extra 10 s to fetch piece 0 before declaring failure,
+/// matching the `handle.stream()` retry budget that was already established
+/// by the May 1 Wilderpeople fifth-bug fix (`af3fc41`).
+pub(crate) const PROBE_DEADLINE_SECS: u64 = 30;
+
+/// Compute the actual probe target — `min(PROBE_BYTES, range_len)`. For
+/// very small ranges (e.g., a HEAD-style 1 KB sniff from a client that
+/// just wants the EBML header), we cap at the range length so we don't
+/// try to read past it.
+pub(crate) fn compute_probe_target(range_len: u64) -> usize {
+    range_len.min(PROBE_BYTES as u64) as usize
+}
+
+/// Decision: did the head-of-stream probe succeed?
+///
+/// Success criteria: we got at least `target` bytes within the allowed
+/// budget. `target` of 0 (degenerate / empty range) is treated as
+/// failure — the response should never have entered the probe path in
+/// the first place, and the upstream EmptyResource check should have
+/// caught it; defensive false-return here keeps the contract clear.
+pub(crate) fn probe_succeeded(probed: usize, target: usize) -> bool {
+    target > 0 && probed >= target
+}
 
 /// Parsed Range request, both endpoints inclusive (RFC 7233 § 2.1).
 /// `start <= end < total` always holds for a valid request.
@@ -202,8 +254,91 @@ pub async fn serve_torrent_stream(
         })?;
 
     let len = range.len();
-    let limited = stream.take(len);
-    let body = Body::from_stream(ReaderStream::new(limited));
+
+    // May 13, 2026 v3.4.0 — head-of-stream probe.
+    //
+    // Synchronously read up to `PROBE_BYTES` (or `len`, whichever is
+    // smaller) before constructing the response Body. Confirms the
+    // FileStream is actually producing bytes — catches the May 13
+    // incident pattern where the response promised N bytes via
+    // Content-Length but the underlying stream truncated mid-flight,
+    // producing the 75 s blue-cast-icon failure mode.
+    //
+    // librqbit's `FileStream::poll_read` (8.1.1 src/torrent_state/
+    // streaming.rs) returns `Poll::Pending` when the current piece
+    // isn't yet downloaded, NOT EOF — so a successful probe means
+    // the piece(s) covering the start of the range are confirmed
+    // present and the storage backing is readable. If we can't get
+    // enough bytes within `PROBE_DEADLINE_SECS`, return 503 so
+    // ffmpeg's `-reconnect` retries instead of accepting a half-
+    // formed response.
+    let probe_target = compute_probe_target(len);
+    let mut probe_buf = vec![0u8; probe_target];
+    let probe_outcome = tokio::time::timeout(
+        tokio::time::Duration::from_secs(PROBE_DEADLINE_SECS),
+        async {
+            let mut total = 0usize;
+            while total < probe_target {
+                let n = stream.read(&mut probe_buf[total..probe_target]).await?;
+                if n == 0 {
+                    // poll_read returning 0 means the FileStream reports
+                    // EOF — only legitimate when the underlying file is
+                    // smaller than the probe target. Bail and let the
+                    // probe_succeeded check decide if this counts as
+                    // success (small-range case) or failure (early EOF
+                    // on a large range).
+                    break;
+                }
+                total += n;
+            }
+            Ok::<usize, std::io::Error>(total)
+        },
+    )
+    .await;
+
+    let probed_n = match probe_outcome {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "torrent_stream probe IO error for torrent {} file {}: {} — returning 503",
+                id,
+                file_idx,
+                e
+            );
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "torrent_stream probe: timed out after {}s for torrent {} file {} (piece covering range start likely not downloaded yet) — returning 503",
+                PROBE_DEADLINE_SECS,
+                id,
+                file_idx
+            );
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+
+    if !probe_succeeded(probed_n, probe_target) {
+        tracing::warn!(
+            "torrent_stream probe: got {} of {} bytes for torrent {} file {} — returning 503",
+            probed_n,
+            probe_target,
+            id,
+            file_idx
+        );
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // Body construction: probed bytes first, then the rest of the
+    // FileStream. probed_n == probe_target always at this point
+    // (probe_succeeded enforced), so .take(len - probed_n) yields
+    // exactly the remaining bytes of the range.
+    probe_buf.truncate(probed_n);
+    let remaining = len - probed_n as u64;
+    let probe_chunk: Result<Bytes, std::io::Error> = Ok(Bytes::from(probe_buf));
+    let probe_stream = tokio_stream::once(probe_chunk);
+    let rest_stream = ReaderStream::new(stream.take(remaining));
+    let body = Body::from_stream(probe_stream.chain(rest_stream));
 
     let status = if range.is_full(total) {
         StatusCode::OK
@@ -403,5 +538,81 @@ mod tests {
         assert_eq!(r.start, 2_250_000_000);
         assert_eq!(r.end, total - 1);
         assert_eq!(r.len(), total - 2_250_000_000);
+    }
+
+    // --- Head-of-stream probe (May 13, 2026 v3.4.0) ---
+    //
+    // The probe confirms the FileStream is actually producing bytes before
+    // we construct the axum response Body. Catches the May 13 incident
+    // pattern where the response promised N bytes via Content-Length but
+    // the underlying stream truncated mid-flight (HTTP client saw 50
+    // bytes + EOF → EBML parse failure → ffmpeg crashed → 0 HLS segments
+    // → 75 s blue-cast icon). These tests pin the pure decision helpers;
+    // the actual probe read against a real FileStream is integration-
+    // tested by the May 13 incident replay live on Darwin.
+
+    #[test]
+    fn test_probe_target_clamps_to_max_for_large_range() {
+        // 4.5 GB range (typical full-file torrent stream) → probe is still
+        // capped at PROBE_BYTES (64 KB). We never probe more than the
+        // container-format sniff requires.
+        assert_eq!(compute_probe_target(4_500_000_000), PROBE_BYTES);
+    }
+
+    #[test]
+    fn test_probe_target_clamps_to_range_for_small_range() {
+        // Tiny range (1 KB — say a HEAD-style probe from a client that
+        // only wants to read the start of the file). Probe target follows
+        // the range — no point asking for 64 KB when only 1 KB is being
+        // served.
+        assert_eq!(compute_probe_target(1000), 1000);
+    }
+
+    #[test]
+    fn test_probe_target_handles_zero_range() {
+        // Degenerate: zero-byte range. Should never reach the probe path
+        // (parse_range_header would have errored on EmptyResource), but
+        // defensively: target = 0.
+        assert_eq!(compute_probe_target(0), 0);
+    }
+
+    #[test]
+    fn test_probe_succeeded_at_target() {
+        assert!(probe_succeeded(PROBE_BYTES, PROBE_BYTES));
+        assert!(probe_succeeded(PROBE_BYTES + 100, PROBE_BYTES)); // got more than asked
+    }
+
+    #[test]
+    fn test_probe_succeeded_at_smaller_target() {
+        // Small range case: target was 1000, got 1000 → success.
+        assert!(probe_succeeded(1000, 1000));
+    }
+
+    #[test]
+    fn test_probe_failed_below_target() {
+        // The May 13 failure mode: target 64 KB, got 50 bytes → failure.
+        // Returning 503 here lets ffmpeg's -reconnect retry rather than
+        // committing to a Content-Length we can't deliver.
+        assert!(!probe_succeeded(50, PROBE_BYTES));
+        assert!(!probe_succeeded(0, PROBE_BYTES));
+    }
+
+    #[test]
+    fn test_probe_failed_for_zero_target() {
+        // target=0 is degenerate — even with probed=0, must return false
+        // so we don't silently accept a zero-byte body as success.
+        assert!(!probe_succeeded(0, 0));
+        assert!(!probe_succeeded(100, 0));
+    }
+
+    #[test]
+    fn test_probe_constants_are_stable() {
+        // 64 KB / 30 s. Calibrated against EBML header (~64 bytes), MP4
+        // moov atom (≤32 KB), and the May 13 v3.4.0 stream-start fail-fast
+        // window in server.rs (20 s — probe gets +10 s to coordinate with
+        // librqbit's `handle.stream()` 30 s init-state retry from
+        // commit af3fc41).
+        assert_eq!(PROBE_BYTES, 64 * 1024);
+        assert_eq!(PROBE_DEADLINE_SECS, 30);
     }
 }

@@ -469,6 +469,10 @@ impl SearchEngine {
 pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
     const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
     const MIN_SEEDS_FOR_RESOLUTION_PREF: u32 = 50;
+    // May 13, 2026 v3.4.0: when the HEVC alternative has ≥SEED_DISPARITY_OVERRIDE×
+    // the seeds of the H.264 tier-4 winner, override the codec preference. See
+    // tier 4 body below for the full rationale + Apr/May 2026 anchoring incident.
+    const SEED_DISPARITY_OVERRIDE: u32 = 30;
 
     results.sort_by(|a, b| {
         // Tier 1: single-file > pack
@@ -509,10 +513,43 @@ pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
             }
         }
 
-        // Tier 4: H.264 > HEVC within same resolution + DV status (insta-play tiebreak)
+        // Tier 4: H.264 > HEVC within same resolution + DV status (insta-play tiebreak).
+        // May 13, 2026 v3.4.0 amendment — seed-disparity override:
+        // when the HEVC alternative has ≥30× the seeds of the H.264 winner,
+        // promote the HEVC. Rationale: well-seeded swarms (MeGusta-class,
+        // 1000+ seeds) start streaming within seconds, while starved swarms
+        // (Cinecalidad 99-seed Apr/May 2026 case) blocked librqbit's
+        // first-piece fetch past ffmpeg's reconnect budget — 0 segments,
+        // 75 s blue-cast icon, manual recovery. HEVC→H.264 NVENC transcode
+        // on Darwin's GTX 1650 adds 5-10 s of cold-start cost, strictly
+        // cheaper than waiting for a starved swarm or failing entirely. The
+        // 30× threshold is "user-tuned conservative" — at 30× the H.264
+        // winner is unambiguously inferior; below 30× the codec-cost
+        // tradeoff isn't worth flipping. Per-resolution + DV gates still
+        // fire first (tier 3 / tier 2), so this override only ever swaps
+        // codec WITHIN the same resolution + DV bucket.
         let a_hevc = is_hevc_from_title(&a.title);
         let b_hevc = is_hevc_from_title(&b.title);
         if a_hevc != b_hevc {
+            let (h264_seeds, hevc_seeds, h264_is_a) = if a_hevc {
+                (b.seeds, a.seeds, false)
+            } else {
+                (a.seeds, b.seeds, true)
+            };
+            // `max(1)` guards h264_seeds = 0 so the multiplier stays meaningful
+            // (without it, saturating_mul yields 0 and any positive HEVC count
+            // trivially satisfies the inequality — semantically fine but
+            // makes the threshold a no-op for that edge case).
+            let h264_seeds_safe = h264_seeds.max(1);
+            if hevc_seeds >= h264_seeds_safe.saturating_mul(SEED_DISPARITY_OVERRIDE) {
+                return if h264_is_a {
+                    std::cmp::Ordering::Greater // H.264 (a) loses to HEVC (b)
+                } else {
+                    std::cmp::Ordering::Less // H.264 (b) loses to HEVC (a)
+                };
+            }
+            // No qualifying disparity — apply the existing H.264 preference
+            // if the H.264 winner has viable seeds (≥5).
             let preferred = if a_hevc { b } else { a }; // the H.264 one
             if preferred.seeds >= MIN_SEEDS_FOR_CODEC_PREF {
                 return if a_hevc {
@@ -1221,6 +1258,145 @@ mod tests {
         // so tier 4 doesn't fire and we fall through to tier 5 seed tiebreak:
         // 100 > 2 → HEVC wins. Same behavior as v3.0.0 for this fixture.
         assert_eq!(results[0].title, "Movie.x265.mkv");
+    }
+
+    // --- Seed-disparity override (May 13, 2026 v3.4.0) ---
+    //
+    // Apr 13, 2026 (sic — May 13) incident: searching `The Boys` S05E07
+    // returned a Cinecalidad 1080p H.264 release with 99 seeds as the
+    // tier-4 winner ahead of a MeGusta 1080p HEVC release with 7116 seeds
+    // (72× more). librqbit couldn't fetch the H.264 swarm's first piece
+    // before ffmpeg's reconnect budget expired (50 bytes + EBML parse
+    // failure + 0 segments + 75 s blue-cast icon). The MeGusta release
+    // would have started streaming within seconds. The fix: when the HEVC
+    // alternative has ≥30× the seeds of the H.264 tier-4 winner, override
+    // the codec preference. Rationale: 1080p HEVC→H.264 NVENC transcode
+    // on Darwin's GTX 1650 adds 5-10 s of cold-start cost; a starved
+    // swarm adds *minutes* (or fails entirely). The latency tradeoff
+    // flips.
+
+    #[test]
+    fn test_ranking_may13_2026_apr13_incident_cinecalidad_vs_megusta() {
+        // Exact fixture from the May 13 2026 The Boys S05E07 incident.
+        // Cinecalidad H.264 1080p with 99 seeds was tier-4 winner under
+        // v3.1.0 even though MeGusta HEVC 1080p had 7116 seeds (72×).
+        // Under v3.4.0 disparity override, MeGusta must win.
+        let mut results = vec![
+            make_result(1, "The.Boys.S05E07.2026.WEB-DL.1080p-Dual-Lat", 99, None),
+            make_result(
+                2,
+                "The.Boys.S05E07.The.Frenchman.the.Female.and.the.Man.Called.Mothers.Milk.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                7116,
+                Some(0),
+            ),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            is_hevc_from_title(&results[0].title),
+            "HEVC release with 72× more seeds should win the v3.4.0 disparity override — got {:?}",
+            results[0].title
+        );
+        assert_eq!(results[0].seeds, 7116);
+    }
+
+    #[test]
+    fn test_ranking_seed_disparity_at_exact_30x_threshold() {
+        // Boundary: 30× exactly should trigger the override (≥, not >).
+        let mut results = vec![
+            make_result(1, "Movie.1080p.x264.mkv", 100, Some(0)),
+            make_result(2, "Movie.1080p.x265.mkv", 3000, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            is_hevc_from_title(&results[0].title),
+            "30× disparity is exactly the threshold — HEVC should win"
+        );
+    }
+
+    #[test]
+    fn test_ranking_seed_disparity_just_below_30x_keeps_h264_preference() {
+        // 29.99× — codec preference still wins. Pins the boundary on the
+        // other side so the threshold doesn't drift silently if the
+        // constant is touched.
+        let mut results = vec![
+            make_result(1, "Movie.1080p.x264.mkv", 100, Some(0)),
+            make_result(2, "Movie.1080p.x265.mkv", 2999, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            !is_hevc_from_title(&results[0].title),
+            "29.99× disparity — H.264 preference still wins; got {:?}",
+            results[0].title
+        );
+    }
+
+    #[test]
+    fn test_ranking_seed_disparity_does_not_override_resolution_tier() {
+        // Disparity check is INSIDE tier 4 (same resolution). A 720p HEVC
+        // with massive seeds must NOT promote over a viable 1080p H.264.
+        // Tier 3 (resolution) fires before tier 4 disparity check.
+        let mut results = vec![
+            make_result(1, "Movie.1080p.x264.mkv", 100, Some(0)),
+            make_result(2, "Movie.720p.x265.mkv", 10000, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            results[0].title.contains("1080p"),
+            "1080p H.264 with viable seeds beats 720p HEVC regardless of swarm — got {:?}",
+            results[0].title
+        );
+    }
+
+    #[test]
+    fn test_ranking_seed_disparity_does_not_override_dv_gate() {
+        // Tier 2 (non-DV > DV) is a HARD GPU gate. Even a massive seed
+        // advantage on a DV release cannot promote it over a non-DV
+        // alternative (NVENC on Darwin's GTX 1650 can't decode DV RPU).
+        let mut results = vec![
+            make_result(1, "Movie.1080p.DV.HEVC.mkv", 10000, Some(0)),
+            make_result(2, "Movie.1080p.x264.mkv", 100, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            !has_dolby_vision_in_title(&results[0].title),
+            "DV gate must fire before disparity check — got {:?}",
+            results[0].title
+        );
+    }
+
+    #[test]
+    fn test_ranking_seed_disparity_handles_zero_seed_h264() {
+        // Edge case: H.264 has 0 seeds. Any positive HEVC seed count
+        // satisfies "≥30× more". The `max(1)` saturating-multiply guard
+        // prevents division-by-zero / overflow at this boundary.
+        let mut results = vec![
+            make_result(1, "Movie.1080p.x264.mkv", 0, Some(0)),
+            make_result(2, "Movie.1080p.x265.mkv", 50, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            is_hevc_from_title(&results[0].title),
+            "HEVC with any positive seeds beats H.264 with 0 seeds — got {:?}",
+            results[0].title
+        );
+    }
+
+    #[test]
+    fn test_ranking_existing_h264_preference_unchanged_when_no_disparity() {
+        // Sanity pin: when the seed ratio is normal (here ~5×), the
+        // existing H.264 > HEVC tier-4 preference still applies. Guards
+        // against the disparity override silently regressing the common
+        // case.
+        let mut results = vec![
+            make_result(1, "Movie.1080p.x265.mkv", 500, Some(0)),
+            make_result(2, "Movie.1080p.x264.mkv", 100, Some(0)),
+        ];
+        rank_results_mut(&mut results);
+        assert!(
+            !is_hevc_from_title(&results[0].title),
+            "5× disparity is below threshold — H.264 preference wins; got {:?}",
+            results[0].title
+        );
     }
 
     #[test]
