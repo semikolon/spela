@@ -3151,7 +3151,7 @@ pub(crate) fn find_local_bypass_match(
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
             if (ext == "mp4" || ext == "mkv")
                 && !fname.starts_with("transcoded")
-                && top_level_file_is_healthy(&path)
+                && top_level_file_is_healthy(&path, expected_bytes)
             {
                 if corrupt_files.contains(&path.to_string_lossy().to_string()) {
                     tracing::warn!(
@@ -3234,12 +3234,33 @@ fn is_physically_full(path: &std::path::Path, expected_bytes: u64) -> bool {
 ///
 /// Sanity floor: 100 MB. Anything smaller than that is a partial download or
 /// a stub file, not a real movie file.
-fn top_level_file_is_healthy(path: &std::path::Path) -> bool {
+///
+/// If we know the search result's expected size, require the top-level file to
+/// be within a broad size window. This keeps the Apr 15 "different release,
+/// same content" flexibility while rejecting obviously wrong matches, like a
+/// 700 MB file standing in for a 1.6 GB request.
+fn top_level_file_is_healthy(path: &std::path::Path, expected_bytes: u64) -> bool {
     const MIN_MOVIE_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+    const MIN_EXPECTED_RATIO: f64 = 0.75;
+    const MAX_EXPECTED_RATIO: f64 = 1.25;
     if let Ok(meta) = std::fs::metadata(path) {
         let logical_size = meta.len();
         if logical_size < MIN_MOVIE_SIZE_BYTES {
             return false;
+        }
+        if expected_bytes > 0 {
+            let min_expected = (expected_bytes as f64 * MIN_EXPECTED_RATIO) as u64;
+            let max_expected = (expected_bytes as f64 * MAX_EXPECTED_RATIO) as u64;
+            if logical_size < min_expected || logical_size > max_expected {
+                tracing::info!(
+                    "Local Bypass: Top-level file size {} outside expected window [{}..={}] for {:?}. Rejecting.",
+                    logical_size,
+                    min_expected,
+                    max_expected,
+                    path
+                );
+                return false;
+            }
         }
         let physical_size = meta.blocks() * 512;
         if physical_size < (logical_size as f64 * 0.95) as u64 {
@@ -4981,6 +5002,26 @@ mod tests {
     }
 
     #[test]
+    fn find_local_bypass_top_level_file_skips_large_expected_size_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        make_dense_mkv(
+            root.path(),
+            "The.Night.Manager.S02E04.1080p.HEVC.x265-MeGusta.mkv",
+        );
+        let result = find_local_bypass_match(
+            root.path(),
+            "The Night Manager S02E04",
+            Some("1080p"),
+            1_696_512_081,
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            result.is_none(),
+            "top-level local bypass must reject clearly wrong-size episode files"
+        );
+    }
+
+    #[test]
     fn find_local_bypass_returns_none_on_no_match() {
         let root = tempfile::tempdir().unwrap();
         make_dense_mkv(root.path(), "Different.Show.S01E01.mkv");
@@ -5134,7 +5175,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let small = dir.path().join("tiny.mkv");
         std::fs::write(&small, vec![0u8; 50 * 1024 * 1024]).unwrap(); // 50 MB
-        assert!(!top_level_file_is_healthy(&small));
+        assert!(!top_level_file_is_healthy(&small, 0));
     }
 
     #[test]
@@ -5144,7 +5185,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let healthy = dir.path().join("full.mkv");
         std::fs::write(&healthy, vec![0u8; 110 * 1024 * 1024]).unwrap();
-        assert!(top_level_file_is_healthy(&healthy));
+        assert!(top_level_file_is_healthy(&healthy, 0));
     }
 
     #[test]
@@ -5157,7 +5198,7 @@ mod tests {
         let f = std::fs::File::create(&sparse).unwrap();
         f.set_len(200 * 1024 * 1024).unwrap(); // 200 MB logical, 0 physical
         drop(f);
-        assert!(!top_level_file_is_healthy(&sparse));
+        assert!(!top_level_file_is_healthy(&sparse, 0));
     }
 
     #[test]
@@ -5165,7 +5206,7 @@ mod tests {
         // Symptom of stale Local Bypass cache reference; must return false
         // not panic.
         let nonexistent = std::path::Path::new("/tmp/spela-nonexistent-fixture-xxxxyyyyzzzz");
-        assert!(!top_level_file_is_healthy(nonexistent));
+        assert!(!top_level_file_is_healthy(nonexistent, 0));
     }
 
     #[test]
