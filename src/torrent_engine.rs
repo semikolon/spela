@@ -145,11 +145,7 @@ impl TorrentEngine {
     /// Returns immediately after librqbit accepts the magnet — the actual
     /// metadata fetch + peer connection happens in background tasks owned by
     /// the session. The caller polls `progress()` to detect dead seeds.
-    pub async fn start(
-        &self,
-        magnet: &str,
-        file_index: Option<u32>,
-    ) -> Result<TorrentStartInfo> {
+    pub async fn start(&self, magnet: &str, file_index: Option<u32>) -> Result<TorrentStartInfo> {
         // Apr 30, 2026 SSRF defense — see `validate_magnet_uri` doc.
         validate_magnet_uri(magnet).map_err(|e| anyhow!("{}", e))?;
         let opts = AddTorrentOptions {
@@ -298,7 +294,10 @@ pub(crate) fn unshift_librqbit_id(spela_id: u32) -> Option<usize> {
 /// URL builder used at start time AND by the streaming handler when generating
 /// example URLs. Pure function so it's directly testable.
 pub(crate) fn build_stream_url(host: &str, port: u16, id: u32, file_idx: usize) -> String {
-    format!("http://{}:{}/torrent/{}/stream/{}", host, port, id, file_idx)
+    format!(
+        "http://{}:{}/torrent/{}/stream/{}",
+        host, port, id, file_idx
+    )
 }
 
 /// Parse the leading-number portion of librqbit's `Speed` Display impl.
@@ -329,10 +328,7 @@ fn stats_to_progress(stats: &TorrentStats) -> TorrentProgress {
             // exact precision doesn't matter, but format-stability does.
             let mbps = parse_mbps_string(&format!("{}", live.download_speed));
             let bps = (mbps * 125_000.0) as u64; // mbps * 1e6 / 8
-            (
-                live.snapshot.peer_stats.live as usize,
-                bps,
-            )
+            (live.snapshot.peer_stats.live as usize, bps)
         }
         None => (0, 0),
     };
@@ -470,7 +466,10 @@ mod tests {
     fn shift_unshift_roundtrip() {
         for librqbit_id in [0_usize, 1, 42, 1000, (u32::MAX - 1) as usize] {
             let spela_id = shift_librqbit_id(librqbit_id).unwrap();
-            assert_ne!(spela_id, 0, "shifted id must never be the Local Bypass sentinel");
+            assert_ne!(
+                spela_id, 0,
+                "shifted id must never be the Local Bypass sentinel"
+            );
             let recovered = unshift_librqbit_id(spela_id).unwrap();
             assert_eq!(
                 recovered, librqbit_id,

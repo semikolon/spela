@@ -128,6 +128,8 @@ pub struct CurrentStream {
     pub ss_offset: f64,
     #[serde(default)]
     pub smooth: bool,
+    #[serde(default)]
+    pub prepared_hls: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,8 +158,12 @@ pub struct Preferences {
     pub preferred_quality: String,
 }
 
-fn default_target() -> String { "chromecast".into() }
-fn default_quality() -> String { "1080p".into() }
+fn default_target() -> String {
+    "chromecast".into()
+}
+fn default_quality() -> String {
+    "1080p".into()
+}
 
 impl Default for Preferences {
     fn default() -> Self {
@@ -201,28 +207,31 @@ impl AppState {
     /// Save last search results to a separate file for play-by-id.
     pub fn save_last_search(state_dir: &Path, result: &SearchResult) {
         let path = state_dir.join("last_search.json");
-        let _ = serde_json::to_string_pretty(result)
-            .map(|s| std::fs::write(path, s));
+        let _ = serde_json::to_string_pretty(result).map(|s| std::fs::write(path, s));
     }
 
     /// Load last search results.
     pub fn load_last_search(state_dir: &Path) -> Option<SearchResult> {
         let path = state_dir.join("last_search.json");
-        std::fs::read_to_string(path).ok()
+        std::fs::read_to_string(path)
+            .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
     }
 
     pub fn stop_current(&mut self) {
         if let Some(current) = self.current.take() {
-            self.history.insert(0, HistoryEntry {
-                title: current.title,
-                watched_at: Utc::now(),
-                show: current.show,
-                season: current.season,
-                episode: current.episode,
-                imdb_id: current.imdb_id,
-                target: Some(current.target),
-            });
+            self.history.insert(
+                0,
+                HistoryEntry {
+                    title: current.title,
+                    watched_at: Utc::now(),
+                    show: current.show,
+                    season: current.season,
+                    episode: current.episode,
+                    imdb_id: current.imdb_id,
+                    target: Some(current.target),
+                },
+            );
             self.history.truncate(50);
         }
     }
@@ -232,7 +241,13 @@ impl AppState {
     /// If duration is provided and t is near the end (>= HWM_CLEAR_FRACTION or within
     /// HWM_CLEAR_TAIL_SECS of the end), clears the saved position so next play starts
     /// fresh instead of auto-resuming from the credits.
-    pub fn save_position_smart(&mut self, imdb_id: Option<String>, title: Option<String>, t: f64, duration: Option<f64>) -> (String, bool) {
+    pub fn save_position_smart(
+        &mut self,
+        imdb_id: Option<String>,
+        title: Option<String>,
+        t: f64,
+        duration: Option<f64>,
+    ) -> (String, bool) {
         let key = match resume_position_key(imdb_id.as_deref(), title.as_deref()) {
             Some(k) => k,
             None => return ("unknown".into(), false),
@@ -242,7 +257,12 @@ impl AppState {
         // Clear the HWM when the user has effectively watched to the end.
         if let Some(dur) = duration {
             if dur > 0.0 && (t >= dur * HWM_CLEAR_FRACTION || t >= (dur - HWM_CLEAR_TAIL_SECS)) {
-                tracing::info!("Playback completion detected for '{}' at {}s (of {}s) — clearing resume point", key, t, dur);
+                tracing::info!(
+                    "Playback completion detected for '{}' at {}s (of {}s) — clearing resume point",
+                    key,
+                    t,
+                    dur
+                );
                 self.reset_position(imdb_id, title);
                 return (key, true);
             }
@@ -328,10 +348,14 @@ fn extract_se_suffix(title: &str) -> Option<String> {
             let boundary_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
             if boundary_ok {
                 let mut j = i + 1;
-                while j < n && bytes[j].is_ascii_digit() { j += 1; }
+                while j < n && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
                 if j < n && bytes[j] == b'e' && j + 1 < n && bytes[j + 1].is_ascii_digit() {
                     let mut k = j + 1;
-                    while k < n && bytes[k].is_ascii_digit() { k += 1; }
+                    while k < n && bytes[k].is_ascii_digit() {
+                        k += 1;
+                    }
                     let season: u32 = lower[i + 1..j].parse().ok()?;
                     let episode: u32 = lower[j + 1..k].parse().ok()?;
                     return Some(format!("_s{:02}e{:02}", season, episode));
@@ -366,7 +390,8 @@ mod tests {
         let title = Some("28 Years Later".to_string());
 
         // 1. Regular save (50 mins in) — well below HWM_CLEAR_FRACTION
-        let (key, saved) = state.save_position_smart(imdb_id.clone(), title.clone(), 3000.0, Some(6907.0));
+        let (key, saved) =
+            state.save_position_smart(imdb_id.clone(), title.clone(), 3000.0, Some(6907.0));
         assert!(saved);
         assert_eq!(state.resume_positions.get(&key), Some(&3000.0));
 
@@ -374,16 +399,24 @@ mod tests {
         //    below the 0.96 HWM_CLEAR_FRACTION threshold, the HWM must SURVIVE
         //    — the Send Help incident was caused by killing streams past 92%
         //    when the user was still mid-climax. This case must save, not clear.
-        let (key2, saved2) = state.save_position_smart(imdb_id.clone(), title.clone(), 6600.0, Some(6907.0));
+        let (key2, saved2) =
+            state.save_position_smart(imdb_id.clone(), title.clone(), 6600.0, Some(6907.0));
         assert!(saved2);
-        assert_eq!(state.resume_positions.get(&key2), Some(&6600.0),
-                   "HWM must survive at 95.5% — below HWM_CLEAR_FRACTION (0.96)");
+        assert_eq!(
+            state.resume_positions.get(&key2),
+            Some(&6600.0),
+            "HWM must survive at 95.5% — below HWM_CLEAR_FRACTION (0.96)"
+        );
 
         // 3. Completion clear at 97.1% (6708s / 6907s) — past HWM_CLEAR_FRACTION.
-        let (key3, saved3) = state.save_position_smart(imdb_id.clone(), title.clone(), 6708.0, Some(6907.0));
+        let (key3, saved3) =
+            state.save_position_smart(imdb_id.clone(), title.clone(), 6708.0, Some(6907.0));
         assert!(saved3);
-        assert_eq!(state.resume_positions.get(&key3), None,
-                   "HWM must clear at 97.1% — past HWM_CLEAR_FRACTION");
+        assert_eq!(
+            state.resume_positions.get(&key3),
+            None,
+            "HWM must clear at 97.1% — past HWM_CLEAR_FRACTION"
+        );
     }
 
     /// Apr 19, 2026: the HWM clear threshold must be at least 0.96. Lower values
@@ -392,11 +425,15 @@ mod tests {
     /// The 0.96 lower bound is load-bearing UX policy — don't regress it.
     #[test]
     fn test_hwm_clear_fraction_invariant() {
-        assert!(HWM_CLEAR_FRACTION >= 0.96,
-                "HWM_CLEAR_FRACTION must not drop below 0.96 — see Send Help incident \
-                 Apr 19, 2026. Lower values amputate climax scenes of modern films.");
-        assert!(HWM_CLEAR_FRACTION < 1.0,
-                "HWM_CLEAR_FRACTION must be < 1.0 or the HWM never clears.");
+        assert!(
+            HWM_CLEAR_FRACTION >= 0.96,
+            "HWM_CLEAR_FRACTION must not drop below 0.96 — see Send Help incident \
+                 Apr 19, 2026. Lower values amputate climax scenes of modern films."
+        );
+        assert!(
+            HWM_CLEAR_FRACTION < 1.0,
+            "HWM_CLEAR_FRACTION must be < 1.0 or the HWM never clears."
+        );
     }
 
     #[test]
@@ -440,8 +477,14 @@ mod tests {
 
         // Keys MUST be different — otherwise one save overwrites the other.
         assert_ne!(s02_key, s03_key);
-        assert!(s02_key.contains("s05e02"), "S02 key missing suffix: {s02_key}");
-        assert!(s03_key.contains("s05e03"), "S03 key missing suffix: {s03_key}");
+        assert!(
+            s02_key.contains("s05e02"),
+            "S02 key missing suffix: {s02_key}"
+        );
+        assert!(
+            s03_key.contains("s05e03"),
+            "S03 key missing suffix: {s03_key}"
+        );
 
         // Both positions must be independently retrievable
         let s02_pos = state.get_position(show_id.clone(), Some("The Boys S05E02".to_string()));
@@ -465,7 +508,8 @@ mod tests {
         assert_eq!(key, "tt10548174");
 
         // Same id + different marketing titles → same key (correct for movies)
-        let key_alt = resume_position_key(Some("tt10548174"), Some("28 Years Later — Extended")).unwrap();
+        let key_alt =
+            resume_position_key(Some("tt10548174"), Some("28 Years Later — Extended")).unwrap();
         assert_eq!(key, key_alt);
     }
 
@@ -474,18 +518,34 @@ mod tests {
     #[test]
     fn test_extract_se_suffix_variants() {
         // Zero-padded forms (most common)
-        assert_eq!(extract_se_suffix("The Boys S05E03 Every One of You Sons of Bitches"),
-                   Some("_s05e03".to_string()));
-        assert_eq!(extract_se_suffix("The.Boys.S05E02.Teenage.Kix.1080p"),
-                   Some("_s05e02".to_string()));
+        assert_eq!(
+            extract_se_suffix("The Boys S05E03 Every One of You Sons of Bitches"),
+            Some("_s05e03".to_string())
+        );
+        assert_eq!(
+            extract_se_suffix("The.Boys.S05E02.Teenage.Kix.1080p"),
+            Some("_s05e02".to_string())
+        );
         // Case-insensitive
-        assert_eq!(extract_se_suffix("the.boys.s05e03.flux"), Some("_s05e03".to_string()));
+        assert_eq!(
+            extract_se_suffix("the.boys.s05e03.flux"),
+            Some("_s05e03".to_string())
+        );
         // Unpadded single-digit forms — normalize to 2-digit
-        assert_eq!(extract_se_suffix("Lost S1E1 Pilot"), Some("_s01e01".to_string()));
+        assert_eq!(
+            extract_se_suffix("Lost S1E1 Pilot"),
+            Some("_s01e01".to_string())
+        );
         // Double-digit episodes
-        assert_eq!(extract_se_suffix("Show S1E12 Finale"), Some("_s01e12".to_string()));
+        assert_eq!(
+            extract_se_suffix("Show S1E12 Finale"),
+            Some("_s01e12".to_string())
+        );
         // Space-separated (playWEB-style release names)
-        assert_eq!(extract_se_suffix("The Boys S05E03 Every One"), Some("_s05e03".to_string()));
+        assert_eq!(
+            extract_se_suffix("The Boys S05E03 Every One"),
+            Some("_s05e03".to_string())
+        );
         // No SxxExx marker → None
         assert_eq!(extract_se_suffix("28 Years Later (2025)"), None);
         assert_eq!(extract_se_suffix("The Matrix 1999 1080p"), None);
@@ -493,7 +553,10 @@ mod tests {
         assert_eq!(extract_se_suffix(""), None);
         // Word-boundary guard: "ses" should NOT trigger on the trailing 's'
         // (this was a real pitfall in earlier drafts — "Loses"/"Dragons" etc).
-        assert_eq!(extract_se_suffix("Dragons S05E01"), Some("_s05e01".to_string()));
+        assert_eq!(
+            extract_se_suffix("Dragons S05E01"),
+            Some("_s05e01".to_string())
+        );
         assert_eq!(extract_se_suffix("NoSeOrEHere"), None);
     }
 
@@ -524,6 +587,7 @@ mod tests {
             poster_url: None,
             ss_offset: 1800.0,
             smooth: false,
+            prepared_hls: false,
         };
         let serialized = serde_json::to_string(&stream).expect("serialize");
         assert!(

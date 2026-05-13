@@ -113,7 +113,9 @@ fn fs_free_mb(path: &Path) -> Option<u64> {
 ///   `.spela_done` marker exists for files), so the 7-day grace applies.
 /// - Partial / in-progress directories: deleted after 24h of inactivity.
 pub fn prune_disk(media_dir: &Path, active_title: &str) {
-    if !media_dir.exists() { return; }
+    if !media_dir.exists() {
+        return;
+    }
     let now = SystemTime::now();
 
     let entries = match std::fs::read_dir(media_dir) {
@@ -176,8 +178,14 @@ pub fn prune_disk(media_dir: &Path, active_title: &str) {
                 name,
                 age.as_secs() / 3600,
                 if is_dir {
-                    if is_completed_dir { "completed-dir" } else { "partial-dir" }
-                } else { "file" }
+                    if is_completed_dir {
+                        "completed-dir"
+                    } else {
+                        "partial-dir"
+                    }
+                } else {
+                    "file"
+                }
             );
             if is_dir {
                 let _ = std::fs::remove_dir_all(&path);
@@ -389,7 +397,11 @@ mod tests {
         // at least as big as the logical content.
         let size = dir_size(&dir).unwrap();
         assert!(size >= 11, "dir_size should be >= logical sum (got {size})");
-        assert_eq!(size % 512, 0, "dir_size should be block-aligned (got {size})");
+        assert_eq!(
+            size % 512,
+            0,
+            "dir_size should be block-aligned (got {size})"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -402,7 +414,11 @@ mod tests {
         fs::write(sub.join("child.txt"), "defgh").unwrap();
         let size = dir_size(&dir).unwrap();
         assert!(size >= 8, "dir_size should be >= logical sum (got {size})");
-        assert_eq!(size % 512, 0, "dir_size should be block-aligned (got {size})");
+        assert_eq!(
+            size % 512,
+            0,
+            "dir_size should be block-aligned (got {size})"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -427,10 +443,7 @@ mod tests {
         drop(f);
 
         // Sanity: the OS reports the logical length as 100 MB.
-        assert_eq!(
-            std::fs::metadata(&sparse).unwrap().len(),
-            100 * 1024 * 1024
-        );
+        assert_eq!(std::fs::metadata(&sparse).unwrap().len(), 100 * 1024 * 1024);
 
         // But dir_size must report nearly nothing — the sparse file should
         // occupy at most a few filesystem blocks of metadata, far below
@@ -462,7 +475,11 @@ mod tests {
         fs::write(&old_file, vec![0u8; 1024]).unwrap();
         // Back-date to 10 days ago (past the 7-day "completed-file" threshold).
         let ten_days_ago = SystemTime::now() - Duration::from_secs(10 * 24 * 3600);
-        filetime::set_file_mtime(&old_file, filetime::FileTime::from_system_time(ten_days_ago)).ok();
+        filetime::set_file_mtime(
+            &old_file,
+            filetime::FileTime::from_system_time(ten_days_ago),
+        )
+        .ok();
 
         prune_disk(&dir, "NotMatching");
         assert!(
@@ -494,7 +511,11 @@ mod tests {
         let old_file = dir.join("Old.Movie.mkv");
         fs::write(&old_file, vec![0u8; 1024]).unwrap();
         let ten_days_ago = SystemTime::now() - Duration::from_secs(10 * 24 * 3600);
-        filetime::set_file_mtime(&old_file, filetime::FileTime::from_system_time(ten_days_ago)).ok();
+        filetime::set_file_mtime(
+            &old_file,
+            filetime::FileTime::from_system_time(ten_days_ago),
+        )
+        .ok();
 
         // Empty active_title used to protect everything. Now it protects nothing.
         prune_disk(&dir, "");
@@ -542,7 +563,7 @@ mod tests {
         };
         let oldest = make("oldest.mkv", 3600, 6); // 6 MB, 1h old
         let middle = make("middle.mkv", 1800, 6); // 6 MB, 30 min old
-        let newest = make("newest.mkv", 60, 6);   // 6 MB, 1 min old
+        let newest = make("newest.mkv", 60, 6); // 6 MB, 1 min old
 
         // Cap at 15 MB — we have 18 MB, need to drop 3+ MB → evict oldest.
         prune_to_fit(&dir, "nothing-matches", 15);
@@ -576,7 +597,10 @@ mod tests {
         prune_to_fit(&dir, "The Boys S05E03", 10);
         assert!(active.exists(), "active title must NEVER be evicted");
         // Newer must have been evicted since active is protected
-        assert!(!newer.exists(), "newer must be evicted when active is protected");
+        assert!(
+            !newer.exists(),
+            "newer must be evicted when active is protected"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

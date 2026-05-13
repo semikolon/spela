@@ -864,7 +864,11 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     let mut pid: u32 = 0;
     let mut is_local = false;
     let smooth_mode = req.smooth.unwrap_or(false);
-    let expected_bytes = req.size.as_deref().and_then(parse_size_to_bytes).unwrap_or(0);
+    let expected_bytes = req
+        .size
+        .as_deref()
+        .and_then(parse_size_to_bytes)
+        .unwrap_or(0);
     let corrupt_files = AppState::load(&state.state_dir).corrupt_files;
 
     if req.title.is_some() {
@@ -1191,9 +1195,11 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
             Ok(hls_info) => {
                 let manifest_path = hls_info.manifest_path.clone();
                 let ffmpeg_pid = hls_info.ffmpeg_pid;
+                let prepared_hls_for_cast =
+                    should_wait_for_complete_hls_before_cast(&target, is_local);
                 // Track ffmpeg PID for the post-playback reaper + cleanup
                 *lock_recover(&state.ffmpeg_pid) = Some(ffmpeg_pid);
-                if should_wait_for_complete_hls_before_cast(&target, is_local) {
+                if prepared_hls_for_cast {
                     tracing::info!(
                             "Chromecast reliability mode: waiting for completed local HLS set before LOAD"
                         );
@@ -1238,8 +1244,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                     let min_segments: usize = if target == "chromecast" { 20 } else { 10 };
                     let target_segment = hls_dir.join(format!(
                         "{}{:05}.ts",
-                        hls_info.primary_segment_prefix,
-                        min_segments
+                        hls_info.primary_segment_prefix, min_segments
                     ));
                     let target_low_segment = if hls_info.adaptive {
                         Some(hls_dir.join(format!("seg_1_{:05}.ts", min_segments)))
@@ -1272,7 +1277,10 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                         }
                         if manifest_path.exists()
                             && target_segment.exists()
-                            && target_low_segment.as_ref().map(|p| p.exists()).unwrap_or(true)
+                            && target_low_segment
+                                .as_ref()
+                                .map(|p| p.exists())
+                                .unwrap_or(true)
                         {
                             let seg_count = std::fs::read_dir(&hls_dir)
                                 .map(|d| {
@@ -1501,6 +1509,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
             0.0
         },
         smooth: smooth_mode,
+        prepared_hls: is_transcoded && should_wait_for_complete_hls_before_cast(&target, is_local),
     });
     let _ = app_state.save(&state.state_dir);
 
@@ -1944,6 +1953,8 @@ pub const RECAST_COOLDOWN_SECS: u64 = 30;
 /// to the same path as IDLE (try recast subject to cooldown, else
 /// cleanup).
 pub const MAX_BUFFERING_DURATION_SECS: u64 = 30;
+pub const FAST_CHROMECAST_MAX_BUFFERING_DURATION_SECS: u64 = 20;
+pub const PREPARED_HLS_CHROMECAST_MAX_BUFFERING_DURATION_SECS: u64 = 15;
 
 /// Decision: should `cast_health_monitor` attempt auto-recast before cleanup?
 ///
@@ -2008,6 +2019,19 @@ pub(crate) fn evaluate_buffering_state(
         }
     } else {
         BufferingDecision::Transient
+    }
+}
+
+pub(crate) fn buffering_timeout_for_current_stream(current: Option<&CurrentStream>) -> u64 {
+    match current {
+        Some(c) if c.target.starts_with("chromecast:") && c.url.contains("/hls/") => {
+            if c.prepared_hls {
+                PREPARED_HLS_CHROMECAST_MAX_BUFFERING_DURATION_SECS
+            } else {
+                FAST_CHROMECAST_MAX_BUFFERING_DURATION_SECS
+            }
+        }
+        _ => MAX_BUFFERING_DURATION_SECS,
     }
 }
 
@@ -2262,13 +2286,13 @@ async fn cast_health_monitor(
 
     loop {
         // Identity check: are we still the active stream?
-        let still_active = {
+        let (still_active, buffering_timeout_secs) = {
             let app_state = AppState::load(&state.state_dir);
-            app_state
-                .current
-                .as_ref()
-                .map(|c| c.started_at == started_at)
-                .unwrap_or(false)
+            let current = app_state.current.as_ref();
+            (
+                current.map(|c| c.started_at == started_at).unwrap_or(false),
+                buffering_timeout_for_current_stream(current),
+            )
         };
         if !still_active {
             tracing::info!(
@@ -2372,13 +2396,13 @@ async fn cast_health_monitor(
                     match evaluate_buffering_state(
                         buffering_for_secs,
                         stream_age_secs,
-                        MAX_BUFFERING_DURATION_SECS,
+                        buffering_timeout_secs,
                         MIN_STREAM_AGE_FOR_RECAST_SECS,
                     ) {
                         BufferingDecision::EscalateToCleanup => {
                             tracing::warn!(
                                 "cast_health_monitor: '{}' STALLED — BUFFERING for {}s (≥ {}s threshold, stream_age={}s); escalating to recast/cleanup path",
-                                title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS, stream_age_secs
+                                title_for_log, buffering_for_secs, buffering_timeout_secs, stream_age_secs
                             );
                             // Force cleanup gate to threshold so the
                             // PRE-CLEANUP log shows a legible "3" rather
@@ -2391,7 +2415,7 @@ async fn cast_health_monitor(
                         BufferingDecision::InStartupWindow => {
                             tracing::info!(
                                 "cast_health_monitor: '{}' BUFFERING crossed threshold ({}s ≥ {}s) but stream still in startup window ({}s < {}s) — not escalating",
-                                title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS,
+                                title_for_log, buffering_for_secs, buffering_timeout_secs,
                                 stream_age_secs, MIN_STREAM_AGE_FOR_RECAST_SECS
                             );
                             buffering_started_at = None;
@@ -2399,7 +2423,7 @@ async fn cast_health_monitor(
                         BufferingDecision::Transient => {
                             tracing::info!(
                                 "cast_health_monitor: '{}' BUFFERING (transient — {}s elapsed, threshold {}s)",
-                                title_for_log, buffering_for_secs, MAX_BUFFERING_DURATION_SECS
+                                title_for_log, buffering_for_secs, buffering_timeout_secs
                             );
                         }
                     }
@@ -3313,21 +3337,21 @@ async fn handle_queue_add(
                     (Some(show), None) => show.title.clone(),
                     _ => result.title.clone(),
                 };
-        crate::state::QueuedItem {
-            magnet: result.magnet.clone(),
-            title,
-            show: search.show.as_ref().map(|s| s.title.clone()),
+                crate::state::QueuedItem {
+                    magnet: result.magnet.clone(),
+                    title,
+                    show: search.show.as_ref().map(|s| s.title.clone()),
                     season: search.searching.as_ref().map(|e| e.season),
                     episode: search.searching.as_ref().map(|e| e.episode),
                     imdb_id: search.show.as_ref().and_then(|s| s.imdb_id.clone()),
                     file_index: result.file_index,
                     cast_name: req.cast_name.clone(),
                     target: None,
-            poster_url: search.show.as_ref().and_then(|s| s.poster_url.clone()),
-            quality: Some(result.quality.clone()),
-            size: Some(result.size.clone()),
-            smooth: req.smooth.unwrap_or(false),
-        }
+                    poster_url: search.show.as_ref().and_then(|s| s.poster_url.clone()),
+                    quality: Some(result.quality.clone()),
+                    size: Some(result.size.clone()),
+                    smooth: req.smooth.unwrap_or(false),
+                }
             }
             None => {
                 return Json(json!({
@@ -4717,24 +4741,34 @@ mod tests {
     #[test]
     fn evaluate_buffering_transient_under_threshold() {
         // Apr 18: "BUFFERING is transient" — under threshold, just wait.
-        let d = evaluate_buffering_state(15, 200, 60, 60);
+        let d = evaluate_buffering_state(15, 200, FAST_CHROMECAST_MAX_BUFFERING_DURATION_SECS, 60);
         assert_eq!(d, BufferingDecision::Transient);
     }
 
     #[test]
     fn evaluate_buffering_escalates_when_stalled_mid_stream() {
-        // Apr 29: bound the transient claim. 60s+ BUFFERING past startup
-        // window → escalate to cleanup/recast.
-        let d = evaluate_buffering_state(60, 200, 60, 60);
+        // Fast-start Chromecast path gets less patience now that ABR and
+        // deeper prebuffer are in place.
+        let d = evaluate_buffering_state(
+            FAST_CHROMECAST_MAX_BUFFERING_DURATION_SECS,
+            200,
+            FAST_CHROMECAST_MAX_BUFFERING_DURATION_SECS,
+            60,
+        );
         assert_eq!(d, BufferingDecision::EscalateToCleanup);
     }
 
     #[test]
     fn evaluate_buffering_in_startup_window_does_not_escalate() {
-        // Apr 29 PM refinement: 60s+ BUFFERING during the first 60s of
+        // Apr 29 PM refinement: threshold+ BUFFERING during the first 60s of
         // playback is a legitimate cold-start cost. Don't escalate
         // (recast wouldn't fire anyway), reset and wait.
-        let d = evaluate_buffering_state(60, 30, 60, 60);
+        let d = evaluate_buffering_state(
+            FAST_CHROMECAST_MAX_BUFFERING_DURATION_SECS,
+            30,
+            FAST_CHROMECAST_MAX_BUFFERING_DURATION_SECS,
+            60,
+        );
         assert_eq!(d, BufferingDecision::InStartupWindow);
     }
 
@@ -4743,8 +4777,100 @@ mod tests {
         // Boundary: stream_age == min_stream_age (exactly past startup
         // window) and buffering == max_buffering. The >= comparisons
         // mean this is the first ESCALATE moment.
-        let d = evaluate_buffering_state(60, 60, 60, 60);
+        let d = evaluate_buffering_state(
+            FAST_CHROMECAST_MAX_BUFFERING_DURATION_SECS,
+            60,
+            FAST_CHROMECAST_MAX_BUFFERING_DURATION_SECS,
+            60,
+        );
         assert_eq!(d, BufferingDecision::EscalateToCleanup);
+    }
+
+    #[test]
+    fn prepared_hls_chromecast_uses_tighter_buffering_timeout() {
+        let current = CurrentStream {
+            magnet: "magnet:?xt=urn:btih:abc".into(),
+            title: "Episode".into(),
+            show: None,
+            season: None,
+            episode: None,
+            imdb_id: None,
+            target: "chromecast:Fredriks TV".into(),
+            url: "http://192.168.4.1:7890/hls/master.m3u8".into(),
+            started_at: chrono::Utc::now(),
+            pid: 0,
+            has_subtitles: false,
+            subtitle_lang: None,
+            duration: None,
+            quality: None,
+            size: None,
+            poster_url: None,
+            ss_offset: 0.0,
+            smooth: true,
+            prepared_hls: true,
+        };
+        assert_eq!(
+            buffering_timeout_for_current_stream(Some(&current)),
+            PREPARED_HLS_CHROMECAST_MAX_BUFFERING_DURATION_SECS
+        );
+    }
+
+    #[test]
+    fn fast_start_chromecast_uses_mid_buffering_timeout() {
+        let current = CurrentStream {
+            magnet: "magnet:?xt=urn:btih:def".into(),
+            title: "Episode".into(),
+            show: None,
+            season: None,
+            episode: None,
+            imdb_id: None,
+            target: "chromecast:Fredriks TV".into(),
+            url: "http://192.168.4.1:7890/hls/master.m3u8".into(),
+            started_at: chrono::Utc::now(),
+            pid: 0,
+            has_subtitles: false,
+            subtitle_lang: None,
+            duration: None,
+            quality: None,
+            size: None,
+            poster_url: None,
+            ss_offset: 0.0,
+            smooth: false,
+            prepared_hls: false,
+        };
+        assert_eq!(
+            buffering_timeout_for_current_stream(Some(&current)),
+            FAST_CHROMECAST_MAX_BUFFERING_DURATION_SECS
+        );
+    }
+
+    #[test]
+    fn non_chromecast_keeps_legacy_buffering_timeout() {
+        let current = CurrentStream {
+            magnet: "magnet:?xt=urn:btih:ghi".into(),
+            title: "Episode".into(),
+            show: None,
+            season: None,
+            episode: None,
+            imdb_id: None,
+            target: "vlc:local".into(),
+            url: "http://127.0.0.1:7890/stream/transcode".into(),
+            started_at: chrono::Utc::now(),
+            pid: 0,
+            has_subtitles: false,
+            subtitle_lang: None,
+            duration: None,
+            quality: None,
+            size: None,
+            poster_url: None,
+            ss_offset: 0.0,
+            smooth: false,
+            prepared_hls: false,
+        };
+        assert_eq!(
+            buffering_timeout_for_current_stream(Some(&current)),
+            MAX_BUFFERING_DURATION_SECS
+        );
     }
 
     #[test]
@@ -5797,12 +5923,12 @@ mod tests {
 
     #[test]
     fn test_max_buffering_duration_is_stable() {
-        // Apr 29, 2026 PM: pinning at 30s. The earlier 60s value was
-        // conservative against startup false positives. Cleaner answer:
-        // 30s threshold + stream_age >= MIN_STREAM_AGE_FOR_RECAST_SECS
-        // gate (which the cast_health_monitor enforces). 30s shaves
-        // ~30s off every receiver-internal-freeze recovery.
+        // Non-Chromecast and legacy fallback paths keep the old 30s
+        // threshold. Chromecast now overrides it with tighter
+        // per-mode thresholds.
         assert_eq!(MAX_BUFFERING_DURATION_SECS, 30);
+        assert_eq!(FAST_CHROMECAST_MAX_BUFFERING_DURATION_SECS, 20);
+        assert_eq!(PREPARED_HLS_CHROMECAST_MAX_BUFFERING_DURATION_SECS, 15);
     }
 
     // ---- Apr 29, 2026: VOD-padded manifest tests (B2) ----

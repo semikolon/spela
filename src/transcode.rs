@@ -857,7 +857,10 @@ pub async fn transcode_hls(
             filter.push_str("[acat]asplit=2[ahi][alo]");
         } else {
             let video_filter = build_hls_nvenc_video_filter(subtitle_path);
-            filter.push_str(&format!("[0:v]{},split=2[vhi_src][vlo_src]; ", video_filter));
+            filter.push_str(&format!(
+                "[0:v]{},split=2[vhi_src][vlo_src]; ",
+                video_filter
+            ));
             filter.push_str("[vhi_src]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[vhi]; ");
             filter.push_str("[vlo_src]scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2,setsar=1[vlo]; ");
             filter.push_str(&format!(

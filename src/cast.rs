@@ -6,8 +6,7 @@ use std::time::{Duration, Instant};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use rust_cast::channels::media::{
-    Image, Media, Metadata, MovieMediaMetadata, PlayerState, StreamType,
-    TvShowMediaMetadata,
+    Image, Media, Metadata, MovieMediaMetadata, PlayerState, StreamType, TvShowMediaMetadata,
 };
 use rust_cast::channels::receiver::CastDeviceApp;
 use rust_cast::{CastDevice, ChannelMessage};
@@ -17,7 +16,6 @@ const CAST_PORT: u16 = 8009;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
-
 
 /// Apr 28, 2026: Inputs to `build_cast_metadata`, derived from the play
 /// request + `last_search.json` context. Pure data — no network/IO. Default
@@ -88,7 +86,9 @@ pub fn build_cast_metadata(meta: &CastMetadata) -> Option<Metadata> {
     if let (Some(s), Some(e), Some(series)) = (
         meta.season,
         meta.episode,
-        meta.series_title.as_deref().filter(|s| !s.trim().is_empty()),
+        meta.series_title
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
     ) {
         let episode_title = meta
             .title
@@ -106,16 +106,15 @@ pub fn build_cast_metadata(meta: &CastMetadata) -> Option<Metadata> {
     }
 
     // Tier 2 — Movie: requires title.
-    if let Some(title) = meta
-        .title
-        .as_deref()
-        .filter(|t| !t.trim().is_empty())
-    {
+    if let Some(title) = meta.title.as_deref().filter(|t| !t.trim().is_empty()) {
         // Subtitle: just the release year if we have a date, else None. The
         // receiver renders subtitle directly under the title — keeping it
         // short avoids overflow on TVs with smaller poster overlays.
         let subtitle = meta.release_date.as_deref().and_then(|d| {
-            d.split('-').next().filter(|y| y.len() == 4).map(|y| y.to_string())
+            d.split('-')
+                .next()
+                .filter(|y| y.len() == 4)
+                .map(|y| y.to_string())
         });
         return Some(Metadata::Movie(MovieMediaMetadata {
             title: Some(title.to_string()),
@@ -128,7 +127,6 @@ pub fn build_cast_metadata(meta: &CastMetadata) -> Option<Metadata> {
 
     None
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -181,7 +179,11 @@ impl CastController {
     pub fn new(state_dir: &Path, known_devices: HashMap<String, String>) -> Self {
         let cache_path = state_dir.join("devices.json");
         let device_cache = Self::load_cache(&cache_path);
-        Self { device_cache, cache_path, known_devices }
+        Self {
+            device_cache,
+            cache_path,
+            known_devices,
+        }
     }
 
     fn load_cache(path: &Path) -> HashMap<String, DeviceInfo> {
@@ -199,7 +201,9 @@ impl CastController {
     /// Discover Chromecast devices via mDNS.
     pub fn discover(&mut self) -> Result<Vec<DeviceInfo>> {
         let mdns = ServiceDaemon::new().map_err(|e| anyhow!("mDNS init failed: {}", e))?;
-        let receiver = mdns.browse(CAST_SERVICE).map_err(|e| anyhow!("mDNS browse failed: {}", e))?;
+        let receiver = mdns
+            .browse(CAST_SERVICE)
+            .map_err(|e| anyhow!("mDNS browse failed: {}", e))?;
 
         let mut devices = Vec::new();
         let deadline = Instant::now() + DISCOVERY_TIMEOUT;
@@ -207,10 +211,14 @@ impl CastController {
         while Instant::now() < deadline {
             match receiver.recv_timeout(Duration::from_millis(500)) {
                 Ok(ServiceEvent::ServiceResolved(info)) => {
-                    let name = info.get_property_val_str("fn")
-                        .unwrap_or("Unknown").to_string();
-                    let model = info.get_property_val_str("md")
-                        .unwrap_or("Unknown").to_string();
+                    let name = info
+                        .get_property_val_str("fn")
+                        .unwrap_or("Unknown")
+                        .to_string();
+                    let model = info
+                        .get_property_val_str("md")
+                        .unwrap_or("Unknown")
+                        .to_string();
 
                     if let Some(addr) = info.get_addresses().iter().next() {
                         let device = DeviceInfo {
@@ -267,19 +275,29 @@ impl CastController {
     /// Receiver — Default Media Receiver can't seek in fMP4 without
     /// byte-offset index. Jellyfin solves this with custom receiver + Shaka
     /// Player + server-side seek-restart.
-    pub fn cast_url(&mut self, device_name: &str, url: &str, content_type: &str, duration: Option<f64>, _current_time: Option<f64>, metadata: &CastMetadata) -> Result<CastResult> {
+    pub fn cast_url(
+        &mut self,
+        device_name: &str,
+        url: &str,
+        content_type: &str,
+        duration: Option<f64>,
+        _current_time: Option<f64>,
+        metadata: &CastMetadata,
+    ) -> Result<CastResult> {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, session_id) = Self::get_or_launch_app(&device)?;
 
-        let stream_type = if content_type.contains("mpegurl")
-            || content_type.contains("application/dash+xml")
-        {
-            tracing::info!("cast_url: HLS/DASH content_type {:?} → StreamType::Buffered", content_type);
-            StreamType::Buffered
-        } else {
-            StreamType::Live
-        };
+        let stream_type =
+            if content_type.contains("mpegurl") || content_type.contains("application/dash+xml") {
+                tracing::info!(
+                    "cast_url: HLS/DASH content_type {:?} → StreamType::Buffered",
+                    content_type
+                );
+                StreamType::Buffered
+            } else {
+                StreamType::Live
+            };
 
         let cast_metadata = build_cast_metadata(metadata);
         if cast_metadata.is_none() {
@@ -299,18 +317,18 @@ impl CastController {
 
         // Note: rust_cast's Load message currently doesn't expose currentTime in its high-level API.
         // For now, we rely on the post-load seek in server.rs or the Custom Receiver's LOAD interceptor.
-        let status = device.media.load(
-            transport_id.as_str(),
-            session_id.as_str(),
-            &media,
-        )?;
+        let status = device
+            .media
+            .load(transport_id.as_str(), session_id.as_str(), &media)?;
         let media_session_id = status.entries.first().map(|e| e.media_session_id);
 
         // Wait briefly for playback to start, handling heartbeat pings
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             match device.receive() {
-                Ok(ChannelMessage::Heartbeat(_)) => { let _ = device.heartbeat.pong(); }
+                Ok(ChannelMessage::Heartbeat(_)) => {
+                    let _ = device.heartbeat.pong();
+                }
                 Ok(ChannelMessage::Media(rust_cast::channels::media::MediaResponse::Status(s))) => {
                     if let Some(entry) = s.entries.first() {
                         match entry.player_state {
@@ -343,8 +361,15 @@ impl CastController {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, media_session_id) = Self::get_active_media(&device)?;
-        device.media.pause(transport_id.as_str(), media_session_id)?;
-        Ok(CastResult { status: "paused".into(), device: device_name.into(), url: None, media_session_id: Some(media_session_id) })
+        device
+            .media
+            .pause(transport_id.as_str(), media_session_id)?;
+        Ok(CastResult {
+            status: "paused".into(),
+            device: device_name.into(),
+            url: None,
+            media_session_id: Some(media_session_id),
+        })
     }
 
     /// Resume playback on a device.
@@ -353,7 +378,12 @@ impl CastController {
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, media_session_id) = Self::get_active_media(&device)?;
         device.media.play(transport_id.as_str(), media_session_id)?;
-        Ok(CastResult { status: "playing".into(), device: device_name.into(), url: None, media_session_id: Some(media_session_id) })
+        Ok(CastResult {
+            status: "playing".into(),
+            device: device_name.into(),
+            url: None,
+            media_session_id: Some(media_session_id),
+        })
     }
 
     /// Stop playback on a device.
@@ -363,7 +393,12 @@ impl CastController {
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, media_session_id) = Self::get_active_media(&device)?;
         device.media.stop(transport_id.as_str(), media_session_id)?;
-        Ok(CastResult { status: "stopped".into(), device: device_name.into(), url: None, media_session_id: None })
+        Ok(CastResult {
+            status: "stopped".into(),
+            device: device_name.into(),
+            url: None,
+            media_session_id: None,
+        })
     }
 
     /// Seek to a position (seconds) on a device.
@@ -371,19 +406,36 @@ impl CastController {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;
         let (transport_id, media_session_id) = Self::get_active_media(&device)?;
-        device.media.seek(transport_id.as_str(), media_session_id, Some(seconds as f32), None)?;
-        Ok(CastResult { status: "seeked".into(), device: device_name.into(), url: None, media_session_id: Some(media_session_id) })
+        device.media.seek(
+            transport_id.as_str(),
+            media_session_id,
+            Some(seconds as f32),
+            None,
+        )?;
+        Ok(CastResult {
+            status: "seeked".into(),
+            device: device_name.into(),
+            url: None,
+            media_session_id: Some(media_session_id),
+        })
     }
 
     /// Set volume (0-100) on a device.
     pub fn set_volume(&mut self, device_name: &str, level: u32) -> Result<CastResult> {
         let (ip, port) = self.resolve_device(device_name)?;
         let device = self.connect_with_retry(&ip, port)?;
-        device.receiver.set_volume(rust_cast::channels::receiver::Volume {
-            level: Some(level as f32 / 100.0),
-            muted: Some(false),
-        })?;
-        Ok(CastResult { status: "volume_set".into(), device: device_name.into(), url: None, media_session_id: None })
+        device
+            .receiver
+            .set_volume(rust_cast::channels::receiver::Volume {
+                level: Some(level as f32 / 100.0),
+                muted: Some(false),
+            })?;
+        Ok(CastResult {
+            status: "volume_set".into(),
+            device: device_name.into(),
+            url: None,
+            media_session_id: None,
+        })
     }
 
     /// Get playback info from a device.
@@ -400,7 +452,9 @@ impl CastController {
                 device.connection.connect(app.transport_id.as_str())?;
                 if let Ok(media_status) = device.media.get_status(app.transport_id.as_str(), None) {
                     if let Some(entry) = media_status.entries.first() {
-                        let title = entry.media.as_ref()
+                        let title = entry
+                            .media
+                            .as_ref()
                             .and_then(|m| m.metadata.as_ref())
                             .map(|md| extract_metadata_title(md))
                             .unwrap_or_default();
@@ -409,11 +463,14 @@ impl CastController {
                             device: device_name.into(),
                             player_state: format!("{:?}", entry.player_state),
                             current_time: entry.current_time.unwrap_or(0.0) as f64,
-                            duration: entry.media.as_ref().and_then(|m| m.duration).unwrap_or(0.0) as f64,
+                            duration: entry.media.as_ref().and_then(|m| m.duration).unwrap_or(0.0)
+                                as f64,
                             volume,
                             muted,
                             title,
-                            content_id: entry.media.as_ref()
+                            content_id: entry
+                                .media
+                                .as_ref()
                                 .map(|m| m.content_id.clone())
                                 .unwrap_or_default(),
                             idle_reason: entry.idle_reason.as_ref().map(|r| format!("{:?}", r)),
@@ -475,7 +532,9 @@ impl CastController {
                 return Ok((app.transport_id.clone(), app.session_id.clone()));
             }
         }
-        let app = device.receiver.launch_app(&CastDeviceApp::DefaultMediaReceiver)?;
+        let app = device
+            .receiver
+            .launch_app(&CastDeviceApp::DefaultMediaReceiver)?;
         device.connection.connect(app.transport_id.as_str())?;
         Ok((app.transport_id, app.session_id))
     }
@@ -502,14 +561,15 @@ fn extract_metadata_title(metadata: &Metadata) -> String {
     match metadata {
         Metadata::Generic(m) => m.title.clone().unwrap_or_default(),
         Metadata::Movie(m) => m.title.clone().unwrap_or_default(),
-        Metadata::TvShow(m) => m.episode_title.clone()
+        Metadata::TvShow(m) => m
+            .episode_title
+            .clone()
             .or_else(|| m.series_title.clone())
             .unwrap_or_default(),
         Metadata::MusicTrack(m) => m.title.clone().unwrap_or_default(),
         Metadata::Photo(m) => m.title.clone().unwrap_or_default(),
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Apr 28, 2026 (Apr 29 corrected): build_cast_metadata regression suite.
@@ -539,7 +599,9 @@ fn extract_metadata_title(metadata: &Metadata) -> String {
 mod build_cast_metadata_tests {
     use super::*;
 
-    fn meta() -> CastMetadata { CastMetadata::default() }
+    fn meta() -> CastMetadata {
+        CastMetadata::default()
+    }
 
     // ---- Decision-tree happy path ----
 
@@ -580,8 +642,11 @@ mod build_cast_metadata_tests {
         match build_cast_metadata(&m) {
             Some(Metadata::Movie(mv)) => {
                 assert_eq!(mv.title.as_deref(), Some("Send Help"));
-                assert_eq!(mv.subtitle.as_deref(), Some("2026"),
-                    "Subtitle should be the year extracted from release_date");
+                assert_eq!(
+                    mv.subtitle.as_deref(),
+                    Some("2026"),
+                    "Subtitle should be the year extracted from release_date"
+                );
                 assert_eq!(mv.images.len(), 1);
                 assert_eq!(mv.release_date.as_deref(), Some("2026-01-15"));
             }
@@ -646,8 +711,10 @@ mod build_cast_metadata_tests {
             episode: Some(1),
             ..meta()
         };
-        assert!(matches!(build_cast_metadata(&m), Some(Metadata::Movie(_))),
-            "Whitespace-only series_title must not trigger TvShow path.");
+        assert!(
+            matches!(build_cast_metadata(&m), Some(Metadata::Movie(_))),
+            "Whitespace-only series_title must not trigger TvShow path."
+        );
     }
 
     #[test]
@@ -878,7 +945,9 @@ mod build_cast_metadata_tests {
             series_title: Some("Hijack".into()),
             season: Some(2),
             episode: Some(1),
-            poster_url: Some("https://image.tmdb.org/t/p/w500/qZQqEgXgGRpC8nJa9j5ej31Ynmm.jpg".into()),
+            poster_url: Some(
+                "https://image.tmdb.org/t/p/w500/qZQqEgXgGRpC8nJa9j5ej31Ynmm.jpg".into(),
+            ),
             release_date: None,
         };
         match build_cast_metadata(&m) {

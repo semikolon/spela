@@ -14,7 +14,11 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
 #[derive(Parser)]
-#[command(name = "spela", version, about = "AI-agent-ready media controller — search, stream, cast")]
+#[command(
+    name = "spela",
+    version,
+    about = "AI-agent-ready media controller — search, stream, cast"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -151,6 +155,9 @@ enum QueueAction {
         /// Override the default cast device (e.g. "Fredriks TV").
         #[arg(long)]
         cast: Option<String>,
+        /// Slower startup, fewer buffering stalls on Chromecast
+        #[arg(long)]
+        smooth: bool,
     },
     /// List queue contents.
     List,
@@ -205,7 +212,8 @@ async fn main() {
         }
         _ => {
             let config = config::Config::load().unwrap_or_default();
-            let server_addr = cli.server
+            let server_addr = cli
+                .server
                 .or_else(|| std::env::var("SPELA_SERVER").ok())
                 .unwrap_or(config.server.clone());
 
@@ -233,8 +241,8 @@ async fn main() {
 }
 
 async fn run_setup() {
-    use std::io::{self, Write, BufRead};
     use std::collections::HashMap;
+    use std::io::{self, BufRead, Write};
 
     println!("🎬 spela setup\n");
 
@@ -280,7 +288,10 @@ async fn run_setup() {
             println!("\nFound {} device(s):\n", devices.len());
             let unique: Vec<_> = {
                 let mut seen = std::collections::HashSet::new();
-                devices.into_iter().filter(|d| seen.insert(d.name.clone())).collect()
+                devices
+                    .into_iter()
+                    .filter(|d| seen.insert(d.name.clone()))
+                    .collect()
             };
             for (i, dev) in unique.iter().enumerate() {
                 println!("  {}. {} ({}) — {}", i + 1, dev.name, dev.ip, dev.model);
@@ -293,14 +304,19 @@ async fn run_setup() {
                 if idx >= 1 && idx <= unique.len() {
                     let dev = &unique[idx - 1];
                     config.default_device = dev.name.clone();
-                    config.known_devices.insert(dev.name.clone(), dev.ip.clone());
+                    config
+                        .known_devices
+                        .insert(dev.name.clone(), dev.ip.clone());
                     println!("Default: {}", dev.name);
                 }
             }
 
             // Save all discovered devices as known fallbacks
             for dev in &unique {
-                config.known_devices.entry(dev.name.clone()).or_insert(dev.ip.clone());
+                config
+                    .known_devices
+                    .entry(dev.name.clone())
+                    .or_insert(dev.ip.clone());
             }
         }
         _ => {
@@ -330,7 +346,10 @@ async fn run_setup() {
 
     match config.save() {
         Ok(_) => {
-            println!("\n✅ Config saved to {}", config::Config::config_path().display());
+            println!(
+                "\n✅ Config saved to {}",
+                config::Config::config_path().display()
+            );
             println!("\nNext steps:");
             println!("  1. Start the server:  spela server");
             println!("  2. Search:            spela search \"movie name\"");
@@ -345,18 +364,43 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
     let base = format!("http://{}", server);
 
     match command {
-        Commands::Search { query, movie, season, episode } => {
+        Commands::Search {
+            query,
+            movie,
+            season,
+            episode,
+        } => {
             let q = query.join(" ");
             let mut url = format!("{}/search?q={}", base, urlencoded(&q));
-            if movie { url.push_str("&movie=1"); }
-            if let Some(s) = season { url.push_str(&format!("&season={}", s)); }
-            if let Some(e) = episode { url.push_str(&format!("&episode={}", e)); }
+            if movie {
+                url.push_str("&movie=1");
+            }
+            if let Some(s) = season {
+                url.push_str(&format!("&season={}", s));
+            }
+            if let Some(e) = episode {
+                url.push_str(&format!("&episode={}", e));
+            }
             Ok(client.get(&url).send().await?.json().await?)
         }
-        Commands::Play { source, vlc, cast, title, file_index, no_subs, no_intro, smooth, seek } => {
+        Commands::Play {
+            source,
+            vlc,
+            cast,
+            title,
+            file_index,
+            no_subs,
+            no_intro,
+            smooth,
+            seek,
+        } => {
             // Smart source detection: number = result ID, magnet: = magnet link
             let is_result_id = source.parse::<usize>().ok().filter(|&n| n >= 1 && n <= 20);
-            let seek_to = if let Some(s) = seek { Some(parse_position_string(&s)?) } else { None };
+            let seek_to = if let Some(s) = seek {
+                Some(parse_position_string(&s)?)
+            } else {
+                None
+            };
 
             let body = serde_json::json!({
                 "result_id": is_result_id,
@@ -370,12 +414,38 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
                 "smooth": smooth,
                 "seek_to": seek_to,
             });
-            Ok(client.post(format!("{}/play", base)).json(&body).send().await?.json().await?)
+            Ok(client
+                .post(format!("{}/play", base))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?)
         }
-        Commands::Stop => Ok(client.post(format!("{}/stop", base)).send().await?.json().await?),
-        Commands::Status => Ok(client.get(format!("{}/status", base)).send().await?.json().await?),
-        Commands::Pause => Ok(client.post(format!("{}/pause", base)).send().await?.json().await?),
-        Commands::Resume => Ok(client.post(format!("{}/resume", base)).send().await?.json().await?),
+        Commands::Stop => Ok(client
+            .post(format!("{}/stop", base))
+            .send()
+            .await?
+            .json()
+            .await?),
+        Commands::Status => Ok(client
+            .get(format!("{}/status", base))
+            .send()
+            .await?
+            .json()
+            .await?),
+        Commands::Pause => Ok(client
+            .post(format!("{}/pause", base))
+            .send()
+            .await?
+            .json()
+            .await?),
+        Commands::Resume => Ok(client
+            .post(format!("{}/resume", base))
+            .send()
+            .await?
+            .json()
+            .await?),
         Commands::Seek { seconds } => {
             // Server's /seek route is POST + JSON body (SeekRequest { t, seconds }).
             // Previously this CLI sent `GET /seek?t=N` which hit a 405 Method Not
@@ -383,25 +453,66 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             // "error decoding response body" with no indication the endpoint shape
             // was wrong. Apr 15, 2026 regression — fixed by matching the server.
             let body = serde_json::json!({"t": seconds});
-            Ok(client.post(format!("{}/seek", base)).json(&body).send().await?.json().await?)
+            Ok(client
+                .post(format!("{}/seek", base))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?)
         }
         Commands::Volume { level } => {
             let body = serde_json::json!({"level": level});
-            Ok(client.post(format!("{}/volume", base)).json(&body).send().await?.json().await?)
+            Ok(client
+                .post(format!("{}/volume", base))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?)
         }
-        Commands::Next => Ok(client.post(format!("{}/next", base)).send().await?.json().await?),
-        Commands::Prev => Ok(client.post(format!("{}/prev", base)).send().await?.json().await?),
-        Commands::Targets => Ok(client.get(format!("{}/targets", base)).send().await?.json().await?),
-        Commands::History => Ok(client.get(format!("{}/history", base)).send().await?.json().await?),
-        Commands::Config { key, value } => {
-            match (key, value) {
-                (Some(k), Some(v)) => {
-                    let body = serde_json::json!({k: v});
-                    Ok(client.post(format!("{}/config", base)).json(&body).send().await?.json().await?)
-                }
-                _ => Ok(client.get(format!("{}/config", base)).send().await?.json().await?),
+        Commands::Next => Ok(client
+            .post(format!("{}/next", base))
+            .send()
+            .await?
+            .json()
+            .await?),
+        Commands::Prev => Ok(client
+            .post(format!("{}/prev", base))
+            .send()
+            .await?
+            .json()
+            .await?),
+        Commands::Targets => Ok(client
+            .get(format!("{}/targets", base))
+            .send()
+            .await?
+            .json()
+            .await?),
+        Commands::History => Ok(client
+            .get(format!("{}/history", base))
+            .send()
+            .await?
+            .json()
+            .await?),
+        Commands::Config { key, value } => match (key, value) {
+            (Some(k), Some(v)) => {
+                let body = serde_json::json!({k: v});
+                Ok(client
+                    .post(format!("{}/config", base))
+                    .json(&body)
+                    .send()
+                    .await?
+                    .json()
+                    .await?)
             }
-        }
+            _ => Ok(client
+                .get(format!("{}/config", base))
+                .send()
+                .await?
+                .json()
+                .await?),
+        },
         Commands::Recover { target, position } => {
             let t = parse_position_string(&position)?;
             let is_imdb = target.starts_with("tt") && target.len() > 5;
@@ -410,7 +521,13 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             } else {
                 serde_json::json!({"title": target, "t": t})
             };
-            Ok(client.post(format!("{}/api/position", base)).json(&body).send().await?.json().await?)
+            Ok(client
+                .post(format!("{}/api/position", base))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?)
         }
         Commands::Clear { target } => {
             let is_imdb = target.starts_with("tt") && target.len() > 5;
@@ -419,24 +536,47 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             } else {
                 serde_json::json!({"title": target})
             };
-            Ok(client.post(format!("{}/api/position/reset", base)).json(&body).send().await?.json().await?)
+            Ok(client
+                .post(format!("{}/api/position/reset", base))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?)
         }
         Commands::Queue { action } => match action {
-            QueueAction::List => {
-                Ok(client.get(format!("{}/queue", base)).send().await?.json().await?)
-            }
-            QueueAction::Clear => {
-                Ok(client.delete(format!("{}/queue", base)).send().await?.json().await?)
-            }
-            QueueAction::Add { result_id, cast } => {
+            QueueAction::List => Ok(client
+                .get(format!("{}/queue", base))
+                .send()
+                .await?
+                .json()
+                .await?),
+            QueueAction::Clear => Ok(client
+                .delete(format!("{}/queue", base))
+                .send()
+                .await?
+                .json()
+                .await?),
+            QueueAction::Add {
+                result_id,
+                cast,
+                smooth,
+            } => {
                 // Server resolves result_id against ITS last_search.json.
                 // Required because the CLI runs on a different host than
                 // the server in typical setups (Mac CLI → Darwin spela).
                 let body = serde_json::json!({
                     "result_id": result_id,
                     "cast_name": cast,
+                    "smooth": smooth,
                 });
-                Ok(client.post(format!("{}/queue", base)).json(&body).send().await?.json().await?)
+                Ok(client
+                    .post(format!("{}/queue", base))
+                    .json(&body)
+                    .send()
+                    .await?
+                    .json()
+                    .await?)
             }
         },
         Commands::Server { .. } | Commands::Setup | Commands::KillWorkers => unreachable!(),
@@ -498,7 +638,10 @@ fn print_human(val: &Value) {
                 let m = (total % 3600) / 60;
                 let s = total % 60;
                 if h > 0 {
-                    println!("  ↩ Resuming at {}:{:02}:{:02} (from saved position)", h, m, s);
+                    println!(
+                        "  ↩ Resuming at {}:{:02}:{:02} (from saved position)",
+                        h, m, s
+                    );
                 } else {
                     println!("  ↩ Resuming at {}:{:02} (from saved position)", m, s);
                 }
@@ -547,7 +690,12 @@ fn print_human(val: &Value) {
     // History
     if let Some(history) = val.get("history").and_then(|v| v.as_array()) {
         for h in history.iter().take(10) {
-            let date = h.get("watched_at").and_then(|v| v.as_str()).unwrap_or("").get(..16).unwrap_or("");
+            let date = h
+                .get("watched_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .get(..16)
+                .unwrap_or("");
             let title = h.get("title").and_then(|v| v.as_str()).unwrap_or("?");
             println!("  {} {}", date, title);
         }
@@ -555,7 +703,10 @@ fn print_human(val: &Value) {
 
     // Preferences
     if let Some(prefs) = val.get("preferences") {
-        println!("{}", serde_json::to_string_pretty(prefs).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(prefs).unwrap_or_default()
+        );
     }
 
     // Generic streaming/cast result
@@ -585,10 +736,12 @@ fn parse_position_string(s: &str) -> anyhow::Result<f64> {
 }
 
 fn urlencoded(s: &str) -> String {
-    s.bytes().map(|b| match b {
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-            String::from(b as char)
-        }
-        _ => format!("%{:02X}", b),
-    }).collect()
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                String::from(b as char)
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
 }

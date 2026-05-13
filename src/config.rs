@@ -93,12 +93,24 @@ pub struct Config {
     pub allowed_hosts: Vec<String>,
 }
 
-fn default_server() -> String { "localhost:7890".into() }
-fn default_subtitles() -> String { "en".into() }
-fn default_quality() -> String { "1080p".into() }
-fn default_media_dir() -> String { "~/media".into() }
-fn default_port() -> u16 { 7890 }
-fn default_host() -> String { "0.0.0.0".into() }
+fn default_server() -> String {
+    "localhost:7890".into()
+}
+fn default_subtitles() -> String {
+    "en".into()
+}
+fn default_quality() -> String {
+    "1080p".into()
+}
+fn default_media_dir() -> String {
+    "~/media".into()
+}
+fn default_port() -> u16 {
+    7890
+}
+fn default_host() -> String {
+    "0.0.0.0".into()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -172,7 +184,9 @@ impl Config {
     }
 
     pub fn media_dir(&self) -> PathBuf {
-        let expanded = self.media_dir.replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy());
+        let expanded = self
+            .media_dir
+            .replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy());
         PathBuf::from(expanded)
     }
 
@@ -247,7 +261,10 @@ default_device = "Living Room TV"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.known_devices.len(), 2);
-        assert_eq!(config.known_devices.get("Living Room TV").unwrap(), "192.168.1.50");
+        assert_eq!(
+            config.known_devices.get("Living Room TV").unwrap(),
+            "192.168.1.50"
+        );
     }
 
     #[test]
@@ -263,7 +280,10 @@ default_device = "Living Room TV"
 
     #[test]
     fn test_media_dir_tilde_expansion() {
-        let config = Config { media_dir: "~/media".into(), ..Config::default() };
+        let config = Config {
+            media_dir: "~/media".into(),
+            ..Config::default()
+        };
         let expanded = config.media_dir();
         assert!(!expanded.to_string_lossy().contains('~'));
         assert!(expanded.to_string_lossy().contains("media"));
@@ -271,7 +291,10 @@ default_device = "Living Room TV"
 
     #[test]
     fn test_media_dir_absolute_path() {
-        let config = Config { media_dir: "/tmp/spela-media".into(), ..Config::default() };
+        let config = Config {
+            media_dir: "/tmp/spela-media".into(),
+            ..Config::default()
+        };
         assert_eq!(config.media_dir().to_string_lossy(), "/tmp/spela-media");
     }
 
@@ -298,8 +321,10 @@ default_device = "Living Room TV"
         // stream-type-dependent".  Flip to true once a Custom Receiver is
         // registered with the Cast SDK Developer Console.
         let config = Config::default();
-        assert!(!config.rich_metadata_in_load,
-            "Default must be OFF — opt-in to the poster splash deliberately");
+        assert!(
+            !config.rich_metadata_in_load,
+            "Default must be OFF — opt-in to the poster splash deliberately"
+        );
     }
 
     #[test]
@@ -311,7 +336,10 @@ default_device = "Living Room TV"
 tmdb_api_key = "abc"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(!config.rich_metadata_in_load, "missing field must default to false");
+        assert!(
+            !config.rich_metadata_in_load,
+            "missing field must default to false"
+        );
     }
 
     #[test]

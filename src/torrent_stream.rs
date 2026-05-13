@@ -55,10 +55,7 @@ impl ByteRange {
 ///   responses aren't supported by ffmpeg or Chromecast in our pipeline.
 ///
 /// `total` MUST be > 0; a zero-length file would never reach this code path.
-pub fn parse_range_header(
-    raw: Option<&HeaderValue>,
-    total: u64,
-) -> Result<ByteRange, RangeError> {
+pub fn parse_range_header(raw: Option<&HeaderValue>, total: u64) -> Result<ByteRange, RangeError> {
     if total == 0 {
         return Err(RangeError::EmptyResource);
     }
@@ -75,9 +72,7 @@ pub fn parse_range_header(
     let s = s.strip_prefix("bytes=").ok_or(RangeError::Malformed)?;
     // Multi-range: take first only.
     let first = s.split(',').next().unwrap_or(s).trim();
-    let (start_part, end_part) = first
-        .split_once('-')
-        .ok_or(RangeError::Malformed)?;
+    let (start_part, end_part) = first.split_once('-').ok_or(RangeError::Malformed)?;
 
     let last = total - 1;
     if start_part.is_empty() {
@@ -167,20 +162,14 @@ pub async fn serve_torrent_stream(
     // ffmpeg's `-reconnect` IS triggered as a last resort if init takes
     // even longer).
     let mut stream = {
-        let deadline = tokio::time::Instant::now()
-            + tokio::time::Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
         loop {
             match handle.clone().stream(file_idx) {
                 Ok(s) => break s,
                 Err(err) => {
                     let msg = err.to_string();
-                    if msg.contains("initializing")
-                        && tokio::time::Instant::now() < deadline
-                    {
-                        tokio::time::sleep(
-                            tokio::time::Duration::from_millis(250),
-                        )
-                        .await;
+                    if msg.contains("initializing") && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                         continue;
                     }
                     tracing::warn!(
@@ -201,8 +190,8 @@ pub async fn serve_torrent_stream(
     };
 
     let total = stream.len();
-    let range = parse_range_header(headers.get(header::RANGE), total)
-        .map_err(|err| err.http_status())?;
+    let range =
+        parse_range_header(headers.get(header::RANGE), total).map_err(|err| err.http_status())?;
 
     stream
         .seek(SeekFrom::Start(range.start))
@@ -259,27 +248,51 @@ mod tests {
     #[test]
     fn bytes_eq_n_dash_open_ended() {
         let r = parse_range_header(Some(&hv("bytes=500-")), 1_000).unwrap();
-        assert_eq!(r, ByteRange { start: 500, end: 999 });
+        assert_eq!(
+            r,
+            ByteRange {
+                start: 500,
+                end: 999
+            }
+        );
         assert!(!r.is_full(1_000));
     }
 
     #[test]
     fn bytes_eq_n_dash_m_bounded() {
         let r = parse_range_header(Some(&hv("bytes=100-200")), 1_000).unwrap();
-        assert_eq!(r, ByteRange { start: 100, end: 200 });
+        assert_eq!(
+            r,
+            ByteRange {
+                start: 100,
+                end: 200
+            }
+        );
         assert_eq!(r.len(), 101);
     }
 
     #[test]
     fn bytes_eq_n_dash_m_clamps_end_to_resource() {
         let r = parse_range_header(Some(&hv("bytes=900-9999")), 1_000).unwrap();
-        assert_eq!(r, ByteRange { start: 900, end: 999 });
+        assert_eq!(
+            r,
+            ByteRange {
+                start: 900,
+                end: 999
+            }
+        );
     }
 
     #[test]
     fn suffix_range_returns_last_n() {
         let r = parse_range_header(Some(&hv("bytes=-100")), 1_000).unwrap();
-        assert_eq!(r, ByteRange { start: 900, end: 999 });
+        assert_eq!(
+            r,
+            ByteRange {
+                start: 900,
+                end: 999
+            }
+        );
     }
 
     #[test]
@@ -361,7 +374,11 @@ mod tests {
         assert!(ByteRange { start: 0, end: 999 }.is_full(total));
         assert!(!ByteRange { start: 0, end: 998 }.is_full(total));
         assert!(!ByteRange { start: 1, end: 999 }.is_full(total));
-        assert!(!ByteRange { start: 100, end: 200 }.is_full(total));
+        assert!(!ByteRange {
+            start: 100,
+            end: 200
+        }
+        .is_full(total));
     }
 
     #[test]

@@ -11,13 +11,33 @@ const OPENSUBTITLES_V3: &str = "https://opensubtitles-v3.strem.io/subtitles";
 /// track and fall straight through to OpenSubtitles.
 fn iso639_1_to_2(lang: &str) -> &str {
     match lang {
-        "en" => "eng", "de" => "ger", "es" => "spa", "fr" => "fre",
-        "it" => "ita", "pt" => "por", "ru" => "rus", "ja" => "jpn",
-        "ko" => "kor", "zh" => "chi", "ar" => "ara", "nl" => "dut",
-        "sv" => "swe", "no" => "nor", "da" => "dan", "fi" => "fin",
-        "pl" => "pol", "tr" => "tur", "cs" => "cze", "el" => "gre",
-        "he" => "heb", "hi" => "hin", "hu" => "hun", "id" => "ind",
-        "th" => "tha", "vi" => "vie", "uk" => "ukr",
+        "en" => "eng",
+        "de" => "ger",
+        "es" => "spa",
+        "fr" => "fre",
+        "it" => "ita",
+        "pt" => "por",
+        "ru" => "rus",
+        "ja" => "jpn",
+        "ko" => "kor",
+        "zh" => "chi",
+        "ar" => "ara",
+        "nl" => "dut",
+        "sv" => "swe",
+        "no" => "nor",
+        "da" => "dan",
+        "fi" => "fin",
+        "pl" => "pol",
+        "tr" => "tur",
+        "cs" => "cze",
+        "el" => "gre",
+        "he" => "heb",
+        "hi" => "hin",
+        "hu" => "hun",
+        "id" => "ind",
+        "th" => "tha",
+        "vi" => "vie",
+        "uk" => "ukr",
         // Pass through anything else verbatim — the user might already be
         // using a 3-letter code, or the source might use an exotic tag.
         other => other,
@@ -53,30 +73,26 @@ fn iso639_1_to_2(lang: &str) -> &str {
 /// viewers can't hear the language to know what's said). Apple TV+'s
 /// own forced track DOES translate the German. Extracting the embedded
 /// forced track gets the user the translation Apple shipped originally.
-async fn extract_embedded_subtitle(
-    source: &Path,
-    lang: &str,
-    dest_srt: &Path,
-) -> Result<bool> {
+async fn extract_embedded_subtitle(source: &Path, lang: &str, dest_srt: &Path) -> Result<bool> {
     use tokio::process::Command;
 
     // List subtitle streams in the source.
     let probe = Command::new("ffprobe")
         .args([
-            "-v", "quiet",
-            "-print_format", "json",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
             "-show_streams",
-            "-select_streams", "s",
+            "-select_streams",
+            "s",
         ])
         .arg(source)
         .output()
         .await?;
 
     if !probe.status.success() {
-        anyhow::bail!(
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&probe.stderr)
-        );
+        anyhow::bail!("ffprobe failed: {}", String::from_utf8_lossy(&probe.stderr));
     }
 
     let probe_json: Value = serde_json::from_slice(&probe.stdout)?;
@@ -98,16 +114,14 @@ async fn extract_embedded_subtitle(
     let title_contains_sdh = |s: &&Value| -> bool {
         s["tags"]["title"]
             .as_str()
-            .map(|t| t.to_uppercase().contains("SDH")
-                  || t.to_uppercase().contains("HEARING"))
+            .map(|t| t.to_uppercase().contains("SDH") || t.to_uppercase().contains("HEARING"))
             .unwrap_or(false)
     };
 
     // Tier 1: forced + matching language
-    let forced = streams.iter().find(|s| {
-        stream_lang_matches(s)
-            && s["disposition"]["forced"].as_i64() == Some(1)
-    });
+    let forced = streams
+        .iter()
+        .find(|s| stream_lang_matches(s) && s["disposition"]["forced"].as_i64() == Some(1));
 
     // Tier 2: matching language, NOT forced, NOT SDH (full clean translation)
     let full = streams.iter().find(|s| {
@@ -117,17 +131,15 @@ async fn extract_embedded_subtitle(
     });
 
     // Tier 3: SDH fallback (still better than nothing)
-    let sdh = streams.iter().find(|s| {
-        stream_lang_matches(s) && title_contains_sdh(s)
-    });
+    let sdh = streams
+        .iter()
+        .find(|s| stream_lang_matches(s) && title_contains_sdh(s));
 
-    for (label, candidate) in [
-        ("forced", forced),
-        ("full", full),
-        ("sdh", sdh),
-    ] {
+    for (label, candidate) in [("forced", forced), ("full", full), ("sdh", sdh)] {
         let Some(stream) = candidate else { continue };
-        let Some(abs_idx) = stream["index"].as_i64() else { continue };
+        let Some(abs_idx) = stream["index"].as_i64() else {
+            continue;
+        };
 
         // Extract this track via ffmpeg.
         let map_arg = format!("0:{abs_idx}");
@@ -212,9 +224,7 @@ pub async fn fetch_subtitles(
                 }
             }
         } else {
-            tracing::debug!(
-                "Source path {src:?} does not exist — skipping embedded extraction"
-            );
+            tracing::debug!("Source path {src:?} does not exist — skipping embedded extraction");
         }
     }
 
@@ -229,11 +239,18 @@ pub async fn fetch_subtitles(
         _ => return Ok(None),
     };
 
-    let subs = resp["subtitles"].as_array()
-        .map(|arr| arr.iter().filter(|s| s["lang"].as_str() == Some(lang)).collect::<Vec<_>>())
+    let subs = resp["subtitles"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|s| s["lang"].as_str() == Some(lang))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
 
-    if subs.is_empty() { return Ok(None); }
+    if subs.is_empty() {
+        return Ok(None);
+    }
 
     let sub_url = match subs[0]["url"].as_str() {
         Some(u) => u,
