@@ -189,6 +189,25 @@ over verbatim to ffmpeg workers and any future torrent backend.
    perspective. Worst-case detection latency: 10s grace + 3 × 5s polls =
    25s.
 
+   **v3.4.2 pause-gate (May 13, 2026)**: the monitor maintains a sticky
+   `paused_seen_in_session` local — set to true on first observation of
+   `player_state == "PAUSED"`, NEVER cleared until stream replacement.
+   When the IDLE-failure threshold fires in a session where pause was
+   ever seen, recast is SKIPPED — the monitor logs the pause-derived
+   skip + resets `consecutive_failures` + continues polling (instead of
+   recasting or cleaning up). Anchored to the May 13 PM NM S02E05
+   incident where CrKey 1.56 unloaded the receiver app after ~16 min of
+   pause, the IDLE-failure threshold fired, and pre-v3.4.2 auto-recast
+   resumed playback from saved HWM without user consent. The pause
+   gate makes user intent (Paused = don't play) override receiver-side
+   wedge heuristics (sustained IDLE = recast). Trade-off: if user pauses
+   then manually resumes then the cast genuinely wedges later, no
+   auto-recast fires — manual `spela play` re-issue is the recovery
+   path. Acceptable because false-auto-resume is worse UX than
+   failure-to-recover-from-real-wedge (rare; user-pause is common).
+   `should_attempt_recast` gains a fourth `paused_in_session: bool`
+   parameter as a HARD GATE — see its doc for the full guard ordering.
+
 ## Systemd Drop-In
 
 Use the tracked drop-in rather than overwriting the host's full service file:

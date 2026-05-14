@@ -24,7 +24,8 @@ Because "I want to watch a movie" shouldn't require Sonarr + Radarr + Prowlarr +
 - **Transparent transcoding** -- HEVC to H.264, AC3/DTS to AAC, all via NVENC on your GPU. Output is HLS (MPEG-TS segments) which Chromecast's Default Media Receiver plays natively
 - **Subtitles** -- auto-fetched from OpenSubtitles, burned into the stream
 - **Intro clip** -- your own Netflix-style bumper before every stream (drop an `intro.mp4` in config)
-- **Pause/resume** -- tested up to 10-minute pauses. No timeouts, no dropped connections
+- **Pause/resume** -- tested up to 10-minute pauses. No timeouts, no dropped connections. **v3.4.2 pause-gated auto-recast**: even when CrKey 1.56 receiver firmware unloads its app after long pauses (~16 min, transitions to IDLE), spela will NEVER auto-resume — it correctly distinguishes "user-paused + receiver app dormant" from "stream wedged, needs recovery"
+- **Seek** -- `spela seek <pos>` jumps to absolute episode position via native cast.seek (instant within the current transcode window). `spela seek` (no arg) resumes from the saved HWM. Seeks before the current transcode's start point error with a hint to use `spela play --seek N` for a re-transcode
 - **Post-playback cleanup** -- terminates the active torrent and any ffmpeg transcode workers, cleans temp files after playback ends
 - **Voice-ready** -- works with voice assistants via CLI or HTTP API. Our assistant Ruby (Gemini + MCP) uses `spela search` and `spela play` directly
 - **Self-healing** -- 20 s stream-start fail-fast detects starved swarms (zero HLS segments produced) and auto-retries with the next search result. Failed casts retry up to 3× with backoff. Head-of-stream probe rejects a play before LOAD if librqbit hasn't fetched piece 0 yet, so the Chromecast never sees a half-formed manifest

@@ -1,5 +1,13 @@
 # Spela TODOs 🎬🍿
 
+### v3.4.3 — `spela seek` absolute-episode-position semantics + no-arg HWM resume (SHIPPED May 14, 2026) ✅
+
+Live UX fix triggered by user noticing `spela seek 0` didn't jump to episode start on a resumed play. Pre-v3.4.3: `seek N` was stream-relative (leaked ffmpeg's `-ss` offset into the user-facing API). v3.4.3: `seek N` is absolute episode position; `seek` (no arg) resumes from saved HWM. Errors include actionable hint pointing at `spela play --seek N` for the BeforeStreamStart re-transcode case. +12 tests on `compute_cast_seek_target`. Pure helper at `src/server.rs::compute_cast_seek_target`. CLI signature: `Seek { seconds: f64 }` → `Seek { position: Option<f64> }`. Response JSON adds `absolute_target_secs` / `stream_target_secs` / `ss_offset` for observability. Hard-won lesson in [CLAUDE.md](CLAUDE.md). Commit `e3960aa`.
+
+### v3.4.2 — Pause-gated auto-recast (SHIPPED May 13, 2026 evening) ✅
+
+Live incident: NM S02E05 user pause at 15:19 + CrKey 1.56 Default Media Receiver unloading after 16 min of pause + cast_health_monitor's 3-poll IDLE-failure threshold + Apr 25 auto-recast logic = stream resumed playing without user consent while they were AFK. Verbatim user preference: *"I never want that to happen."* Fix: `paused_in_session: bool` HARD GATE on `should_attempt_recast`. cast_health_monitor maintains sticky `paused_seen_in_session` local — once user pauses in a session, recast is disabled for the rest of that session. Stream replacement clears the flag. +3 tests. Hard-won lesson in [CLAUDE.md](CLAUDE.md). Commit `e0e81bf`.
+
 ### v3.5.0 — HLS cache foundation (SHIPPED May 13, 2026 PM, OPT-IN) ✅
 ### v3.5.1 — HLS cache hit-side wiring (OPEN) 🔧
 
