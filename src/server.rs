@@ -1266,7 +1266,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 *lock_recover(&state.ffmpeg_pid) = Some(ffmpeg_pid);
                 if prepared_hls_for_cast {
                     tracing::info!(
-                            "Chromecast reliability mode: waiting for completed local HLS set before LOAD"
+                            "Local-file cast gate: fast-cast as soon as transcode races ahead of playback (full pre-transcode only as slow-source fallback)"
                         );
                     if let Err(e) = wait_for_complete_hls_before_cast(
                         &manifest_path,
@@ -5110,32 +5110,77 @@ fn should_use_hls_for_playback(
         || is_local
 }
 
-/// When the source is already on local disk, Chromecast reliability is better
-/// if we cast a completed HLS VOD set instead of a still-growing playlist.
-///
-/// May 12, 2026: episode-4 debugging showed a distinct failure class where
-/// ffmpeg was healthy and segments existed, but CrKey 1.56 stalled midstream
-/// while repeatedly re-requesting the current segment from a growing HLS
-/// stream. For local-bypass plays we can eliminate that entire frontier class
-/// by letting ffmpeg finish before sending the LOAD.
+/// Local-disk + Chromecast plays enter the "smart cast-gate"
+/// (`wait_for_complete_hls_before_cast`), which fast-casts as soon as the
+/// transcode has demonstrably raced ahead of playback and only falls back
+/// to full pre-transcode for pathologically slow transcodes. See that fn +
+/// `race_ahead_safe` for the full rationale and the May-12-2026
+/// Chesterton's-Fence context.
 fn should_wait_for_complete_hls_before_cast(target: &str, is_local: bool) -> bool {
     target == "chromecast" && is_local
 }
 
-/// Wait for ffmpeg to finish writing a COMPLETE HLS VOD set before sending
-/// the Chromecast LOAD.
+/// HLS segment duration (`-hls_time` in the ffmpeg args). Content-seconds
+/// buffered ≈ `segments * SEG_DURATION_SECS`.
+const SEG_DURATION_SECS: f64 = 6.0;
+
+/// Has the local-file transcode demonstrably "raced ahead" far enough that
+/// the Chromecast can **never** catch the HLS frontier before ffmpeg writes
+/// `#EXT-X-ENDLIST` — making the May-12-2026 CrKey-1.56 mid-stream
+/// frontier-wedge mathematically impossible WITHOUT pre-transcoding the
+/// whole movie?
 ///
-/// Why this exists: a distinct CrKey 1.56 failure class remained even after
-/// the raw-path and codec-canonicalization fixes. The receiver could play a
-/// growing HLS stream for a few minutes, then wedge mid-episode while
-/// re-requesting the current segment forever. For Local Bypass sources we can
-/// remove that entire "frontier" class by waiting for ffmpeg to finish and
-/// for `playlist.m3u8` to contain `#EXT-X-ENDLIST`.
+/// Math: let transcode speed = S× realtime, Chromecast plays at 1×.
+/// Frontier position at wall time `t` = `S·t` content-seconds; the
+/// receiver's playback position = `t − t_cast`. A frontier "catch"
+/// requires `t − t_cast ≥ S·t` ⇒ `t·(1 − S) ≥ t_cast`. For `S ≥ 1` the
+/// LHS ≤ 0 < `t_cast`: **no solution — the frontier is never caught**, and
+/// ENDLIST lands at `D/S ≤ D`, well before playback finishes at
+/// `t_cast + D`. So the full pre-transcode is only genuinely required when
+/// `S < 1` (transcode slower than realtime — huge source + heavy filters).
 ///
-/// Failure policy:
-///   - If ffmpeg exits before ENDLIST appears, the transcode failed.
-///   - If the manifest stops making progress for 120s, treat it as wedged.
-///   - An overall timeout remains as a final safety net.
+/// We require `S ≥ 1.5` (a jitter/network margin over the theoretical
+/// `S ≥ 1` bound) AND ≥120 s of content already buffered (an absolute
+/// cushion independent of the speed estimate), measured cumulatively from
+/// transcode start (robust to per-scene encode-rate variance). A
+/// transcode that never satisfies this keeps waiting for the full
+/// ENDLIST set — the original May-12 safety net, now scoped to only the
+/// cases that actually need it instead of every local play.
+///
+/// Pure — unit-tested.
+fn race_ahead_safe(content_buffered_secs: f64, wall_elapsed_secs: f64) -> bool {
+    const MIN_LEAD_SECS: f64 = 120.0;
+    const MIN_SPEED: f64 = 1.5;
+    // Don't trust a speed estimate from the first few seconds (ffmpeg
+    // spin-up / NVENC init burst is not representative of sustained rate).
+    const MIN_WALL_SAMPLE_SECS: f64 = 8.0;
+    if wall_elapsed_secs < MIN_WALL_SAMPLE_SECS || content_buffered_secs < MIN_LEAD_SECS {
+        return false;
+    }
+    content_buffered_secs / wall_elapsed_secs >= MIN_SPEED
+}
+
+/// Smart local-file cast gate: return `Ok` (→ send the Chromecast LOAD) at
+/// the EARLIEST moment it is safe, not when the whole movie is transcoded.
+///
+/// Three success/failure classes (checked every poll):
+///   1. **Race-ahead (the fast common case)** — `race_ahead_safe` holds
+///      (transcode ≥1.5× realtime + ≥120 s buffered ⇒ frontier-catch is
+///      mathematically impossible). Cast NOW; ffmpeg keeps running and
+///      writes ENDLIST long before the receiver nears the end. Local files
+///      hit this in ~15-25 s — as fast as / faster than a torrent play.
+///   2. **ENDLIST present** — a complete VOD set already exists (e.g. a
+///      pathologically slow transcode that finished, or a tiny clip). Cast.
+///   3. **Fallback wait** — a transcode genuinely slower than ~1.5× that
+///      hasn't finished keeps waiting (this IS the original May-12-2026
+///      Reliability-Mode behaviour, now scoped to ONLY the slow transcodes
+///      that actually need it — the Chesterton's-Fence reason the full
+///      pre-transcode existed: CrKey 1.56 wedges mid-stream re-requesting
+///      the frontier of a growing playlist when playback can catch it).
+///
+/// Failure policy (unchanged): ffmpeg exits before any exit-condition →
+/// transcode failed; manifest stalls 120 s → wedged; overall timeout =
+/// final safety net. `cast_health_monitor` remains the post-LOAD backstop.
 async fn wait_for_complete_hls_before_cast(
     manifest_path: &Path,
     ffmpeg_pid: u32,
@@ -5193,6 +5238,24 @@ async fn wait_for_complete_hls_before_cast(
                 hls_dir,
                 seg_count,
                 started_at.elapsed().as_secs_f64()
+            );
+            return Ok(());
+        }
+
+        // FAST PATH: the transcode has raced far enough ahead that the
+        // receiver can never catch the frontier before ENDLIST (see
+        // `race_ahead_safe` for the proof). Cast now without waiting for
+        // the whole movie — this is what makes a complete local file start
+        // as fast as (or faster than) a torrent. ffmpeg keeps running.
+        let content_buffered = seg_count as f64 * SEG_DURATION_SECS;
+        let wall = started_at.elapsed().as_secs_f64();
+        if race_ahead_safe(content_buffered, wall) {
+            tracing::info!(
+                "HLS cast gate: race-ahead established — {:.0}s buffered in {:.0}s wall (~{:.1}x realtime), \
+                 frontier-catch impossible; casting now (ffmpeg continues to ENDLIST in background)",
+                content_buffered,
+                wall,
+                content_buffered / wall
             );
             return Ok(());
         }
@@ -5696,6 +5759,43 @@ mod tests {
             build_remote_stream_url("http://10.0.0.2:7891/", "abc123"),
             "http://10.0.0.2:7891/library/stream?h=abc123"
         );
+    }
+
+    // ---- race_ahead_safe: the local-file fast-cast gate ----
+    // Frontier-catch is impossible when transcode speed S >= 1; we require
+    // S >= 1.5 (jitter margin) AND >= 120s buffered AND >= 8s sampled.
+
+    #[test]
+    fn race_ahead_safe_true_for_fast_transcode_with_lead() {
+        // 240s of content produced in 30s wall = 8x realtime, big cushion.
+        assert!(race_ahead_safe(240.0, 30.0));
+    }
+
+    #[test]
+    fn race_ahead_safe_false_for_realtime_transcode() {
+        // 1x realtime (120s in 120s) — below the 1.5x margin → must wait.
+        assert!(!race_ahead_safe(120.0, 120.0));
+    }
+
+    #[test]
+    fn race_ahead_safe_false_when_lead_too_small() {
+        // 90s buffered in 10s wall = 9x (fast!) but < 120s absolute cushion.
+        assert!(!race_ahead_safe(90.0, 10.0));
+    }
+
+    #[test]
+    fn race_ahead_safe_false_before_min_wall_sample() {
+        // Big buffer but only 4s wall — spin-up burst, not a trustworthy
+        // sustained-rate estimate yet.
+        assert!(!race_ahead_safe(300.0, 4.0));
+    }
+
+    #[test]
+    fn race_ahead_safe_boundary_exactly_1_5x_with_cushion() {
+        // 180s in 120s = exactly 1.5x, lead 180 >= 120, wall 120 >= 8 → cast.
+        assert!(race_ahead_safe(180.0, 120.0));
+        // Just under 1.5x with the same cushion → keep waiting.
+        assert!(!race_ahead_safe(120.0, 90.0)); // 1.33x
     }
 
     #[test]
