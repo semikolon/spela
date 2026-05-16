@@ -3756,10 +3756,30 @@ fn local_bypass_file_is_healthy(
         Ok(_) => {}
         Err(_) => return false,
     }
+    // Three-tier health model:
+    //   1. expected_bytes > 0  → strict ±1% size match (torrent path;
+    //      disambiguates files inside a season pack).
+    //   2. .spela_done marker  → completed ~/media download, no size
+    //      context needed — just confirm non-sparse.
+    //   3. NEITHER (v3.6.0 Local Library Streaming) → a curated external
+    //      library dir entry matched by `serve-library` / a remote-origin
+    //      play. There is no torrent size and no marker, but title + year
+    //      + quality were ALREADY matched by the caller. Trust them and
+    //      apply the SAME lenient bar as top-level single-file releases
+    //      (≥100 MB, non-sparse) — exactly the `top_level_file_is_healthy`
+    //      reasoning. Without tier 3 every directory-style library film
+    //      (the majority of a real archive: `Inception (2010)/`,
+    //      `Possession.1981.../`, …) is invisible to Bypass — the
+    //      serve-library dead-on-arrival bug caught during the v3.6.0
+    //      deploy. Tiers 1 & 2 are unchanged, so the torrent and
+    //      completed-download paths behave byte-identically.
     if expected_bytes > 0 {
         return is_physically_full(path, expected_bytes);
     }
-    has_done_marker && is_physically_full(path, 0)
+    if has_done_marker {
+        return is_physically_full(path, 0);
+    }
+    top_level_file_is_healthy(path, 0)
 }
 
 fn is_physically_full(path: &std::path::Path, expected_bytes: u64) -> bool {
@@ -5746,6 +5766,53 @@ mod tests {
             &std::collections::HashSet::new(),
         )
         .is_none());
+    }
+
+    // ---- v3.6.0 tier-3 health: curated-library DIRECTORY entry with
+    // NO .spela_done marker AND no torrent size (serve-library passes 0).
+    // This is the serve-library dead-on-arrival case caught at deploy.
+
+    #[test]
+    fn find_local_bypass_dir_no_marker_no_size_matches_curated_library() {
+        // BOHR-shaped: `<root>/Inception (2010) [1080p]/<dense .mkv>`,
+        // NO .spela_done, expected_bytes=0. Must match (tier 3).
+        let root = tempfile::tempdir().unwrap();
+        let film = root.path().join("Inception (2010) [1080p]");
+        std::fs::create_dir_all(&film).unwrap();
+        let mkv = make_dense_mkv(&film, "Inception.2010.1080p.BluRay.x264.mkv");
+        let got = find_local_bypass_match(
+            root.path(),
+            "Inception 2010",
+            Some("1080p"),
+            0, // serve-library has no torrent-size context
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            got.as_deref(),
+            Some(mkv.as_path()),
+            "directory-style curated-library film must match without a .spela_done marker"
+        );
+    }
+
+    #[test]
+    fn find_local_bypass_dir_no_marker_no_size_rejects_sub_100mb_sample() {
+        // A < 100 MB stub/sample in the dir must NOT match (tier-3 still
+        // applies the top-level ≥100 MB sanity floor → samples excluded).
+        let root = tempfile::tempdir().unwrap();
+        let film = root.path().join("Possession (1981) [1080p]");
+        std::fs::create_dir_all(&film).unwrap();
+        std::fs::write(film.join("sample.mkv"), vec![1u8; 4 * 1024 * 1024]).unwrap();
+        let got = find_local_bypass_match(
+            root.path(),
+            "Possession 1981",
+            Some("1080p"),
+            0,
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            got.is_none(),
+            "a <100MB sample must not satisfy tier-3 curated-library health"
+        );
     }
 
     #[test]
