@@ -1,5 +1,24 @@
 # Spela TODOs 🎬🍿
 
+### v3.6.0 Local Library Streaming + v3.6.1 race-ahead + v3.6.2 tier-3 (SHIPPED May 16, 2026; ONE user step pending) 🔧
+
+Stream pre-existing LAN files instead of re-torrenting. Commits `cf11848`
+(serve-library origin + multi-root + remote-origin bridge), `c0eeadf`
+(race-ahead fast-cast — local files cast in ~20 s, not a 15-min full
+pre-transcode; math proof in `race_ahead_safe`), `ece4d56` (tier-3
+directory health — serve-library was DOA for directory-style films).
+Deployed: Darwin (server, ece4d56, `remote_origins → 192.168.4.2:7891`),
+Mac (release build, `~/.local/bin/spela` symlink, BOHR `library_dirs`,
+launchd `com.fredrikbranstrom.spela-library` running). Full design:
+`docs/LOCAL_LIBRARY_STREAMING_PLAN.md`. serve-library verified working
+(Inception/Possession/Drive/Black-Mirror → handles, Range 206, traversal
+→ 410) when run in a TCC-granted context; Darwin↔Mac network path
+verified (HTTP 410, 3 ms).
+
+- [ ] **USER-ONLY — Full Disk Access grant for the spela binary.** launchd-context `spela` can `stat` BOHR (roots canonicalize) but `read_dir()` on the external volume **hangs** under Tahoe's Removable-Volumes/FDA gate (HTTP 000 @ 25 s; no-FS path is 410 @ 3 ms). Cannot be automated (`tccutil` is forbidden + corrupts cache). **Steps:** System Settings → Privacy & Security → **Full Disk Access** → `+` → ⌘⇧G → paste `/Users/fredrikbranstrom/Projects/spela/target/release/spela` → Add → ensure toggle ON. Then restart the agent: `launchctl kickstart -k gui/$(id -u)/com.fredrikbranstrom.spela-library`. Then BOHR films cast via the bridge (fast, race-ahead). This is the ONLY thing between "shipped" and "working".
+- [ ] **TCC durability hardening (prevents recurrence).** TCC keys the grant to the binary's code-signature; the next `cargo build` on the Mac silently revokes it → serve-library hangs again ("this happened again"). Fix: ad-hoc-codesign with a STABLE identifier in the Mac deploy step (`codesign -s - --identifier com.fredrikbranstrom.spela --force <binary>` post-build) so the FDA grant survives rebuilds. Until then: re-grant after any Mac spela rebuild. (Ref: CLAUDE.md global "TCC code signature gotcha".)
+- [ ] **Fleet-track the launchd agent (Track-everything-automatable).** `~/Library/` is gitignored by nit (correctly — fleet templates plists). Templatize → `dotfiles/templates/Library/LaunchAgents/com.fredrikbranstrom.spela-library.plist.tmpl` with `{{ home_dir }}`, **Mac-Mini-scoped** (MERIAN has no BOHR → blanket KeepAlive would crash-loop `serve-library`'s empty-`library_dirs` bail there), wired to the `30-reload-launchagents` trigger. Deployed+functional+reboot-surviving on Mac Mini now; just not yet nit-reproducible. Fleet-scoping is a *Consult-before-shared-infra* change — propose before implementing.
+
 ### v3.4.3 — `spela seek` absolute-episode-position semantics + no-arg HWM resume (SHIPPED May 14, 2026) ✅
 
 Live UX fix triggered by user noticing `spela seek 0` didn't jump to episode start on a resumed play. Pre-v3.4.3: `seek N` was stream-relative (leaked ffmpeg's `-ss` offset into the user-facing API). v3.4.3: `seek N` is absolute episode position; `seek` (no arg) resumes from saved HWM. Errors include actionable hint pointing at `spela play --seek N` for the BeforeStreamStart re-transcode case. +12 tests on `compute_cast_seek_target`. Pure helper at `src/server.rs::compute_cast_seek_target`. CLI signature: `Seek { seconds: f64 }` → `Seek { position: Option<f64> }`. Response JSON adds `absolute_target_secs` / `stream_target_secs` / `ss_offset` for observability. Hard-won lesson in [CLAUDE.md](CLAUDE.md). Commit `e3960aa`.
