@@ -872,20 +872,85 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     let corrupt_files = AppState::load(&state.state_dir).corrupt_files;
 
     if req.title.is_some() {
-        if let Some(local_path) = find_local_bypass_match(
-            &media_dir,
+        // v3.6.0 Local Library Streaming: scan media_dir FIRST (existing
+        // behaviour — torrent cache, lowest latency / no LAN hop), then each
+        // configured extra library root in order. First healthy match wins.
+        // media_dir precedence is deliberate. Empty `library_dirs` => roots
+        // is just [media_dir] => byte-identical to pre-v3.6.0 behaviour.
+        // See docs/LOCAL_LIBRARY_STREAMING_PLAN.md.
+        let mut roots: Vec<std::path::PathBuf> = vec![media_dir.clone()];
+        roots.extend(state.config.library_dirs());
+        if let Some(local_path) = first_local_bypass_match(
+            &roots,
             &title,
             req.quality.as_deref(),
             expected_bytes,
             &corrupt_files,
         ) {
-            tracing::info!(
-                "Local Bypass: matched on disk: {:?} (expected {}B)",
-                local_path,
-                expected_bytes
-            );
             server_url = format!("file://{}", local_path.to_string_lossy());
             is_local = true;
+        }
+    }
+
+    // v3.6.0 Local Library Streaming — remote origin bridge. Fires ONLY
+    // when the title had no LOCAL match (media_dir ∪ library_dirs) AND
+    // origins are configured. The origin host serves the raw file over
+    // Range HTTP; THIS server's existing detect_codecs + transcode_hls
+    // path consumes it as an `http://` ffmpeg input exactly like any other
+    // URL (the Chromecast still fetches HLS from THIS server — the origin
+    // host never touches the Chromecast; per LOCAL_LIBRARY_STREAMING_PLAN
+    // §4 the Chromecast route is uniformly the NVENC bridge). `is_local`
+    // is set true because the source is a COMPLETE non-torrent file (no
+    // download race → Reliability Mode + no progress gate apply; §5).
+    // The carve-out is implicit + correct: downstream
+    // `server_url.starts_with("file://")` guards (notably embedded-
+    // subtitle extraction ~L1004) simply don't match an http:// URL and
+    // fall back to OpenSubtitles — the intended behaviour for a remote
+    // source whose container we can't cheaply pre-probe for sub tracks.
+    if req.title.is_some() && !is_local && !state.config.remote_origins.is_empty() {
+        for origin in &state.config.remote_origins {
+            let base = origin.trim_end_matches('/');
+            let client = reqwest::Client::new();
+            let mut q: Vec<(&str, String)> = vec![("title", title.clone())];
+            if let Some(quality) = req.quality.as_deref() {
+                q.push(("quality", quality.to_string()));
+            }
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client
+                    .get(format!("{}/library/match", base))
+                    .query(&q)
+                    .send(),
+            )
+            .await;
+            match resp {
+                Ok(Ok(r)) if r.status().is_success() => {
+                    if let Ok(v) = r.json::<serde_json::Value>().await {
+                        if let Some(handle) = v.get("handle").and_then(|h| h.as_str()) {
+                            server_url = build_remote_stream_url(base, handle);
+                            is_local = true;
+                            tracing::info!(
+                                "Local Bypass (remote origin {}): matched '{}', streaming via {}",
+                                base,
+                                title,
+                                server_url
+                            );
+                            break;
+                        }
+                    }
+                }
+                Ok(Ok(r)) => tracing::debug!(
+                    "remote origin {} /library/match -> HTTP {}",
+                    base,
+                    r.status()
+                ),
+                Ok(Err(e)) => {
+                    tracing::warn!("remote origin {} /library/match failed: {}", base, e)
+                }
+                Err(_) => {
+                    tracing::warn!("remote origin {} /library/match timed out (2s)", base)
+                }
+            }
         }
     }
 
@@ -3631,6 +3696,48 @@ pub(crate) fn find_local_bypass_match(
     None
 }
 
+/// v3.6.0 Local Library Streaming: scan `roots` in order, returning the
+/// first healthy `find_local_bypass_match` hit. The caller is responsible
+/// for ordering (pass `media_dir` first so a cached/just-downloaded copy
+/// wins over a colder library copy — no reason to prefer a slower path).
+///
+/// Pure (filesystem-only) — testable via tempfile fixtures. Empty `roots`
+/// or all-missing roots => `None` (caller falls through to remote origins
+/// then torrent). See `docs/LOCAL_LIBRARY_STREAMING_PLAN.md`.
+pub(crate) fn first_local_bypass_match(
+    roots: &[std::path::PathBuf],
+    title: &str,
+    quality: Option<&str>,
+    expected_bytes: u64,
+    corrupt_files: &std::collections::HashSet<String>,
+) -> Option<std::path::PathBuf> {
+    for root in roots {
+        if let Some(p) =
+            find_local_bypass_match(root, title, quality, expected_bytes, corrupt_files)
+        {
+            tracing::info!(
+                "Local Bypass: matched in {:?}: {:?} (expected {}B)",
+                root,
+                p,
+                expected_bytes
+            );
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// v3.6.0: build the origin stream URL from a (trailing-slash-trimmed)
+/// origin base + an opaque handle minted by that origin's
+/// `/library/match`. Pure — pins the format + double-slash safety.
+pub(crate) fn build_remote_stream_url(origin_base: &str, handle: &str) -> String {
+    format!(
+        "{}/library/stream?h={}",
+        origin_base.trim_end_matches('/'),
+        handle
+    )
+}
+
 fn local_bypass_file_is_healthy(
     path: &std::path::Path,
     has_done_marker: bool,
@@ -5500,6 +5607,95 @@ mod tests {
             &std::collections::HashSet::new()
         )
         .is_none());
+    }
+
+    // ---- v3.6.0 Local Library Streaming: first_local_bypass_match ----
+    // These pin the multi-root iteration ONLY (the single-root decision
+    // matrix is already covered by the find_local_bypass_match suite above).
+    // Proven-matchable fixture title reused so a matcher edge can't make
+    // these flaky — they test root ordering, not token matching.
+
+    #[test]
+    fn first_local_bypass_match_scans_second_root_on_first_miss() {
+        let r0 = tempfile::tempdir().unwrap();
+        let r1 = tempfile::tempdir().unwrap();
+        make_dense_mkv(r0.path(), "Different.Show.S01E01.mkv");
+        let want = make_dense_mkv(r1.path(), "The.Boys.S05E03.1080p.FLUX.mkv");
+        let roots = vec![r0.path().to_path_buf(), r1.path().to_path_buf()];
+        let got = first_local_bypass_match(
+            &roots,
+            "The Boys S05E03",
+            Some("1080p"),
+            0,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(got.as_deref(), Some(want.as_path()));
+    }
+
+    #[test]
+    fn first_local_bypass_match_media_dir_precedence_wins() {
+        // Same title in BOTH roots. roots[0] (media_dir) MUST win — a
+        // cached/just-downloaded copy beats a colder library copy.
+        let media = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let media_hit = make_dense_mkv(media.path(), "The.Boys.S05E03.1080p.FLUX.mkv");
+        let _library_hit = make_dense_mkv(library.path(), "The.Boys.S05E03.1080p.FLUX.mkv");
+        let roots = vec![media.path().to_path_buf(), library.path().to_path_buf()];
+        let got = first_local_bypass_match(
+            &roots,
+            "The Boys S05E03",
+            Some("1080p"),
+            0,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            got.as_deref(),
+            Some(media_hit.as_path()),
+            "media_dir (roots[0]) must take precedence over a library copy"
+        );
+    }
+
+    #[test]
+    fn first_local_bypass_match_tolerates_missing_root() {
+        // A configured library root that does not exist must be skipped,
+        // not fatal — the scan continues to later roots.
+        let missing = std::path::PathBuf::from("/nonexistent/spela/library/root");
+        let real = tempfile::tempdir().unwrap();
+        let want = make_dense_mkv(real.path(), "The.Boys.S05E03.1080p.FLUX.mkv");
+        let roots = vec![missing, real.path().to_path_buf()];
+        let got = first_local_bypass_match(
+            &roots,
+            "The Boys S05E03",
+            Some("1080p"),
+            0,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(got.as_deref(), Some(want.as_path()));
+    }
+
+    #[test]
+    fn first_local_bypass_match_empty_roots_is_none() {
+        assert!(first_local_bypass_match(
+            &[],
+            "The Boys S05E03",
+            Some("1080p"),
+            0,
+            &std::collections::HashSet::new(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn build_remote_stream_url_is_double_slash_safe() {
+        assert_eq!(
+            build_remote_stream_url("http://10.0.0.2:7891", "abc123"),
+            "http://10.0.0.2:7891/library/stream?h=abc123"
+        );
+        // trailing slash on the configured origin must not double up
+        assert_eq!(
+            build_remote_stream_url("http://10.0.0.2:7891/", "abc123"),
+            "http://10.0.0.2:7891/library/stream?h=abc123"
+        );
     }
 
     #[test]

@@ -118,11 +118,13 @@ Incident narratives + RCA + journal evidence: `git log` (every fix-commit carrie
 
 ## Chromecast Devices
 
-Hardcoded fallback IPs in `src/cast.rs`:
-- Fredriks TV: 192.168.4.126
-- Vardagsrum: 192.168.4.58
+**Exactly TWO video Chromecasts in the (large) house — there is no third.** This makes "which Chromecast is the bedroom?" a non-question: if it isn't the living room, it IS the bedroom. Never ask the user to disambiguate.
 
-DNS: `darwin.home` → darwin.home (AdGuard Home rewrite, configured Mar 18)
+- **`Fredriks TV` (192.168.4.126) = BEDROOM TV** — spela's configured `default_device`; bedroom is the user's primary daytime screen.
+- **`Vardagsrum` (192.168.4.58) = LIVING ROOM** — "vardagsrum" is Swedish for living room.
+- `Atelier Stereo` / `Nest …` / `Fredrik` (cast group) = audio-only, NOT castable video targets.
+
+Hardcoded fallback IPs in `src/cast.rs`. DNS: `darwin.home` → darwin.home (AdGuard Home rewrite, configured Mar 18)
 
 ## See also
 

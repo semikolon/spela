@@ -98,6 +98,22 @@ pub struct Config {
     /// disable the cache (fills are skipped + hits never recorded).
     #[serde(default = "default_hls_cache_cap_mb")]
     pub hls_cache_cap_mb: u64,
+    /// v3.6.0 Local Library Streaming (server-side): extra roots on THIS
+    /// host scanned for pre-existing media, IN ADDITION to `media_dir`.
+    /// Searched AFTER `media_dir` (media_dir match wins — no LAN hop).
+    /// Tilde-expanded via `library_dirs()`. See
+    /// `docs/LOCAL_LIBRARY_STREAMING_PLAN.md`.
+    #[serde(default)]
+    pub library_dirs: Vec<String>,
+    /// v3.6.0 (server-side): base URLs of remote `spela serve-library`
+    /// origins queried ONLY when no local match is found, e.g.
+    /// `["http://192.168.4.X:7891"]`. Operator-config allowlist (the
+    /// server only ever fetches an origin it was explicitly given).
+    #[serde(default)]
+    pub remote_origins: Vec<String>,
+    /// v3.6.0 (library-host side): port `spela serve-library` listens on.
+    #[serde(default = "default_library_serve_port")]
+    pub library_serve_port: u16,
 }
 
 fn default_server() -> String {
@@ -130,6 +146,9 @@ fn default_hls_cache_cap_mb() -> u64 {
     // cache against the future hit-side wiring.
     0
 }
+fn default_library_serve_port() -> u16 {
+    7891
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -150,6 +169,9 @@ impl Default for Config {
             vod_manifest_padded: false,
             allowed_hosts: Vec::new(),
             hls_cache_cap_mb: default_hls_cache_cap_mb(),
+            library_dirs: Vec::new(),
+            remote_origins: Vec::new(),
+            library_serve_port: default_library_serve_port(),
         }
     }
 }
@@ -208,6 +230,16 @@ impl Config {
             .media_dir
             .replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy());
         PathBuf::from(expanded)
+    }
+
+    /// v3.6.0: tilde-expanded extra library roots (server-side scan).
+    /// Order preserved; callers scan `media_dir()` FIRST then these.
+    pub fn library_dirs(&self) -> Vec<PathBuf> {
+        let home = dirs::home_dir().unwrap_or_default();
+        self.library_dirs
+            .iter()
+            .map(|d| PathBuf::from(d.replace('~', &home.to_string_lossy())))
+            .collect()
     }
 
     pub fn state_dir() -> PathBuf {

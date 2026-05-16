@@ -2,6 +2,7 @@ mod cast;
 mod config;
 mod disk;
 mod hls_cache;
+mod library_origin;
 mod search;
 mod server;
 mod state;
@@ -43,6 +44,16 @@ enum Commands {
         /// Listen host/IP address
         #[arg(long, default_value = "0.0.0.0")]
         host: String,
+    },
+    /// v3.6.0 Local Library Streaming: run the library-host origin (a dumb
+    /// matcher + Range file server). Run this on a machine that holds media
+    /// the spela server can't see on its own filesystem; point the server's
+    /// `remote_origins` config at `http://<this-host-lan-ip>:<port>`.
+    /// See docs/LOCAL_LIBRARY_STREAMING_PLAN.md.
+    ServeLibrary {
+        /// Listen port (overrides config `library_serve_port`, default 7891)
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Search for TV shows or movies
     Search {
@@ -200,6 +211,14 @@ async fn main() {
             config.host = host;
             if let Err(e) = server::run_server(config).await {
                 eprintln!("Server error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::ServeLibrary { port } => {
+            tracing_subscriber::fmt::init();
+            let config = config::Config::load().unwrap_or_default();
+            if let Err(e) = library_origin::run(config, port).await {
+                eprintln!("serve-library error: {}", e);
                 std::process::exit(1);
             }
         }
@@ -593,7 +612,10 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
                     .await?)
             }
         },
-        Commands::Server { .. } | Commands::Setup | Commands::KillWorkers => unreachable!(),
+        Commands::Server { .. }
+        | Commands::Setup
+        | Commands::KillWorkers
+        | Commands::ServeLibrary { .. } => unreachable!(),
     }
 }
 
