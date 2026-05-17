@@ -176,6 +176,9 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/prev", post(handle_prev))
         .route("/targets", get(handle_targets))
         .route("/history", get(handle_history))
+        // Web-remote My Library (US-3): aggregate curated collection
+        // (local library_dirs + remote serve-library origins).
+        .route("/library", get(handle_library))
         .route(
             "/queue",
             get(handle_queue_list)
@@ -203,6 +206,9 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/hls/playlist.m3u8", get(handle_hls_playlist))
         .route("/hls/init.mp4", get(handle_hls_init))
         .route("/hls/{segment}", get(handle_hls_segment))
+        // Web-remote SPA (served same-origin, no-build single asset —
+        // mirrors the cast-receiver static pattern). See web-remote spec.
+        .route("/remote", get(handle_remote_html))
         // Custom Cast Receiver endpoints
         .route("/cast-receiver.html", get(handle_cast_receiver_html))
         .route("/cast-receiver/intro.mp4", get(handle_cast_receiver_intro))
@@ -3933,6 +3939,142 @@ async fn handle_history(State(state): State<SharedState>) -> Json<Value> {
     Json(json!({"history": app_state.history.iter().take(20).collect::<Vec<_>>()}))
 }
 
+/// `GET /library` — aggregated curated-library browse for the web-remote
+/// "My Library" grid (web-remote US-3 / T-3).
+///
+/// Fans out to: (1) this host's local `config.library_dirs()` via
+/// `library_origin::enumerate_library` (the curated collection — NOT
+/// `media_dir`, which is the transient 10 GB torrent cache), then
+/// (2) every `config.remote_origins` `/library/list`.
+///
+/// Remote fan-out reuses the **v3.6.3 cold-origin pattern verbatim**
+/// (the same shape as the load-bearing `do_play` block ~L910): a 2 s
+/// liveness ping to `/library/stream?h=<sentinel>` (serve-library
+/// answers ~1 ms WITHOUT touching the library FS) distinguishes "origin
+/// DOWN" from "origin UP, USB HDD spinning up", followed by a GENEROUS
+/// 25 s `/library/list` timeout so a cold drive yields the real list
+/// rather than an empty grid. Do NOT shrink these timeouts — that
+/// reintroduces the silent-empty-on-cold-HDD failure the v3.6.3 work
+/// exists to kill. This handler intentionally MIRRORS rather than
+/// refactors `do_play`'s block: `do_play` is just-stabilised and its
+/// CLAUDE.md Hard-Won-Lessons entry says do NOT touch it.
+///
+/// `origin_status` is `"offline"` iff remote origins ARE configured but
+/// none returned a list (distinct from an empty-but-healthy library, so
+/// the SPA can show "library offline" ≠ "empty" — AC-3.4). Posters stay
+/// `None` (T-4 TMDB enrichment deferred; SPA renders titled fallback
+/// tiles per AC-3.2). De-duped by (lowercased title, year) with local
+/// precedence (mirrors do_play's local-before-remote ordering).
+async fn handle_library(State(state): State<SharedState>) -> Json<Value> {
+    use std::collections::HashSet;
+
+    // v3.6.3 cold-origin pattern — see do_play ~L910. Do NOT shrink.
+    const PING_TIMEOUT_SECS: u64 = 2;
+    const LIST_TIMEOUT_SECS: u64 = 25;
+
+    let mut library: Vec<crate::library_origin::LibraryEntry> = Vec::new();
+    // De-dupe by (lowercased title, year); first writer wins, and local
+    // is enumerated first → local precedence (mirrors do_play's
+    // local-before-remote ordering).
+    let mut seen: HashSet<(String, Option<u32>)> = HashSet::new();
+
+    // (1) Local curated dirs. The walk can be heavy on a cold disk —
+    //     run it off the async runtime.
+    let local_roots = state.config.library_dirs();
+    if !local_roots.is_empty() {
+        if let Ok(local) = tokio::task::spawn_blocking(move || {
+            crate::library_origin::enumerate_library(&local_roots)
+        })
+        .await
+        {
+            for e in local {
+                if seen.insert((e.title.to_lowercase(), e.year)) {
+                    library.push(e);
+                }
+            }
+        }
+    }
+
+    // (2) Remote serve-library origins (the BOHR collection lives here).
+    let mut any_origin_listed = false;
+    for origin in &state.config.remote_origins {
+        let base = origin.trim_end_matches('/');
+        let client = reqwest::Client::new();
+
+        // Liveness ping — no library-FS access on the origin side.
+        let alive = matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(PING_TIMEOUT_SECS),
+                client
+                    .get(format!("{}/library/stream", base))
+                    .query(&[("h", "__spela_liveness__")])
+                    .send(),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if !alive {
+            tracing::warn!(
+                "/library: remote origin {} unreachable (liveness ping failed) — skipping",
+                base
+            );
+            continue;
+        }
+
+        // Origin up — generous window for a cold library drive.
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(LIST_TIMEOUT_SECS),
+            client.get(format!("{}/library/list", base)).send(),
+        )
+        .await;
+        match resp {
+            Ok(Ok(r)) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                Ok(v) => {
+                    if let Some(arr) = v.get("entries").and_then(|e| e.as_array()) {
+                        any_origin_listed = true;
+                        for item in arr {
+                            if let Ok(entry) = serde_json::from_value::<
+                                crate::library_origin::LibraryEntry,
+                            >(item.clone())
+                            {
+                                if seen.insert((entry.title.to_lowercase(), entry.year)) {
+                                    library.push(entry);
+                                }
+                            }
+                        }
+                        tracing::info!("/library: origin {} listed {} entries", base, arr.len());
+                    }
+                }
+                Err(e) => tracing::warn!("/library: origin {} /library/list bad JSON: {}", base, e),
+            },
+            Ok(Ok(r)) => tracing::warn!(
+                "/library: origin {} /library/list -> HTTP {}",
+                base,
+                r.status()
+            ),
+            Ok(Err(e)) => {
+                tracing::warn!("/library: origin {} /library/list failed: {}", base, e)
+            }
+            Err(_) => tracing::warn!(
+                "/library: origin {} /library/list timed out ({}s) despite liveness OK",
+                base,
+                LIST_TIMEOUT_SECS
+            ),
+        }
+    }
+
+    // "offline" ONLY when origins are configured yet none produced a
+    // list — a healthy-but-empty library must read as "ok"/empty so the
+    // SPA distinguishes "offline" from "empty" (AC-3.4).
+    let origin_status = if !state.config.remote_origins.is_empty() && !any_origin_listed {
+        "offline"
+    } else {
+        "ok"
+    };
+
+    Json(json!({ "library": library, "origin_status": origin_status }))
+}
+
 // ----- Apr 29, 2026: queue endpoints -----
 //
 // Queue lets the user line up the next item to play after natural EOF.
@@ -4260,6 +4402,20 @@ async fn handle_cast_receiver_html() -> impl IntoResponse {
         .header("Content-Type", "text/html; charset=utf-8")
         .header("Cache-Control", "no-cache")
         .body(axum::body::Body::from(RECEIVER_HTML))
+        .unwrap()
+}
+
+/// Serve the web-remote SPA (web-remote spec US-1..US-5). Same
+/// `include_str!`'d single-asset, no-build pattern as
+/// `handle_cast_receiver_html` — one artifact compiled into the binary,
+/// served same-origin from `/remote` so there is zero CORS/Host friction.
+/// T-1 ships a dark stub; the full hash-routed SPA shell is Phase 3+.
+async fn handle_remote_html() -> impl IntoResponse {
+    const REMOTE_HTML: &str = include_str!("../static/remote.html");
+    axum::response::Response::builder()
+        .header("Content-Type", "text/html; charset=utf-8")
+        .header("Cache-Control", "no-cache")
+        .body(axum::body::Body::from(REMOTE_HTML))
         .unwrap()
 }
 
@@ -6614,6 +6770,20 @@ mod tests {
         assert!(html.contains("subtitle_url"));
         assert!(html.contains("TrackType.TEXT"));
         assert!(html.contains("text/vtt"));
+    }
+
+    // --- Web-remote SPA HTML ---
+
+    #[test]
+    fn test_remote_html_embedded() {
+        // The web-remote SPA is embedded via include_str! (same pattern as
+        // the cast receiver). Verify the asset is present and dark-first so
+        // /remote can't regress to an empty body or a white-flash baseline.
+        let html = include_str!("../static/remote.html");
+        assert!(html.contains("spela remote")); // <title>
+        assert!(html.contains("color-scheme")); // dark-first, no theme flash
+        assert!(html.contains("width=device-width")); // mobile viewport (NFR-1)
+        assert!(html.contains("#0b0b0f")); // dark background paints immediately
     }
 
     // --- Resume position ---
