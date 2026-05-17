@@ -206,6 +206,8 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/hls/playlist.m3u8", get(handle_hls_playlist))
         .route("/hls/init.mp4", get(handle_hls_init))
         .route("/hls/{segment}", get(handle_hls_segment))
+        // Bare / → the web remote (so http://spela.home works portless).
+        .route("/", get(handle_root_redirect))
         // Web-remote SPA (served same-origin, no-build single asset —
         // mirrors the cast-receiver static pattern). See web-remote spec.
         .route("/remote", get(handle_remote_html))
@@ -4417,6 +4419,13 @@ async fn handle_remote_html() -> impl IntoResponse {
         .header("Cache-Control", "no-cache")
         .body(axum::body::Body::from(REMOTE_HTML))
         .unwrap()
+}
+
+/// Bare `/` → the web remote, so `http://spela.home` (no path, no port)
+/// lands on the SPA. 307 (temporary) keeps `/` free for any future use
+/// and avoids browsers caching it as permanent.
+async fn handle_root_redirect() -> impl IntoResponse {
+    axum::response::Redirect::temporary("/remote")
 }
 
 /// Serve the intro clip from config dir.
