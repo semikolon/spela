@@ -92,3 +92,17 @@ Then download Apple's BipBop HLS subset (`master.m3u8` + `gear1/prog_index.m3u8`
 | `idle_reason=ERROR` from pychromecast, blue cast icon | Receiver returned `LOAD_FAILED` — content/header issue | Recipe 2 (LOAD_FAILED capture); recipe 3 (header-diff bisect against known-good commit) |
 | `cast_health_monitor` kills stream at `stream_age=20-30s` despite ffmpeg producing segments | Cold-start IDLE protection broken | CLAUDE.md § "cold-start IDLE protection mirrors BUFFERING" |
 | Master CODECS lies about actual stream profile | NVENC profile not forced | CLAUDE.md § "NVENC profile must match" — `-profile:v high -level:v 4.0` on all reencode paths |
+
+---
+
+## 4. Local-library bridge & cold-source failure modes (May 17, 2026 movie-night firefight)
+
+The night's meta-lesson: **the authoritative oracle is the Darwin SERVER journal (`ssh darwin journalctl -u spela`), NOT client `spela status` nor inference.** Every misdiagnosis came from trusting client status / a hypothesis over the journal. On any "not playing / wrong source" report, read the journal FIRST and reconcile the `Local Bypass` / `remote origin` / `race-ahead` / `PRE-CLEANUP` event lines within the reported time window.
+
+| Symptom | Root cause | Diagnostic → fix |
+|---|---|---|
+| `pid:0` + streaming but wrong/HEVC source | `pid:0` is Local Bypass — **both** Darwin-`~/media` AND remote-origin bridge report it; not proof of the bridge | Journal must show `Local Bypass (remote origin http://<mac>:7891): … streaming via …/library/stream`. If it shows `Local Bypass: matched in "/home/fredrik/media"` it took a Darwin-cached copy, not BOHR |
+| Bridge "not used" for a BOHR title | A prior torrent fallback left the file in Darwin `~/media`; `do_play` scans `media_dir` **before** `remote_origins`, so the leftover shadows the bridge for that title until disk-cap cleanup | `ssh darwin 'rm -rf /home/fredrik/media/<Title>*'` (transient re-downloadable cache) → replay → bridge engages. Known-open: "prefer curated library over transient torrent rip" option (TODO) |
+| Won't start; `ls transcoded_hls/*.ts`=0 yet `pgrep -c ffmpeg`>1 | **NVENC-contention death-spiral**: churned restarts + cast_health_monitor recast each spawn ffmpeg (2 `h264_nvenc` each); GTX 1650 session limit → none init → 0 segments → IDLE → recast → another contending ffmpeg → ∞ | `spela stop; spela kill-workers`; loop-verify `ssh darwin pgrep ffmpeg`=0 + `nvidia-smi` encoder 0%; THEN one clean play. Never blind-retry into the spiral |
+| First play after long idle silently torrents not bridges | BOHR is a USB **HDD** spinning down ~10min idle; first `/library/match` blocks on spin-up (5-15s+) | Fixed v3.6.3 (liveness-ping + 25s timeout + serve-library self-warm). If recurs: time `curl localhost:7891/library/match` cold vs warm; `pgrep -f serve-library`; no-FS `/library/stream?h=zzz` → fast 410 = process alive, FS just cold |
+| Resume position unrecoverable / end-of-movie | Repeated `spela play --seek 0` clears HWM; an abandoned stream auto-plays to EOF saving end-position → `state.json` HWM useless | No log recovery once overwritten; fall back to a content/scene anchor (web-research the scene timestamp). The web-remote is the real prevention (no more `--seek 0` CLI churn) |

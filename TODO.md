@@ -1,5 +1,8 @@
 # Spela TODOs 🎬🍿
 
+### Web remote — SPEC'D, ready to build 🔧
+Dark, snappy, spela-served mobile SPA over the existing API. Full Kiro spec: `.claude/specs/web-remote/{requirements,design,tasks}.md` (May 17 2026). Decided: v1 = cast-remote **+** in-browser phone playback **+** "My Library" BOHR browse; hybrid search (top-pick + "more sources"). Only real new backend = `serve-library GET /library/list` + spela `GET /library` aggregator (reuse v3.6.3 liveness+timeout). Supersedes the "A. web remote" path in `PHONE_APP_PROJECT.md`; native iOS app remains the separate deferred track.
+
 ### v3.6.0 Local Library Streaming + v3.6.1 race-ahead + v3.6.2 tier-3 (SHIPPED May 16, 2026; ONE user step pending) 🔧
 
 Stream pre-existing LAN files instead of re-torrenting. Commits `cf11848`
