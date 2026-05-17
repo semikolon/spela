@@ -7,39 +7,554 @@
 <meta name="theme-color" content="#0b0b0f">
 <title>spela remote</title>
 <!--
-  T-1 stub (web-remote spec, Phase 1 "dependency root"). The full dark SPA
-  shell — hash-routed Search / My Library / Now-Playing, poster grid,
-  optimistic transport, phone-direct HLS — is Phase 3+ (tasks.md T-5..T-15).
-  This stub exists so /remote 200s and the static-serve plumbing
-  (include_str! + serve_static_with_range mirror of /cast-receiver.html) is
-  verifiable before the SPA lands. Dark-first paint here already so Phase 3
-  inherits a no-theme-flash baseline (NFR-1).
+  web-remote SPA — Phase 3 (shell + grid + API client) + Phase 4 (search +
+  hybrid play + target picker + now-playing + scrubber). Single no-build
+  asset, served same-origin from /remote (mirrors /cast-receiver.html).
+  Phase 5 (My Library view) + Phase 6 (in-browser phone playback) are not
+  built yet; the nav/target entries for them are honest placeholders, not
+  broken states (spec embarrassment criteria). Built against the verified
+  live spela contracts (not the spec's assumed ones).
 -->
 <style>
-  :root { color-scheme: dark; }
-  html, body {
-    margin: 0; height: 100%;
-    background: #0b0b0f; color: #e8e8ee;
-    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-    -webkit-font-smoothing: antialiased;
+  :root{
+    color-scheme:dark;
+    --bg:#0b0b0f; --bg2:#15151c; --bg3:#1f1f29; --line:#2a2a36;
+    --fg:#e8e8ee; --dim:#8a8a99; --dim2:#5a5a6a;
+    --accent:#5b8cff; --accent2:#3a64d8; --good:#37c87a; --warn:#e0a23a; --bad:#e0564a;
+    --r:14px; --safe-b:env(safe-area-inset-bottom,0px); --safe-t:env(safe-area-inset-top,0px);
   }
-  .wrap {
-    min-height: 100%;
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    text-align: center; padding: 2rem;
-    box-sizing: border-box;
-  }
-  .mark { font-size: 2.25rem; font-weight: 700; letter-spacing: -0.02em; }
-  .sub  { margin-top: 0.35rem; color: #8a8a99; font-size: 0.95rem; }
-  .dot  { margin-top: 1.5rem; color: #5a5a6a; font-size: 0.85rem; }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;overscroll-behavior-y:none}
+  body{display:flex;flex-direction:column;min-height:100%}
+  button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
+  input{font:inherit}
+  a{color:var(--accent);text-decoration:none}
+
+  /* ---- top bar ---- */
+  header{position:sticky;top:0;z-index:20;background:rgba(11,11,15,.92);
+    backdrop-filter:saturate(140%) blur(8px);border-bottom:1px solid var(--line);
+    padding:calc(.6rem + var(--safe-t)) .8rem .6rem;display:flex;align-items:center;gap:.6rem}
+  .brand{font-weight:800;letter-spacing:-.02em;font-size:1.15rem}
+  .brand small{color:var(--dim2);font-weight:600;font-size:.7rem;margin-left:.3rem}
+  nav{display:flex;gap:.15rem;margin-left:.4rem;background:var(--bg2);border-radius:999px;padding:.2rem}
+  nav a{color:var(--dim);padding:.32rem .7rem;border-radius:999px;font-size:.85rem;font-weight:600}
+  nav a.on{color:var(--fg);background:var(--bg3)}
+  .tgt{margin-left:auto;display:flex;align-items:center;gap:.35rem;background:var(--bg2);
+    border:1px solid var(--line);border-radius:999px;padding:.34rem .7rem;font-size:.82rem;max-width:46vw}
+  .tgt b{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tgt .dot{width:7px;height:7px;border-radius:50%;background:var(--dim2);flex:none}
+  .tgt.set .dot{background:var(--good)}
+
+  main{flex:1;padding:.8rem;padding-bottom:8rem}
+  .view{display:none;animation:fade .18s ease}
+  .view.on{display:block}
+  @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+  /* ---- search ---- */
+  .searchbar{display:flex;flex-direction:column;gap:.6rem;margin-bottom:1rem}
+  .searchbar input{width:100%;background:var(--bg2);border:1px solid var(--line);
+    border-radius:var(--r);padding:.85rem 1rem;color:var(--fg)}
+  .searchbar input:focus{outline:2px solid var(--accent2);outline-offset:0}
+  .seg{display:flex;background:var(--bg2);border:1px solid var(--line);border-radius:999px;
+    padding:.2rem;align-self:flex-start}
+  .seg button{padding:.3rem .9rem;border-radius:999px;color:var(--dim);font-size:.84rem;font-weight:600}
+  .seg button.on{background:var(--accent2);color:#fff}
+
+  /* ---- poster grid / card ---- */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.8rem;
+    content-visibility:auto;contain-intrinsic-size:auto 280px}
+  .card{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);
+    overflow:hidden;display:flex;flex-direction:column}
+  .poster{position:relative;aspect-ratio:2/3;background:linear-gradient(135deg,var(--bg3),var(--bg2))}
+  .poster img{width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity .25s}
+  .poster img.in{opacity:1}
+  .poster .shimmer{position:absolute;inset:0;background:linear-gradient(100deg,
+    var(--bg2) 30%,var(--bg3) 50%,var(--bg2) 70%);background-size:200% 100%;
+    animation:sh 1.2s linear infinite}
+  @keyframes sh{from{background-position:200% 0}to{background-position:-200% 0}}
+  .poster .fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    text-align:center;padding:.8rem;color:var(--dim);font-weight:700;font-size:.95rem}
+  .meta{padding:.6rem .7rem}
+  .meta .t{font-weight:700;font-size:.95rem;line-height:1.25;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .meta .y{color:var(--dim);font-size:.8rem;margin-top:.15rem}
+  .card .play{margin:.55rem .7rem .7rem;background:var(--accent2);color:#fff;
+    border-radius:10px;padding:.55rem;font-weight:700;font-size:.88rem;text-align:center}
+  .card .play:active{transform:scale(.98)}
+  .src-toggle{margin:0 .7rem .7rem;color:var(--accent);font-size:.8rem;font-weight:600;text-align:center}
+  .sources{margin:0 .55rem .65rem;display:none;flex-direction:column;gap:.3rem}
+  .sources.open{display:flex}
+  .src{display:flex;gap:.5rem;align-items:center;background:var(--bg3);border:1px solid var(--line);
+    border-radius:9px;padding:.5rem .6rem;font-size:.78rem}
+  .src:active{border-color:var(--accent2)}
+  .src .q{font-weight:700;color:var(--fg)}
+  .src .x{color:var(--dim)}
+  .src .s{margin-left:auto;color:var(--good);font-weight:700;white-space:nowrap}
+
+  /* ---- states ---- */
+  .state{padding:3rem 1rem;text-align:center;color:var(--dim)}
+  .state .big{font-size:1.05rem;color:var(--fg);font-weight:700;margin-bottom:.3rem}
+  .skeleton .card .shimmer{display:block}
+  .banner{position:sticky;top:0;z-index:30;background:var(--bad);color:#fff;
+    padding:.6rem .9rem;display:none;align-items:center;gap:.6rem;font-size:.85rem;font-weight:600}
+  .banner.on{display:flex}
+  .banner button{margin-left:auto;background:rgba(255,255,255,.2);border-radius:8px;padding:.3rem .7rem;font-weight:700}
+  .toast{position:fixed;left:50%;bottom:calc(8.5rem + var(--safe-b));transform:translateX(-50%);
+    background:var(--bg3);border:1px solid var(--line);color:var(--fg);padding:.7rem 1rem;
+    border-radius:12px;font-size:.85rem;max-width:90vw;z-index:40;opacity:0;pointer-events:none;
+    transition:opacity .2s;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  .toast.on{opacity:1}
+
+  /* ---- now-playing bar + full view ---- */
+  #nowbar{position:fixed;left:0;right:0;bottom:0;z-index:25;
+    background:rgba(21,21,28,.97);backdrop-filter:blur(10px);border-top:1px solid var(--line);
+    padding:.55rem .7rem calc(.55rem + var(--safe-b));display:none;gap:.6rem;align-items:center}
+  #nowbar.on{display:flex}
+  #nowbar .mp{width:42px;height:42px;border-radius:8px;object-fit:cover;background:var(--bg3);flex:none}
+  #nowbar .nt{flex:1;min-width:0}
+  #nowbar .nt .a{font-weight:700;font-size:.88rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #nowbar .nt .b{color:var(--dim);font-size:.74rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tbtn{width:40px;height:40px;border-radius:50%;background:var(--bg3);display:flex;
+    align-items:center;justify-content:center;font-size:1rem;flex:none}
+  .tbtn:active{background:var(--accent2)}
+  .tbtn.big{width:54px;height:54px;font-size:1.3rem;background:var(--accent2);color:#fff}
+  .nowfull{display:flex;flex-direction:column;align-items:center;gap:1rem;padding:1rem .5rem}
+  .nowfull .bigposter{width:min(62vw,260px);aspect-ratio:2/3;border-radius:18px;object-fit:cover;
+    background:var(--bg3);box-shadow:0 18px 50px rgba(0,0,0,.55)}
+  .nowfull h2{margin:.2rem 0 0;font-size:1.3rem;text-align:center}
+  .nowfull .sub{color:var(--dim);font-size:.85rem;margin-top:-.4rem}
+  .scrub{width:min(92vw,420px)}
+  .scrub .rail{position:relative;height:6px;border-radius:3px;background:var(--bg3);overflow:hidden}
+  .scrub .frontier{position:absolute;inset:0 0 0 0;background:var(--line)}
+  .scrub .fill{position:absolute;left:0;top:0;bottom:0;background:var(--accent);width:0}
+  .scrub input{width:100%;margin:.4rem 0 0;accent-color:var(--accent);background:transparent}
+  .scrub .times{display:flex;justify-content:space-between;color:var(--dim);font-size:.76rem;margin-top:.1rem}
+  .transport{display:flex;gap:.7rem;align-items:center;justify-content:center;margin-top:.3rem}
+  .starting{display:flex;flex-direction:column;align-items:center;gap:.5rem;color:var(--warn);
+    font-weight:700;padding:1rem}
+  .spin{width:26px;height:26px;border:3px solid var(--bg3);border-top-color:var(--warn);
+    border-radius:50%;animation:rot .8s linear infinite}
+  @keyframes rot{to{transform:rotate(360deg)}}
+
+  /* ---- target sheet ---- */
+  .scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:50;display:none}
+  .scrim.on{display:block}
+  .sheet{position:fixed;left:0;right:0;bottom:0;z-index:51;background:var(--bg2);
+    border-radius:18px 18px 0 0;border-top:1px solid var(--line);
+    padding:1rem 1rem calc(1.2rem + var(--safe-b));transform:translateY(100%);
+    transition:transform .22s ease;max-height:80vh;overflow:auto}
+  .sheet.on{transform:none}
+  .sheet h3{margin:.1rem 0 .8rem;font-size:1rem}
+  .topt{display:flex;align-items:center;gap:.7rem;width:100%;background:var(--bg3);
+    border:1px solid var(--line);border-radius:12px;padding:.85rem;margin-bottom:.5rem;text-align:left}
+  .topt[disabled]{opacity:.5}
+  .topt .ic{font-size:1.1rem}
+  .topt .nm{font-weight:700}
+  .topt .md{color:var(--dim);font-size:.76rem}
+  .topt.sel{border-color:var(--accent);background:var(--accent2)}
+  .topt .tag{margin-left:auto;font-size:.68rem;color:var(--dim2);border:1px solid var(--line);
+    border-radius:6px;padding:.1rem .35rem}
 </style>
 </head>
 <body>
-  <div class="wrap" id="app">
-    <div class="mark">spela</div>
-    <div class="sub">remote</div>
-    <div class="dot">SPA shell loads here (Phase 3) — backend live</div>
-  </div>
+<div class="banner" id="banner"><span id="bannerMsg">spela unreachable</span><button id="bannerRetry">Retry</button></div>
+
+<header>
+  <div class="brand">spela<small>remote</small></div>
+  <nav>
+    <a href="#/search" data-v="search">Search</a>
+    <a href="#/library" data-v="library">Library</a>
+    <a href="#/now" data-v="now">Now</a>
+  </nav>
+  <button class="tgt" id="tgtBtn"><span class="dot"></span><b id="tgtLabel">Pick target</b></button>
+</header>
+
+<main>
+  <section class="view" id="v-search">
+    <div class="searchbar">
+      <input id="q" type="search" inputmode="search" autocomplete="off"
+        placeholder="Search a movie or show…" aria-label="Search">
+      <div class="seg" id="modeSeg">
+        <button data-m="movie" class="on">Movies</button>
+        <button data-m="tv">TV</button>
+      </div>
+    </div>
+    <div id="searchOut"></div>
+  </section>
+
+  <section class="view" id="v-library">
+    <div class="state">
+      <div class="big">My Library</div>
+      <div>The browsable BOHR poster grid lands in <b>Phase 5</b>.</div>
+      <div style="margin-top:.6rem;font-size:.8rem" id="libNote">Backend <code>/library</code> is live; the view is next.</div>
+    </div>
+  </section>
+
+  <section class="view" id="v-now">
+    <div id="nowFull"></div>
+  </section>
+</main>
+
+<div id="nowbar">
+  <img class="mp" id="nbPoster" alt="">
+  <div class="nt"><div class="a" id="nbTitle">—</div><div class="b" id="nbState">—</div></div>
+  <button class="tbtn" id="nbRestart" title="Restart">⏮</button>
+  <button class="tbtn" id="nbPlay" title="Play/Pause">⏸</button>
+  <button class="tbtn" id="nbExpand" title="Open player">▣</button>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="scrim" id="scrim"></div>
+<div class="sheet" id="sheet">
+  <h3>Where should it play?</h3>
+  <div id="tgtList"><div class="state">Loading targets…</div></div>
+</div>
+
+<script type="module">
+"use strict";
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const el=(t,p={})=>Object.assign(document.createElement(t),p);
+const fmt=s=>{ s=Math.max(0,Math.round(s||0)); const h=s/3600|0,m=(s%3600)/60|0,x=s%60;
+  return (h?h+":"+String(m).padStart(2,"0"):m)+":"+String(x).padStart(2,"0"); };
+
+/* ---------- state ---------- */
+const TKEY="spela_target", MKEY="spela_mode";
+const S={
+  target:JSON.parse(sessionStorage.getItem(TKEY)||"null"),   // {kind:'chromecast'|'phone', name}
+  mode:sessionStorage.getItem(MKEY)||"movie",                 // 'movie' | 'tv'
+  search:{q:"",abort:null,data:null},
+  now:{data:null,posAbs:0,dur:0,frontier:0,endlist:false,playing:false,lastSync:0,
+       optimistic:null,cold:false,seekDrag:false},
+  pollTimer:null, frontierTimer:null
+};
+
+/* ---------- API client (abortable; network err -> banner) ---------- */
+let reachable=true;
+function setBanner(on,msg){ const b=$("#banner"); if(msg)$("#bannerMsg").textContent=msg;
+  b.classList.toggle("on",on); }
+async function api(path,{method="GET",body,signal}={}){
+  try{
+    const r=await fetch(path,{method,signal,
+      headers:body?{"Content-Type":"application/json"}:undefined,
+      body:body?JSON.stringify(body):undefined});
+    const j=await r.json().catch(()=>({}));
+    if(!reachable){reachable=true;setBanner(false);}
+    return j;
+  }catch(e){
+    if(e.name==="AbortError") throw e;
+    reachable=false; setBanner(true,"spela unreachable");
+    throw e;
+  }
+}
+$("#bannerRetry").onclick=()=>{ setBanner(false); route(); pollNow(true); };
+
+let toastT;
+function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("on");
+  clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("on"),4200); }
+
+/* ---------- router ---------- */
+function route(){
+  const v=(location.hash.replace(/^#\//,"")||"search").split("?")[0];
+  const known=["search","library","now"].includes(v)?v:"search";
+  $$(".view").forEach(s=>s.classList.toggle("on",s.id==="v-"+known));
+  $$("nav a").forEach(a=>a.classList.toggle("on",a.dataset.v===known));
+  if(known==="now") renderNowFull();
+}
+addEventListener("hashchange",route);
+
+/* ---------- poster card (skeleton -> img | titled fallback) ---------- */
+function posterCard({poster,title,year,cta,onPlay,sources}){
+  const c=el("div",{className:"card"});
+  const p=el("div",{className:"poster"});
+  const sh=el("div",{className:"shimmer"});
+  p.appendChild(sh);
+  if(poster){
+    const img=el("img",{loading:"lazy",decoding:"async",alt:title||""});
+    img.onload=()=>{img.classList.add("in");sh.remove();};
+    img.onerror=()=>{sh.remove();p.appendChild(el("div",{className:"fallback",textContent:title||"Untitled"}));};
+    img.src=poster; p.appendChild(img);
+  }else{
+    sh.remove(); p.appendChild(el("div",{className:"fallback",textContent:title||"Untitled"}));
+  }
+  c.appendChild(p);
+  const m=el("div",{className:"meta"});
+  m.appendChild(el("div",{className:"t",textContent:title||"Untitled"}));
+  if(year) m.appendChild(el("div",{className:"y",textContent:year}));
+  c.appendChild(m);
+  if(onPlay){
+    const b=el("button",{className:"play",textContent:cta||"Play"});
+    b.onclick=()=>onPlay(); c.appendChild(b);
+  }
+  if(sources&&sources.length){
+    const tg=el("button",{className:"src-toggle",textContent:`More sources (${sources.length})`});
+    const box=el("div",{className:"sources"});
+    sources.forEach(r=>{
+      const row=el("button",{className:"src"});
+      row.appendChild(el("span",{className:"q",textContent:r.quality||"?"}));
+      row.appendChild(el("span",{className:"x",textContent:codec(r.title)}));
+      row.appendChild(el("span",{className:"x",textContent:r.size||""}));
+      row.appendChild(el("span",{className:"x",textContent:r.source||""}));
+      row.appendChild(el("span",{className:"s",textContent:(r.seeds??0)+"🌱"}));
+      row.onclick=()=>doPlay({result_id:r.id});
+      box.appendChild(row);
+    });
+    tg.onclick=()=>{box.classList.toggle("open");
+      tg.textContent=(box.classList.contains("open")?"Hide sources":`More sources (${sources.length})`);};
+    c.append(tg,box);
+    c._openSources=()=>{box.classList.add("open");tg.textContent="Hide sources";};
+  }
+  return c;
+}
+const codec=t=>/(\bx265\b|\bh\.?\s?265\b|hevc)/i.test(t||"")?"HEVC"
+  :/(\bx264\b|\bh\.?\s?264\b|avc)/i.test(t||"")?"H.264":"—";
+
+/* ---------- search (debounced, abortable, Movies/TV) ---------- */
+const seg=$("#modeSeg");
+[...seg.children].forEach(b=>b.classList.toggle("on",b.dataset.m===S.mode));
+seg.onclick=e=>{ const b=e.target.closest("button"); if(!b)return;
+  S.mode=b.dataset.m; sessionStorage.setItem(MKEY,S.mode);
+  [...seg.children].forEach(x=>x.classList.toggle("on",x===b));
+  if(S.search.q) runSearch(S.search.q); };
+
+let dT;
+$("#q").addEventListener("input",e=>{ const q=e.target.value.trim();
+  clearTimeout(dT); dT=setTimeout(()=>{ S.search.q=q; q?runSearch(q):($("#searchOut").innerHTML=""); },300); });
+
+async function runSearch(q){
+  if(S.search.abort) S.search.abort.abort();
+  const ac=new AbortController(); S.search.abort=ac;
+  const out=$("#searchOut");
+  out.innerHTML=`<div class="grid skeleton"><div class="card"><div class="poster"><div class="shimmer"></div></div><div class="meta"><div class="t">&nbsp;</div></div></div></div>`;
+  let qs="q="+encodeURIComponent(q); if(S.mode==="movie") qs+="&movie=1";
+  let d;
+  try{ d=await api("/search?"+qs,{signal:ac.signal}); }
+  catch(e){ if(e.name==="AbortError")return;
+    out.innerHTML=`<div class="state"><div class="big">spela unreachable</div>Check the connection and retry.</div>`; return; }
+  S.search.data=d;
+  if(d.error){ out.innerHTML=`<div class="state"><div class="big">No match</div>${esc(d.error)}<div style="margin-top:.6rem;font-size:.82rem">Try the Movies / TV toggle above.</div></div>`; return; }
+  const res=d.results||[];
+  if(!res.length){ out.innerHTML=`<div class="state"><div class="big">No playable sources</div>Nothing found for “${esc(q)}”. Try the Movies / TV toggle.</div>`; return; }
+  const show=d.show||{}, year=(show.release_date||"").slice(0,4);
+  const grid=el("div",{className:"grid"});
+  const card=posterCard({
+    poster:show.poster_url, title:show.title||res[0].title, year:year||undefined,
+    cta:"Play best source", sources:res,
+    onPlay:()=>doPlay({result_id:res[0].id}, card)
+  });
+  grid.appendChild(card); out.innerHTML=""; out.appendChild(grid);
+}
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+/* ---------- hybrid play ---------- */
+async function doPlay(opts,cardForSources){
+  if(!S.target){ toast("Pick where to play first"); openSheet(); return; }
+  if(S.target.kind==="phone"){ toast("Watch-on-phone arrives in Phase 6 — pick a TV for now"); openSheet(); return; }
+  const body={...opts,target:"chromecast",cast_name:S.target.name};
+  toast(`Starting on ${S.target.name}…`);
+  let r;
+  try{ r=await api("/play",{method:"POST",body}); }
+  catch{ toast("spela unreachable"); return; }
+  if(r&&r.error){
+    toast("Couldn’t play: "+r.error);
+    if(cardForSources&&cardForSources._openSources) cardForSources._openSources();
+    return;
+  }
+  toast("Playing — opening now-playing");
+  S.now.cold=true; S.now.lastSync=0;
+  location.hash="#/now"; pollNow(true);
+}
+
+/* ---------- target picker ---------- */
+const AUDIO_RE=/(group|stereo|speaker|\baudio\b|\bmini\b|home(?!.*hub)|\bnest\b(?!.*hub))/i;
+const VIDEO_RE=/(chromecast|google tv|androidtv|\bnest hub\b|shield|\btv\b)/i;
+function isAudioOnly(d){ const n=d.name||"",m=d.model||"";
+  if(VIDEO_RE.test(m)||VIDEO_RE.test(n)) return false;        // keep anything clearly video
+  return AUDIO_RE.test(m)||AUDIO_RE.test(n);                  // filter only clear audio; ambiguous kept
+}
+function tgtLabel(){ const t=S.target; const b=$("#tgtBtn");
+  $("#tgtLabel").textContent=t?(t.kind==="phone"?"This phone":t.name):"Pick target";
+  b.classList.toggle("set",!!t); }
+tgtLabel();
+$("#tgtBtn").onclick=openSheet;
+$("#scrim").onclick=closeSheet;
+function closeSheet(){ $("#sheet").classList.remove("on"); $("#scrim").classList.remove("on"); }
+function openSheet(){
+  $("#sheet").classList.add("on"); $("#scrim").classList.add("on");
+  const list=$("#tgtList"); list.innerHTML=`<div class="state">Discovering targets…</div>`;
+  api("/targets").then(d=>{
+    const all=(d&&d.targets)||[];
+    const tvs=all.filter(x=>!isAudioOnly(x));
+    list.innerHTML="";
+    if(!tvs.length) list.appendChild(el("div",{className:"state",textContent:
+      d&&d.error?("Discovery failed: "+d.error):"No video targets found on the network."}));
+    tvs.forEach(d2=>{
+      const o=el("button",{className:"topt"});
+      o.innerHTML=`<span class="ic">📺</span><span><span class="nm">${esc(d2.name)}</span><br><span class="md">${esc(d2.model||"Chromecast")}</span></span>`;
+      if(S.target&&S.target.kind==="chromecast"&&S.target.name===d2.name) o.classList.add("sel");
+      o.onclick=()=>{ S.target={kind:"chromecast",name:d2.name};
+        sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet(); };
+      list.appendChild(o);
+    });
+    // "This phone" — present but disabled until Phase 6 (US-5 in-browser playback)
+    const ph=el("button",{className:"topt"}); ph.disabled=true;
+    ph.innerHTML=`<span class="ic">📱</span><span><span class="nm">This phone</span><br><span class="md">watch in-browser</span></span><span class="tag">Phase 6</span>`;
+    list.appendChild(ph);
+  }).catch(()=>{ list.innerHTML=`<div class="state">spela unreachable — can’t list targets.</div>`; });
+}
+
+/* ---------- now-playing: status poll (visibility+active gated) ---------- */
+function startPolling(){ if(S.pollTimer)return; S.pollTimer=setInterval(()=>pollNow(false),3000); }
+function stopPolling(){ clearInterval(S.pollTimer); S.pollTimer=null; }
+document.addEventListener("visibilitychange",()=>{
+  if(document.visibilityState==="visible"){ pollNow(true); }
+  else stopPolling();
+});
+
+async function pollNow(force){
+  if(document.visibilityState!=="visible"&&!force) return;
+  let s; try{ s=await api("/status"); }catch{ return; }
+  if(!s||s.status==="idle"||!s.current){
+    S.now.data=null; S.now.playing=false; stopPolling();
+    $("#nowbar").classList.remove("on"); renderNowFull(); return;
+  }
+  const c=s.current, was=S.now.data;
+  S.now.data=c; S.now.dur=c.duration||0;
+  S.now.cold = !s.running;                         // current present but not live yet = cold-start
+  if(!was||was.title!==c.title){ S.now.frontier=0; S.now.endlist=false; S.now.posAbs=0; }
+  if(s.running){
+    // resync playhead from the authoritative HWM (cast_health_monitor saves
+    // device current_time + ss_offset every save-interval); interpolate
+    // between syncs by wall-clock so the bar glides instead of stepping.
+    try{
+      const p=await api(`/api/position?imdb_id=${encodeURIComponent(c.imdb_id||"")}&title=${encodeURIComponent(c.title||"")}`);
+      if(p&&typeof p.t==="number"&&p.t>=0){ S.now.posAbs=p.t; S.now.lastSync=Date.now(); }
+    }catch{}
+    S.now.playing = (S.now.optimistic==="pause")?false:true;
+  }
+  startPolling();
+  $("#nowbar").classList.add("on");
+  updateNowBar(); if(currentView()==="now") renderNowFull();
+  pollFrontier();
+}
+const currentView=()=>(location.hash.replace(/^#\//,"")||"search").split("?")[0];
+
+/* derive transcoded frontier from the live HLS media playlist (no /status
+   field exists for it): Σ #EXTINF = stream secs transcoded so far,
+   #EXT-X-ENDLIST = whole file done -> full scrub allowed. Absolute episode
+   frontier = ss_offset + Σ. */
+async function pollFrontier(){
+  if(S.now.endlist||!S.now.data) return;
+  if(S.frontierTimer&&Date.now()-S.frontierTimer<9000) return;
+  S.frontierTimer=Date.now();
+  try{
+    const txt=await fetch("/hls/playlist.m3u8",{cache:"no-store"}).then(r=>r.ok?r.text():"");
+    if(!txt) return;
+    let sum=0; for(const m of txt.matchAll(/#EXTINF:([\d.]+)/g)) sum+=parseFloat(m[1])||0;
+    S.now.frontier=(S.now.data.ss_offset||0)+sum;
+    S.now.endlist=/#EXT-X-ENDLIST/.test(txt);
+  }catch{}
+}
+
+function livePos(){
+  // interpolate forward while playing; never past the seekable max
+  let p=S.now.posAbs;
+  if(S.now.playing&&S.now.lastSync) p+=(Date.now()-S.now.lastSync)/1000;
+  return Math.min(p,seekMax());
+}
+function seekMax(){ return S.now.endlist? (S.now.dur||0)
+  : (S.now.frontier>0? S.now.frontier : (S.now.dur||0)); }
+
+function updateNowBar(){
+  const c=S.now.data; if(!c)return;
+  $("#nbPoster").src=c.poster_url||""; $("#nbTitle").textContent=c.title||"—";
+  $("#nbState").textContent = S.now.cold ? "Starting…"
+    : `${fmt(livePos())} / ${fmt(S.now.dur)}`;
+  $("#nbPlay").textContent = S.now.cold ? "…" : (S.now.playing?"⏸":"▶");
+}
+
+/* ---------- now-playing: full view + scrubber ---------- */
+function renderNowFull(){
+  const root=$("#nowFull"), c=S.now.data;
+  if(!c){ root.innerHTML=`<div class="state"><div class="big">Nothing playing</div>Start something from Search.</div>`; return; }
+  if(S.now.cold){
+    root.innerHTML=`<div class="nowfull">
+      <img class="bigposter" src="${esc(c.poster_url||"")}" alt="">
+      <h2>${esc(c.title||"")}</h2>
+      <div class="starting"><div class="spin"></div>Starting on ${esc((c.target||"").split(":")[1]||S.target?.name||"TV")}…</div>
+      <div class="sub">Cold-start can take up to a minute — this is normal, not an error.</div>
+    </div>`;
+    return;
+  }
+  const max=seekMax(), pos=livePos(), pct=max?Math.min(100,pos/max*100):0;
+  const fpct=(S.now.dur&&!S.now.endlist&&S.now.frontier)?Math.min(100,S.now.frontier/S.now.dur*100):100;
+  root.innerHTML=`<div class="nowfull">
+    <img class="bigposter" src="${esc(c.poster_url||"")}" alt="">
+    <h2>${esc(c.title||"")}</h2>
+    <div class="sub">${esc(c.quality||"")} · ${esc((c.target||"").split(":")[1]||"")}</div>
+    <div class="scrub">
+      <div class="rail"><div class="frontier" style="width:${fpct}%"></div><div class="fill" id="fFill" style="width:${pct}%"></div></div>
+      <input id="fSeek" type="range" min="0" max="${Math.max(1,Math.round(S.now.dur||max))}" value="${Math.round(pos)}">
+      <div class="times"><span id="fCur">${fmt(pos)}</span><span>${fmt(S.now.dur)}</span></div>
+    </div>
+    <div class="transport">
+      <button class="tbtn" id="tPrev" title="Previous">⏮⏮</button>
+      <button class="tbtn" id="tRestart" title="Restart">⏮</button>
+      <button class="tbtn big" id="tPlay">${S.now.playing?"⏸":"▶"}</button>
+      <button class="tbtn" id="tStop" title="Stop">⏹</button>
+      <button class="tbtn" id="tNext" title="Next">⏭⏭</button>
+    </div>
+    ${!S.now.endlist&&S.now.frontier?`<div class="sub">Seekable up to ${fmt(S.now.frontier)} (still transcoding)</div>`:""}
+  </div>`;
+  const sl=$("#fSeek");
+  sl.addEventListener("input",()=>{ S.now.seekDrag=true;
+    const v=+sl.value; $("#fCur").textContent=fmt(v);
+    $("#fFill").style.width=(max?Math.min(100,v/max*100):0)+"%"; });
+  sl.addEventListener("change",async()=>{
+    let v=+sl.value; const m=seekMax();
+    if(v>m){ v=Math.floor(m); toast("That part isn’t transcoded yet — seeking to the edge"); }
+    S.now.seekDrag=false; S.now.posAbs=v; S.now.lastSync=Date.now();
+    const r=await api("/seek",{method:"POST",body:{seconds:v}}).catch(()=>({error:"unreachable"}));
+    if(r&&r.error) toast("Seek failed: "+r.error);
+  });
+  $("#tRestart").onclick=restart;
+  $("#tStop").onclick=async()=>{ await api("/stop",{method:"POST"}).catch(()=>{});
+    S.now.data=null; $("#nowbar").classList.remove("on"); renderNowFull(); stopPolling(); };
+  $("#tNext").onclick=()=>transport("/next");
+  $("#tPrev").onclick=()=>transport("/prev");
+  $("#tPlay").onclick=togglePlay;
+}
+
+/* optimistic transport: reflect intent instantly, reconcile on next poll */
+async function transport(path){ await api(path,{method:"POST"}).catch(()=>toast("spela unreachable"));
+  setTimeout(()=>pollNow(true),600); }
+async function togglePlay(){
+  const toPause=S.now.playing;
+  S.now.playing=!toPause; S.now.optimistic=toPause?"pause":"resume";
+  if(!toPause){ S.now.lastSync=Date.now(); }   // resuming: restart interpolation clock
+  updateNowBar(); if(currentView()==="now") renderNowFull();
+  await api(toPause?"/pause":"/resume",{method:"POST"}).catch(()=>toast("spela unreachable"));
+  setTimeout(()=>{S.now.optimistic=null;pollNow(true);},900);
+}
+async function restart(){
+  S.now.posAbs=0; S.now.lastSync=Date.now(); S.now.playing=true;
+  updateNowBar(); if(currentView()==="now") renderNowFull();
+  const r=await api("/seek",{method:"POST",body:{seconds:0}}).catch(()=>({error:"unreachable"}));
+  if(r&&r.error) toast("Restart failed: "+r.error); else toast("Rewound to the start");
+}
+$("#nbRestart").onclick=restart;
+$("#nbPlay").onclick=()=>{ if(!S.now.cold) togglePlay(); };
+$("#nbExpand").onclick=()=>location.hash="#/now";
+
+/* tick the now-bar/full view between polls so interpolation stays smooth */
+setInterval(()=>{ if(S.now.data&&!S.now.cold&&!S.now.seekDrag){
+  updateNowBar(); if(currentView()==="now"){ const f=$("#fFill"),cu=$("#fCur"),sl=$("#fSeek");
+    if(f&&cu&&sl){ const p=livePos(),m=seekMax(); f.style.width=(m?Math.min(100,p/m*100):0)+"%";
+      cu.textContent=fmt(p); if(!S.now.seekDrag) sl.value=Math.round(p); } } } },1000);
+
+/* ---------- boot ---------- */
+route(); pollNow(true);
+</script>
 </body>
 </html>
