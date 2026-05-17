@@ -95,6 +95,9 @@
 
   /* ---- states ---- */
   .state{padding:3rem 1rem;text-align:center;color:var(--dim)}
+  .libbar{display:flex;align-items:center;justify-content:space-between;color:var(--dim);font-size:.82rem;margin:.1rem .15rem .7rem}
+  .srcbtn{background:var(--bg3);border:1px solid var(--line);border-radius:9px;padding:.45rem .9rem;color:var(--fg);font-weight:700;font-size:.85rem}
+  .srcbtn:active{border-color:var(--accent2)}
   .state .big{font-size:1.05rem;color:var(--fg);font-weight:700;margin-bottom:.3rem}
   .skeleton .card .shimmer{display:block}
   .banner{position:sticky;top:0;z-index:30;background:var(--bad);color:#fff;
@@ -184,13 +187,7 @@
     <div id="searchOut"></div>
   </section>
 
-  <section class="view" id="v-library">
-    <div class="state">
-      <div class="big">My Library</div>
-      <div>The browsable BOHR poster grid lands in <b>Phase 5</b>.</div>
-      <div style="margin-top:.6rem;font-size:.8rem" id="libNote">Backend <code>/library</code> is live; the view is next.</div>
-    </div>
-  </section>
+  <section class="view" id="v-library"><div id="libraryOut"></div></section>
 
   <section class="view" id="v-now">
     <div id="nowFull"></div>
@@ -225,8 +222,9 @@ const S={
   target:JSON.parse(sessionStorage.getItem(TKEY)||"null"),   // {kind:'chromecast'|'phone', name}
   mode:sessionStorage.getItem(MKEY)||"movie",                 // 'movie' | 'tv'
   search:{q:"",abort:null,data:null},
+  library:{data:null,loading:false},
   now:{data:null,posAbs:0,dur:0,frontier:0,endlist:false,playing:false,lastSync:0,
-       optimistic:null,cold:false,seekDrag:false},
+       everRan:false,cold:false,seekDrag:false},
   pollTimer:null, frontierTimer:null
 };
 
@@ -261,6 +259,7 @@ function route(){
   $$(".view").forEach(s=>s.classList.toggle("on",s.id==="v-"+known));
   $$("nav a").forEach(a=>a.classList.toggle("on",a.dataset.v===known));
   if(known==="now") renderNowFull();
+  if(known==="library") renderLibrary();
 }
 addEventListener("hashchange",route);
 
@@ -362,8 +361,69 @@ async function doPlay(opts,cardForSources){
     return;
   }
   toast("Playing — opening now-playing");
-  S.now.cold=true; S.now.lastSync=0;
+  S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   location.hash="#/now"; pollNow(true);
+}
+
+/* ---------- My Library (Phase 5 / US-3) ---------- */
+async function doPlayLibrary(entry){
+  if(!S.target){ toast("Pick where to play first"); openSheet(); return; }
+  if(S.target.kind==="phone"){ toast("Watch-on-phone arrives in Phase 6 — pick a TV for now"); openSheet(); return; }
+  toast(`Starting ${entry.title} on ${S.target.name}…`);
+  let r;
+  try{ r=await api("/play",{method:"POST",body:{title:entry.raw_name,target:"chromecast",cast_name:S.target.name}}); }
+  catch{ toast("spela unreachable"); return; }
+  if(r&&r.error){ toast("Couldn’t play: "+r.error); return; }
+  toast("Playing — opening now-playing");
+  S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
+  location.hash="#/now"; pollNow(true);
+}
+async function renderLibrary(force){
+  const out=$("#libraryOut"); if(!out) return;
+  if(S.library.loading) return;
+  if(S.library.data && !force){ paintLibrary(); return; }
+  S.library.loading=true;
+  out.innerHTML='<div class="grid">'+
+    '<div class="card"><div class="poster"><div class="shimmer"></div></div><div class="meta"><div class="t">&nbsp;</div></div></div>'.repeat(6)+'</div>';
+  let d;
+  try{ d=await api("/library"); }
+  catch{
+    S.library.loading=false; S.library.data=null;
+    out.innerHTML=`<div class="state"><div class="big">spela unreachable</div>Can’t reach the server.<div style="margin-top:.7rem"><button class="srcbtn" id="libRetry">Retry</button></div></div>`;
+    $("#libRetry").onclick=()=>renderLibrary(true); return;
+  }
+  S.library.loading=false; S.library.data=d; paintLibrary();
+}
+function paintLibrary(){
+  const out=$("#libraryOut"); if(!out) return;
+  const d=S.library.data||{}, lib=Array.isArray(d.library)?d.library:[];
+  // A real /library payload always carries library[] and/or origin_status.
+  // Its absence = server down / 404 / malformed → "unreachable" (NOT "empty":
+  // mislabeling couldn't-load as empty is the exact ambiguous-state the spec
+  // forbids).
+  if(!Array.isArray(d.library) && typeof d.origin_status!=="string"){
+    out.innerHTML=`<div class="state"><div class="big">spela unreachable</div>Couldn’t load your library.<div style="margin-top:.7rem"><button class="srcbtn" id="libRetry">Retry</button></div></div>`;
+    $("#libRetry").onclick=()=>renderLibrary(true); return;
+  }
+  // AC-3.4: "offline" (origin unreachable) is a DISTINCT state from "empty".
+  if(d.origin_status==="offline" && !lib.length){
+    out.innerHTML=`<div class="state"><div class="big">Library offline</div>Your library host isn’t reachable right now — Search still works.<div style="margin-top:.7rem"><button class="srcbtn" id="libRetry">Retry</button></div></div>`;
+    $("#libRetry").onclick=()=>renderLibrary(true); return;
+  }
+  if(!lib.length){
+    out.innerHTML=`<div class="state"><div class="big">Library is empty</div>Nothing in your curated library yet.</div>`; return;
+  }
+  out.innerHTML="";
+  const bar=el("div",{className:"libbar"});
+  bar.appendChild(el("span",{textContent:`${lib.length} in library`}));
+  const rb=el("button",{className:"srcbtn",textContent:"↻ Refresh"});
+  rb.onclick=()=>renderLibrary(true); bar.appendChild(rb);
+  const grid=el("div",{className:"grid"});
+  lib.forEach(e=>grid.appendChild(posterCard({
+    poster:e.poster_url, title:e.title, year:e.year, cta:"Play",
+    onPlay:()=>doPlayLibrary(e)
+  })));
+  out.append(bar,grid);
 }
 
 /* ---------- target picker ---------- */
@@ -420,18 +480,35 @@ async function pollNow(force){
     $("#nowbar").classList.remove("on"); renderNowFull(); return;
   }
   const c=s.current, was=S.now.data;
+  // A re-play / seek-restart keeps the title but changes started_at — both
+  // signal a fresh stream.
+  const newStream = !was || was.title!==c.title || was.started_at!==c.started_at;
   S.now.data=c; S.now.dur=c.duration||0;
-  S.now.cold = !s.running;                         // current present but not live yet = cold-start
-  if(!was||was.title!==c.title){ S.now.frontier=0; S.now.endlist=false; S.now.posAbs=0; }
-  if(s.running){
-    // resync playhead from the authoritative HWM (cast_health_monitor saves
-    // device current_time + ss_offset every save-interval); interpolate
-    // between syncs by wall-clock so the bar glides instead of stepping.
+  if(newStream){
+    S.now.frontier=0; S.now.endlist=false; S.now.posAbs=0;
+    S.now.everRan=false; S.now.playing=true;   // a fresh stream starts playing
+  }
+  if(s.running) S.now.everRan=true;            // sticky: once live, never "cold" again
+
+  // Cold-start is a TIME-BOUNDED startup phase, NOT merely "running:false".
+  // A fast bridge/local play fully transcodes then ffmpeg EXITS
+  // (running:false / process_dead) while the Chromecast keeps playing or
+  // pausing the COMPLETE HLS perfectly — that is an ESTABLISHED,
+  // fully-controllable stream, not "Starting…". Only treat as cold during
+  // the genuine initial window (never-ran, no ENDLIST, < 75 s old).
+  const age = c.started_at ? (Date.now()-Date.parse(c.started_at))/1000 : 1e9;
+  S.now.cold = !s.running && !S.now.everRan && !S.now.endlist && age < 75;
+
+  // Position resync is independent of play/pause. /status carries NO
+  // play-state field, so S.now.playing is driven SOLELY by user intent
+  // (togglePlay) and is intentionally NEVER overwritten here — the old
+  // code reasserted playing=true every poll, which made every tap re-send
+  // /pause and left /resume permanently unreachable.
+  if(!S.now.cold){
     try{
       const p=await api(`/api/position?imdb_id=${encodeURIComponent(c.imdb_id||"")}&title=${encodeURIComponent(c.title||"")}`);
       if(p&&typeof p.t==="number"&&p.t>=0){ S.now.posAbs=p.t; S.now.lastSync=Date.now(); }
     }catch{}
-    S.now.playing = (S.now.optimistic==="pause")?false:true;
   }
   startPolling();
   $("#nowbar").classList.add("on");
@@ -531,11 +608,11 @@ async function transport(path){ await api(path,{method:"POST"}).catch(()=>toast(
   setTimeout(()=>pollNow(true),600); }
 async function togglePlay(){
   const toPause=S.now.playing;
-  S.now.playing=!toPause; S.now.optimistic=toPause?"pause":"resume";
+  S.now.playing=!toPause;
   if(!toPause){ S.now.lastSync=Date.now(); }   // resuming: restart interpolation clock
   updateNowBar(); if(currentView()==="now") renderNowFull();
   await api(toPause?"/pause":"/resume",{method:"POST"}).catch(()=>toast("spela unreachable"));
-  setTimeout(()=>{S.now.optimistic=null;pollNow(true);},900);
+  setTimeout(()=>pollNow(true),900);           // re-sync position only; never play-state
 }
 async function restart(){
   S.now.posAbs=0; S.now.lastSync=Date.now(); S.now.playing=true;
