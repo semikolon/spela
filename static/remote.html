@@ -126,6 +126,7 @@
   .nowfull{display:flex;flex-direction:column;align-items:center;gap:1rem;padding:1rem .5rem}
   .nowfull .bigposter{width:min(62vw,260px);aspect-ratio:2/3;border-radius:18px;object-fit:cover;
     background:var(--bg3);box-shadow:0 18px 50px rgba(0,0,0,.55)}
+  .phvid{width:min(94vw,640px);aspect-ratio:16/9;background:#000;border-radius:14px;box-shadow:0 14px 40px rgba(0,0,0,.5)}
   .nowfull h2{margin:.2rem 0 0;font-size:1.3rem;text-align:center}
   .nowfull .sub{color:var(--dim);font-size:.85rem;margin-top:-.4rem}
   .scrub{width:min(92vw,420px)}
@@ -224,7 +225,7 @@ const S={
   search:{q:"",abort:null,data:null},
   library:{data:null,loading:false},
   now:{data:null,posAbs:0,dur:0,frontier:0,endlist:false,playing:false,lastSync:0,
-       everRan:false,cold:false,seekDrag:false},
+       everRan:false,cold:false,seekDrag:false,phone:false},
   pollTimer:null, frontierTimer:null
 };
 
@@ -349,7 +350,7 @@ const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",
 /* ---------- hybrid play ---------- */
 async function doPlay(opts,cardForSources){
   if(!S.target){ toast("Pick where to play first"); openSheet(); return; }
-  if(S.target.kind==="phone"){ toast("Watch-on-phone arrives in Phase 6 — pick a TV for now"); openSheet(); return; }
+  if(S.target.kind==="phone"){ return doPhoneDirect(opts,cardForSources,(S.search.data&&S.search.data.show&&S.search.data.show.title)||""); }
   const body={...opts,target:"chromecast",cast_name:S.target.name};
   toast(`Starting on ${S.target.name}…`);
   let r;
@@ -361,21 +362,55 @@ async function doPlay(opts,cardForSources){
     return;
   }
   toast("Playing — opening now-playing");
-  S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
+  S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   location.hash="#/now"; pollNow(true);
+}
+
+/* ---------- Phone-direct playback (Phase 6 / US-5 / T-14,15) ----------
+   Reuses the proven no-Chromecast HLS path (target:"vlc" → spela builds
+   /hls/master.m3u8 but does not cast). iOS Safari plays HLS natively;
+   Chromium lazy-loads a CDN-pinned hls.js. The <video> element IS the
+   transport (native controls = scrub/seek/fullscreen). Single backend
+   stream → switching target moves it (R-1). */
+async function doPhoneDirect(opts,cardForSources,label){
+  toast(`Starting ${label||""} on this phone…`.replace(/\s+/g," "));
+  let r;
+  try{ r=await api("/play",{method:"POST",body:{...opts,target:"vlc"}}); }
+  catch{ toast("spela unreachable"); return; }
+  if(r&&r.error){ toast("Couldn’t play: "+r.error);
+    if(cardForSources&&cardForSources._openSources) cardForSources._openSources(); return; }
+  const old=$("#phvid"); if(old){ old.pause(); old.remove(); }   // fresh play → rebuild player
+  S.now.phone=true; S.now.cold=false; S.now.everRan=true;
+  S.now.data={title:label||"Playing",quality:""};                // placeholder until first /status
+  location.hash="#/now"; pollNow(true);
+}
+let _hlsLoading;
+function attachPhoneVideo(v,src){
+  if(!v) return;
+  if(v.canPlayType("application/vnd.apple.mpegurl")){ v.src=src; v.play().catch(()=>{}); return; }
+  const go=()=>{
+    if(window.Hls&&Hls.isSupported()){ const h=new Hls();
+      h.loadSource(src); h.attachMedia(v); h.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{})); }
+    else { v.src=src; v.play().catch(()=>{}); }
+  };
+  if(window.Hls) return go();
+  if(!_hlsLoading){ _hlsLoading=new Promise(res=>{ const s=document.createElement("script");
+    s.src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"; s.onload=res; s.onerror=res;
+    document.head.appendChild(s); }); }
+  _hlsLoading.then(go);
 }
 
 /* ---------- My Library (Phase 5 / US-3) ---------- */
 async function doPlayLibrary(entry){
   if(!S.target){ toast("Pick where to play first"); openSheet(); return; }
-  if(S.target.kind==="phone"){ toast("Watch-on-phone arrives in Phase 6 — pick a TV for now"); openSheet(); return; }
+  if(S.target.kind==="phone"){ return doPhoneDirect({title:entry.raw_name},null,entry.title); }
   toast(`Starting ${entry.title} on ${S.target.name}…`);
   let r;
   try{ r=await api("/play",{method:"POST",body:{title:entry.raw_name,target:"chromecast",cast_name:S.target.name}}); }
   catch{ toast("spela unreachable"); return; }
   if(r&&r.error){ toast("Couldn’t play: "+r.error); return; }
   toast("Playing — opening now-playing");
-  S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
+  S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   location.hash="#/now"; pollNow(true);
 }
 async function renderLibrary(force){
@@ -453,13 +488,20 @@ function openSheet(){
       const o=el("button",{className:"topt"});
       o.innerHTML=`<span class="ic">📺</span><span><span class="nm">${esc(d2.name)}</span><br><span class="md">${esc(d2.model||"Chromecast")}</span></span>`;
       if(S.target&&S.target.kind==="chromecast"&&S.target.name===d2.name) o.classList.add("sel");
-      o.onclick=()=>{ S.target={kind:"chromecast",name:d2.name};
-        sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet(); };
+      o.onclick=()=>{ const moving=!!S.now.data;
+        S.target={kind:"chromecast",name:d2.name};
+        sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
+        if(moving) toast("Single stream — your next play moves it to "+d2.name); };
       list.appendChild(o);
     });
-    // "This phone" — present but disabled until Phase 6 (US-5 in-browser playback)
-    const ph=el("button",{className:"topt"}); ph.disabled=true;
-    ph.innerHTML=`<span class="ic">📱</span><span><span class="nm">This phone</span><br><span class="md">watch in-browser</span></span><span class="tag">Phase 6</span>`;
+    // "This phone" — in-browser HLS playback (Phase 6 / US-5).
+    const ph=el("button",{className:"topt"});
+    ph.innerHTML=`<span class="ic">📱</span><span><span class="nm">This phone</span><br><span class="md">watch in-browser</span></span>`;
+    if(S.target&&S.target.kind==="phone") ph.classList.add("sel");
+    ph.onclick=()=>{ const moving=!!S.now.data;
+      S.target={kind:"phone",name:"This phone"};
+      sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
+      if(moving) toast("Single stream — your next play moves it here, off the TV"); };
     list.appendChild(ph);
   }).catch(()=>{ list.innerHTML=`<div class="state">spela unreachable — can’t list targets.</div>`; });
 }
@@ -476,7 +518,7 @@ async function pollNow(force){
   if(document.visibilityState!=="visible"&&!force) return;
   let s; try{ s=await api("/status"); }catch{ return; }
   if(!s||s.status==="idle"||!s.current){
-    S.now.data=null; S.now.playing=false; stopPolling();
+    S.now.data=null; S.now.playing=false; S.now.phone=false; stopPolling();
     $("#nowbar").classList.remove("on"); renderNowFull(); return;
   }
   const c=s.current, was=S.now.data;
@@ -498,20 +540,21 @@ async function pollNow(force){
   // the genuine initial window (never-ran, no ENDLIST, < 75 s old).
   const age = c.started_at ? (Date.now()-Date.parse(c.started_at))/1000 : 1e9;
   S.now.cold = !s.running && !S.now.everRan && !S.now.endlist && age < 75;
+  if(S.now.phone) S.now.cold=false;   // phone-direct: the <video> owns buffering, never "Starting…"
 
   // Position resync is independent of play/pause. /status carries NO
   // play-state field, so S.now.playing is driven SOLELY by user intent
   // (togglePlay) and is intentionally NEVER overwritten here — the old
   // code reasserted playing=true every poll, which made every tap re-send
   // /pause and left /resume permanently unreachable.
-  if(!S.now.cold){
+  if(!S.now.cold && !S.now.phone){
     try{
       const p=await api(`/api/position?imdb_id=${encodeURIComponent(c.imdb_id||"")}&title=${encodeURIComponent(c.title||"")}`);
       if(p&&typeof p.t==="number"&&p.t>=0){ S.now.posAbs=p.t; S.now.lastSync=Date.now(); }
     }catch{}
   }
   startPolling();
-  $("#nowbar").classList.add("on");
+  if(S.now.phone) $("#nowbar").classList.remove("on"); else $("#nowbar").classList.add("on");
   updateNowBar(); if(currentView()==="now") renderNowFull();
   pollFrontier();
 }
@@ -555,6 +598,25 @@ function updateNowBar(){
 function renderNowFull(){
   const root=$("#nowFull"), c=S.now.data;
   if(!c){ root.innerHTML=`<div class="state"><div class="big">Nothing playing</div>Start something from Search.</div>`; return; }
+  if(S.now.phone){
+    if($("#phvid")) return;   // built once — poll re-renders must NOT rebuild the playing <video>
+    root.innerHTML=`<div class="nowfull">
+      <h2>${esc(c.title||"")}</h2>
+      <div class="sub">${esc(c.quality||"")} · on this phone</div>
+      <video id="phvid" class="phvid" controls playsinline autoplay></video>
+      <div class="transport">
+        <button class="tbtn" id="phStop" title="Stop">⏹</button>
+        <button class="srcbtn" id="phTo">Move to a TV…</button>
+      </div>
+      <div class="sub">Single backend stream — moving to a TV stops it here.</div>
+    </div>`;
+    attachPhoneVideo($("#phvid"),"/hls/master.m3u8");
+    $("#phStop").onclick=async()=>{ const v=$("#phvid"); if(v){ v.pause(); v.remove(); }
+      await api("/stop",{method:"POST"}).catch(()=>{});
+      S.now.phone=false; S.now.data=null; $("#nowbar").classList.remove("on"); stopPolling(); renderNowFull(); };
+    $("#phTo").onclick=()=>{ const v=$("#phvid"); if(v) v.pause(); openSheet(); };
+    return;
+  }
   if(S.now.cold){
     root.innerHTML=`<div class="nowfull">
       <img class="bigposter" src="${esc(c.poster_url||"")}" alt="">
