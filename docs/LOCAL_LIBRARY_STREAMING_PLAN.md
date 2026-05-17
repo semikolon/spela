@@ -208,7 +208,8 @@ if req.title.is_some():
     # 2. remote origins (new) — only if no local hit
     if not is_local:
         for origin in config.remote_origins:
-            r = GET {origin}/library/match?title=&quality=&year=   # 2s timeout
+            ping {origin}/library/stream?h=<sentinel>  # 2s liveness (no FS)
+            r = GET {origin}/library/match?title=&quality=&year=   # 25s (cold-HDD tolerant)
             if r.200:
                 server_url = "{origin}/library/stream?h={r.handle}"
                 is_local = true                                    # complete source
@@ -300,7 +301,7 @@ component is enabled on the workstation (Security-audit-before-public-exposure).
   (forced by §4 anyway; no special case).
 - Server-local match beats remote (no LAN hop, lower latency).
 - Single binary + `serve-library` subcommand (not a separate crate).
-- `/library/match` remote query timeout = 2 s (fail fast → torrent fallback).
+- Remote-origin selection (v3.6.3): 2 s liveness ping (no-FS `/library/stream` sentinel → distinguishes origin-down vs drive-waking) then `/library/match` with a 25 s timeout that tolerates a cold USB-HDD spin-up; serve-library self-warms its roots every 180 s so the drive is never cold in steady state. (Pre-v3.6.3 a bare 2 s match timeout silently torrent-fell-back on every first-after-idle play.)
 - Handle TTL = 120 s (covers detect_codecs + transcode start; refreshed if a
   play re-resolves).
 

@@ -99,6 +99,28 @@ pub async fn run(config: Config, port_override: Option<u16>) -> Result<()> {
     }
 
     let port = port_override.unwrap_or(config.library_serve_port);
+
+    // v3.6.3 self-warm. A remote library typically lives on a USB HDD that
+    // macOS spins down after ~10 min idle. A cold first `/library/match`
+    // then blocks on spin-up (5-15s+), which used to trip the caller's
+    // timeout into a silent torrent fallback (wrong source/quality). Keep
+    // the backing drive spun up: touch each root immediately, then every
+    // 180s (well under the macOS disk-idle default). Cheap (one dir entry);
+    // a dedicated std thread so a cold spin-up never stalls the async
+    // runtime. This is HALF the "bridge works flawlessly" guarantee — the
+    // do_play liveness-gated generous timeout is the other half. Do NOT
+    // remove either half.
+    let warm_roots: Vec<PathBuf> = roots.clone();
+    std::thread::Builder::new()
+        .name("serve-library-warm".into())
+        .spawn(move || loop {
+            for r in &warm_roots {
+                let _ = std::fs::read_dir(r).map(|mut it| it.next());
+            }
+            std::thread::sleep(Duration::from_secs(180));
+        })
+        .ok();
+
     let state: Shared = std::sync::Arc::new(LibraryOriginState {
         roots,
         handles: Mutex::new(HashMap::new()),

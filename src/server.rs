@@ -908,15 +908,59 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // fall back to OpenSubtitles — the intended behaviour for a remote
     // source whose container we can't cheaply pre-probe for sub tracks.
     if req.title.is_some() && !is_local && !state.config.remote_origins.is_empty() {
+        // v3.6.3 cold-origin robustness. A remote origin's library often
+        // sits on a USB HDD that spins down when idle; its FIRST
+        // /library/match after a long gap blocks on drive spin-up (5-15s+).
+        // A bare short timeout there silently fell back to torrent (wrong
+        // source + wrong quality — the v3.6.2-era bug). Fix: distinguish
+        // "origin DOWN" from "origin UP, drive waking":
+        //   1. Liveness ping to /library/stream?h=<sentinel> — serve-library
+        //      answers 410 in ~1ms WITHOUT touching the library FS, proving
+        //      the origin process is reachable. Short timeout.
+        //   2. Origin reachable → /library/match with a GENEROUS timeout
+        //      that tolerates a worst-case cold spin-up: WAIT for the local
+        //      path rather than torrenting.
+        //   3. Liveness fails (timeout / conn refused) → origin genuinely
+        //      down → fall through fast to torrent.
+        // serve-library also self-warms its roots (see library_origin::run),
+        // so in steady state the drive is never cold and this is just
+        // belt-and-suspenders for post-Mac-wake / post-restart. Do NOT
+        // shrink MATCH_TIMEOUT back down — that reintroduces the silent
+        // torrent-fallback bug the user explicitly demanded gone.
+        const REMOTE_ORIGIN_PING_TIMEOUT_SECS: u64 = 2;
+        const REMOTE_ORIGIN_MATCH_TIMEOUT_SECS: u64 = 25;
         for origin in &state.config.remote_origins {
             let base = origin.trim_end_matches('/');
             let client = reqwest::Client::new();
+
+            // 1. Liveness ping (no library-FS access on the origin side).
+            let alive = matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(REMOTE_ORIGIN_PING_TIMEOUT_SECS),
+                    client
+                        .get(format!("{}/library/stream", base))
+                        .query(&[("h", "__spela_liveness__")])
+                        .send(),
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            if !alive {
+                tracing::warn!(
+                    "remote origin {} unreachable (liveness ping failed) — skipping (torrent fallback)",
+                    base
+                );
+                continue;
+            }
+
+            // 2. Origin is up; allow a generous window for a cold library
+            //    drive to spin up before the match returns.
             let mut q: Vec<(&str, String)> = vec![("title", title.clone())];
             if let Some(quality) = req.quality.as_deref() {
                 q.push(("quality", quality.to_string()));
             }
             let resp = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(REMOTE_ORIGIN_MATCH_TIMEOUT_SECS),
                 client
                     .get(format!("{}/library/match", base))
                     .query(&q)
@@ -947,9 +991,11 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 Ok(Err(e)) => {
                     tracing::warn!("remote origin {} /library/match failed: {}", base, e)
                 }
-                Err(_) => {
-                    tracing::warn!("remote origin {} /library/match timed out (2s)", base)
-                }
+                Err(_) => tracing::warn!(
+                    "remote origin {} /library/match timed out ({}s) despite liveness OK — torrent fallback",
+                    base,
+                    REMOTE_ORIGIN_MATCH_TIMEOUT_SECS
+                ),
             }
         }
     }
