@@ -1,5 +1,7 @@
 # Tasks: spela web remote
 
+> **STATUS (v3.7, shipped + deployed Darwin):** Phases 1-4 DONE — T-1, T-2, T-3, T-5, T-6, T-7, T-8, T-9, T-10, T-11, T-12 ✅; T-17 deploy ✅. **T-4 deferred** (poster enrichment — titled-fallback tile covers it; purely additive). **Remaining:** T-13 (Phase 5 My-Library view; `/library` backend live), T-14/T-15 (Phase 6 phone-direct; "This phone" is a disabled Phase-6 placeholder today), T-16 manual-e2e (in user testing), T-18 (TODO pointer — done). Portless `spela.home` access added beyond spec scope (LAN reverse-proxy + DNS rewrite + `allowed_hosts` + `/`→307; host-private infra).
+
 ## Overview
 - **Scope**: M (frontend is a single no-build asset; the real new backend work is `/library/list` + the `/library` aggregator).
 - **External blockers**: none for v1. Cold-BOHR latency is mitigated by reusing the v3.6.3 liveness+timeout pattern; the v3.6.3 **self-warm** deploy (tracked in `TODO.md`) makes My-Library snappier but is NOT a blocker.

@@ -1,7 +1,7 @@
 # Spela TODOs 🎬🍿
 
-### Web remote — SPEC'D, ready to build 🔧
-Dark, snappy, spela-served mobile SPA over the existing API. Full Kiro spec: `.claude/specs/web-remote/{requirements,design,tasks}.md` (May 17 2026). Decided: v1 = cast-remote **+** in-browser phone playback **+** "My Library" BOHR browse; hybrid search (top-pick + "more sources"). Only real new backend = `serve-library GET /library/list` + spela `GET /library` aggregator (reuse v3.6.3 liveness+timeout). Supersedes the "A. web remote" path in `PHONE_APP_PROJECT.md`; native iOS app remains the separate deferred track.
+### Web remote — Phases 1-4 SHIPPED (v3.7, deployed Darwin) · Phase 5-6 next 🔧
+Dark single-asset SPA at `/remote`, portless via a LAN reverse proxy (host-private infra). Full Kiro spec: `.claude/specs/web-remote/{requirements,design,tasks}.md`. **Done:** Phase 1 (`/remote` route), Phase 2 (`serve-library GET /library/list` + spela `GET /library` aggregator), Phase 3 (shell/grid/API-client), Phase 4 (search/hybrid-play/target-picker/now-playing/scrubber), bare-`/`→307 redirect. **Next:** Phase 5 = T-13 My-Library *view* (`/library` backend already live; render the grid + offline state); Phase 6 = T-14/15 in-browser phone-direct playback (the picker's "This phone" is a disabled Phase-6 placeholder today); T-4 poster enrichment **deferred** (TMDB-by-parsed-title; the titled fallback tile covers it — purely additive when picked up). Supersedes the "A. web remote" path in `PHONE_APP_PROJECT.md`; native iOS app remains the separate deferred track.
 
 ### v3.6.0 Local Library Streaming + v3.6.1 race-ahead + v3.6.2 tier-3 (SHIPPED May 16, 2026; ONE user step pending) 🔧
 
