@@ -7,7 +7,7 @@ description = "AI-agent-ready media controller — search, stream, cast"
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "charset", "rustls-tls-webpki-roots-no-provider"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
@@ -41,6 +41,14 @@ librqbit = { version = "8.1", default-features = false, features = ["rust-tls"] 
 #    Rustls crate features."
 # The panic poisons whatever mutex the panicking task was holding, cascading
 # into PoisonError on every subsequent `.lock().unwrap()`.
+# May 18, 2026: reqwest pinned to `rustls-tls-webpki-roots-no-provider`
+# (default-features off → no `default-tls`/native-tls/openssl-sys). This
+# (a) unifies the whole binary on ONE TLS stack = rustls + the aws-lc-rs
+# process-default installed in main.rs (the `-no-provider` variant brings
+# NO bundled provider, so it can't reintroduce the ring-vs-aws-lc-rs
+# multi-provider panic above), and (b) removes openssl-sys, which has no
+# aarch64 dev libs in the cross-rs image and blocked the Shannon
+# thin-renderer (kiosk Phase 7) cross-build.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
 # May 7, 2026: explicit dep for `parse_episode_markers` in src/search.rs and
