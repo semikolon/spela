@@ -142,6 +142,19 @@ impl SearchEngine {
             "https://api.themoviedb.org/3/search/multi?query={}&api_key={}",
             q, self.tmdb_key
         ));
+        // Rank candidates by orthographic similarity to the cleaned
+        // query instead of blindly taking the first poster-bearing hit.
+        // This both recovers typos ("American Psyco" ~ "American Psycho",
+        // sim ~0.93) AND fixes a latent correctness bug — a typo'd query
+        // that fuzzy-returned a *wrong* film with a poster used to yield
+        // that wrong poster. Below ACCEPT we return None: a titled
+        // fallback (AC-3.2) is strictly better than a confidently-wrong
+        // poster. Snappy: a near-exact hit (>= STRONG) early-returns and
+        // skips the remaining attempts, so the common case is 1 call.
+        const STRONG: f32 = 0.90;
+        const ACCEPT: f32 = 0.72;
+        let want = title_norm(title);
+        let mut best: Option<(f32, String)> = None;
         for url in urls {
             let Ok(resp) = self.client.get(&url).send().await else {
                 continue;
@@ -149,15 +162,28 @@ impl SearchEngine {
             let Ok(v) = resp.json::<Value>().await else {
                 continue;
             };
-            if let Some(arr) = v["results"].as_array() {
-                for item in arr {
-                    if let Some(p) = tmdb_poster_url(item["poster_path"].as_str()) {
-                        return Some(p);
-                    }
+            let Some(arr) = v["results"].as_array() else {
+                continue;
+            };
+            for item in arr {
+                let Some(poster) = tmdb_poster_url(item["poster_path"].as_str()) else {
+                    continue;
+                };
+                let cand = item["title"]
+                    .as_str()
+                    .or_else(|| item["name"].as_str())
+                    .or_else(|| item["original_title"].as_str())
+                    .unwrap_or("");
+                let s = title_similarity(&want, &title_norm(cand));
+                if s >= STRONG {
+                    return Some(poster);
+                }
+                if best.as_ref().is_none_or(|(bs, _)| s > *bs) {
+                    best = Some((s, poster));
                 }
             }
         }
-        None
+        best.filter(|(s, _)| *s >= ACCEPT).map(|(_, p)| p)
     }
 
     pub async fn search(
@@ -1002,6 +1028,61 @@ fn clean_title_for_tmdb(raw: &str) -> String {
     out.join(" ").trim().to_string()
 }
 
+/// Web-remote T-4: normalise a title for similarity comparison — lowercase, every non-alphanumeric run to a single space, trimmed. Pure.
+fn title_norm(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = true; // leading-space suppression
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Web-remote T-4: char-level Levenshtein edit distance (unicode-safe; titles are short so O(n*m) is trivial). Pure.
+fn levenshtein(a: &[char], b: &[char]) -> usize {
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Web-remote T-4: orthographic similarity in [0,1] = 1 - lev/maxlen. 1.0 = identical; ~0.93 for a single-char typo in a ~15-char title; garbage scores well under the ACCEPT floor. Pure.
+fn title_similarity(a: &str, b: &str) -> f32 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let (ac, bc): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let max = ac.len().max(bc.len());
+    if max == 0 {
+        return 0.0;
+    }
+    1.0 - (levenshtein(&ac, &bc) as f32 / max as f32)
+}
+
 fn tmdb_poster_url(poster_path: Option<&str>) -> Option<String> {
     let path = poster_path?.trim();
     if path.is_empty() {
@@ -1298,6 +1379,41 @@ mod tests {
             clean_title_for_tmdb("2001 A Space Odyssey 1080p BluRay"),
             "2001 A Space Odyssey"
         );
+    }
+
+    // T-4 typo-tolerance — orthographic similarity gates poster
+    // acceptance. Pure, deterministic. Mirrors the real "American Psyco"
+    // miss + the latent wrong-poster correctness concern.
+    #[test]
+    fn title_norm_strips_punct_and_lowercases() {
+        assert_eq!(title_norm("American Psyco!!"), "american psyco");
+        assert_eq!(title_norm("The.Third_Man  (1949)"), "the third man 1949");
+        assert_eq!(title_norm("  Spirited—Away  "), "spirited away");
+    }
+
+    #[test]
+    fn title_similarity_recovers_typo_rejects_garbage() {
+        // Identical → 1.0 (the >= STRONG 0.90 fast-path).
+        assert!((title_similarity("american psycho", "american psycho") - 1.0).abs() < 1e-6);
+        // One-char typo in a ~15-char title → well above ACCEPT (0.72),
+        // below STRONG (so it ranks rather than early-outs).
+        let s = title_similarity("american psyco", "american psycho");
+        assert!(s > 0.85 && s < 1.0, "typo sim was {s}");
+        // Coincidental wrong film → far below ACCEPT → titled fallback,
+        // never a confidently-wrong poster.
+        assert!(
+            title_similarity("american psyco", "the godfather") < 0.5,
+            "garbage must score < ACCEPT"
+        );
+    }
+
+    #[test]
+    fn levenshtein_basic() {
+        let c = |s: &str| s.chars().collect::<Vec<_>>();
+        assert_eq!(levenshtein(&c("abc"), &c("abc")), 0);
+        assert_eq!(levenshtein(&c("abc"), &c("axc")), 1);
+        assert_eq!(levenshtein(&c("psyco"), &c("psycho")), 1);
+        assert_eq!(levenshtein(&c(""), &c("abc")), 3);
     }
 
     #[test]
