@@ -455,10 +455,10 @@ function attachPhoneVideo(v,src){
 /* ---------- My Library (Phase 5 / US-3) ---------- */
 async function doPlayLibrary(entry){
   if(!S.target){ S.pending=()=>doPlayLibrary(entry); toast("Pick where to play — it starts right after"); openSheet(); return; }
-  if(S.target.kind==="phone"){ return doPhoneDirect({title:entry.raw_name},null,entry.title); }
+  if(S.target.kind==="phone"){ return doPhoneDirect({title:entry.raw_name,poster_url:entry.poster_url},null,entry.title); }
   toast(`Starting ${entry.title} on ${S.target.name}…`);
   let r;
-  try{ r=await api("/play",{method:"POST",body:{title:entry.raw_name,target:"chromecast",cast_name:S.target.name}}); }
+  try{ r=await api("/play",{method:"POST",body:{title:entry.raw_name,poster_url:entry.poster_url,target:"chromecast",cast_name:S.target.name}}); }
   catch{ toast("spela unreachable"); return; }
   if(r&&r.error){ toast("Couldn’t play: "+r.error); return; }
   toast("Playing — opening now-playing");
