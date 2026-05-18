@@ -277,7 +277,8 @@ const S={
   library:{data:null,loading:false},
   now:{data:null,posAbs:0,dur:0,frontier:0,endlist:false,playing:false,lastSync:0,
        everRan:false,cold:false,seekDrag:false,phone:false},
-  pollTimer:null, frontierTimer:null
+  pollTimer:null, frontierTimer:null,
+  pending:null   // deferred play: tapped before a target was set → picker → resume
 };
 
 /* ---------- API client (abortable; network err -> banner) ---------- */
@@ -400,7 +401,7 @@ const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",
 
 /* ---------- hybrid play ---------- */
 async function doPlay(opts,cardForSources){
-  if(!S.target){ toast("Pick where to play first"); openSheet(); return; }
+  if(!S.target){ S.pending=()=>doPlay(opts,cardForSources); toast("Pick where to play — it starts right after"); openSheet(); return; }
   if(S.target.kind==="phone"){ return doPhoneDirect(opts,cardForSources,(S.search.data&&S.search.data.show&&S.search.data.show.title)||""); }
   const body={...opts,target:"chromecast",cast_name:S.target.name};
   toast(`Starting on ${S.target.name}…`);
@@ -453,7 +454,7 @@ function attachPhoneVideo(v,src){
 
 /* ---------- My Library (Phase 5 / US-3) ---------- */
 async function doPlayLibrary(entry){
-  if(!S.target){ toast("Pick where to play first"); openSheet(); return; }
+  if(!S.target){ S.pending=()=>doPlayLibrary(entry); toast("Pick where to play — it starts right after"); openSheet(); return; }
   if(S.target.kind==="phone"){ return doPhoneDirect({title:entry.raw_name},null,entry.title); }
   toast(`Starting ${entry.title} on ${S.target.name}…`);
   let r;
@@ -524,7 +525,7 @@ function tgtLabel(){ const t=S.target; const b=$("#tgtBtn");
   b.classList.toggle("set",!!t); }
 tgtLabel();
 $("#tgtBtn").onclick=openSheet;
-$("#scrim").onclick=closeSheet;
+$("#scrim").onclick=()=>{ S.pending=null; closeSheet(); };  // dismiss w/o picking → drop the deferred play
 function closeSheet(){ $("#sheet").classList.remove("on"); $("#scrim").classList.remove("on"); }
 function openSheet(){
   $("#sheet").classList.add("on"); $("#scrim").classList.add("on");
@@ -539,20 +540,22 @@ function openSheet(){
       const o=el("button",{className:"topt"});
       o.innerHTML=`<span class="ic">📺</span><span><span class="nm">${esc(d2.name)}</span><br><span class="md">${esc(d2.model||"Chromecast")}</span></span>`;
       if(S.target&&S.target.kind==="chromecast"&&S.target.name===d2.name) o.classList.add("sel");
-      o.onclick=()=>{ const moving=!!S.now.data;
+      o.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
         S.target={kind:"chromecast",name:d2.name};
         sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
-        if(moving) toast("Single stream — your next play moves it to "+d2.name); };
+        if(resume) resume();   // the play the user originally tapped now fires (to this target)
+        else if(moving) toast("Single stream — your next play moves it to "+d2.name); };
       list.appendChild(o);
     });
     // "This phone" — in-browser HLS playback (Phase 6 / US-5).
     const ph=el("button",{className:"topt"});
     ph.innerHTML=`<span class="ic">📱</span><span><span class="nm">This phone</span><br><span class="md">watch in-browser</span></span>`;
     if(S.target&&S.target.kind==="phone") ph.classList.add("sel");
-    ph.onclick=()=>{ const moving=!!S.now.data;
+    ph.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
       S.target={kind:"phone",name:"This phone"};
       sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
-      if(moving) toast("Single stream — your next play moves it here, off the TV"); };
+      if(resume) resume();   // the play the user originally tapped now fires (to this phone)
+      else if(moving) toast("Single stream — your next play moves it here, off the TV"); };
     list.appendChild(ph);
   }).catch(()=>{ list.innerHTML=`<div class="state">spela unreachable — can’t list targets.</div>`; });
 }

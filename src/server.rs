@@ -761,6 +761,31 @@ async fn handle_play(
     Json(json!({"error": "All retry attempts failed"}))
 }
 
+/// Caller-facing error when a play request reaches the torrent fallback
+/// with no usable magnet. Two distinct cases want different guidance:
+///
+/// * `has_title == true` — a title-only request (My-Library tap / AC-3.3,
+///   or `spela play "<title>"`) that matched nothing in the local library
+///   or any reachable remote origin and carries no torrent to fall back
+///   to. "Missing magnet" is meaningless to that user; tell them no
+///   playable source was found.
+/// * `has_title == false` — a raw `/play` with neither magnet nor
+///   `result_id`: the original CLI-oriented guidance is still correct.
+///
+/// May 19, 2026: introduced when `do_play`'s unconditional magnet gate
+/// was moved from a precondition to the `if !is_local` torrent branch —
+/// the precondition had made the entire My-Library bridge structurally
+/// unreachable (every title-only tap died here before serve-library was
+/// ever consulted). See the gate-deferral comment in `do_play`.
+pub(crate) const fn magnet_required_error(has_title: bool) -> &'static str {
+    if has_title {
+        "Couldn't play: no playable source found for this title — it isn't in your library, \
+         no library origin is reachable, and there's no torrent/magnet to fall back to."
+    } else {
+        "Missing magnet. Use 'spela play <N>' with a result number, or pass a magnet link."
+    }
+}
+
 async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     let mut media_dir = state.media_dir.clone();
     if media_dir.to_string_lossy().starts_with("~/") {
@@ -834,21 +859,25 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         }
     }
 
-    let magnet = match &req.magnet {
-        Some(m) if !m.is_empty() => m.clone(),
-        _ => {
-            return Json(
-                json!({"error": "Missing magnet. Use 'spela play <N>' with a result number, or pass a magnet link."}),
-            )
+    // May 19, 2026: the magnet is a TORRENT-PATH concern, NOT a do_play
+    // precondition. A title-only request (My-Library tap / AC-3.3:
+    // `{title,target}`, no magnet/result_id) MUST flow through the
+    // local-library scan + remote-origin bridge below; a magnet is only
+    // genuinely required if NO library/remote source is found and we
+    // fall back to starting a torrent. The old unconditional gate here
+    // made the entire My-Library bridge structurally unreachable —
+    // every library tap died with "Missing magnet" before serve-library
+    // was ever consulted. The requirement now lives at its real point of
+    // need: the `if !is_local` torrent branch (see `magnet_required_error`).
+    let magnet: Option<String> = req.magnet.as_ref().filter(|m| !m.is_empty()).cloned();
+    // SSRF defense (Apr 30, 2026): librqbit's add_torrent fetches
+    // http(s):// URLs as .torrent files — an SSRF pivot on the
+    // unauthenticated surface. Validate ONLY when a magnet was actually
+    // supplied; a title-only library play has nothing to validate.
+    if let Some(m) = &magnet {
+        if let Err(e) = torrent_engine::validate_magnet_uri(m) {
+            return Json(json!({"error": format!("Invalid magnet: {}", e)}));
         }
-    };
-    // Apr 30, 2026 SSRF defense: librqbit's add_torrent fetches
-    // http(s):// URLs as .torrent files. With the unauthenticated HTTP
-    // surface, that's an SSRF pivot — see torrent_engine::validate_magnet_uri.
-    // Reject at the HTTP boundary so the rejection error reaches the caller
-    // cleanly (not buried in a librqbit error).
-    if let Err(e) = torrent_engine::validate_magnet_uri(&magnet) {
-        return Json(json!({"error": format!("Invalid magnet: {}", e)}));
     }
 
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
@@ -1060,12 +1089,21 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // (`http://stream_host:port/torrent/{id}/stream/{file_idx}` —
     // FileStream-backed via librqbit, served on the same axum router).
     if !is_local {
+        // No local-library or remote-origin source was found. A torrent
+        // is the only remaining path, so the magnet is genuinely
+        // required HERE — deferred from the old unconditional gate that
+        // had made the My-Library bridge unreachable (see above).
+        let Some(magnet) = magnet.as_deref() else {
+            return Json(json!({
+                "error": magnet_required_error(req.title.is_some())
+            }));
+        };
         // Disk check: only required if we are going to start a NEW download
         if let Ok(Some(err)) = disk::check_space(&media_dir) {
             return Json(json!({"error": err}));
         }
 
-        let result = match start_torrent_for_play(state, &magnet, req.file_index).await {
+        let result = match start_torrent_for_play(state, magnet, req.file_index).await {
             Ok(r) => r,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
@@ -1592,7 +1630,10 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // Chromecast directly, so an attacker-controlled URL becomes a
     // probe vector via the TV's request log.
     app_state.current = Some(CurrentStream {
-        magnet: magnet.clone(),
+        // Empty when this is a library / remote-origin bridge play (no
+        // torrent fallback) — consistent with the `pid == 0` Local-Bypass
+        // convention. A torrent play always has Some(magnet) here.
+        magnet: magnet.clone().unwrap_or_default(),
         title: title.clone(),
         show: req.show.clone(),
         season: req.season,
@@ -5583,6 +5624,37 @@ fn cast_result_to_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- May 19, 2026: My-Library tap-to-play regression ---
+    // do_play's magnet gate used to fire BEFORE the local-library /
+    // remote-origin bridge scan, so every title-only My-Library tap
+    // (`{title,target}`, no magnet — exactly AC-3.3) died with
+    // "Missing magnet" before serve-library was ever consulted. The
+    // magnet is now required only at the torrent fallback; these pin
+    // the caller-facing contract of that deferred requirement.
+
+    #[test]
+    fn magnet_required_error_is_library_aware_when_title_present() {
+        let msg = magnet_required_error(true);
+        assert!(
+            !msg.contains("Missing magnet"),
+            "a title-only library tap that matched no source must NOT show the \
+             torrent-centric 'Missing magnet' message — got: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("library") || msg.to_lowercase().contains("source"),
+            "library-miss message must explain no playable source was found — got: {msg}"
+        );
+    }
+
+    #[test]
+    fn magnet_required_error_keeps_classic_guidance_without_title() {
+        // Raw `/play` with neither magnet nor result_id nor title:
+        // the original CLI-oriented guidance is still the right help.
+        let msg = magnet_required_error(false);
+        assert!(msg.contains("Missing magnet"));
+        assert!(msg.contains("spela play <N>"));
+    }
 
     // --- Input validation (Apr 30, 2026 — security audit cluster) ---
 
