@@ -1,6 +1,6 @@
 # Tasks: spela web remote
 
-> **STATUS (v3.7, shipped + deployed Darwin) — v1 FEATURE-COMPLETE:** Phases 1-6 DONE — T-1, T-2, T-3, T-5, T-6, T-7, T-8, T-9, T-10, T-11, T-12, T-13, T-14, T-15 ✅; T-17 deploy ✅; T-18 ✅. **T-4 deferred** (poster enrichment — titled-fallback covers it; purely additive). **T-16** real-device e2e = ongoing via the user's normal use (pause/resume bug found this way + fixed). Beyond spec scope: portless `spela.home` (LAN reverse-proxy + DNS rewrite + `allowed_hosts` + `/`→307; host-private) and a successor systemic-HTTPS spec (`~/dotfiles/docs/lan_https_dns01_wildcard_spec_2026_05_18.md`). Known data-gating: My-Library is empty until the Mac serve-library `/library/list` TCC follow-up.
+> **STATUS (v3.7, shipped + deployed Darwin) — v1 FEATURE-COMPLETE:** **ALL TASKS DONE** — T-1..T-18 ✅ (T-4 TMDB poster enrichment shipped+deployed 2026-05-18). **T-16** real-device e2e = ongoing via the user's normal use (pause/resume bug found this way + fixed). Beyond spec scope: portless `spela.home` + the now-LIVE systemic-HTTPS successor (`https://spela.fredrikbranstrom.se`, spec `~/dotfiles/docs/lan_https_dns01_wildcard_spec_2026_05_18.md`). My-Library is **LIVE**: the Mac serve-library was a stale binary missing `/library/list` (NOT a "TCC follow-up" — that framing was a misattribution); rebuilt+restarted 2026-05-18 → 57 films + T-4 posters end-to-end. Only open follow-up: serve-library's TCC grant is code-signature-keyed so a Mac rebuild revokes it (re-Allow needed) — stable-codesign durability fix tracked at `TODO.md` "TCC durability hardening".
 
 ## Overview
 - **Scope**: M (frontend is a single no-build asset; the real new backend work is `/library/list` + the `/library` aggregator).
@@ -16,7 +16,7 @@
 ## Phase 2 — Backend: My Library endpoints (US-3, the only substantial new backend)
 - [ ] **T-2**: `serve-library` `GET /library/list` — enumerate the configured roots (reuse the same root-walk as `/library/match`; include the `Demeter…/` films + `…/TV`), return `[LibraryEntry]` (title/year parsed from raw_name, size, container, raw_name). No absolute-path leakage. Depends: none (sibling of existing match).
 - [ ] **T-3**: spela `GET /library` aggregator — fan out to `config.remote_origins` `/library/list` + local `config.library_dirs`; **reuse the v3.6.3 liveness-ping (2 s, no-FS) + generous (25 s) timeout** so a cold/absent origin yields `origin_status:"offline"` not a hang/empty; merge entries. Depends: T-2.
-- [ ] **T-4**: Poster enrichment — for each `LibraryEntry`, best-effort TMDB lookup by parsed title (reuse the existing TMDB client used by search/ranker); in-memory cache per scan; `poster_url: None` on miss (frontend renders a clean titled tile). Depends: T-3.
+- [x] **T-4** ✅ (2026-05-18): `SearchEngine::movie_poster` (fail-soft, one `/search/movie`, reuses `tmdb_search`+`tmdb_poster_url`) + `handle_library` enriches per UNIQUE title with per-scan dedupe + bounded `JoinSet` concurrency. `None` on miss → titled fallback (AC-3.2). Verified live: 57 entries, 35 TMDB-resolved. Frontend already rendered `e.poster_url` — zero frontend change.
 
 ## Phase 3 — Frontend shell (NFR-1 foundation)
 - [ ] **T-5**: `remote.html` dark SPA shell — inline critical CSS (instant dark, no flash), system font stack, hash-routed views (Search / Library / Now-Playing), zero framework. Depends: T-1.
