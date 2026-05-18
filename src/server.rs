@@ -4078,43 +4078,46 @@ async fn handle_library(State(state): State<SharedState>) -> Json<Value> {
 
     // Web-remote T-4: best-effort TMDB poster enrichment. Entries arrive
     // `poster_url: None` (serve-library is keyless; local enumerate sets
-    // None). One `/search/movie` per UNIQUE lowercased title (per-scan
-    // dedupe cache), bounded concurrency via tokio JoinSet (no extra
-    // dep) so a 50+ film library doesn't serialise into a multi-second
-    // wall. Fully fail-soft: any miss leaves `None` → SPA titled
-    // fallback (AC-3.2). No-ops when TMDB key unset (movie_poster guards).
+    // None). One lookup per UNIQUE (lowercased title, year) — keyed with
+    // the year so same-title remakes don't share a poster — via a
+    // per-scan dedupe cache + bounded concurrency (tokio JoinSet, no
+    // extra dep) so a 50+ film library doesn't serialise into a
+    // multi-second wall. `movie_poster` itself is snappy (year-precise
+    // first call; /search/multi fallback only on a miss). Fully
+    // fail-soft: any miss leaves `None` → SPA titled fallback (AC-3.2).
+    // No-ops when TMDB key unset (movie_poster guards).
     if !library.is_empty() {
         let engine = std::sync::Arc::new(crate::search::SearchEngine::new(
             state.config.tmdb_api_key.clone(),
         ));
-        let mut want: Vec<String> = library
+        let mut want: Vec<(String, Option<u32>)> = library
             .iter()
             .filter(|e| e.poster_url.is_none())
-            .map(|e| e.title.to_lowercase())
+            .map(|e| (e.title.to_lowercase(), e.year))
             .collect();
         want.sort();
         want.dedup();
-        let mut posters: std::collections::HashMap<String, String> =
+        let mut posters: std::collections::HashMap<(String, Option<u32>), String> =
             std::collections::HashMap::new();
         for chunk in want.chunks(8) {
             let mut set = tokio::task::JoinSet::new();
-            for title in chunk {
+            for key in chunk {
                 let engine = engine.clone();
-                let title = title.clone();
+                let key = key.clone();
                 set.spawn(async move {
-                    let p = engine.movie_poster(&title).await;
-                    (title, p)
+                    let p = engine.movie_poster(&key.0, key.1).await;
+                    (key, p)
                 });
             }
             while let Some(joined) = set.join_next().await {
-                if let Ok((title, Some(url))) = joined {
-                    posters.insert(title, url);
+                if let Ok((key, Some(url))) = joined {
+                    posters.insert(key, url);
                 }
             }
         }
         for e in library.iter_mut() {
             if e.poster_url.is_none() {
-                if let Some(url) = posters.get(&e.title.to_lowercase()) {
+                if let Some(url) = posters.get(&(e.title.to_lowercase(), e.year)) {
                     e.poster_url = Some(url.clone());
                 }
             }

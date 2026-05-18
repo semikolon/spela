@@ -95,20 +95,58 @@ impl SearchEngine {
         }
     }
 
-    /// Web-remote T-4: best-effort TMDB poster for a library entry by its
-    /// parsed title. Fully fail-soft — empty key / blank title / no hit /
-    /// network error all yield `None`, and the SPA renders a clean titled
-    /// fallback tile (AC-3.2). One `/search/movie` call; the first hit
-    /// already carries `poster_path`, so no movie-details round-trip.
-    /// Reuses `tmdb_search` + `tmdb_poster_url` — no new TMDB surface.
-    pub async fn movie_poster(&self, title: &str) -> Option<String> {
+    /// Web-remote T-4: best-effort TMDB poster for a library entry by
+    /// parsed title (+ parsed year when known). Fully fail-soft — empty
+    /// key / blank title / no hit / network error all yield `None`, and
+    /// the SPA renders a clean titled fallback tile (AC-3.2). Snappy:
+    /// returns at the FIRST hit; the extra attempts fire ONLY on a miss.
+    /// Research-tuned 2026-05-18: lifts the title-only ~61% by
+    /// disambiguating remakes/typos/foreign + catching TV-classified
+    /// entries, all on the existing TMDB key, no new dep. Attempt order
+    /// (a) `/search/movie` + `&year=` when year known (best precision),
+    /// then (b) `/search/movie` no year (release-name years are often
+    /// off-by-one vs TMDB `primary_release_year`), then (c)
+    /// `/search/multi` (catches TMDB-as-TV / alt media; person results
+    /// carry no `poster_path` so are skipped). First poster-bearing
+    /// result wins; no movie-details round-trip (search hits already
+    /// carry `poster_path`); does NOT touch the stabilised `tmdb_search`
+    /// used by the main search/ranker path.
+    pub async fn movie_poster(&self, title: &str, year: Option<u32>) -> Option<String> {
         if self.tmdb_key.is_empty() || title.trim().is_empty() {
             return None;
         }
-        match self.tmdb_search(title, "movie").await {
-            Ok(hit) => tmdb_poster_url(hit["poster_path"].as_str()),
-            Err(_) => None,
+        let q = urlencoded(title);
+        let mut urls: Vec<String> = Vec::with_capacity(3);
+        if let Some(y) = year {
+            urls.push(format!(
+                "https://api.themoviedb.org/3/search/movie?query={}&year={}&api_key={}",
+                q, y, self.tmdb_key
+            ));
         }
+        urls.push(format!(
+            "https://api.themoviedb.org/3/search/movie?query={}&api_key={}",
+            q, self.tmdb_key
+        ));
+        urls.push(format!(
+            "https://api.themoviedb.org/3/search/multi?query={}&api_key={}",
+            q, self.tmdb_key
+        ));
+        for url in urls {
+            let Ok(resp) = self.client.get(&url).send().await else {
+                continue;
+            };
+            let Ok(v) = resp.json::<Value>().await else {
+                continue;
+            };
+            if let Some(arr) = v["results"].as_array() {
+                for item in arr {
+                    if let Some(p) = tmdb_poster_url(item["poster_path"].as_str()) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub async fn search(
@@ -1085,14 +1123,14 @@ mod tests {
     #[tokio::test]
     async fn movie_poster_empty_key_is_none_no_network() {
         let e = SearchEngine::new(String::new());
-        assert_eq!(e.movie_poster("Blade Runner").await, None);
+        assert_eq!(e.movie_poster("Blade Runner", Some(1982)).await, None);
     }
 
     #[tokio::test]
     async fn movie_poster_blank_title_is_none_no_network() {
         let e = SearchEngine::new("dummy-key-never-used".into());
-        assert_eq!(e.movie_poster("   ").await, None);
-        assert_eq!(e.movie_poster("").await, None);
+        assert_eq!(e.movie_poster("   ", None).await, None);
+        assert_eq!(e.movie_poster("", Some(2000)).await, None);
     }
 
     #[test]
