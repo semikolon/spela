@@ -160,6 +160,57 @@
   .topt.sel{border-color:var(--accent);background:var(--accent2)}
   .topt .tag{margin-left:auto;font-size:.68rem;color:var(--dim2);border:1px solid var(--line);
     border-radius:6px;padding:.1rem .35rem}
+
+  /* ===== Movie-night touch overrides (2026-05-18) =====================
+     Research-backed: WCAG 2.5.5 AAA / Apple HIG = 44px min; this is a
+     dim-room one-handed phone remote, so primary targets go WELL beyond
+     (Fitts's law: bigger + spaced + edge-anchored = faster, fewer
+     mistaps). Appended → later-cascade wins, original design intact,
+     behaviour unchanged. touch-action:manipulation kills the 300ms tap
+     delay + double-tap-zoom (snappier); inputs stay >=16px (no iOS
+     focus-zoom); strong :active since touchless = no hover. */
+  button,a,input,.card,.src,.topt,[role=button]{touch-action:manipulation}
+  html,body{font-size:17px}
+  nav{gap:.25rem;padding:.28rem}
+  nav a{min-height:46px;display:flex;align-items:center;padding:.55rem 1.05rem;font-size:1rem}
+  .seg button{min-height:46px;display:flex;align-items:center;padding:.5rem 1.15rem;font-size:1rem}
+  .searchbar input{min-height:56px;font-size:1.05rem;padding:1rem 1.1rem}
+  .tgt{min-height:44px;font-size:.92rem;padding:.5rem .8rem}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:1rem}
+  .card .play{min-height:56px;display:flex;align-items:center;justify-content:center;
+    margin:.6rem .7rem .75rem;font-size:1.02rem;border-radius:12px}
+  .card .play:active{transform:scale(.97);background:var(--accent)}
+  .src-toggle{min-height:44px;display:flex;align-items:center;justify-content:center;font-size:.92rem}
+  .src{min-height:56px;font-size:.9rem;padding:.7rem .8rem;gap:.7rem}
+  .src:active{transform:scale(.985);border-color:var(--accent)}
+  .srcbtn{min-height:48px;font-size:.95rem;padding:.6rem 1.1rem}
+  .meta .t{font-size:1.02rem}
+  .meta .y{font-size:.86rem}
+  #nowbar{padding:.7rem .8rem calc(.7rem + var(--safe-b));gap:.7rem}
+  #nowbar .mp{width:52px;height:52px}
+  #nowbar .nt .a{font-size:.98rem}
+  #nowbar .nt .b{font-size:.82rem}
+  .tbtn{width:60px;height:60px;font-size:1.5rem}
+  .tbtn:active{transform:scale(.92);background:var(--accent)}
+  .tbtn.big{width:88px;height:88px;font-size:2.1rem}
+  .scrub{width:min(94vw,460px)}
+  .scrub .rail{height:12px;border-radius:6px}
+  .scrub input{min-height:48px;margin:.1rem 0 0}
+  .scrub .times{font-size:.9rem;margin-top:.35rem}
+  .transport{gap:1.1rem;margin-top:.6rem}
+  .nowfull h2{font-size:1.5rem}
+  .nowfull .bigposter{width:min(68vw,300px)}
+  .topt{min-height:64px;padding:1rem;font-size:1rem}
+  .topt .ic{font-size:1.5rem}
+  .topt .nm{font-size:1.02rem}
+  .state{padding:3.5rem 1rem;font-size:1.02rem}
+  .state .big{font-size:1.25rem}
+  .starting{font-size:1.05rem}
+  .spin{width:34px;height:34px}
+  .banner{min-height:52px;font-size:.95rem}
+  .banner button{min-height:40px;padding:.45rem 1rem}
+  main{padding-bottom:9rem}
+  @media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 </style>
 </head>
 <body>
@@ -198,7 +249,7 @@
 <div id="nowbar">
   <img class="mp" id="nbPoster" alt="">
   <div class="nt"><div class="a" id="nbTitle">—</div><div class="b" id="nbState">—</div></div>
-  <button class="tbtn" id="nbRestart" title="Restart">⏮</button>
+  <button class="tbtn" id="nbRestart" title="Restart from start" aria-label="Restart from start">↺</button>
   <button class="tbtn" id="nbPlay" title="Play/Pause">⏸</button>
   <button class="tbtn" id="nbExpand" title="Open player">▣</button>
 </div>
@@ -638,11 +689,11 @@ function renderNowFull(){
       <div class="times"><span id="fCur">${fmt(pos)}</span><span>${fmt(S.now.dur)}</span></div>
     </div>
     <div class="transport">
-      <button class="tbtn" id="tPrev" title="Previous">⏮⏮</button>
-      <button class="tbtn" id="tRestart" title="Restart">⏮</button>
-      <button class="tbtn big" id="tPlay">${S.now.playing?"⏸":"▶"}</button>
-      <button class="tbtn" id="tStop" title="Stop">⏹</button>
-      <button class="tbtn" id="tNext" title="Next">⏭⏭</button>
+      <button class="tbtn" id="tPrev" title="Previous episode" aria-label="Previous episode">⏮</button>
+      <button class="tbtn" id="tRestart" title="Restart from start" aria-label="Restart from start">↺</button>
+      <button class="tbtn big" id="tPlay" aria-label="Play/Pause">${S.now.playing?"⏸":"▶"}</button>
+      <button class="tbtn" id="tStop" title="Stop" aria-label="Stop">⏹</button>
+      <button class="tbtn" id="tNext" title="Next episode" aria-label="Next episode">⏭</button>
     </div>
     ${!S.now.endlist&&S.now.frontier?`<div class="sub">Seekable up to ${fmt(S.now.frontier)} (still transcoding)</div>`:""}
   </div>`;
