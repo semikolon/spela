@@ -156,8 +156,13 @@ impl SearchEngine {
         // AC-3.2, is strictly better than a confidently-wrong poster).
         // Snappy: a full-containment hit (== STRONG) early-returns and
         // skips the remaining attempts, so the common case is 1 call.
+        // ACCEPT is intentionally a hair above zero: take the BEST-overlap
+        // poster across all attempts, rejecting only true zero-overlap
+        // garbage. This preserves blind-first recall (best-of >= first-of)
+        // while adding typo recovery + better selection — per the user's
+        // stated priority (more posters), not a stricter rejection.
         const STRONG: f32 = 1.0;
-        const ACCEPT: f32 = 0.67;
+        const ACCEPT: f32 = 0.01;
         let want = title_norm(title);
         let mut best: Option<(f32, String)> = None;
         for url in urls {
@@ -1088,13 +1093,23 @@ fn title_similarity(a: &str, b: &str) -> f32 {
     1.0 - (levenshtein(&ac, &bc) as f32 / max as f32)
 }
 
-/// Web-remote T-4: asymmetric token containment — fraction of `query` words that fuzzy-appear (per-word char-sim >= 0.80) among `cand` words. 1.0 = every query word matched (the canonical title may add more). Right metric for release-cleaned-query vs canonical-title; tolerates typos AND length/subset differences. Pure.
+/// Web-remote T-4: stopword-filtered asymmetric token containment — fraction of meaningful `query` words that fuzzy-appear (per-word char-sim >= 0.80) among `cand` words. 1.0 = every meaningful query word matched (the canonical title may add more). Stopwords ({the,of,a,an,and,to,in,on,&}) are dropped so common-word coincidence ("the godfather"~"the matrix") doesn't score; if a side is all-stopwords it falls back unfiltered (titles like "It"/"Up"). Right metric for release-cleaned-query vs canonical-title — tolerates typos AND length/subset differences. Pure.
 fn title_token_score(query: &str, cand: &str) -> f32 {
-    let q: Vec<&str> = query.split_whitespace().collect();
+    fn toks(s: &str) -> Vec<&str> {
+        const STOP: [&str; 9] = ["the", "of", "a", "an", "and", "to", "in", "on", "&"];
+        let all: Vec<&str> = s.split_whitespace().collect();
+        let kept: Vec<&str> = all.iter().copied().filter(|w| !STOP.contains(w)).collect();
+        if kept.is_empty() {
+            all
+        } else {
+            kept
+        }
+    }
+    let q = toks(query);
     if q.is_empty() {
         return 0.0;
     }
-    let c: Vec<&str> = cand.split_whitespace().collect();
+    let c = toks(cand);
     let hits = q
         .iter()
         .filter(|qt| c.iter().any(|ct| title_similarity(qt, ct) >= 0.80))
@@ -1457,9 +1472,13 @@ mod tests {
                 < 1e-6,
             "query-subset-of-canonical must be full containment"
         );
-        // Extra canonical words never hurt; partial query match scores
-        // proportionally and stays below ACCEPT (0.67) for true garbage.
-        assert!(title_token_score("american psyco", "the godfather") < 0.34);
+        // True garbage → 0.0 (no meaningful word overlaps) → below the
+        // hair-above-zero ACCEPT → titled fallback, never a wrong poster.
+        assert_eq!(title_token_score("american psyco", "the godfather"), 0.0);
+        // Stopword anti-coincidence: a shared "the" must NOT score —
+        // otherwise the low ACCEPT would accept "The Matrix" for "The
+        // Godfather". Meaningful words (godfather vs matrix) don't match.
+        assert_eq!(title_token_score("the godfather", "the matrix"), 0.0);
         assert_eq!(title_token_score("", "anything"), 0.0);
     }
 
