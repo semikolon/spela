@@ -115,6 +115,17 @@ impl SearchEngine {
         if self.tmdb_key.is_empty() || title.trim().is_empty() {
             return None;
         }
+        // Strip scene-release noise (SxxExx, resolution/source/codec/tags,
+        // release-group dashes) so the TMDB query is the bare work title —
+        // the dominant cause of misses (esp. TV: "Black Mirror S01 720p
+        // HDTV x264" → "Black Mirror"). Boundary-only: LibraryEntry.title
+        // is untouched, so play/bypass matching is unaffected.
+        let cleaned = clean_title_for_tmdb(title);
+        let title = if cleaned.is_empty() {
+            title
+        } else {
+            cleaned.as_str()
+        };
         let q = urlencoded(title);
         let mut urls: Vec<String> = Vec::with_capacity(3);
         if let Some(y) = year {
@@ -879,6 +890,118 @@ fn extract_episode(val: &Value) -> Option<EpisodeRef> {
 ///   - Already-prefixed URL (someone manually built one) → returned as-is
 ///     so we don't end up with `https://image.tmdb.org/t/p/w500https://...`
 ///   - Missing leading slash → still works, we insert one
+/// Web-remote T-4: strip scene-release noise so the TMDB query is the bare work title. Pure, RED-GREEN tested; boundary-only (never mutates `LibraryEntry.title`, so play/bypass is intact).
+fn clean_title_for_tmdb(raw: &str) -> String {
+    // Truncate at the FIRST scene "stop token" after normalising `._-`
+    // to spaces. Unambiguous markers (SxxExx / Sxx / NxNN / NNNp / WxH)
+    // stop anywhere; a 4-digit year and the source/codec/tag keyword set
+    // only stop once real title content precedes them, so a title that
+    // legitimately opens with such a word ("Web of Lies", "2001 A Space
+    // Odyssey") survives. Empty result => caller falls back to raw title.
+    fn is_stop(tok: &str, have_content: bool) -> bool {
+        let t = tok.to_ascii_lowercase();
+        let b = t.as_bytes();
+        if b.is_empty() {
+            return false;
+        }
+        // Sxx / SxxExx (S01, S07E19) — unambiguous, stops anywhere.
+        if b[0] == b's' && b.len() >= 2 && b[1].is_ascii_digit() {
+            return true;
+        }
+        // NxNN episode (1x06) OR WxH resolution (1920x1038) — unambiguous.
+        if let Some(x) = t.find('x') {
+            let (l, r) = (&t[..x], &t[x + 1..]);
+            if !l.is_empty()
+                && !r.is_empty()
+                && l.bytes().all(|c| c.is_ascii_digit())
+                && r.bytes().all(|c| c.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+        // Resolution 720p/1080p/2160p — unambiguous.
+        if t.len() >= 3 && t.ends_with('p') && t[..t.len() - 1].bytes().all(|c| c.is_ascii_digit())
+        {
+            return true;
+        }
+        if !have_content {
+            return false;
+        }
+        // 4-digit release year — only once a title precedes it.
+        if t.len() == 4
+            && t.bytes().all(|c| c.is_ascii_digit())
+            && (t.starts_with("19") || t.starts_with("20"))
+        {
+            return true;
+        }
+        matches!(
+            t.as_str(),
+            "bluray"
+                | "blu"
+                | "brrip"
+                | "bdrip"
+                | "dvdrip"
+                | "web"
+                | "webdl"
+                | "webrip"
+                | "hdtv"
+                | "hdrip"
+                | "remux"
+                | "x264"
+                | "x265"
+                | "h264"
+                | "h265"
+                | "hevc"
+                | "xvid"
+                | "divx"
+                | "aac"
+                | "ac3"
+                | "dts"
+                | "flac"
+                | "dd5"
+                | "ddp5"
+                | "limited"
+                | "proper"
+                | "rerip"
+                | "repack"
+                | "unrated"
+                | "extended"
+                | "remastered"
+                | "theatrical"
+                | "internal"
+                | "3d"
+                | "sbs"
+                | "hsbs"
+                | "mkvonly"
+                | "multilang"
+                | "multisub"
+                | "multilingual"
+                | "dubbed"
+                | "subbed"
+                | "complete"
+                | "season"
+        )
+    }
+    let normalized: String = raw
+        .chars()
+        .map(|c| {
+            if c == '.' || c == '_' || c == '-' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut out: Vec<&str> = Vec::new();
+    for tok in normalized.split_whitespace() {
+        if is_stop(tok, !out.is_empty()) {
+            break;
+        }
+        out.push(tok);
+    }
+    out.join(" ").trim().to_string()
+}
+
 fn tmdb_poster_url(poster_path: Option<&str>) -> Option<String> {
     let path = poster_path?.trim();
     if path.is_empty() {
@@ -1131,6 +1254,50 @@ mod tests {
         let e = SearchEngine::new("dummy-key-never-used".into());
         assert_eq!(e.movie_poster("   ", None).await, None);
         assert_eq!(e.movie_poster("", Some(2000)).await, None);
+    }
+
+    // T-4 title cleaning — the dominant miss-cause was scene-noise in the
+    // parsed title. Pure + deterministic; cases mirror the 2026-05-18
+    // production misses (TV-with-SxxExx, untrimmed movie tags).
+    #[test]
+    fn clean_title_strips_tv_season_episode_noise() {
+        assert_eq!(
+            clean_title_for_tmdb("Black Mirror S01 720p HDTV x264"),
+            "Black Mirror"
+        );
+        assert_eq!(
+            clean_title_for_tmdb("Futurama S07E19 720p HDTV x264-EVOLVE"),
+            "Futurama"
+        );
+        assert_eq!(
+            clean_title_for_tmdb("Game Of Thrones S01 S02 S03 Complete 1080p X264 anoXmous"),
+            "Game Of Thrones"
+        );
+    }
+
+    #[test]
+    fn clean_title_strips_movie_tags_and_dashes() {
+        assert_eq!(
+            clean_title_for_tmdb("Enter The Void LIMITED"),
+            "Enter The Void"
+        );
+        assert_eq!(clean_title_for_tmdb("Pacific Rim 3D"), "Pacific Rim");
+        assert_eq!(
+            clean_title_for_tmdb("The Third Man-720p MP4 AAC x264 BRRip 1949-CC"),
+            "The Third Man"
+        );
+    }
+
+    #[test]
+    fn clean_title_preserves_clean_titles_and_leading_year() {
+        // No scene tokens → unchanged.
+        assert_eq!(clean_title_for_tmdb("Aladdin"), "Aladdin");
+        // A title that legitimately OPENS with a year/keyword survives
+        // (year/keyword only stop once real content precedes them).
+        assert_eq!(
+            clean_title_for_tmdb("2001 A Space Odyssey 1080p BluRay"),
+            "2001 A Space Odyssey"
+        );
     }
 
     #[test]
