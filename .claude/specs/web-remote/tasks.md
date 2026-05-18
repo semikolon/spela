@@ -1,6 +1,6 @@
 # Tasks: spela web remote
 
-> **STATUS (v3.7, shipped + deployed Darwin):** Phases 1-4 DONE — T-1, T-2, T-3, T-5, T-6, T-7, T-8, T-9, T-10, T-11, T-12 ✅; T-17 deploy ✅. **T-4 deferred** (poster enrichment — titled-fallback tile covers it; purely additive). **Remaining:** T-13 (Phase 5 My-Library view; `/library` backend live), T-14/T-15 (Phase 6 phone-direct; "This phone" is a disabled Phase-6 placeholder today), T-16 manual-e2e (in user testing), T-18 (TODO pointer — done). Portless `spela.home` access added beyond spec scope (LAN reverse-proxy + DNS rewrite + `allowed_hosts` + `/`→307; host-private infra).
+> **STATUS (v3.7, shipped + deployed Darwin) — v1 FEATURE-COMPLETE:** Phases 1-6 DONE — T-1, T-2, T-3, T-5, T-6, T-7, T-8, T-9, T-10, T-11, T-12, T-13, T-14, T-15 ✅; T-17 deploy ✅; T-18 ✅. **T-4 deferred** (poster enrichment — titled-fallback covers it; purely additive). **T-16** real-device e2e = ongoing via the user's normal use (pause/resume bug found this way + fixed). Beyond spec scope: portless `spela.home` (LAN reverse-proxy + DNS rewrite + `allowed_hosts` + `/`→307; host-private) and a successor systemic-HTTPS spec (`~/dotfiles/docs/lan_https_dns01_wildcard_spec_2026_05_18.md`). Known data-gating: My-Library is empty until the Mac serve-library `/library/list` TCC follow-up.
 
 ## Overview
 - **Scope**: M (frontend is a single no-build asset; the real new backend work is `/library/list` + the `/library` aggregator).
