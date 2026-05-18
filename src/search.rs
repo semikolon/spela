@@ -142,6 +142,31 @@ impl SearchEngine {
             "https://api.themoviedb.org/3/search/multi?query={}&api_key={}",
             q, self.tmdb_key
         ));
+        // Relaxed last-resort tiers — TMDB does NOT Levenshtein-correct
+        // internal-char typos ("American Psyco" → 0 results for every
+        // form above), so broaden the QUERY (typo is usually not in the
+        // first word) and let the similarity scorer pick the right film
+        // from the wider candidate set. Only reached on a miss (no STRONG
+        // early-out), so the 51 happy-path stays 1 call / snappy.
+        let words: Vec<&str> = title.split_whitespace().collect();
+        if words.len() >= 2 {
+            let head = urlencoded(&words[..words.len() - 1].join(" ")); // drop last word
+            let first = urlencoded(words[0]); // first word only
+            if let Some(y) = year {
+                urls.push(format!(
+                    "https://api.themoviedb.org/3/search/movie?query={}&year={}&api_key={}",
+                    head, y, self.tmdb_key
+                ));
+                urls.push(format!(
+                    "https://api.themoviedb.org/3/search/movie?query={}&year={}&api_key={}",
+                    first, y, self.tmdb_key
+                ));
+            }
+            urls.push(format!(
+                "https://api.themoviedb.org/3/search/multi?query={}&api_key={}",
+                head, self.tmdb_key
+            ));
+        }
         // Score candidates by token containment (fraction of query words
         // that fuzzy-appear in the candidate title) instead of blindly
         // taking the first poster-bearing hit. Token-level — NOT
