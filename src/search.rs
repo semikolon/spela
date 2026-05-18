@@ -142,17 +142,22 @@ impl SearchEngine {
             "https://api.themoviedb.org/3/search/multi?query={}&api_key={}",
             q, self.tmdb_key
         ));
-        // Rank candidates by orthographic similarity to the cleaned
-        // query instead of blindly taking the first poster-bearing hit.
-        // This both recovers typos ("American Psyco" ~ "American Psycho",
-        // sim ~0.93) AND fixes a latent correctness bug — a typo'd query
-        // that fuzzy-returned a *wrong* film with a poster used to yield
-        // that wrong poster. Below ACCEPT we return None: a titled
-        // fallback (AC-3.2) is strictly better than a confidently-wrong
-        // poster. Snappy: a near-exact hit (>= STRONG) early-returns and
+        // Score candidates by token containment (fraction of query words
+        // that fuzzy-appear in the candidate title) instead of blindly
+        // taking the first poster-bearing hit. Token-level — NOT
+        // whole-string Levenshtein, which over-penalises legitimate
+        // length differences (release-cleaned "Lord Of The Rings
+        // Fellowship" vs TMDB "The Lord of the Rings: The Fellowship of
+        // the Ring" is a CORRECT subset, not a mismatch). Per-word fuzzy
+        // matching still recovers typos ("psyco"~"psycho"). This both
+        // lifts recall AND fixes a latent bug — a typo'd query that
+        // fuzzy-returned a *wrong* film with a poster used to yield that
+        // wrong poster; below ACCEPT we now return None (titled fallback,
+        // AC-3.2, is strictly better than a confidently-wrong poster).
+        // Snappy: a full-containment hit (== STRONG) early-returns and
         // skips the remaining attempts, so the common case is 1 call.
-        const STRONG: f32 = 0.90;
-        const ACCEPT: f32 = 0.72;
+        const STRONG: f32 = 1.0;
+        const ACCEPT: f32 = 0.67;
         let want = title_norm(title);
         let mut best: Option<(f32, String)> = None;
         for url in urls {
@@ -174,7 +179,7 @@ impl SearchEngine {
                     .or_else(|| item["name"].as_str())
                     .or_else(|| item["original_title"].as_str())
                     .unwrap_or("");
-                let s = title_similarity(&want, &title_norm(cand));
+                let s = title_token_score(&want, &title_norm(cand));
                 if s >= STRONG {
                     return Some(poster);
                 }
@@ -1083,6 +1088,20 @@ fn title_similarity(a: &str, b: &str) -> f32 {
     1.0 - (levenshtein(&ac, &bc) as f32 / max as f32)
 }
 
+/// Web-remote T-4: asymmetric token containment — fraction of `query` words that fuzzy-appear (per-word char-sim >= 0.80) among `cand` words. 1.0 = every query word matched (the canonical title may add more). Right metric for release-cleaned-query vs canonical-title; tolerates typos AND length/subset differences. Pure.
+fn title_token_score(query: &str, cand: &str) -> f32 {
+    let q: Vec<&str> = query.split_whitespace().collect();
+    if q.is_empty() {
+        return 0.0;
+    }
+    let c: Vec<&str> = cand.split_whitespace().collect();
+    let hits = q
+        .iter()
+        .filter(|qt| c.iter().any(|ct| title_similarity(qt, ct) >= 0.80))
+        .count();
+    hits as f32 / q.len() as f32
+}
+
 fn tmdb_poster_url(poster_path: Option<&str>) -> Option<String> {
     let path = poster_path?.trim();
     if path.is_empty() {
@@ -1414,6 +1433,34 @@ mod tests {
         assert_eq!(levenshtein(&c("abc"), &c("axc")), 1);
         assert_eq!(levenshtein(&c("psyco"), &c("psycho")), 1);
         assert_eq!(levenshtein(&c(""), &c("abc")), 3);
+    }
+
+    // T-4 token containment — the metric the poster gate actually uses.
+    // Pins the three behaviours: typo recovery, SUBSET acceptance (the
+    // 2026-05-18 51->47 regression: whole-string Levenshtein wrongly
+    // rejected legit length differences), garbage rejection.
+    #[test]
+    fn title_token_score_typo_subset_and_garbage() {
+        // Typo: both query words fuzzy-match → full containment.
+        assert!(
+            (title_token_score("american psyco", "american psycho") - 1.0).abs() < 1e-6,
+            "typo must reach STRONG (1.0)"
+        );
+        // Subset: release-cleaned query ⊂ canonical title → 1.0 (the
+        // regression this fixes — every query word appears).
+        assert!(
+            (title_token_score(
+                "lord of the rings fellowship",
+                "the lord of the rings the fellowship of the ring"
+            ) - 1.0)
+                .abs()
+                < 1e-6,
+            "query-subset-of-canonical must be full containment"
+        );
+        // Extra canonical words never hurt; partial query match scores
+        // proportionally and stays below ACCEPT (0.67) for true garbage.
+        assert!(title_token_score("american psyco", "the godfather") < 0.34);
+        assert_eq!(title_token_score("", "anything"), 0.0);
     }
 
     #[test]
