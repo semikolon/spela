@@ -76,6 +76,14 @@ enum Commands {
         /// Stream to VLC instead of Chromecast
         #[arg(long)]
         vlc: bool,
+        /// Phase 7 thin-client: no Chromecast — the server (Darwin, NVENC)
+        /// builds the HLS as usual; THIS host plays it locally via mpv.
+        /// Run on the bedroom box (Shannon). Heavy transcode stays on the
+        /// server; this machine is a thin player. Blocks until mpv exits,
+        /// then tells the server to stop. Display/GPU specifics live in
+        /// the host's own ~/.config/mpv/mpv.conf (kiosk: vo=gpu/drm).
+        #[arg(long)]
+        local_renderer: bool,
         /// Chromecast device name
         #[arg(long)]
         cast: Option<String>,
@@ -417,6 +425,7 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
         Commands::Play {
             source,
             vlc,
+            local_renderer,
             cast,
             title,
             file_index,
@@ -433,10 +442,14 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
                 None
             };
 
+            // Phase 7 thin-client: --local-renderer reuses the no-cast
+            // "vlc" path (server builds HLS, no Chromecast) and plays it
+            // here via mpv. Server (do_play) is UNCHANGED.
+            let no_cast = vlc || local_renderer;
             let body = serde_json::json!({
                 "result_id": is_result_id,
                 "magnet": if is_result_id.is_none() { Some(&source) } else { None },
-                "target": if vlc { "vlc" } else { "chromecast" },
+                "target": if no_cast { "vlc" } else { "chromecast" },
                 "cast_name": cast,
                 "title": title,
                 "file_index": file_index,
@@ -445,13 +458,61 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
                 "smooth": smooth,
                 "seek_to": seek_to,
             });
-            Ok(client
+            let play_resp: Value = client
                 .post(format!("{}/play", base))
                 .json(&body)
                 .send()
                 .await?
                 .json()
-                .await?)
+                .await?;
+            if !local_renderer {
+                return Ok(play_resp);
+            }
+
+            // Thin-client render: wait for the server's HLS to be ready
+            // (Darwin transcode cold-start), then play it locally with
+            // mpv. Heavy transcode stays on the server's NVENC GPU; this
+            // host is a dumb player. Blocks until mpv exits, then stops
+            // the server-side stream. Display/GPU specifics belong in the
+            // host's ~/.config/mpv/mpv.conf (kiosk: vo=gpu or vo=drm).
+            let hls = format!("{}/hls/master.m3u8", base);
+            eprintln!("local-renderer: server transcoding; waiting for HLS …");
+            let mut ready = false;
+            for _ in 0..60 {
+                if let Ok(r) = client.get(&hls).send().await {
+                    if r.status().is_success() {
+                        ready = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            if !ready {
+                let _ = client.post(format!("{}/stop", base)).send().await;
+                return Err(anyhow::anyhow!(
+                    "local-renderer: server HLS not ready after 60s ({})",
+                    hls
+                ));
+            }
+            eprintln!("local-renderer: launching mpv → {hls}");
+            let status = tokio::process::Command::new("mpv")
+                .arg("--fullscreen")
+                .arg("--force-window=yes")
+                .arg(&hls)
+                .status()
+                .await;
+            // mpv exited (user quit / EOF) → release the server stream.
+            let _ = client.post(format!("{}/stop", base)).send().await;
+            match status {
+                Ok(s) => Ok(serde_json::json!({
+                    "local_renderer": true,
+                    "mpv_exit_code": s.code(),
+                    "play": play_resp
+                })),
+                Err(e) => Err(anyhow::anyhow!(
+                    "local-renderer: failed to launch mpv ({e}). Is mpv installed (apt install mpv)?"
+                )),
+            }
         }
         Commands::Stop => Ok(client
             .post(format!("{}/stop", base))
