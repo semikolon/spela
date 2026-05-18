@@ -95,6 +95,22 @@ impl SearchEngine {
         }
     }
 
+    /// Web-remote T-4: best-effort TMDB poster for a library entry by its
+    /// parsed title. Fully fail-soft — empty key / blank title / no hit /
+    /// network error all yield `None`, and the SPA renders a clean titled
+    /// fallback tile (AC-3.2). One `/search/movie` call; the first hit
+    /// already carries `poster_path`, so no movie-details round-trip.
+    /// Reuses `tmdb_search` + `tmdb_poster_url` — no new TMDB surface.
+    pub async fn movie_poster(&self, title: &str) -> Option<String> {
+        if self.tmdb_key.is_empty() || title.trim().is_empty() {
+            return None;
+        }
+        match self.tmdb_search(title, "movie").await {
+            Ok(hit) => tmdb_poster_url(hit["poster_path"].as_str()),
+            Err(_) => None,
+        }
+    }
+
     pub async fn search(
         &self,
         query: &str,
@@ -1059,6 +1075,24 @@ mod tests {
     #[test]
     fn tmdb_poster_url_none_returns_none() {
         assert_eq!(tmdb_poster_url(None), None);
+    }
+
+    // T-4 movie_poster guard paths — deterministic, NO network (both
+    // short-circuit before any TMDB call). The TMDB-hit path is
+    // integration (network) and intentionally not unit-pinned; the
+    // poster-URL shaping it depends on is covered by the
+    // `tmdb_poster_url_*` tests above.
+    #[tokio::test]
+    async fn movie_poster_empty_key_is_none_no_network() {
+        let e = SearchEngine::new(String::new());
+        assert_eq!(e.movie_poster("Blade Runner").await, None);
+    }
+
+    #[tokio::test]
+    async fn movie_poster_blank_title_is_none_no_network() {
+        let e = SearchEngine::new("dummy-key-never-used".into());
+        assert_eq!(e.movie_poster("   ").await, None);
+        assert_eq!(e.movie_poster("").await, None);
     }
 
     #[test]

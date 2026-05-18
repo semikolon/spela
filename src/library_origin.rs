@@ -123,9 +123,9 @@ pub struct LibraryEntry {
     pub size_bytes: u64,
     pub container: String,
     /// Best-effort TMDB art, filled by spela's aggregator (web-remote
-    /// T-4, deferred). `serve-library` always emits `None` — it is a
-    /// dumb file server with no TMDB key; the frontend renders a clean
-    /// titled fallback tile on `None` (AC-3.2).
+    /// T-4). `serve-library` always emits `None` — it is a dumb file
+    /// server with no TMDB key; spela's `/library` enriches, and the
+    /// frontend renders a clean titled fallback tile on `None` (AC-3.2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poster_url: Option<String>,
 }
