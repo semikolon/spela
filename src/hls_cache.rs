@@ -195,6 +195,32 @@ pub fn build_cache_key_for_title(
     ))
 }
 
+/// Resolve the cache key for a play. imdb-based when available
+/// (search/torrent plays), else the raw-title hash (library/bypass
+/// plays — the 5th-facet path). `None` when caching is disabled
+/// (`cap_mb == 0`) so every caller gets ONE uniform "no key" signal.
+///
+/// SINGLE SOURCE OF TRUTH for BOTH cache-fill (`do_cleanup` promote)
+/// AND cache-hit (`do_play` short-circuit): if these two computed the
+/// key differently, a library play would fill under one key and miss
+/// under another → the cache would never hit for library plays. Always
+/// route both through this.
+pub fn resolve_cache_key(
+    cap_mb: u64,
+    imdb_id: Option<&str>,
+    season: Option<u32>,
+    episode: Option<u32>,
+    subtitle_lang: Option<&str>,
+    has_intro: bool,
+    title: Option<&str>,
+) -> Option<String> {
+    if cap_mb == 0 {
+        return None;
+    }
+    build_cache_key(imdb_id, season, episode, subtitle_lang, has_intro)
+        .or_else(|| title.and_then(|t| build_cache_key_for_title(t, subtitle_lang, has_intro)))
+}
+
 /// Compute the on-disk path for a cache entry. `media_dir/hls_cache/<key>/`.
 pub fn cache_dir_for_key(media_dir: &Path, key: &str) -> PathBuf {
     media_dir.join(CACHE_DIR_NAME).join(key)
@@ -203,6 +229,43 @@ pub fn cache_dir_for_key(media_dir: &Path, key: &str) -> PathBuf {
 /// Root cache directory (parent of all per-episode cache entries).
 pub fn cache_root(media_dir: &Path) -> PathBuf {
     media_dir.join(CACHE_DIR_NAME)
+}
+
+/// Total duration (seconds) of a COMPLETE cached set, from the Σ#EXTINF
+/// of its first media variant. A cache-HIT play has no source to
+/// `ffprobe`, but the cast needs a duration to enter Buffered/seekable
+/// mode — without it the Chromecast treats the stream as Live (no
+/// seek = no resume, defeating the cache's whole point). The cached set
+/// always carries `#EXT-X-ENDLIST`, so the EXTINF sum is exact. Reads
+/// the master's FIRST variant URI (multi-variant → `stream_0.m3u8`),
+/// the server-side twin of the web scrubber's frontier derivation.
+/// `None` on any I/O / parse miss (caller falls back to req.duration).
+pub fn cached_duration(media_dir: &Path, key: &str) -> Option<f64> {
+    let dir = cache_dir_for_key(media_dir, key);
+    let master = std::fs::read_to_string(dir.join(MANIFEST_NAME)).ok()?;
+    let variant = master
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap_or("playlist.m3u8");
+    let pl = std::fs::read_to_string(dir.join(variant)).ok()?;
+    let mut sum = 0.0_f64;
+    for line in pl.lines() {
+        if let Some(rest) = line.trim().strip_prefix("#EXTINF:") {
+            sum += rest
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<f64>()
+                .unwrap_or(0.0);
+        }
+    }
+    if sum > 0.0 {
+        Some(sum)
+    } else {
+        None
+    }
 }
 
 /// Cache hit if BOTH the complete-marker AND the master manifest exist.
@@ -481,6 +544,101 @@ mod tests {
         // A path-traversal-y raw_name must NOT leak separators into the key.
         let k = build_cache_key_for_title("../../etc/passwd", None, false).unwrap();
         assert!(!k.contains('/') && !k.contains("..") && !k.contains(' '));
+    }
+
+    // --- resolve_cache_key: the shared fill/hit key resolver ---
+
+    #[test]
+    fn test_resolve_cache_key_disabled_when_cap_zero() {
+        assert!(
+            resolve_cache_key(
+                0,
+                Some("tt0119229"),
+                None,
+                None,
+                Some("eng"),
+                false,
+                Some("X")
+            )
+            .is_none(),
+            "cap 0 → no key (caching disabled), regardless of metadata"
+        );
+    }
+
+    #[test]
+    fn test_resolve_cache_key_prefers_imdb_then_falls_back_to_title() {
+        // Search/torrent play (imdb present) → tt key.
+        let k = resolve_cache_key(
+            12288,
+            Some("tt0119229"),
+            Some(0),
+            Some(0),
+            Some("eng"),
+            false,
+            Some("Grosse.Pointe.Blank"),
+        )
+        .unwrap();
+        assert!(
+            k.starts_with("tt0119229_"),
+            "imdb present → imdb key, got {k}"
+        );
+        // Library/bypass play (no imdb, has title) → lib key (5th facet).
+        let k2 = resolve_cache_key(
+            12288,
+            None,
+            None,
+            None,
+            Some("eng"),
+            false,
+            Some("Grosse.Pointe.Blank.1997.1080p"),
+        )
+        .unwrap();
+        assert!(
+            k2.starts_with("lib"),
+            "no imdb + title → lib title-hash key, got {k2}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_cache_key_none_when_no_imdb_and_no_title() {
+        assert!(resolve_cache_key(12288, None, None, None, Some("eng"), false, None).is_none());
+    }
+
+    // --- cached_duration: server-side EXTINF sum for cache-hit casts ---
+
+    #[test]
+    fn test_cached_duration_sums_first_variant_extinf() {
+        let tmp = TempDir::new().unwrap();
+        let key = "lib00000000deadbeef_eng_nointro_v1";
+        let dir = cache_dir_for_key(tmp.path(), key);
+        fs::create_dir_all(&dir).unwrap();
+        // Multi-variant master → first non-# line is the variant URI.
+        fs::write(
+            dir.join(MANIFEST_NAME),
+            b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5640800\nstream_0.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=1425600\nstream_1.m3u8\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("stream_0.m3u8"),
+            b"#EXTM3U\n#EXTINF:6.000,\nseg_0_00000.ts\n#EXTINF:6.000,\nseg_0_00001.ts\n#EXTINF:3.500,\nseg_0_00002.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        assert_eq!(cached_duration(tmp.path(), key), Some(15.5));
+    }
+
+    #[test]
+    fn test_cached_duration_none_when_missing_or_no_extinf() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(
+            cached_duration(tmp.path(), "tt0_s00e00_eng_nointro_v1"),
+            None
+        );
+        let key = "tt1_s00e00_eng_nointro_v1";
+        let dir = cache_dir_for_key(tmp.path(), key);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(MANIFEST_NAME), b"#EXTM3U\nstream_0.m3u8\n").unwrap();
+        fs::write(dir.join("stream_0.m3u8"), b"#EXTM3U\n#EXT-X-ENDLIST\n").unwrap();
+        assert_eq!(cached_duration(tmp.path(), key), None);
     }
 
     // --- Path layout ---

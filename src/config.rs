@@ -135,16 +135,17 @@ fn default_host() -> String {
     "0.0.0.0".into()
 }
 fn default_hls_cache_cap_mb() -> u64 {
-    // v3.5.0 foundation default: disabled. The cache module + cache-fill in
-    // `do_cleanup` are shipped, but the cache-HIT short-circuit in `do_play`
-    // (which would actually return value from cached entries) is deferred to
-    // v3.5.1 — it requires reconciling spela's synthetic master playlist
-    // (`handle_hls_master`) with ffmpeg's real multi-variant master, and
-    // shouldn't ship without integration test coverage of the cast path.
-    // Setting this to 0 keeps disk usage flat for default users; adventurous
-    // users can opt in (e.g. `hls_cache_cap_mb = 20480`) to populate the
-    // cache against the future hit-side wiring.
-    0
+    // v3.7.9: ENABLED. The cache-HIT short-circuit in `do_play` is wired
+    // (the synthetic-vs-multivariant-master blocker was resolved — spela
+    // serves the cached real multi-variant master unchanged via the
+    // dedicated `/hls_cache/{key}/{file}` route). 12 GiB ≈ a movie-night's
+    // worth of recent replays/resumes (~2-3 full 1080p movies or many
+    // more episodes); `prune_cache_to_fit` LRU-evicts oldest beyond this
+    // so it's a self-maintaining ceiling, not unbounded growth. Sized
+    // conservatively vs Darwin's documented disk-pressure sensitivity
+    // (host also runs the 10 GB media cap + 20 GB free-space floor).
+    // Tunable per-host via `hls_cache_cap_mb` in config.toml.
+    12288
 }
 fn default_library_serve_port() -> u16 {
     7891

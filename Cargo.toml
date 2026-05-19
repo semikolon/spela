@@ -1,6 +1,6 @@
 [package]
 name = "spela"
-version = "3.7.8"
+version = "3.7.9"
 edition = "2021"
 description = "AI-agent-ready media controller — search, stream, cast"
 

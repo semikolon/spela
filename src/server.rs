@@ -88,6 +88,26 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     let state_dir = Config::state_dir();
     let media_dir = config.media_dir();
     std::fs::create_dir_all(&state_dir)?;
+
+    // v3.7.9: one-shot HLS-cache LRU pass on startup — defends the cap
+    // against a config-shrink between runs or an unclean prior exit.
+    // No-op when caching is disabled (cap 0).
+    if config.hls_cache_cap_mb > 0 {
+        let mut md = media_dir.clone();
+        if md.to_string_lossy().starts_with("~/") {
+            if let Some(h) = dirs::home_dir() {
+                md = h.join(md.strip_prefix("~/").unwrap());
+            }
+        }
+        let md = std::fs::canonicalize(&md).unwrap_or(md);
+        let evicted = crate::hls_cache::prune_cache_to_fit(
+            &crate::hls_cache::cache_root(&md),
+            config.hls_cache_cap_mb.saturating_mul(1024 * 1024),
+        );
+        if evicted > 0 {
+            tracing::info!("HLS cache: startup LRU evicted {} stale entries", evicted);
+        }
+    }
     std::fs::create_dir_all(&media_dir)?;
 
     // librqbit is the only torrent backend since v3.3.0 (Apr 30, 2026 — Phase 3
@@ -207,6 +227,12 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/hls/playlist.m3u8", get(handle_hls_playlist))
         .route("/hls/init.mp4", get(handle_hls_init))
         .route("/hls/{segment}", get(handle_hls_segment))
+        // v3.7.9 HLS cache HIT: serve a COMPLETE cached set unchanged
+        // (master.m3u8 → stream_0/1.m3u8 → seg_*.ts). The Chromecast gets
+        // ffmpeg's REAL multi-variant master — no synthetic-master
+        // reconciliation (that was the v3.5.1 blocker; resolved by
+        // serving the cached files verbatim through their own route).
+        .route("/hls_cache/{key}/{file}", get(handle_hls_cache_file))
         // Bare / → the web remote (so http://spela.home works portless).
         .route("/", get(handle_root_redirect))
         // Web-remote SPA (served same-origin, no-build single asset —
@@ -987,7 +1013,45 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         .unwrap_or(0);
     let corrupt_files = AppState::load(&state.state_dir).corrupt_files;
 
-    if req.title.is_some() {
+    // v3.7.9 HLS cache HIT short-circuit. Compute the play's cache key
+    // ONCE here from REQUEST INTENT (the only inputs available before the
+    // torrent start) — imdb when present (search/torrent), else the
+    // v3.7.8 title-hash (library/bypass: the 5th facet). The SAME
+    // `play_cache_key` is reused at the CurrentStream fill-site below, so
+    // cache-FILL and cache-HIT provably agree (computing it twice — once
+    // from request-intent, once from post-resolution actuals — was the
+    // trap: a library play would fill under one key and never hit). If a
+    // COMPLETE cached set exists, set `is_local` (skips the torrent
+    // block) and the transcode region serves the cached master via
+    // `/hls_cache` instead of running ffmpeg.
+    let subs_intent: Option<&str> = if req.no_subs.unwrap_or(false) {
+        None
+    } else {
+        Some(req.subtitle_lang.as_deref().unwrap_or("eng"))
+    };
+    let intro_intent = !req.no_intro.unwrap_or(false)
+        && dirs::home_dir()
+            .map(|h| h.join(".config/spela/intro.mp4").exists())
+            .unwrap_or(false);
+    let play_cache_key = crate::hls_cache::resolve_cache_key(
+        state.config.hls_cache_cap_mb,
+        req.imdb_id.as_deref(),
+        req.season,
+        req.episode,
+        subs_intent,
+        intro_intent,
+        Some(title.as_str()),
+    );
+    let cache_hit_key: Option<String> = play_cache_key
+        .as_deref()
+        .filter(|k| crate::hls_cache::is_cache_hit(&media_dir, k))
+        .map(str::to_string);
+    if let Some(ref hk) = cache_hit_key {
+        is_local = true;
+        tracing::info!("HLS cache HIT: {} — skipping torrent + ffmpeg", hk);
+    }
+
+    if req.title.is_some() && cache_hit_key.is_none() {
         // v3.6.0 Local Library Streaming: scan media_dir FIRST (existing
         // behaviour — torrent cache, lowest latency / no LAN hop), then each
         // configured extra library root in order. First healthy match wins.
@@ -1321,6 +1385,24 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // Codec detection + transcode decision
     let mut final_url = server_url.clone();
     let mut is_transcoded = false;
+    // v3.7.9: hoisted so the cache-HIT branch and the cache-MISS
+    // transcode branch both feed it. On a cache HIT we serve the cached
+    // COMPLETE VOD master directly: is_transcoded stays false (so the
+    // post-LOAD native `cast.seek` does the resume — cached set has
+    // `#EXT-X-ENDLIST` → CrKey 1.56 VOD seek works — and ss_offset stays
+    // 0, no ffmpeg `-ss`); duration comes from the cached EXTINF sum so
+    // the cast enters Buffered/seekable mode. detect_codecs + the whole
+    // transcode pipeline are skipped (the `cache_hit_key.is_none()` guard
+    // below). The existing cast / CurrentStream / reaper /
+    // cast_health_monitor path is UNCHANGED.
+    let mut source_duration: Option<f64> = None;
+    if let Some(ref hk) = cache_hit_key {
+        final_url = format!(
+            "http://{}:{}/hls_cache/{}/master.m3u8",
+            state.config.stream_host, state.config.port, hk
+        );
+        source_duration = crate::hls_cache::cached_duration(&media_dir, hk).or(req.duration);
+    }
     let no_intro = req.no_intro.unwrap_or(false);
     let intro_path = if no_intro {
         None
@@ -1328,258 +1410,265 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         transcode::find_intro()
     };
 
-    let codec_info = transcode::detect_codecs(&server_url)
-        .await
-        .unwrap_or(transcode::CodecInfo {
-            video_codec: None,
-            audio_codec: None,
-            duration: None,
-            audio_stream: "0:a:0".to_string(),
-            audio_index: 0,
-        });
-    let video_codec = codec_info.video_codec;
-    let audio_codec = codec_info.audio_codec;
-    let source_duration = codec_info.duration;
-    let audio_stream = codec_info.audio_stream.clone();
-    let audio_index = codec_info.audio_index;
-    if let Some(dur) = source_duration {
-        tracing::info!(
-            "Source duration: {:.0}s ({:.0} min), preferred audio: {} (index {})",
-            dur,
-            dur / 60.0,
-            audio_stream,
-            audio_index
-        );
-    }
+    // v3.7.9: skip the ENTIRE detect_codecs + transcode pipeline on a
+    // cache HIT (final_url / source_duration / is_transcoded were set
+    // above). Closing brace is just before "// Cast to Chromecast".
+    if cache_hit_key.is_none() {
+        let codec_info =
+            transcode::detect_codecs(&server_url)
+                .await
+                .unwrap_or(transcode::CodecInfo {
+                    video_codec: None,
+                    audio_codec: None,
+                    duration: None,
+                    audio_stream: "0:a:0".to_string(),
+                    audio_index: 0,
+                });
+        let video_codec = codec_info.video_codec;
+        let audio_codec = codec_info.audio_codec;
+        source_duration = codec_info.duration;
+        let audio_stream = codec_info.audio_stream.clone();
+        let audio_index = codec_info.audio_index;
+        if let Some(dur) = source_duration {
+            tracing::info!(
+                "Source duration: {:.0}s ({:.0} min), preferred audio: {} (index {})",
+                dur,
+                dur / 60.0,
+                audio_stream,
+                audio_index
+            );
+        }
 
-    let need_audio_tc = audio_codec
-        .as_deref()
-        .map_or(false, transcode::audio_needs_transcode);
-    // May 12, 2026: the old CrKey 1.56 receiver is materially happier when
-    // Chromecast-targeted HLS is a single canonical profile:
-    // H.264 High@4.0, 30 fps, fixed 6 s GOP, AAC stereo. Merely wrapping a
-    // "compatible" source in HLS still leaves too many source-dependent
-    // variables in play (50 fps H.264 levels, undetected HEVC on partial
-    // torrent probes, odd GOP cadence on copy paths). For Chromecast,
-    // canonicalize the video stream unconditionally; other targets keep the
-    // old codec-driven transcode decision.
-    let need_video_tc = if target == "chromecast" {
-        true
-    } else {
-        video_codec
+        let need_audio_tc = audio_codec
             .as_deref()
-            .map_or(false, transcode::video_needs_transcode)
-    };
-    let use_hls = should_use_hls_for_playback(
-        &target,
-        need_audio_tc,
-        need_video_tc,
-        intro_path.is_some(),
-        subtitle_srt_path.is_some(),
-        is_local,
-    );
-
-    if use_hls {
-        let mut reasons = Vec::new();
-        if target == "chromecast" {
-            reasons.push("chromecast requires HLS delivery".into());
-        }
-        if need_audio_tc {
-            reasons.push(format!("{} -> AAC", audio_codec.as_deref().unwrap_or("?")));
-        }
-        if need_video_tc {
-            if target == "chromecast" {
-                reasons.push("canonical H.264 Chromecast transcode".into());
-            } else {
-                reasons.push(format!(
-                    "{} -> H.264 (NVENC)",
-                    video_codec.as_deref().unwrap_or("?")
-                ));
-            }
-        }
-        if subtitle_srt_path.is_some() {
-            reasons.push("subtitle burn-in".into());
-        }
-        if intro_path.is_some() {
-            reasons.push("intro clip".into());
-        }
-        if is_local && target != "chromecast" {
-            reasons.push("local file served via ffmpeg pipeline".into());
-        }
-        tracing::info!("Using HLS pipeline: {}", reasons.join(" + "));
-
-        let sub_path = subtitle_srt_path.as_deref();
-        // Apr 15, 2026: switched from `transcode::transcode` (fragmented MP4
-        // served via chunked-transfer at /stream/transcode, which Chromecast
-        // Default Media Receiver rejects with player_state=IDLE) to
-        // `transcode::transcode_hls` (HLS event playlist + fmp4 segments
-        // served via /hls/playlist.m3u8 with proper Content-Length + Range).
-        // See ~/Projects/spela/TODO.md § "Cast Pipeline Rework" for the full
-        // trade-off analysis.
-        match transcode::transcode_hls(
-            &server_url,
-            &media_dir,
-            sub_path,
-            intro_path.as_deref(),
+            .map_or(false, transcode::audio_needs_transcode);
+        // May 12, 2026: the old CrKey 1.56 receiver is materially happier when
+        // Chromecast-targeted HLS is a single canonical profile:
+        // H.264 High@4.0, 30 fps, fixed 6 s GOP, AAC stereo. Merely wrapping a
+        // "compatible" source in HLS still leaves too many source-dependent
+        // variables in play (50 fps H.264 levels, undetected HEVC on partial
+        // torrent probes, odd GOP cadence on copy paths). For Chromecast,
+        // canonicalize the video stream unconditionally; other targets keep the
+        // old codec-driven transcode decision.
+        let need_video_tc = if target == "chromecast" {
+            true
+        } else {
+            video_codec
+                .as_deref()
+                .map_or(false, transcode::video_needs_transcode)
+        };
+        let use_hls = should_use_hls_for_playback(
+            &target,
+            need_audio_tc,
             need_video_tc,
-            seek_to,
-            audio_index,
-            target == "chromecast",
-        )
-        .await
-        {
-            Ok(hls_info) => {
-                let manifest_path = hls_info.manifest_path.clone();
-                let ffmpeg_pid = hls_info.ffmpeg_pid;
-                let prepared_hls_for_cast =
-                    should_wait_for_complete_hls_before_cast(&target, is_local);
-                // Track ffmpeg PID for the post-playback reaper + cleanup
-                *lock_recover(&state.ffmpeg_pid) = Some(ffmpeg_pid);
-                if prepared_hls_for_cast {
-                    tracing::info!(
+            intro_path.is_some(),
+            subtitle_srt_path.is_some(),
+            is_local,
+        );
+
+        if use_hls {
+            let mut reasons = Vec::new();
+            if target == "chromecast" {
+                reasons.push("chromecast requires HLS delivery".into());
+            }
+            if need_audio_tc {
+                reasons.push(format!("{} -> AAC", audio_codec.as_deref().unwrap_or("?")));
+            }
+            if need_video_tc {
+                if target == "chromecast" {
+                    reasons.push("canonical H.264 Chromecast transcode".into());
+                } else {
+                    reasons.push(format!(
+                        "{} -> H.264 (NVENC)",
+                        video_codec.as_deref().unwrap_or("?")
+                    ));
+                }
+            }
+            if subtitle_srt_path.is_some() {
+                reasons.push("subtitle burn-in".into());
+            }
+            if intro_path.is_some() {
+                reasons.push("intro clip".into());
+            }
+            if is_local && target != "chromecast" {
+                reasons.push("local file served via ffmpeg pipeline".into());
+            }
+            tracing::info!("Using HLS pipeline: {}", reasons.join(" + "));
+
+            let sub_path = subtitle_srt_path.as_deref();
+            // Apr 15, 2026: switched from `transcode::transcode` (fragmented MP4
+            // served via chunked-transfer at /stream/transcode, which Chromecast
+            // Default Media Receiver rejects with player_state=IDLE) to
+            // `transcode::transcode_hls` (HLS event playlist + fmp4 segments
+            // served via /hls/playlist.m3u8 with proper Content-Length + Range).
+            // See ~/Projects/spela/TODO.md § "Cast Pipeline Rework" for the full
+            // trade-off analysis.
+            match transcode::transcode_hls(
+                &server_url,
+                &media_dir,
+                sub_path,
+                intro_path.as_deref(),
+                need_video_tc,
+                seek_to,
+                audio_index,
+                target == "chromecast",
+            )
+            .await
+            {
+                Ok(hls_info) => {
+                    let manifest_path = hls_info.manifest_path.clone();
+                    let ffmpeg_pid = hls_info.ffmpeg_pid;
+                    let prepared_hls_for_cast =
+                        should_wait_for_complete_hls_before_cast(&target, is_local);
+                    // Track ffmpeg PID for the post-playback reaper + cleanup
+                    *lock_recover(&state.ffmpeg_pid) = Some(ffmpeg_pid);
+                    if prepared_hls_for_cast {
+                        tracing::info!(
                             "Local-file cast gate: fast-cast as soon as transcode races ahead of playback (full pre-transcode only as slow-source fallback)"
                         );
-                    if let Err(e) = wait_for_complete_hls_before_cast(
-                        &manifest_path,
-                        ffmpeg_pid,
-                        source_duration,
-                    )
-                    .await
-                    {
-                        do_cleanup(&state);
-                        return Json(json!({
-                            "error": format!(
-                                "Chromecast local-HLS completion gate failed before cast: {}",
-                                e
-                            )
-                        }));
-                    }
-                } else {
-                    // HLS pre-buffer: wait for the manifest + enough
-                    // segments to survive the Chromecast's initial
-                    // read-ahead burst.
-                    //
-                    // Apr 18, 2026 root cause fix: waiting for just 1
-                    // segment caused the Chromecast to catch up to the
-                    // transcode frontier after ~30s and start buffering
-                    // (spinner). With intro concat + subtitle burn-in +
-                    // seek, ffmpeg produces segments at ~1x realtime
-                    // initially. The Chromecast consumes at 1x too, so
-                    // 1-segment head start = 6 seconds of cushion,
-                    // exhausted by segment 5.
-                    //
-                    // Fix: wait for 10 segments (~60s of content). At
-                    // NVENC's ~3-6x realtime, this takes 10-20s of wall
-                    // time. Gives the Chromecast a 60-second buffer
-                    // before it can catch the frontier, by which time
-                    // ffmpeg is well ahead.
-                    let hls_dir = manifest_path
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| media_dir.join("transcoded_hls"));
-                    let min_segments: usize = if target == "chromecast" { 20 } else { 10 };
-                    let target_segment = hls_dir.join(format!(
-                        "{}{:05}.ts",
-                        hls_info.primary_segment_prefix, min_segments
-                    ));
-                    let target_low_segment = if hls_info.adaptive {
-                        Some(hls_dir.join(format!("seg_1_{:05}.ts", min_segments)))
-                    } else {
-                        None
-                    };
-                    let prebuffer_timeout_secs: u64 = if intro_path.is_some() { 90 } else { 60 };
-                    let prebuffer_start = tokio::time::Instant::now();
-                    let prebuffer_deadline =
-                        prebuffer_start + tokio::time::Duration::from_secs(prebuffer_timeout_secs);
-                    loop {
-                        // May 13, 2026 v3.4.0: stream-start fail-fast. If ffmpeg
-                        // has produced 0 segments after FAIL_FAST_STREAM_START_SECS
-                        // (20 s), declare stream-start failure and return an error
-                        // — `handle_play`'s existing auto-retry loop will bump
-                        // result_id and re-enter do_play with the next search
-                        // candidate. See `should_fail_fast_stream_start` doc for
-                        // root cause + Apr/May 2026 incident anchor.
-                        let elapsed_secs = prebuffer_start.elapsed().as_secs();
-                        let seg_count = count_hls_segments(&hls_dir);
-                        if should_fail_fast_stream_start(elapsed_secs, seg_count) {
-                            tracing::error!(
-                                "HLS stream-start fail-fast: {}s elapsed with 0 segments. \
-                                 Likely starved swarm or bad source — returning error so \
-                                 handle_play's auto-retry loop can fall back to the next \
-                                 result if one is available.",
-                                elapsed_secs
-                            );
-                            do_cleanup(state);
-                            // Error message intentionally describes only what
-                            // happened (not what will happen next); handle_play
-                            // decides retry vs surface based on attempts remaining.
+                        if let Err(e) = wait_for_complete_hls_before_cast(
+                            &manifest_path,
+                            ffmpeg_pid,
+                            source_duration,
+                        )
+                        .await
+                        {
+                            do_cleanup(&state);
                             return Json(json!({
                                 "error": format!(
-                                    "Stream-start fail-fast: ffmpeg produced no HLS segments \
-                                     in {elapsed_secs}s (likely starved swarm or bad source)."
+                                    "Chromecast local-HLS completion gate failed before cast: {}",
+                                    e
                                 )
                             }));
                         }
-                        if tokio::time::Instant::now() > prebuffer_deadline {
-                            tracing::warn!(
+                    } else {
+                        // HLS pre-buffer: wait for the manifest + enough
+                        // segments to survive the Chromecast's initial
+                        // read-ahead burst.
+                        //
+                        // Apr 18, 2026 root cause fix: waiting for just 1
+                        // segment caused the Chromecast to catch up to the
+                        // transcode frontier after ~30s and start buffering
+                        // (spinner). With intro concat + subtitle burn-in +
+                        // seek, ffmpeg produces segments at ~1x realtime
+                        // initially. The Chromecast consumes at 1x too, so
+                        // 1-segment head start = 6 seconds of cushion,
+                        // exhausted by segment 5.
+                        //
+                        // Fix: wait for 10 segments (~60s of content). At
+                        // NVENC's ~3-6x realtime, this takes 10-20s of wall
+                        // time. Gives the Chromecast a 60-second buffer
+                        // before it can catch the frontier, by which time
+                        // ffmpeg is well ahead.
+                        let hls_dir = manifest_path
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| media_dir.join("transcoded_hls"));
+                        let min_segments: usize = if target == "chromecast" { 20 } else { 10 };
+                        let target_segment = hls_dir.join(format!(
+                            "{}{:05}.ts",
+                            hls_info.primary_segment_prefix, min_segments
+                        ));
+                        let target_low_segment = if hls_info.adaptive {
+                            Some(hls_dir.join(format!("seg_1_{:05}.ts", min_segments)))
+                        } else {
+                            None
+                        };
+                        let prebuffer_timeout_secs: u64 =
+                            if intro_path.is_some() { 90 } else { 60 };
+                        let prebuffer_start = tokio::time::Instant::now();
+                        let prebuffer_deadline = prebuffer_start
+                            + tokio::time::Duration::from_secs(prebuffer_timeout_secs);
+                        loop {
+                            // May 13, 2026 v3.4.0: stream-start fail-fast. If ffmpeg
+                            // has produced 0 segments after FAIL_FAST_STREAM_START_SECS
+                            // (20 s), declare stream-start failure and return an error
+                            // — `handle_play`'s existing auto-retry loop will bump
+                            // result_id and re-enter do_play with the next search
+                            // candidate. See `should_fail_fast_stream_start` doc for
+                            // root cause + Apr/May 2026 incident anchor.
+                            let elapsed_secs = prebuffer_start.elapsed().as_secs();
+                            let seg_count = count_hls_segments(&hls_dir);
+                            if should_fail_fast_stream_start(elapsed_secs, seg_count) {
+                                tracing::error!(
+                                    "HLS stream-start fail-fast: {}s elapsed with 0 segments. \
+                                 Likely starved swarm or bad source — returning error so \
+                                 handle_play's auto-retry loop can fall back to the next \
+                                 result if one is available.",
+                                    elapsed_secs
+                                );
+                                do_cleanup(state);
+                                // Error message intentionally describes only what
+                                // happened (not what will happen next); handle_play
+                                // decides retry vs surface based on attempts remaining.
+                                return Json(json!({
+                                    "error": format!(
+                                        "Stream-start fail-fast: ffmpeg produced no HLS segments \
+                                         in {elapsed_secs}s (likely starved swarm or bad source)."
+                                    )
+                                }));
+                            }
+                            if tokio::time::Instant::now() > prebuffer_deadline {
+                                tracing::warn!(
                                 "HLS pre-buffer timeout ({}s) — casting with {} segments available",
                                 prebuffer_timeout_secs,
                                 seg_count
                             );
-                            break;
+                                break;
+                            }
+                            if manifest_path.exists()
+                                && target_segment.exists()
+                                && target_low_segment
+                                    .as_ref()
+                                    .map(|p| p.exists())
+                                    .unwrap_or(true)
+                            {
+                                tracing::info!(
+                                    "HLS pre-buffer ready: {} segments at {:?} (target was {})",
+                                    seg_count,
+                                    hls_dir,
+                                    min_segments
+                                );
+                                break;
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         }
-                        if manifest_path.exists()
-                            && target_segment.exists()
-                            && target_low_segment
-                                .as_ref()
-                                .map(|p| p.exists())
-                                .unwrap_or(true)
-                        {
-                            tracing::info!(
-                                "HLS pre-buffer ready: {} segments at {:?} (target was {})",
-                                seg_count,
-                                hls_dir,
-                                min_segments
-                            );
-                            break;
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    }
+
+                    // Cast URL is the HLS MASTER playlist (not the media
+                    // playlist directly). Older Chromecast firmwares —
+                    // confirmed live on CrKey 1.56 / Fredriks TV — refuse
+                    // to load a bare media playlist without CODECS /
+                    // RESOLUTION / BANDWIDTH hints. /hls/master.m3u8 wraps
+                    // ffmpeg's media playlist with those hints synthetically.
+                    // Chromecast resolves segment URLs against the master,
+                    // and `playlist.m3u8` (relative) → `/hls/playlist.m3u8`,
+                    // and `seg_00000.ts` (relative to playlist.m3u8) →
+                    // `/hls/seg_00000.ts`.
+                    final_url = format!(
+                        "http://{}:{}/hls/master.m3u8",
+                        state.config.stream_host, state.config.port
+                    );
+                    is_transcoded = true;
+
+                    if sub_path.is_some() {
+                        tracing::info!("Subtitles burned into video stream via NVENC");
                     }
                 }
-
-                // Cast URL is the HLS MASTER playlist (not the media
-                // playlist directly). Older Chromecast firmwares —
-                // confirmed live on CrKey 1.56 / Fredriks TV — refuse
-                // to load a bare media playlist without CODECS /
-                // RESOLUTION / BANDWIDTH hints. /hls/master.m3u8 wraps
-                // ffmpeg's media playlist with those hints synthetically.
-                // Chromecast resolves segment URLs against the master,
-                // and `playlist.m3u8` (relative) → `/hls/playlist.m3u8`,
-                // and `seg_00000.ts` (relative to playlist.m3u8) →
-                // `/hls/seg_00000.ts`.
-                final_url = format!(
-                    "http://{}:{}/hls/master.m3u8",
-                    state.config.stream_host, state.config.port
-                );
-                is_transcoded = true;
-
-                if sub_path.is_some() {
-                    tracing::info!("Subtitles burned into video stream via NVENC");
+                Err(e) => {
+                    if target == "chromecast" {
+                        return Json(json!({
+                            "error": format!(
+                                "Chromecast playback requires HLS delivery; refusing raw fallback after HLS preparation failed: {}",
+                                e
+                            )
+                        }));
+                    }
+                    tracing::warn!("HLS transcode failed (casting original): {}", e);
                 }
-            }
-            Err(e) => {
-                if target == "chromecast" {
-                    return Json(json!({
-                        "error": format!(
-                            "Chromecast playback requires HLS delivery; refusing raw fallback after HLS preparation failed: {}",
-                            e
-                        )
-                    }));
-                }
-                tracing::warn!("HLS transcode failed (casting original): {}", e);
             }
         }
-    }
+    } // end `if cache_hit_key.is_none()` — cache-MISS transcode region (v3.7.9)
 
     // Cast to Chromecast
     if target == "chromecast" {
@@ -1762,18 +1851,14 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         // they can't seed the cache). `do_cleanup` reads this back to decide
         // whether to atomically promote `transcoded_hls/` into the cache
         // root on ffmpeg natural-exit. See `hls_cache` module docs.
-        cache_key: if state.config.hls_cache_cap_mb > 0 && seek_to.is_none() {
-            crate::hls_cache::build_cache_key(
-                req.imdb_id.as_deref(),
-                req.season,
-                req.episode,
-                if has_subtitles {
-                    Some(sub_lang.as_str())
-                } else {
-                    None
-                },
-                intro_path.is_some(),
-            )
+        // v3.7.9: REUSE the single early `play_cache_key` (request-intent
+        // imdb-or-title key) so cache-FILL here and cache-HIT above
+        // provably agree (computing it twice with divergent inputs was
+        // the trap). None on a cache-HIT play (nothing new to fill), a
+        // resumed/seek play (not a full-episode output), or when caching
+        // is disabled (resolve_cache_key already returned None for cap 0).
+        cache_key: if seek_to.is_none() && cache_hit_key.is_none() {
+            play_cache_key.clone()
         } else {
             None
         },
@@ -5698,6 +5783,59 @@ fn cast_result_to_json(
         Ok(Err(e)) => Json(json!({"error": e.to_string()})),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
+}
+
+/// v3.7.9 — serve a file from a COMPLETE HLS cache entry, verbatim.
+/// `/hls_cache/{key}/{file}`: `key` = a cache-key dir, `file` =
+/// `master.m3u8` / `stream_N.m3u8` / `seg_*.ts`. Same strict
+/// path-traversal hardening as `handle_hls_segment`, applied to BOTH
+/// components. The Chromecast gets ffmpeg's REAL multi-variant master
+/// and resolves the variant playlists + segments against it through
+/// this same route (no synthetic-master reconciliation — the resolved
+/// v3.5.1 blocker). `serve_static_with_range` → Content-Length + Range.
+async fn handle_hls_cache_file(
+    State(state): State<SharedState>,
+    axum::extract::Path((key, file)): axum::extract::Path<(String, String)>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let key_safe = !key.is_empty()
+        && key.len() <= 128
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        && !key.contains("..");
+    let file_safe = !file.is_empty()
+        && file.len() <= 64
+        && (file.ends_with(".ts")
+            || file.ends_with(".m4s")
+            || file.ends_with(".m3u8")
+            || file.ends_with(".mp4"))
+        && file
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        && !file.contains("..");
+    if !key_safe || !file_safe {
+        tracing::warn!(
+            "HLS cache request rejected as unsafe: key={:?} file={:?}",
+            key,
+            file
+        );
+        return axum::response::Response::builder()
+            .status(403)
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from("Forbidden"))
+            .unwrap();
+    }
+    let content_type: &'static str = if file.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else if file.ends_with(".ts") {
+        "video/mp2t"
+    } else {
+        "video/mp4"
+    };
+    let md = resolve_media_dir(&state);
+    let path = crate::hls_cache::cache_dir_for_key(&md, &key).join(&file);
+    serve_static_with_range(path, content_type, &headers).await
 }
 
 #[cfg(test)]
