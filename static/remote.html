@@ -129,6 +129,11 @@
   .phvid{width:min(94vw,640px);aspect-ratio:16/9;background:#000;border-radius:14px;box-shadow:0 14px 40px rgba(0,0,0,.5)}
   .nowfull h2{margin:.2rem 0 0;font-size:1.3rem;text-align:center}
   .nowfull .sub{color:var(--dim);font-size:.85rem;margin-top:-.4rem}
+  .lu{width:1.05em;height:1.05em;display:inline-block;vertical-align:-.16em;flex:none;stroke:currentColor}
+  nav a .lu,.seg button .lu{margin-right:.34em}
+  .tgt .lu{margin-right:.4em}
+  .topt .ic .lu{width:1.3em;height:1.3em;vertical-align:-.2em}
+  .srcbtn .lu{margin-right:.35em}
   .scrub{width:min(92vw,420px)}
   .scrub .rail{position:relative;height:6px;border-radius:3px;background:var(--bg3);overflow:hidden}
   .scrub .frontier{position:absolute;inset:0 0 0 0;background:var(--line)}
@@ -219,11 +224,11 @@
 <header>
   <div class="brand">spela<small>remote</small></div>
   <nav>
-    <a href="#/search" data-v="search">Search</a>
-    <a href="#/library" data-v="library">Library</a>
-    <a href="#/now" data-v="now">Now</a>
+    <a href="#/search" data-v="search" data-ic="search">Search</a>
+    <a href="#/library" data-v="library" data-ic="library">Library</a>
+    <a href="#/now" data-v="now" data-ic="tv">Now</a>
   </nav>
-  <button class="tgt" id="tgtBtn"><span class="dot"></span><b id="tgtLabel">Pick target</b></button>
+  <button class="tgt" id="tgtBtn" data-ic="cast"><b id="tgtLabel">Pick target</b></button>
 </header>
 
 <main>
@@ -232,8 +237,8 @@
       <input id="q" type="search" inputmode="search" autocomplete="off"
         placeholder="Search a movie or show…" aria-label="Search">
       <div class="seg" id="modeSeg">
-        <button data-m="movie" class="on">Movies</button>
-        <button data-m="tv">TV</button>
+        <button data-m="movie" class="on" data-ic="film">Movies</button>
+        <button data-m="tv" data-ic="tv">TV</button>
       </div>
     </div>
     <div id="searchOut"></div>
@@ -249,9 +254,9 @@
 <div id="nowbar">
   <img class="mp" id="nbPoster" alt="">
   <div class="nt"><div class="a" id="nbTitle">—</div><div class="b" id="nbState">—</div></div>
-  <button class="tbtn" id="nbRestart" title="Restart from start" aria-label="Restart from start">↺</button>
-  <button class="tbtn" id="nbPlay" title="Play/Pause">⏸</button>
-  <button class="tbtn" id="nbExpand" title="Open player">▣</button>
+  <button class="tbtn" id="nbRestart" title="Restart from start" aria-label="Restart from start" data-ic="restart"></button>
+  <button class="tbtn" id="nbPlay" title="Play/Pause" aria-label="Play/Pause" data-ic="pause"></button>
+  <button class="tbtn" id="nbExpand" title="Open player" aria-label="Open player" data-ic="expand"></button>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -399,6 +404,30 @@ async function runSearch(q){
 }
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
+/* ---------- Lucide icons (inlined — no CDN dep; single-asset mandate;
+   currentColor = theme/accent-aware; SVG = crisp at the huge touch
+   sizes, unlike the old emoji glyphs) ---------- */
+const LU={
+  play:'<polygon points="6 3 20 12 6 21 6 3"/>',
+  pause:'<rect x="14" y="3" width="5" height="18" rx="1"/><rect x="5" y="3" width="5" height="18" rx="1"/>',
+  stop:'<rect width="18" height="18" x="3" y="3" rx="2"/>',
+  back:'<polygon points="19 20 9 12 19 4 19 20"/><line x1="5" x2="5" y1="19" y2="5"/>',
+  fwd:'<polygon points="5 4 15 12 5 20 5 4"/><line x1="19" x2="19" y1="5" y2="19"/>',
+  restart:'<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
+  expand:'<polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" x2="14" y1="3" y2="10"/><line x1="3" x2="10" y1="21" y2="14"/>',
+  search:'<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+  library:'<path d="m16 6 4 14"/><path d="M12 6v14"/><path d="M8 8v12"/><path d="M4 4v16"/>',
+  tv:'<rect width="20" height="15" x="2" y="7" rx="2" ry="2"/><polyline points="17 2 12 7 7 2"/>',
+  cast:'<path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><path d="M2 12a9 9 0 0 1 8 8"/><path d="M2 16a5 5 0 0 1 4 4"/><line x1="2" x2="2.01" y1="20" y2="20"/>',
+  phone:'<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>',
+  refresh:'<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+  film:'<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18"/><path d="M3 7.5h4"/><path d="M3 12h18"/><path d="M3 16.5h4"/><path d="M17 3v18"/><path d="M17 7.5h4"/><path d="M17 16.5h4"/>'
+};
+function ic(n){ return '<svg class="lu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+(LU[n]||"")+'</svg>'; }
+/* one-time pass: prepend the icon to every static [data-ic] button/link */
+function iconizeStatic(){ document.querySelectorAll("[data-ic]").forEach(e=>{
+  if(!e.querySelector(".lu")) e.insertAdjacentHTML("afterbegin", ic(e.dataset.ic)); }); }
+
 /* ---------- hybrid play ---------- */
 async function doPlay(opts,cardForSources){
   if(!S.target){ S.pending=()=>doPlay(opts,cardForSources); toast("Pick where to play — it starts right after"); openSheet(); return; }
@@ -476,7 +505,7 @@ async function renderLibrary(force){
   try{ d=await api("/library"); }
   catch{
     S.library.loading=false; S.library.data=null;
-    out.innerHTML=`<div class="state"><div class="big">spela unreachable</div>Can’t reach the server.<div style="margin-top:.7rem"><button class="srcbtn" id="libRetry">Retry</button></div></div>`;
+    out.innerHTML=`<div class="state"><div class="big">spela unreachable</div>Can’t reach the server.<div style="margin-top:.7rem"><button class="srcbtn" id="libRetry">${ic("refresh")}Retry</button></div></div>`;
     $("#libRetry").onclick=()=>renderLibrary(true); return;
   }
   S.library.loading=false; S.library.data=d; paintLibrary();
@@ -489,12 +518,12 @@ function paintLibrary(){
   // mislabeling couldn't-load as empty is the exact ambiguous-state the spec
   // forbids).
   if(!Array.isArray(d.library) && typeof d.origin_status!=="string"){
-    out.innerHTML=`<div class="state"><div class="big">spela unreachable</div>Couldn’t load your library.<div style="margin-top:.7rem"><button class="srcbtn" id="libRetry">Retry</button></div></div>`;
+    out.innerHTML=`<div class="state"><div class="big">spela unreachable</div>Couldn’t load your library.<div style="margin-top:.7rem"><button class="srcbtn" id="libRetry">${ic("refresh")}Retry</button></div></div>`;
     $("#libRetry").onclick=()=>renderLibrary(true); return;
   }
   // AC-3.4: "offline" (origin unreachable) is a DISTINCT state from "empty".
   if(d.origin_status==="offline" && !lib.length){
-    out.innerHTML=`<div class="state"><div class="big">Library offline</div>Your library host isn’t reachable right now — Search still works.<div style="margin-top:.7rem"><button class="srcbtn" id="libRetry">Retry</button></div></div>`;
+    out.innerHTML=`<div class="state"><div class="big">Library offline</div>Your library host isn’t reachable right now — Search still works.<div style="margin-top:.7rem"><button class="srcbtn" id="libRetry">${ic("refresh")}Retry</button></div></div>`;
     $("#libRetry").onclick=()=>renderLibrary(true); return;
   }
   if(!lib.length){
@@ -538,7 +567,7 @@ function openSheet(){
       d&&d.error?("Discovery failed: "+d.error):"No video targets found on the network."}));
     tvs.forEach(d2=>{
       const o=el("button",{className:"topt"});
-      o.innerHTML=`<span class="ic">📺</span><span><span class="nm">${esc(d2.name)}</span><br><span class="md">${esc(d2.model||"Chromecast")}</span></span>`;
+      o.innerHTML=`<span class="ic">${ic("tv")}</span><span><span class="nm">${esc(d2.name)}</span><br><span class="md">${esc(d2.model||"Chromecast")}</span></span>`;
       if(S.target&&S.target.kind==="chromecast"&&S.target.name===d2.name) o.classList.add("sel");
       o.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
         S.target={kind:"chromecast",name:d2.name};
@@ -549,7 +578,7 @@ function openSheet(){
     });
     // "This phone" — in-browser HLS playback (Phase 6 / US-5).
     const ph=el("button",{className:"topt"});
-    ph.innerHTML=`<span class="ic">📱</span><span><span class="nm">This phone</span><br><span class="md">watch in-browser</span></span>`;
+    ph.innerHTML=`<span class="ic">${ic("phone")}</span><span><span class="nm">This phone</span><br><span class="md">watch in-browser</span></span>`;
     if(S.target&&S.target.kind==="phone") ph.classList.add("sel");
     ph.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
       S.target={kind:"phone",name:"This phone"};
@@ -662,7 +691,7 @@ function updateNowBar(){
   $("#nbPoster").src=c.poster_url||""; $("#nbTitle").textContent=c.title||"—";
   $("#nbState").textContent = S.now.cold ? "Starting…"
     : `${fmt(livePos())} / ${fmt(S.now.dur)}`;
-  $("#nbPlay").textContent = S.now.cold ? "…" : (S.now.playing?"⏸":"▶");
+  $("#nbPlay").innerHTML = S.now.cold ? "…" : ic(S.now.playing?"pause":"play");
 }
 
 /* ---------- now-playing: full view + scrubber ---------- */
@@ -676,8 +705,8 @@ function renderNowFull(){
       <div class="sub">${esc(c.quality||"")} · on this phone</div>
       <video id="phvid" class="phvid" controls playsinline autoplay></video>
       <div class="transport">
-        <button class="tbtn" id="phStop" title="Stop">⏹</button>
-        <button class="srcbtn" id="phTo">Move to a TV…</button>
+        <button class="tbtn" id="phStop" title="Stop" aria-label="Stop">${ic("stop")}</button>
+        <button class="srcbtn" id="phTo">${ic("tv")}Move to a TV…</button>
       </div>
       <div class="sub">Single backend stream — moving to a TV stops it here.</div>
     </div>`;
@@ -709,11 +738,11 @@ function renderNowFull(){
       <div class="times"><span id="fCur">${fmt(pos)}</span><span>${fmt(S.now.dur)}</span></div>
     </div>
     <div class="transport">
-      <button class="tbtn" id="tPrev" title="Previous episode" aria-label="Previous episode">⏮</button>
-      <button class="tbtn" id="tRestart" title="Restart from start" aria-label="Restart from start">↺</button>
-      <button class="tbtn big" id="tPlay" aria-label="Play/Pause">${S.now.playing?"⏸":"▶"}</button>
-      <button class="tbtn" id="tStop" title="Stop" aria-label="Stop">⏹</button>
-      <button class="tbtn" id="tNext" title="Next episode" aria-label="Next episode">⏭</button>
+      <button class="tbtn" id="tPrev" title="Previous episode" aria-label="Previous episode">${ic("back")}</button>
+      <button class="tbtn" id="tRestart" title="Restart from start" aria-label="Restart from start">${ic("restart")}</button>
+      <button class="tbtn big" id="tPlay" aria-label="Play/Pause">${ic(S.now.playing?"pause":"play")}</button>
+      <button class="tbtn" id="tStop" title="Stop" aria-label="Stop">${ic("stop")}</button>
+      <button class="tbtn" id="tNext" title="Next episode" aria-label="Next episode">${ic("fwd")}</button>
     </div>
     ${!S.now.endlist&&S.now.frontier?`<div class="sub">Seekable up to ${fmt(S.now.frontier)} (still transcoding)</div>`:""}
   </div>`;
@@ -764,7 +793,7 @@ setInterval(()=>{ if(S.now.data&&!S.now.cold&&!S.now.seekDrag){
       cu.textContent=fmt(p); if(!S.now.seekDrag) sl.value=Math.round(p); } } } },1000);
 
 /* ---------- boot ---------- */
-route(); pollNow(true);
+iconizeStatic(); route(); pollNow(true);
 </script>
 </body>
 </html>
