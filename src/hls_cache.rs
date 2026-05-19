@@ -150,6 +150,51 @@ pub fn build_cache_key(
     ))
 }
 
+/// Cache key for a LIBRARY / Local-Bypass play that has no `imdb_id`
+/// (the v3.7.1 title-only bridge path → [`build_cache_key`] returns
+/// `None` → such plays never cached: the 5th facet of the library-bridge
+/// root). Keys off the raw library name instead so My-Library replays
+/// can hit the cache.
+///
+/// FNV-1a 64-bit of the trimmed `raw_name` → 16-hex — deterministic,
+/// dependency-free, collision-negligible at single-user library scale,
+/// and hex is filesystem-safe (a path-traversal-y raw_name can never
+/// leak `/` or `..` into the on-disk cache path). `lib`-prefixed so it
+/// can't collide with an `tt…` imdb key. Returns `None` for an empty
+/// name. Movies have no season/episode — the raw_name disambiguates
+/// fully (including any embedded SxxExx).
+pub fn build_cache_key_for_title(
+    raw_name: &str,
+    subtitle_lang: Option<&str>,
+    has_intro: bool,
+) -> Option<String> {
+    let name = raw_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let lang = subtitle_lang.unwrap_or("none");
+    let lang_safe: String = lang
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    let lang_safe = if lang_safe.is_empty() {
+        "none".into()
+    } else {
+        lang_safe
+    };
+    let intro = if has_intro { "intro" } else { "nointro" };
+    Some(format!(
+        "lib{:016x}_{}_{}_v{}",
+        h, lang_safe, intro, CACHE_VERSION
+    ))
+}
+
 /// Compute the on-disk path for a cache entry. `media_dir/hls_cache/<key>/`.
 pub fn cache_dir_for_key(media_dir: &Path, key: &str) -> PathBuf {
     media_dir.join(CACHE_DIR_NAME).join(key)
@@ -390,6 +435,52 @@ mod tests {
         let k_sv =
             build_cache_key(Some("tt1399664"), Some(2), Some(4), Some("swe"), false).unwrap();
         assert_ne!(k_en, k_sv);
+    }
+
+    // --- Library title-hash key (v3.7.8 — 5th facet of the v3.7.1 root:
+    // library-bridge plays carry no imdb_id, so build_cache_key() returns
+    // None and they never cache. build_cache_key_for_title() keys off the
+    // raw library name instead so My-Library replays can hit the cache.) ---
+
+    #[test]
+    fn test_title_key_deterministic_and_prefixed() {
+        let a = build_cache_key_for_title("Grosse.Pointe.Blank.1997.1080p", Some("eng"), false);
+        let b = build_cache_key_for_title("Grosse.Pointe.Blank.1997.1080p", Some("eng"), false);
+        assert_eq!(a, b, "same raw_name+lang+intro must be deterministic");
+        assert!(
+            a.as_deref().unwrap().starts_with("lib"),
+            "library keys are lib-prefixed (distinct from tt imdb keys)"
+        );
+        assert!(a
+            .as_deref()
+            .unwrap()
+            .ends_with(&format!("_v{}", CACHE_VERSION)));
+    }
+
+    #[test]
+    fn test_title_key_distinct_per_title_lang_intro() {
+        let base = build_cache_key_for_title("A.Movie.2020", Some("eng"), false).unwrap();
+        assert_ne!(
+            base,
+            build_cache_key_for_title("B.Movie.2020", Some("eng"), false).unwrap()
+        );
+        assert_ne!(
+            base,
+            build_cache_key_for_title("A.Movie.2020", Some("swe"), false).unwrap()
+        );
+        assert_ne!(
+            base,
+            build_cache_key_for_title("A.Movie.2020", Some("eng"), true).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_title_key_empty_is_none_and_is_filesystem_safe() {
+        assert!(build_cache_key_for_title("", Some("eng"), false).is_none());
+        assert!(build_cache_key_for_title("   ", Some("eng"), false).is_none());
+        // A path-traversal-y raw_name must NOT leak separators into the key.
+        let k = build_cache_key_for_title("../../etc/passwd", None, false).unwrap();
+        assert!(!k.contains('/') && !k.contains("..") && !k.contains(' '));
     }
 
     // --- Path layout ---
