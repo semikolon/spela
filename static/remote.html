@@ -609,7 +609,11 @@ async function pollNow(force){
   }
   startPolling();
   if(S.now.phone) $("#nowbar").classList.remove("on"); else $("#nowbar").classList.add("on");
-  updateNowBar(); if(currentView()==="now") renderNowFull();
+  // Do NOT rebuild the now-view DOM while the user is dragging the
+  // scrubber — renderNowFull() recreates #fSeek via innerHTML, which
+  // yanks the slider out from under the finger every 3s poll. The 1s
+  // interpolation timer already respects seekDrag the same way.
+  updateNowBar(); if(currentView()==="now" && !S.now.seekDrag) renderNowFull();
   pollFrontier();
 }
 const currentView=()=>(location.hash.replace(/^#\//,"")||"search").split("?")[0];
@@ -623,7 +627,20 @@ async function pollFrontier(){
   if(S.frontierTimer&&Date.now()-S.frontierTimer<9000) return;
   S.frontierTimer=Date.now();
   try{
-    const txt=await fetch("/hls/playlist.m3u8",{cache:"no-store"}).then(r=>r.ok?r.text():"");
+    // The media-playlist name VARIES: ffmpeg's `-var_stream_map` emits a
+    // MULTI-variant master -> the real media playlist is `stream_0.m3u8`,
+    // NOT `playlist.m3u8` (which 404s -> frontier stuck at 0 -> seekMax
+    // falls back to full duration -> the scrubber lets you skip past the
+    // transcoded edge and the seek silently no-ops). Derive the real
+    // media playlist from the master's FIRST variant URI so this works
+    // for single-variant (playlist.m3u8) AND multi-variant masters alike.
+    const mtxt=await fetch("/hls/master.m3u8",{cache:"no-store"}).then(r=>r.ok?r.text():"");
+    let media="playlist.m3u8";
+    for(const ln of mtxt.split(/\r?\n/)){
+      const s=ln.trim();
+      if(s&&!s.startsWith("#")){ media=s; break; }   // first non-comment line = first variant URI
+    }
+    const txt=await fetch("/hls/"+media,{cache:"no-store"}).then(r=>r.ok?r.text():"");
     if(!txt) return;
     let sum=0; for(const m of txt.matchAll(/#EXTINF:([\d.]+)/g)) sum+=parseFloat(m[1])||0;
     S.now.frontier=(S.now.data.ss_offset||0)+sum;
