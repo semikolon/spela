@@ -738,11 +738,9 @@ function renderNowFull(){
       <div class="times"><span id="fCur">${fmt(pos)}</span><span>${fmt(S.now.dur)}</span></div>
     </div>
     <div class="transport">
-      <button class="tbtn" id="tPrev" title="Previous episode" aria-label="Previous episode">${ic("back")}</button>
       <button class="tbtn" id="tRestart" title="Restart from start" aria-label="Restart from start">${ic("restart")}</button>
       <button class="tbtn big" id="tPlay" aria-label="Play/Pause">${ic(S.now.playing?"pause":"play")}</button>
       <button class="tbtn" id="tStop" title="Stop" aria-label="Stop">${ic("stop")}</button>
-      <button class="tbtn" id="tNext" title="Next episode" aria-label="Next episode">${ic("fwd")}</button>
     </div>
     ${!S.now.endlist&&S.now.frontier?`<div class="sub">Seekable up to ${fmt(S.now.frontier)} (still transcoding)</div>`:""}
   </div>`;
@@ -760,8 +758,6 @@ function renderNowFull(){
   $("#tRestart").onclick=restart;
   $("#tStop").onclick=async()=>{ await api("/stop",{method:"POST"}).catch(()=>{});
     S.now.data=null; $("#nowbar").classList.remove("on"); renderNowFull(); stopPolling(); };
-  $("#tNext").onclick=()=>transport("/next");
-  $("#tPrev").onclick=()=>transport("/prev");
   $("#tPlay").onclick=togglePlay;
 }
 
