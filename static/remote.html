@@ -781,6 +781,10 @@ async function restart(){
 $("#nbRestart").onclick=restart;
 $("#nbPlay").onclick=()=>{ if(!S.now.cold) togglePlay(); };
 $("#nbExpand").onclick=()=>location.hash="#/now";
+// Tap anywhere on the now-bar (poster/title) opens the full player;
+// taps on its buttons keep their own action (closest() walks up from
+// the inner SVG icon to the button, so this guard is icon-safe).
+$("#nowbar").addEventListener("click",e=>{ if(e.target.closest("button")) return; location.hash="#/now"; });
 
 /* tick the now-bar/full view between polls so interpolation stays smooth */
 setInterval(()=>{ if(S.now.data&&!S.now.cold&&!S.now.seekDrag){
