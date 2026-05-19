@@ -749,11 +749,22 @@ function renderNowFull(){
     const v=+sl.value; $("#fCur").textContent=fmt(v);
     $("#fFill").style.width=(max?Math.min(100,v/max*100):0)+"%"; });
   sl.addEventListener("change",async()=>{
-    let v=+sl.value; const m=seekMax();
-    if(v>m){ v=Math.floor(m); toast("That part isn’t transcoded yet — seeking to the edge"); }
+    const v=+sl.value;
     S.now.seekDrag=false; S.now.posAbs=v; S.now.lastSync=Date.now();
-    const r=await api("/seek",{method:"POST",body:{seconds:v}}).catch(()=>({error:"unreachable"}));
-    if(r&&r.error) toast("Seek failed: "+r.error);
+    // Past the transcoded frontier while still transcoding → RE-TRANSCODE
+    // from there (user's "play from that time", NOT clamp-to-edge).
+    // Within the window (or whole file done) → instant cast.seek.
+    const pastFrontier = !S.now.endlist && S.now.frontier>0 && v>S.now.frontier;
+    if(pastFrontier){
+      toast(`Transcoding from ${fmt(v)}…`);
+      const r=await api("/seek-retranscode",{method:"POST",body:{t:v}}).catch(()=>({error:"unreachable"}));
+      if(r&&r.error){ toast("Couldn’t seek there: "+r.error); }
+      else { S.now.cold=true; S.now.everRan=false; S.now.lastSync=0;
+             S.now.frontier=0; S.now.endlist=false; pollNow(true); }
+    } else {
+      const r=await api("/seek",{method:"POST",body:{seconds:v}}).catch(()=>({error:"unreachable"}));
+      if(r&&r.error) toast("Seek failed: "+r.error);
+    }
   });
   $("#tRestart").onclick=restart;
   $("#tStop").onclick=async()=>{ await api("/stop",{method:"POST"}).catch(()=>{});

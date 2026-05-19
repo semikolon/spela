@@ -171,6 +171,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/pause", post(handle_pause))
         .route("/resume", post(handle_resume))
         .route("/seek", post(handle_seek))
+        .route("/seek-retranscode", post(handle_seek_retranscode))
         .route("/volume", post(handle_volume))
         .route("/next", post(handle_next))
         .route("/prev", post(handle_prev))
@@ -784,6 +785,84 @@ pub(crate) const fn magnet_required_error(has_title: bool) -> &'static str {
     } else {
         "Missing magnet. Use 'spela play <N>' with a result number, or pass a magnet link."
     }
+}
+
+/// Rebuild a `PlayRequest` that re-plays the CURRENT stream from
+/// absolute episode position `seek_to` (seconds). Used by
+/// `/seek-retranscode` so a scrubber seek PAST the transcoded frontier
+/// re-transcodes from that point (the user's "play from that time, not
+/// the closest time") instead of clamping. Reuses the solid v3.4.3
+/// do_play+`ss_offset` machinery — pure + unit-tested; the `do_play`
+/// call is the integration boundary.
+///
+/// `current.target` is the `"<kind>:<cast_name>"` form do_play stored
+/// (`format!("{}:{}", target, cast_name)`); split on the FIRST ':'.
+/// `current.magnet` is `""` for a Local Bypass / library-bridge play
+/// (v3.7.1) → map back to `None` so do_play takes the title-bridge
+/// path, NOT the magnet/torrent path (exactly as the original library
+/// tap did). NOTE: `CurrentStream` carries no `file_index`, so a
+/// multi-file torrent re-play re-selects librqbit's default file —
+/// acceptable: seek-retranscode's primary use is single-file library
+/// plays; documented limitation, not a regression of normal play.
+pub(crate) fn replay_request_from_current(current: &CurrentStream, seek_to: f64) -> PlayRequest {
+    let (target, cast_name) = match current.target.split_once(':') {
+        Some((k, n)) => (Some(k.to_string()), Some(n.to_string())),
+        None => (Some(current.target.clone()), None),
+    };
+    PlayRequest {
+        magnet: if current.magnet.is_empty() {
+            None
+        } else {
+            Some(current.magnet.clone())
+        },
+        result_id: None,
+        target,
+        cast_name,
+        title: Some(current.title.clone()),
+        file_index: None,
+        no_subs: Some(!current.has_subtitles),
+        no_intro: None,
+        smooth: Some(current.smooth),
+        subtitle_lang: current.subtitle_lang.clone(),
+        imdb_id: current.imdb_id.clone(),
+        show: current.show.clone(),
+        season: current.season,
+        episode: current.episode,
+        seek_to: Some(seek_to),
+        duration: current.duration,
+        quality: current.quality.clone(),
+        size: current.size.clone(),
+        poster_url: current.poster_url.clone(),
+    }
+}
+
+/// v3.7.7 — re-transcode the CURRENT stream from an absolute episode
+/// position. The web scrubber calls this when the user seeks PAST the
+/// transcoded frontier while still transcoding: instead of clamping to
+/// the edge, re-transcode from that point. `/seek` (cast.seek) only
+/// works WITHIN the transcoded window; this is the documented
+/// server-side restart (do_play + `seek_to`/`-ss`, the v3.4.3
+/// `ss_offset` path) wired to a real endpoint — `/api/seek-restart` was
+/// a dead webtorrent-era stub. Works for library plays because the
+/// v3.7.1 fix lets a title-only (no-magnet) do_play reach the bridge.
+async fn handle_seek_retranscode(
+    State(state): State<SharedState>,
+    Json(req): Json<SeekRequest>,
+) -> Json<Value> {
+    let absolute = match req.t.or(req.seconds) {
+        Some(p) if p.is_finite() && p >= 0.0 => p,
+        _ => {
+            return Json(json!({
+                "error": "seek-retranscode needs a finite, non-negative absolute position"
+            }))
+        }
+    };
+    let current = match AppState::load(&state.state_dir).current {
+        Some(c) => c,
+        None => return Json(json!({"error": "No active stream to re-transcode"})),
+    };
+    let mut play = replay_request_from_current(&current, absolute);
+    do_play(&state, &mut play).await
 }
 
 async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
@@ -5654,6 +5733,72 @@ mod tests {
         let msg = magnet_required_error(false);
         assert!(msg.contains("Missing magnet"));
         assert!(msg.contains("spela play <N>"));
+    }
+
+    // --- May 19, 2026: Slice 2 — seek past frontier re-transcodes ---
+    // replay_request_from_current rebuilds a PlayRequest that replays the
+    // CURRENT stream from absolute N. Library plays (magnet "") MUST map
+    // back to None so do_play takes the v3.7.1 title-bridge path (not the
+    // magnet/torrent path); target "<kind>:<name>" must split on first ':'.
+    fn _cs_fixture(magnet: &str, target: &str) -> CurrentStream {
+        CurrentStream {
+            magnet: magnet.into(),
+            title: "Grosse.Pointe.Blank.1997.1080p".into(),
+            show: None,
+            season: None,
+            episode: None,
+            imdb_id: Some("tt0119229".into()),
+            target: target.into(),
+            url: "http://x/hls/master.m3u8".into(),
+            started_at: Utc::now(),
+            pid: 0,
+            has_subtitles: true,
+            subtitle_lang: Some("eng".into()),
+            duration: Some(6443.0),
+            quality: Some("1080p".into()),
+            size: None,
+            poster_url: Some("https://image.tmdb.org/x.jpg".into()),
+            ss_offset: 0.0,
+            smooth: false,
+            prepared_hls: true,
+            cache_key: None,
+        }
+    }
+
+    #[test]
+    fn replay_request_library_play_drops_empty_magnet_to_none() {
+        let r = replay_request_from_current(&_cs_fixture("", "chromecast:Fredriks TV"), 2240.0);
+        assert_eq!(
+            r.magnet, None,
+            "empty magnet (library/bypass) must become None so do_play takes the title-bridge path"
+        );
+        assert_eq!(r.title.as_deref(), Some("Grosse.Pointe.Blank.1997.1080p"));
+        assert_eq!(r.seek_to, Some(2240.0));
+        assert_eq!(r.target.as_deref(), Some("chromecast"));
+        assert_eq!(r.cast_name.as_deref(), Some("Fredriks TV"));
+        assert_eq!(r.imdb_id.as_deref(), Some("tt0119229"));
+        assert_eq!(
+            r.poster_url.as_deref(),
+            Some("https://image.tmdb.org/x.jpg")
+        );
+    }
+
+    #[test]
+    fn replay_request_torrent_play_keeps_magnet() {
+        let r = replay_request_from_current(
+            &_cs_fixture("magnet:?xt=urn:btih:abc", "chromecast:Vrum"),
+            10.0,
+        );
+        assert_eq!(r.magnet.as_deref(), Some("magnet:?xt=urn:btih:abc"));
+        assert_eq!(r.cast_name.as_deref(), Some("Vrum"));
+        assert_eq!(r.seek_to, Some(10.0));
+    }
+
+    #[test]
+    fn replay_request_target_without_colon_is_kind_only() {
+        let r = replay_request_from_current(&_cs_fixture("", "vlc"), 0.0);
+        assert_eq!(r.target.as_deref(), Some("vlc"));
+        assert_eq!(r.cast_name, None);
     }
 
     // --- Input validation (Apr 30, 2026 — security audit cluster) ---
