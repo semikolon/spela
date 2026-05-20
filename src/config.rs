@@ -114,6 +114,15 @@ pub struct Config {
     /// v3.6.0 (library-host side): port `spela serve-library` listens on.
     #[serde(default = "default_library_serve_port")]
     pub library_serve_port: u16,
+    /// v3.8.0 (library-host side): ntfy base URL for serve-library drive-
+    /// state transition alerts (e.g. drive disappeared / came back). Empty
+    /// string disables. Default points at the fleet ntfy on Darwin under
+    /// the `spela-library-alerts` topic (the `<system>-<purpose>` naming
+    /// convention used by `brf-auto-alerts`, `router-security`, etc.).
+    /// Best-effort POST — if the daemon can't reach ntfy it logs WARN
+    /// once and continues serving; it never crashes on a failed alert.
+    #[serde(default = "default_library_ntfy_url")]
+    pub library_ntfy_url: String,
 }
 
 fn default_server() -> String {
@@ -150,6 +159,12 @@ fn default_hls_cache_cap_mb() -> u64 {
 fn default_library_serve_port() -> u16 {
     7891
 }
+fn default_library_ntfy_url() -> String {
+    // Darwin fleet ntfy (per global service-port map). Topic name follows
+    // the `<system>-<purpose>` convention (sibling: `brf-auto-alerts`,
+    // `router-security`, `shannon-security`).
+    "http://darwin.home:8099/spela-library-alerts".into()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -173,6 +188,7 @@ impl Default for Config {
             library_dirs: Vec::new(),
             remote_origins: Vec::new(),
             library_serve_port: default_library_serve_port(),
+            library_ntfy_url: default_library_ntfy_url(),
         }
     }
 }

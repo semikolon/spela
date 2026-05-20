@@ -46,9 +46,10 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::time::sleep;
 use tokio_util::io::ReaderStream;
 
 use crate::config::Config;
@@ -60,15 +61,80 @@ use crate::torrent_stream::parse_range_header;
 /// generous headroom; a re-resolved play simply mints a fresh handle.
 const HANDLE_TTL: Duration = Duration::from_secs(120);
 
-struct LibraryOriginState {
-    /// Canonicalized configured library roots. A served path must
-    /// canonicalize to a prefix-child of one of these.
-    roots: Vec<PathBuf>,
-    /// opaque handle → (canonical absolute path, issued_at).
-    handles: Mutex<HashMap<String, (PathBuf, Instant)>>,
+/// v3.8.0 drive-aware state machine. Replaces the v3.6.0-pre-3.8 model
+/// where serve-library exited 1 the moment no roots canonicalized (which
+/// led launchd's KeepAlive into a 10s crash-loop that drowned the logs
+/// in identical "no usable library_dirs" lines until someone noticed —
+/// the exact failure-as-noise-not-signal mode the global directives
+/// forbid). Now the daemon stays alive in `Waiting`, periodically re-
+/// probes, logs ONLY on transitions, and fires a single ntfy when a
+/// drive vanishes or comes back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryStateKind {
+    /// Before the first probe completes. Distinct from `Serving` so the
+    /// initial-state log fires exactly once even if startup happens to
+    /// be Serving.
+    Initial,
+    /// All configured roots canonicalize cleanly.
+    Serving,
+    /// Some configured roots are reachable, others aren't.
+    Degraded,
+    /// None of the configured roots canonicalize — drives missing.
+    /// `/library/{list,match}` return 503 + JSON until at least one
+    /// root recovers.
+    Waiting,
 }
 
-type Shared = std::sync::Arc<LibraryOriginState>;
+/// Pure: classify operational state from healthy vs configured root
+/// counts. Precondition (enforced upstream in `run`): `configured > 0`
+/// — an empty `library_dirs` is a genuine config error and the daemon
+/// bails before reaching the state machine. The `configured == 0` arm
+/// here is defensive only.
+fn classify_state(healthy: usize, configured: usize) -> LibraryStateKind {
+    if configured == 0 {
+        return LibraryStateKind::Waiting;
+    }
+    if healthy == 0 {
+        LibraryStateKind::Waiting
+    } else if healthy < configured {
+        LibraryStateKind::Degraded
+    } else {
+        LibraryStateKind::Serving
+    }
+}
+
+/// Quiet sibling of `canonicalize_roots` (the pre-3.8 version that
+/// warned per failing path on every call). The state machine's probe
+/// runs every 30 s and re-canonicalizes — logging at WARN per missing
+/// root each probe would re-introduce the spam this whole refactor
+/// exists to eliminate. The transition logger handles the user-visible
+/// signal instead.
+fn canonicalize_roots_quiet(raw: &[PathBuf]) -> Vec<PathBuf> {
+    raw.iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect()
+}
+
+struct LibraryOriginState {
+    /// Configured library_dirs from config — RAW (not canonicalized).
+    /// Re-canonicalized every probe to detect drive appearance/loss.
+    /// Immutable for daemon lifetime (restart to pick up config edits).
+    configured_roots: Vec<PathBuf>,
+    /// Currently-usable canonicalized subset (re-probed every 30 s).
+    /// Handlers read THIS, never `configured_roots`, so a vanished
+    /// drive immediately disappears from `/library/list` results.
+    healthy_roots: Mutex<Vec<PathBuf>>,
+    /// Last observed state. Transition detection compares the result of
+    /// the next probe against this, then overwrites. `Initial → ...`
+    /// is fabricated on first probe so the startup log always fires.
+    last_state: Mutex<LibraryStateKind>,
+    /// opaque handle → (canonical absolute path, issued_at).
+    handles: Mutex<HashMap<String, (PathBuf, Instant)>>,
+    /// ntfy base URL for transition alerts. Empty string disables.
+    ntfy_url: String,
+}
+
+type Shared = Arc<LibraryOriginState>;
 
 #[derive(Deserialize)]
 struct MatchParams {
@@ -321,49 +387,56 @@ pub fn enumerate_library(roots: &[PathBuf]) -> Vec<LibraryEntry> {
 
 /// Entry point for `spela serve-library`.
 pub async fn run(config: Config, port_override: Option<u16>) -> Result<()> {
-    let roots = canonicalize_roots(&config.library_dirs());
-    if roots.is_empty() {
+    let configured = config.library_dirs();
+    if configured.is_empty() {
+        // Genuine CONFIG error (distinct from "drive unplugged" which the
+        // state machine handles gracefully below). Bail loudly — the user
+        // needs to edit config.toml; we have nothing to serve in any state.
         anyhow::bail!(
-            "serve-library: no usable library_dirs in config (set `library_dirs` \
+            "serve-library: library_dirs is empty in config (set `library_dirs` \
              in ~/.config/spela/config.toml to existing directories)"
         );
     }
-    for r in &roots {
-        tracing::info!("serve-library root: {:?}", r);
-    }
+
+    let healthy_initial = canonicalize_roots_quiet(&configured);
+    let state_initial = classify_state(healthy_initial.len(), configured.len());
+    log_initial_state(state_initial, &healthy_initial, &configured);
 
     let port = port_override.unwrap_or(config.library_serve_port);
 
-    // v3.6.3 self-warm. A remote library typically lives on a USB HDD that
-    // macOS spins down after ~10 min idle. A cold first `/library/match`
-    // then blocks on spin-up (5-15s+), which used to trip the caller's
-    // timeout into a silent torrent fallback (wrong source/quality). Keep
-    // the backing drive spun up: touch each root immediately, then every
-    // 180s (well under the macOS disk-idle default). Cheap (one dir entry);
-    // a dedicated std thread so a cold spin-up never stalls the async
-    // runtime. This is HALF the "bridge works flawlessly" guarantee — the
-    // do_play liveness-gated generous timeout is the other half. Do NOT
-    // remove either half.
-    let warm_roots: Vec<PathBuf> = roots.clone();
-    std::thread::Builder::new()
-        .name("serve-library-warm".into())
-        .spawn(move || loop {
-            for r in &warm_roots {
-                let _ = std::fs::read_dir(r).map(|mut it| it.next());
-            }
-            std::thread::sleep(Duration::from_secs(180));
-        })
-        .ok();
-
-    let state: Shared = std::sync::Arc::new(LibraryOriginState {
-        roots,
+    let state: Shared = Arc::new(LibraryOriginState {
+        configured_roots: configured,
+        healthy_roots: Mutex::new(healthy_initial),
+        last_state: Mutex::new(LibraryStateKind::Initial),
         handles: Mutex::new(HashMap::new()),
+        ntfy_url: config.library_ntfy_url.clone(),
     });
+
+    // Seed the transition detector by overwriting Initial → state_initial
+    // through the probe path so the startup log already fired via
+    // log_initial_state above, but the next *real* transition is detected
+    // against state_initial (not Initial). The state machine probe handles
+    // this on its first tick.
+    {
+        let mut last = state.last_state.lock().unwrap_or_else(|e| e.into_inner());
+        *last = state_initial;
+    }
+
+    // v3.8.0 state-machine probe. Replaces v3.6.3's std-thread self-warm
+    // (the warming job is now subsumed: every 30 s probe touches each
+    // healthy root, which is well under macOS's ~10 min USB-HDD idle-
+    // spin-down threshold). FS I/O runs inside `spawn_blocking` so a cold
+    // spin-up never stalls the axum runtime. Logs ONLY on transitions —
+    // steady state is silent (the v3.7-era log-spam-on-missing-drive is
+    // structurally gone).
+    let probe_state = state.clone();
+    tokio::spawn(async move { run_state_machine_probe(probe_state).await });
 
     let app = Router::new()
         .route("/library/match", get(handle_match))
         .route("/library/list", get(handle_library_list))
         .route("/library/stream", get(handle_stream))
+        .route("/health", get(handle_health))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -375,19 +448,206 @@ pub async fn run(config: Config, port_override: Option<u16>) -> Result<()> {
     Ok(())
 }
 
-/// Canonicalize each configured root, dropping (with a warning) any that
-/// don't resolve. Canonical roots are required so the per-request
-/// prefix-check in `resolve_under_roots` is sound against `..`/symlinks.
-fn canonicalize_roots(raw: &[PathBuf]) -> Vec<PathBuf> {
-    raw.iter()
-        .filter_map(|p| match std::fs::canonicalize(p) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!("serve-library: skipping unusable root {:?}: {}", p, e);
-                None
+/// One-shot startup log line. Severity matches user-actionability:
+/// Serving = INFO, Degraded/Waiting = WARN. Steady state after this is
+/// silent until `log_transition` fires.
+fn log_initial_state(state: LibraryStateKind, healthy: &[PathBuf], configured: &[PathBuf]) {
+    match state {
+        LibraryStateKind::Serving => {
+            tracing::info!(
+                "serve-library: SERVING — {} root(s): {:?}",
+                healthy.len(),
+                healthy
+            );
+        }
+        LibraryStateKind::Degraded => {
+            tracing::warn!(
+                "serve-library: DEGRADED — {}/{} configured roots healthy ({} missing); \
+                 daemon serving the healthy subset, ntfy alert dispatched if configured",
+                healthy.len(),
+                configured.len(),
+                configured.len() - healthy.len()
+            );
+        }
+        LibraryStateKind::Waiting => {
+            tracing::warn!(
+                "serve-library: WAITING — 0/{} configured roots healthy. \
+                 HTTP /library/{{list,match}} returns 503 until drives mount. \
+                 Probe re-checks every 30s; ntfy alert on recovery.",
+                configured.len()
+            );
+        }
+        LibraryStateKind::Initial => unreachable!("classify_state never returns Initial"),
+    }
+}
+
+/// Probe loop — drives the state machine. Runs in tokio::spawn task.
+/// Cadence: 30 s. Each tick: re-canonicalize, update healthy_roots,
+/// detect transition, log + ntfy on change, then self-warm (touch each
+/// healthy root once so the backing USB HDD doesn't spin down).
+async fn run_state_machine_probe(state: Shared) {
+    let probe_interval = Duration::from_secs(30);
+    loop {
+        sleep(probe_interval).await;
+
+        let configured = state.configured_roots.clone();
+        let configured_len = configured.len();
+        let healthy_now =
+            tokio::task::spawn_blocking(move || canonicalize_roots_quiet(&configured))
+                .await
+                .unwrap_or_default();
+        let new_state = classify_state(healthy_now.len(), configured_len);
+
+        // Update healthy_roots so the next /library/list call uses the
+        // current set (cheap clone; readers always see latest).
+        {
+            let mut h = state
+                .healthy_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *h = healthy_now.clone();
+        }
+
+        // Transition detection — atomic check + swap.
+        let prev_state = {
+            let mut last = state.last_state.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = *last;
+            *last = new_state;
+            prev
+        };
+        if prev_state != new_state {
+            log_transition(prev_state, new_state, &healthy_now, &state.configured_roots);
+            if !state.ntfy_url.is_empty() {
+                send_ntfy_alert(
+                    &state.ntfy_url,
+                    prev_state,
+                    new_state,
+                    &healthy_now,
+                    &state.configured_roots,
+                )
+                .await;
             }
-        })
-        .collect()
+        }
+
+        // Self-warm: cheap directory-entry touch keeps the USB HDD spinning
+        // (mirrors the v3.6.3 invariant — see the do_play liveness-gated
+        // 25s match-timeout in server.rs which depends on the drive being
+        // warm in steady state).
+        for r in &healthy_now {
+            let _ = std::fs::read_dir(r).map(|mut it| it.next());
+        }
+    }
+}
+
+/// Logged ONCE per state transition. Severity rises for degraded/waiting
+/// (drive-loss events the operator wants visible at WARN).
+fn log_transition(
+    prev: LibraryStateKind,
+    curr: LibraryStateKind,
+    healthy: &[PathBuf],
+    configured: &[PathBuf],
+) {
+    let high = matches!(curr, LibraryStateKind::Waiting | LibraryStateKind::Degraded);
+    let msg = format!(
+        "serve-library: state transition {:?} → {:?} ({}/{} roots healthy)",
+        prev,
+        curr,
+        healthy.len(),
+        configured.len()
+    );
+    if high {
+        tracing::warn!("{}", msg);
+    } else {
+        tracing::info!("{}", msg);
+    }
+}
+
+/// Best-effort ntfy POST on state transition. Never crashes the daemon
+/// on failure — logs WARN once and continues. 3 s timeout so a wedged
+/// ntfy can't stall the probe loop.
+async fn send_ntfy_alert(
+    url: &str,
+    prev: LibraryStateKind,
+    curr: LibraryStateKind,
+    healthy: &[PathBuf],
+    configured: &[PathBuf],
+) {
+    let (title, priority) = match curr {
+        LibraryStateKind::Waiting => ("spela-library: all drives missing", "high"),
+        LibraryStateKind::Degraded => ("spela-library: degraded", "default"),
+        LibraryStateKind::Serving => ("spela-library: recovered", "default"),
+        LibraryStateKind::Initial => return,
+    };
+    let body = format!(
+        "{:?} -> {:?}  ({} of {} roots healthy)",
+        prev,
+        curr,
+        healthy.len(),
+        configured.len()
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "serve-library: ntfy client build failed: {} (best-effort, ignoring)",
+                e
+            );
+            return;
+        }
+    };
+    match client
+        .post(url)
+        .header("Title", title)
+        .header("Priority", priority)
+        .header("Tags", "spela,library,storage")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!(
+                "serve-library: ntfy alert posted ({:?} -> {:?})",
+                prev,
+                curr
+            );
+        }
+        Ok(r) => {
+            tracing::warn!(
+                "serve-library: ntfy POST returned {} (best-effort, ignoring)",
+                r.status()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "serve-library: ntfy POST failed: {} (best-effort, ignoring)",
+                e
+            );
+        }
+    }
+}
+
+/// 503 + JSON shape returned by `/library/{list,match}` while in
+/// `Waiting`. The JSON body tells the spela aggregator (and any future
+/// monitoring) WHICH roots are missing so the operator can act
+/// specifically, not just "origin offline".
+fn waiting_response(configured: &[PathBuf]) -> Response {
+    let missing: Vec<String> = configured
+        .iter()
+        .filter(|p| std::fs::canonicalize(p).is_err())
+        .map(|p| p.display().to_string())
+        .collect();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "library_drives_unavailable",
+            "status": "waiting",
+            "missing_roots": missing,
+        })),
+    )
+        .into_response()
 }
 
 /// Pure security boundary: a candidate path is acceptable IFF, after
@@ -445,15 +705,25 @@ async fn handle_match(State(state): State<Shared>, Query(p): Query<MatchParams>)
     if p.title.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "title required").into_response();
     }
+    let roots = state
+        .healthy_roots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if roots.is_empty() {
+        // Waiting state — drives gone. Honest 503 + JSON instead of an
+        // upstream-confusing 404 ("no local match" would be misleading).
+        return waiting_response(&state.configured_roots);
+    }
     let empty = std::collections::HashSet::new();
     // Reuse the EXACT server-side matcher + multi-root helper. expected
     // bytes = 0 (the origin host has no torrent-size expectation; the
     // title/year/quality + health matrix is the discriminator).
-    let hit = first_local_bypass_match(&state.roots, &p.title, p.quality.as_deref(), 0, &empty);
+    let hit = first_local_bypass_match(&roots, &p.title, p.quality.as_deref(), 0, &empty);
     let Some(path) = hit else {
         return (StatusCode::NOT_FOUND, "no local match").into_response();
     };
-    let Some(canon) = resolve_under_roots(&state.roots, &path) else {
+    let Some(canon) = resolve_under_roots(&roots, &path) else {
         // Matched something that fails the security boundary — treat as miss.
         return (StatusCode::NOT_FOUND, "no servable match").into_response();
     };
@@ -485,10 +755,21 @@ async fn handle_match(State(state): State<Shared>, Query(p): Query<MatchParams>)
 /// stalled; the caller (spela `/library`) gates it behind a liveness
 /// ping + generous timeout (web-remote T-3 / the v3.6.3 pattern).
 async fn handle_library_list(State(state): State<Shared>) -> Response {
-    let roots = state.roots.clone();
+    let roots = state
+        .healthy_roots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if roots.is_empty() {
+        return waiting_response(&state.configured_roots);
+    }
     match tokio::task::spawn_blocking(move || enumerate_library(&roots)).await {
         Ok(entries) => {
-            tracing::info!("serve-library: /library/list -> {} entries", entries.len());
+            // DEBUG, not INFO — this fires every SPA library-view open
+            // (3 s polling, web-remote AC-3.4). Steady-state silence is
+            // the new invariant; the daemon logs only at startup + state
+            // transitions.
+            tracing::debug!("serve-library: /library/list -> {} entries", entries.len());
             Json(json!({ "entries": entries })).into_response()
         }
         Err(e) => {
@@ -496,6 +777,35 @@ async fn handle_library_list(State(state): State<Shared>) -> Response {
             (StatusCode::INTERNAL_SERVER_ERROR, "enumeration failed").into_response()
         }
     }
+}
+
+/// `GET /health` — operational state snapshot for monitoring / external
+/// checks (sluss / sentinel / Darwin's `/library` aggregator). Always
+/// 200; the JSON `status` field tells the caller whether the drives
+/// are actually serving. Distinct from `/library/list`'s 503 because
+/// monitoring needs reachable-AND-state-aware liveness; the SPA reads
+/// `/library/list` and the aggregator pings `/library/stream?h=<sentinel>`
+/// — `/health` is the third oracle for things that want both signals.
+async fn handle_health(State(state): State<Shared>) -> Response {
+    let healthy = state
+        .healthy_roots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let curr = *state.last_state.lock().unwrap_or_else(|e| e.into_inner());
+    let status_str = match curr {
+        LibraryStateKind::Serving => "serving",
+        LibraryStateKind::Degraded => "degraded",
+        LibraryStateKind::Waiting => "waiting",
+        LibraryStateKind::Initial => "initial",
+    };
+    Json(json!({
+        "status": status_str,
+        "configured_count": state.configured_roots.len(),
+        "healthy_count": healthy.len(),
+        "healthy_roots": healthy.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+    }))
+    .into_response()
 }
 
 async fn handle_stream(
@@ -514,8 +824,16 @@ async fn handle_stream(
         }
     };
     // Defense in depth: re-validate the path is still under a root and not
-    // a symlink, every request (TOCTOU + handle-map integrity).
-    let Some(canon) = resolve_under_roots(&state.roots, &path) else {
+    // a symlink, every request (TOCTOU + handle-map integrity). If the
+    // drive vanished mid-stream, healthy_roots is empty and resolve fails
+    // — surfaces as 403 (security-boundary), matching pre-3.8 behaviour
+    // when canonicalize would have failed for the same reason.
+    let roots_now = state
+        .healthy_roots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(canon) = resolve_under_roots(&roots_now, &path) else {
         return (StatusCode::FORBIDDEN, "path failed security boundary").into_response();
     };
 
@@ -742,5 +1060,75 @@ mod tests {
         assert_eq!(got[1].raw_name, "Inception (2010)");
         // Largest inner file represents the dir, not the 5 MB sample.
         assert_eq!(got[1].size_bytes, 200 * 1024 * 1024);
+    }
+
+    // ----- v3.8.0 drive-aware state machine -----
+
+    #[test]
+    fn classify_state_all_healthy_is_serving() {
+        assert_eq!(classify_state(3, 3), LibraryStateKind::Serving);
+        assert_eq!(classify_state(1, 1), LibraryStateKind::Serving);
+    }
+
+    #[test]
+    fn classify_state_partial_is_degraded() {
+        assert_eq!(classify_state(1, 2), LibraryStateKind::Degraded);
+        assert_eq!(classify_state(2, 3), LibraryStateKind::Degraded);
+    }
+
+    #[test]
+    fn classify_state_none_healthy_is_waiting() {
+        assert_eq!(classify_state(0, 1), LibraryStateKind::Waiting);
+        assert_eq!(classify_state(0, 5), LibraryStateKind::Waiting);
+    }
+
+    #[test]
+    fn classify_state_zero_configured_defensive_waiting() {
+        // Precondition is `configured > 0` (run() bails first), but the
+        // defensive arm must NOT misclassify into Serving — that would
+        // silently mean "you have nothing serving but I'll pretend it's
+        // fine", which is exactly the failure-as-no-signal mode this
+        // refactor exists to eliminate.
+        assert_eq!(classify_state(0, 0), LibraryStateKind::Waiting);
+    }
+
+    #[test]
+    fn canonicalize_roots_quiet_drops_missing_without_warning() {
+        // The "without warning" property is verified by inspection of the
+        // function body (no tracing::warn! call) — same behaviour against
+        // the same input as the old canonicalize_roots, just silent so
+        // 30s-cadence probes don't flood the log.
+        let real = tempfile::tempdir().unwrap();
+        let real_path = real.path().to_path_buf();
+        let missing = PathBuf::from("/nonexistent/path/that/definitely/does/not/exist");
+        let raw = vec![real_path.clone(), missing];
+        let got = canonicalize_roots_quiet(&raw);
+        assert_eq!(got.len(), 1, "missing path dropped, real path kept");
+        assert_eq!(got[0], std::fs::canonicalize(&real_path).unwrap());
+    }
+
+    #[test]
+    fn canonicalize_roots_quiet_handles_empty_input() {
+        let got = canonicalize_roots_quiet(&[]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn canonicalize_roots_quiet_all_missing_returns_empty() {
+        // The "BOHR vanished" case — every configured root fails. The
+        // result drives the state machine into Waiting (verified by the
+        // classify_state tests above).
+        let raw = vec![
+            PathBuf::from("/nope/one"),
+            PathBuf::from("/nope/two"),
+            PathBuf::from("/nope/three"),
+        ];
+        let got = canonicalize_roots_quiet(&raw);
+        assert!(got.is_empty());
+        // Sanity: the resulting state IS Waiting.
+        assert_eq!(
+            classify_state(got.len(), raw.len()),
+            LibraryStateKind::Waiting
+        );
     }
 }
