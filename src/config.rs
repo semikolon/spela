@@ -91,6 +91,18 @@ pub struct Config {
     /// stripped from the incoming Host header before comparison.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// 2026-05-23: URL of Shannon's `shannon-kiosk-actions` daemon `/watch`
+    /// endpoint. When a `/play` request arrives with `target="shannon"`,
+    /// spela POSTs `{title}` to this URL — Shannon's daemon then spawns
+    /// `spela-local` which does its own `/search` + `/play target=vlc` to
+    /// fetch the HLS stream + decode locally. Default
+    /// `http://192.168.4.30:8080/watch` matches the Shannon WiFi
+    /// reservation per dotfiles fleet docs; override per-host (e.g.
+    /// over WireGuard tunnel from MERIAN) by setting this in
+    /// `~/.config/spela/config.toml`. Empty string disables the
+    /// shannon target (`/play target=shannon` returns an error).
+    #[serde(default)]
+    pub shannon_watch_url: Option<String>,
     /// May 13, 2026 (v3.5.0 HLS cache): maximum bytes of transcoded HLS sets
     /// kept on disk for cache-hit fast resume. When the cache exceeds this,
     /// LRU eviction runs (`hls_cache::prune_cache_to_fit`). 20 GB = ~60
@@ -184,6 +196,7 @@ impl Default for Config {
             experimental_endlist_hack: false,
             vod_manifest_padded: false,
             allowed_hosts: Vec::new(),
+            shannon_watch_url: None,
             hls_cache_cap_mb: default_hls_cache_cap_mb(),
             library_dirs: Vec::new(),
             remote_origins: Vec::new(),

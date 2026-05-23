@@ -964,6 +964,82 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         }
     }
 
+    // 2026-05-23: target="shannon" dispatch — Shannon's bedroom kiosk
+    // is a peer playback target alongside Chromecasts ("This phone" /
+    // chromecast: are the existing pair). Architecturally distinct
+    // from chromecast/vlc paths: Darwin spela does NOT transcode here.
+    // Instead, we just notify Shannon's shannon-kiosk-actions daemon
+    // (`http://192.168.4.30:8080/watch` — LAN-bound since 2026-05-23
+    // dotfiles `ad65b709`) with the title; Shannon's `spela-local`
+    // shell client then does its own `/search` + `/play target=vlc`
+    // round-trip, kicks off transcoding via the standard non-cast
+    // HLS path, and decodes locally (HW via v4l2slh264dec when
+    // available, SW playbin3+kmssink fallback). Avoids the
+    // double-/play race that would occur if we transcoded here AND
+    // Shannon's spela-local also called /play.
+    //
+    // Config knob: spela.toml `shannon_watch_url` overrides the
+    // default for fleet rebinding. Empty = disable shannon target.
+    let req_target = req
+        .target
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    if req_target == "shannon" {
+        let shannon_url = state
+            .config
+            .shannon_watch_url
+            .clone()
+            .unwrap_or_else(|| "http://192.168.4.30:8080/watch".to_string());
+        let title_for_shannon = req
+            .title
+            .clone()
+            .or_else(|| req.show.clone())
+            .unwrap_or_default();
+        if title_for_shannon.is_empty() {
+            return Json(json!({
+                "error": "target=shannon requires a title (or a result_id from a previous search)"
+            }));
+        }
+        let body = json!({ "title": title_for_shannon });
+        let client = reqwest::Client::new();
+        let post_result = client
+            .post(&shannon_url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await;
+        match post_result {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(
+                    "target=shannon: dispatched '{}' to {}",
+                    title_for_shannon,
+                    shannon_url
+                );
+                return Json(json!({
+                    "status": "dispatched_to_shannon",
+                    "target": "shannon",
+                    "title": title_for_shannon,
+                    "shannon_url": shannon_url,
+                }));
+            }
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                return Json(json!({
+                    "error": format!("Shannon daemon returned HTTP {}", code),
+                    "shannon_url": shannon_url,
+                }));
+            }
+            Err(e) => {
+                return Json(json!({
+                    "error": format!("Shannon daemon unreachable: {}", e),
+                    "shannon_url": shannon_url,
+                }));
+            }
+        }
+    }
+
     // May 19, 2026: the magnet is a TORRENT-PATH concern, NOT a do_play
     // precondition. A title-only request (My-Library tap / AC-3.3:
     // `{title,target}`, no magnet/result_id) MUST flow through the

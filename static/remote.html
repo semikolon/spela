@@ -432,6 +432,7 @@ function iconizeStatic(){ document.querySelectorAll("[data-ic]").forEach(e=>{
 async function doPlay(opts,cardForSources){
   if(!S.target){ S.pending=()=>doPlay(opts,cardForSources); toast("Pick where to play — it starts right after"); openSheet(); return; }
   if(S.target.kind==="phone"){ return doPhoneDirect(opts,cardForSources,(S.search.data&&S.search.data.show&&S.search.data.show.title)||""); }
+  if(S.target.kind==="shannon"){ return doShannonPlay(opts,cardForSources); }
   const body={...opts,target:"chromecast",cast_name:S.target.name};
   toast(`Starting on ${S.target.name}…`);
   let r;
@@ -443,6 +444,29 @@ async function doPlay(opts,cardForSources){
     return;
   }
   toast("Playing — opening now-playing");
+  S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
+  location.hash="#/now"; pollNow(true);
+}
+
+/* ---------- Shannon-TV playback (Phase-7 / target=shannon, 2026-05-23) ----------
+   spela /play target=shannon → server POSTs to Shannon's
+   shannon-kiosk-actions daemon /watch → Shannon's spela-local fetches
+   HLS + decodes locally (HW via v4l2slh264dec when working, SW
+   playbin3 fallback). The Darwin spela /status reflects Shannon's
+   ACTIVE stream once spela-local's own /play call lands (typically
+   within ~5s of the dispatch), so the now-playing UI populates
+   shortly. */
+async function doShannonPlay(opts,cardForSources){
+  toast("Starting on Shannon TV…");
+  let r;
+  try{ r=await api("/play",{method:"POST",body:{...opts,target:"shannon"}}); }
+  catch{ toast("spela unreachable"); return; }
+  if(r&&r.error){
+    toast("Shannon: "+r.error);
+    if(cardForSources&&cardForSources._openSources) cardForSources._openSources();
+    return;
+  }
+  toast("Dispatched — Shannon will fetch + play in ~10s");
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   location.hash="#/now"; pollNow(true);
 }
@@ -485,6 +509,7 @@ function attachPhoneVideo(v,src){
 async function doPlayLibrary(entry){
   if(!S.target){ S.pending=()=>doPlayLibrary(entry); toast("Pick where to play — it starts right after"); openSheet(); return; }
   if(S.target.kind==="phone"){ return doPhoneDirect({title:entry.raw_name,poster_url:entry.poster_url},null,entry.title); }
+  if(S.target.kind==="shannon"){ return doShannonPlay({title:entry.raw_name,poster_url:entry.poster_url},null); }
   toast(`Starting ${entry.title} on ${S.target.name}…`);
   let r;
   try{ r=await api("/play",{method:"POST",body:{title:entry.raw_name,poster_url:entry.poster_url,target:"chromecast",cast_name:S.target.name}}); }
@@ -586,6 +611,21 @@ function openSheet(){
       if(resume) resume();   // the play the user originally tapped now fires (to this phone)
       else if(moving) toast("Single stream — your next play moves it here, off the TV"); };
     list.appendChild(ph);
+    // "Shannon TV" — Phase-7 spela-thin-client (2026-05-23). Sends
+    // target="shannon" → spela server POSTs to Shannon's daemon /watch
+    // → Shannon's spela-local fetches HLS + decodes locally. Always
+    // shown; if Shannon is unreachable, the /play call returns an
+    // error toast (no separate discovery — Shannon's a known fleet
+    // member, not a Chromecast).
+    const sh=el("button",{className:"topt"});
+    sh.innerHTML=`<span class="ic">${ic("tv")}</span><span><span class="nm">Shannon TV</span><br><span class="md">bedroom · native HW playback</span></span>`;
+    if(S.target&&S.target.kind==="shannon") sh.classList.add("sel");
+    sh.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
+      S.target={kind:"shannon",name:"Shannon TV"};
+      sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
+      if(resume) resume();
+      else if(moving) toast("Single stream — your next play moves it to Shannon"); };
+    list.appendChild(sh);
   }).catch(()=>{ list.innerHTML=`<div class="state">spela unreachable — can’t list targets.</div>`; });
 }
 
