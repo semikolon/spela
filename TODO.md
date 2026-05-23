@@ -28,11 +28,10 @@ Architecture: Shannon plays Darwin's no-cast HLS via a local renderer; Darwin's 
 | 4 | **Rust gstreamer-rs renderer** (proper architectural fix) | high (~3-6h) | Solves audio + HW reliability simultaneously per upstream "decodebin3 incomplete fallback" issue. The `tsdemux` audio branch (Codex tried + reverted today) needs pad-added signal handling that gst-launch syntax can't express. |
 | 5 | **Live verify Music + Sensors + Buses on TV** | trivial (just observe) | Code shipped (`ff662ae`); presence-on-TV unconfirmed since deploy |
 | 6 | **Buses-A "crash" repro + Bevy freeze diagnostics** | medium | Fredrik reported kiosk freeze after A on Buses tile (which is a `_ => {}` no-op). Either a kiosk-level state issue or controller disconnect mid-press. Need `journalctl -u shannon-display -n 50` + `/var/log/spela-local.log` captured at next freeze. |
-| 7 | **Plymouth boot/shutdown splash** | low — partial-deploy 2026-05-23 | Overlay files (theme + apply script + hooks) committed `1351b023` and now LIVE on Shannon. The disruptive hook ran `shannon-boot-splash-apply` which tried `apt-get install plymouth` and failed with `No space left on device` (root `/dev/sda2` shows 16 GB free → likely a small `/boot` partition or tmpfs is what filled). Reboot deferred until the install completes. Diagnosis + fix → dotfiles `TODO.md` § Shannon. |
-| 8 | **Audio in spela-local** | medium | The explicit `tsdemux name=d ... d. ! aacparse ! avdec_aac` audio branch hits `not-negotiated` at preroll. Likely needs the gstreamer-rs renderer (#4) to do pad-added signal handling properly. |
-| 9 | **Layer-1 cage + `vo=dmabuf-wayland` zero-copy** | high | cage is single-client; needs investigation of subsurface support or process-swap reshape |
-| 10 | **Layer-3 evdev → IPC controller shim for playback control** | medium | Pause/seek during playback. Currently mpv/gst runs unattended until EOF or smoke timeout. |
-| 11 | **Cross-build patched ffmpeg+mpv from Kwiboo/jernejsk source** | high | Fallback if gstreamer-rs path also fails. apt.undo.it remains offline. |
+| 7 | **Audio in spela-local** | medium | The explicit `tsdemux name=d ... d. ! aacparse ! avdec_aac` audio branch hits `not-negotiated` at preroll. Likely needs the gstreamer-rs renderer (#4) to do pad-added signal handling properly. |
+| 8 | **Layer-1 cage + `vo=dmabuf-wayland` zero-copy** | high | cage is single-client; needs investigation of subsurface support or process-swap reshape |
+| 9 | **Layer-3 evdev → IPC controller shim for playback control** | medium | Pause/seek during playback. Currently mpv/gst runs unattended until EOF or smoke timeout. |
+| 10 | **Cross-build patched ffmpeg+mpv from Kwiboo/jernejsk source** | high | Fallback if gstreamer-rs path also fails. apt.undo.it remains offline. |
 
 **Closed loops** (no longer pending):
 - ~~Layer-4 keystone~~ ✅ LIVE
@@ -43,6 +42,7 @@ Architecture: Shannon plays Darwin's no-cast HLS via a local renderer; Darwin's 
 - ~~MODE=blank dotfiles drift~~ ✅ `c35e194e`
 - ~~GStreamer rank-syntax gotcha~~ ✅ documented + numeric `300` used
 - ~~Rust `spela --local-renderer` path~~ ⏸ permanent hold (shell client supersedes; bring back only if signed-binary distribution becomes a need)
+- ~~Plymouth boot/shutdown splash + seamless splash→kiosk handoff~~ ✅ shipped 2026-05-24 (`98b6ace5`) — `bootlogo=true` + `console=serial` + initramfs DRM modules + `Conflicts=getty@tty1`/plymouth-quit-wait ordering. Architecture detail in dotfiles `system/shannon/README.md` § "Plymouth boot splash + kiosk handoff architecture". Visual confirmation by Fredrik on next watched reboot pending; technical render path verified via `plymouthd --debug` (scanout buffer set on 1920x1080 head).
 
 **Chromecast retirement is PARTIAL** per research § 6 — spela + direct-URL YouTube only; Netflix/HBO/DRM apps keep the Chromecast (irreducible aarch64-Widevine gap).
 
