@@ -3,25 +3,48 @@
 ### Web remote — Phases 1-6 SHIPPED · v1 FEATURE-COMPLETE (v3.7, deployed Darwin) ✅
 Dark single-asset SPA at `/remote`, portless via a LAN reverse proxy (host-private infra). Full Kiro spec: `.claude/specs/web-remote/{requirements,design,tasks}.md`. **Done (all 6 phases):** `/remote`+`/library`+`/library/list`, shell/grid/API-client, search/hybrid-play/target-picker/now-playing/scrubber, My-Library view (distinct unreachable/offline/empty states), bare-`/`→307, the now-playing pause/resume state-machine fix, **phone-direct in-browser playback** ("This phone" live; `target:"vlc"` no-cast HLS → native `<video>`/hls.js). **Status (2026-05-18):** (1) T-4 poster enrichment **✅ shipped+deployed: 54/57 (95%)** best-effort (pipeline: clean-title → token-similarity → year-param → `/search/multi` → relaxed first-word/drop-last tiers; 3 honest-ceiling misses — fansub-prefix/double-feature/obscure-TV-doc); (2) My-Library list+posters **✅ LIVE** (stale-`/library/list`-binary fix; 57 films + posters e2e) — but **tap-to-play was structurally broken, fixed v3.7.1** (deploy to Darwin to land): (a) `do_play` magnet gate ran *before* the local/remote bridge → "Missing magnet" on every library tap; (b) SPA target-picker abandoned the play on first tap (no pending-replay) → silent no-op. "end-to-end" had only meant list/posters (*Built≠Verified*); (3) `spela.home` → systemic HTTPS **✅ DONE** (`https://spela.fredrikbranstrom.se` live; xref `~/dotfiles/docs/lan_https_dns01_wildcard_spec_2026_05_18.md`); (4) real-device e2e (T-16) is yours via normal use. **Open:** (a) "TCC durability hardening" below (serve-library grant code-signature-keyed → Mac-rebuild revokes; stable-codesign fix); (b) Phase-7 thin-client remaining layers — see next block. Supersedes the "A. web remote" path in `PHONE_APP_PROJECT.md`; native iOS app remains the separate deferred track (now informed by real phone-direct use).
 
-### Phase-7 spela-thin-client (Shannon bedroom, kiosk Option A) — Layer-4 + 4a + 4b + 5 SHIPPED · HW-decode pivoted mpv → GStreamer · TV-render smoothness verification pending
-Architecture: Shannon plays Darwin's no-cast HLS via a local renderer; Darwin's NVENC does all transcoding (research-§6-compliant H.264 8-bit). The keystone — Bevy `MenuItem::Watch` → daemon `POST /watch` → shell `spela-local` → local renderer — is LIVE (`shannon-bedroom-kiosk @7233c34` kiosk + daemon binaries deployed; dotfiles `c22138ad` + `c35e194e` for spela-local + system overlay). **Authoritative deploy spec = the kiosk-plan research §6** (`~/dotfiles/docs/shannon_kiosk_gpu_hwaccel_research_2026_05_18.md`) — do NOT duplicate it here.
+### Phase-7 spela-thin-client (Shannon bedroom, kiosk Option A) — architectural keystone LIVE · HW-decode regressed since 2026-05-21 · Watch UI is the next UX rank-1
+Architecture: Shannon plays Darwin's no-cast HLS via a local renderer; Darwin's NVENC does all transcoding (research § 6-compliant H.264 8-bit). Two entry points to the same plumbing:
+1. **Bevy Watch tile** → daemon `POST /watch` → spawns `spela-local` → /search + /play target=vlc on Darwin → fetches HLS + decodes locally
+2. **Spela web remote "Shannon TV" target** (2026-05-23, `ffa22bf`) → spela `POST /play target=shannon` → Darwin spela POSTs to Shannon's daemon `/watch` → same downstream
 
-**Live state per layer**:
-- ✅ **Layer-4 (Bevy ↔ daemon ↔ spela-local keystone)**: shipped + empirically verified at the route level (POST /watch returns 202 spawns spela-local; kiosk button dispatches; scanout handoff works — kiosk briefly blanks then restores cleanly on mpv/gst-launch exit).
-- ✅ **Layer-4a (daemon /watch)** + **Layer-5 (dotfiles `spela-local`)**: shipped + nit-tracked.
-- ✅ **spela-local hardening**: `curl --max-time` on all upstream calls (defends Darwin spela hangs that previously stuck the script + the daemon's reap-thread). Scanout handoff "Option β" (script-internal `systemctl stop shannon-display.service` + `trap EXIT` restart — chose over Option-α `shannon-modes/watch.sh` because Watch is ephemeral, not a persistent display mode).
-- 🟡 **HW-decode — architecture pivoted mpv → GStreamer (2026-05-21)**: stock mpv on Trixie cannot HW-decode H.264 on RK3399 mainline (rkvdec exposes ONLY v4l2-request stateless; stock mpv has v4l2m2m STATEFUL only → `h264_v4l2m2m: Could not find a valid device`). apt.undo.it patched-mpv repo was ECONNREFUSED. **GStreamer is the working mainline path**: `gstreamer1.0-plugins-bad` ships `v4l2slh264dec` which auto-discovers `rkvdec-proc` at `/dev/video2` (`v4l2-ctl --list-formats-out /dev/video2` confirms S264/S265/VP9F accepted). spela-local now invokes `gst-launch-1.0 playbin3 ... video-sink=kmssink audio-sink=autoaudiosink` with `GST_PLUGIN_FEATURE_RANK="v4l2slh264dec:300,avdec_h264:0"`. **decodebin3 logs confirm `created decoder <v4l2slh264dec0>`** — HW decoder IS instantiating. **TV-visible smoothness verification still pending** — early lag reports were resolved as either (a) a stale mpv from a prior smoke test still running, or (b) the GST_PLUGIN_FEATURE_RANK token `MAX` being invalid (parsed as rank 0 = DISABLE; valid values are NONE/MARGINAL/SECONDARY/PRIMARY or numeric).
-- ⏸ **Layer-1 (cage compositor + `vo=dmabuf-wayland` zero-copy)** + **Layer-3 (evdev → mpv-IPC controller shim)**: still deferred. `vo=dmabuf-wayland` zero-copy would beat the current `kmssink` raw-KMS path but requires cage to accept a 2nd Wayland client surface (cage is single-client by design — needs investigation).
+**Authoritative deploy spec** = kiosk research § 6 (`~/dotfiles/docs/shannon_kiosk_gpu_hwaccel_research_2026_05_18.md`). Do NOT duplicate the architecture here.
 
-**Open items** (queued for follow-up sessions, ranked by impact):
-1. **First-light real test with current gst-launch path** — Fredrik presses Watch on a clean kiosk (Shannon now in `MODE=shannon-kiosk`, all stale mpv processes killed, hemma deploy with `c35e194e` will keep MODE correct). If smooth → done. If still laggy → next item.
-2. **If gst-launch still SW-decodes**: instrument with `pidstat -p $GST_PID 1` during real playback to measure CPU; if v4l2slh264dec engaged correctly, gst-launch's main thread should sit at <30% CPU on RK3399's 1.008 GHz-capped cores. If 80%+ → decoder wasn't picked; check `GST_DEBUG=v4l2codecs:5,decodebin3:5` logs for which decoder decodebin3 picked.
-3. **Cross-build patched ffmpeg+mpv from Kwiboo/jernejsk source** — fallback path if gst-launch doesn't work and apt.undo.it stays offline. Heavy (multi-hour cross-compile, complex deps). Source: `github.com/Kwiboo/FFmpeg`, `github.com/jernejsk/FFmpeg`. The patched-mpv repo `apt.undo.it:7242` is the prebuilt convenience layer.
-4. **Layer-1 cage + `vo=dmabuf-wayland`**: investigate whether cage's single-client model can accept mpv/gst-launch as a runtime-swapped client (vs the current process-swap via shannon-display.service). Zero-copy GPU compositing under cage is the proper end state per kiosk research § 6.
-5. **Layer-3 evdev → mpv-IPC shim**: keyboard/controller during playback (pause/seek). Currently the playback runs unattended until smoke timeout or EOF; no controller interaction during playback.
-6. **`/etc/default/shannon-display` runtime-mutation discipline**: the file IS now tracked with steady-state `MODE=shannon-kiosk` (was `MODE=blank` since May 17, biting every `hemma system-apply` — full diagnosis in `c35e194e`). Future agents: do NOT commit transient `shannon-mode set blank` test-states to dotfiles. Consider the file a candidate for the "forward-only sync" pattern (per global CLAUDE.md "Forward-only sync candidates") once that mechanism exists.
-7. **Chromecast retirement is PARTIAL per research §6** (spela + direct-URL YouTube only; Netflix/HBO keep the Chromecast — irreducible aarch64-Widevine gap).
-8. **Rust binary portable aarch64 cross-build**: the shell `spela-local` supersedes the Rust `spela play --local-renderer` flag (`e5ca156`); ergonomic + zero-cross-build-friction. The Rust path is on permanent hold unless a specific need arises (e.g. signed binary distribution).
+**Live state**:
+- ✅ Bevy keystone (kiosk `7233c34`+`ff662ae`) + daemon `/watch` route + `spela-local` shell
+- ✅ Spela `target=shannon` + web remote "Shannon TV" button (`ffa22bf`)
+- ✅ Daemon LAN-bound (`0.0.0.0:8080` since 2026-05-23) so Darwin spela can reach it
+- ✅ Two-path renderer in spela-local: Path A (HW: fdsrc+tsdemux+h264parse+v4l2slh264dec+kmssink) with 8s preroll budget → Path B (SW: playbin3+kmssink+autoaudiosink) auto-fallback
+- ✅ MODE=blank dotfiles drift fixed (`c35e194e`)
+- 🟡 **HW decode REGRESSED 2026-05-23**: same EXACT filesrc+single-segment pipeline that engaged rkvdec on 2026-05-21 (~25% CPU + V4L2-request allocator activity in logs) now EOSes in <1s with zero allocator activity. Cause unknown. SW fallback covers (user always sees video) but playback stutters at 1080p on Shannon's 1.008 GHz cap.
+
+**Open items, RE-PRIORITIZED 2026-05-23**:
+
+| Rank | Item | Effort | Note |
+|------|------|--------|------|
+| 1 | **Watch UI mirrors spela web on Shannon** — search + library grid + now-playing + scrubber natively in Bevy | medium-high (Bevy + spela polling) | Fredrik's explicit direction. Watch button currently hardcodes ONE smoke title; this is the biggest unrealized UX value. |
+| 2 | **Shannon reboot → re-test HW decode** | trivial (~3 min) | Cheapest first probe for the regression — rkvdec state may just need reset. Defer source-build investigation until this is exhausted. |
+| 3 | **result_id passthrough on target=shannon** | low (Shannon spela-local takes `--result-id N`; spela server passes it forward via /watch body) | Silent bug: user clicks 1080p H.264 in web remote, Shannon's own /search picks result_id=1 which may be a DV-HEVC NVENC can't transcode |
+| 4 | **Rust gstreamer-rs renderer** (proper architectural fix) | high (~3-6h) | Solves audio + HW reliability simultaneously per upstream "decodebin3 incomplete fallback" issue. The `tsdemux` audio branch (Codex tried + reverted today) needs pad-added signal handling that gst-launch syntax can't express. |
+| 5 | **Live verify Music + Sensors + Buses on TV** | trivial (just observe) | Code shipped (`ff662ae`); presence-on-TV unconfirmed since deploy |
+| 6 | **Buses-A "crash" repro + Bevy freeze diagnostics** | medium | Fredrik reported kiosk freeze after A on Buses tile (which is a `_ => {}` no-op). Either a kiosk-level state issue or controller disconnect mid-press. Need `journalctl -u shannon-display -n 50` + `/var/log/spela-local.log` captured at next freeze. |
+| 7 | **Plymouth boot/shutdown splash** | low (Codex drafted overlay, never deployed) | `~/dotfiles/system/shannon/usr/share/plymouth/themes/shannon-raven/` + `shannon-boot-splash-apply` script. One `hemma system-apply` + reboot to activate. |
+| 8 | **Audio in spela-local** | medium | The explicit `tsdemux name=d ... d. ! aacparse ! avdec_aac` audio branch hits `not-negotiated` at preroll. Likely needs the gstreamer-rs renderer (#4) to do pad-added signal handling properly. |
+| 9 | **Layer-1 cage + `vo=dmabuf-wayland` zero-copy** | high | cage is single-client; needs investigation of subsurface support or process-swap reshape |
+| 10 | **Layer-3 evdev → IPC controller shim for playback control** | medium | Pause/seek during playback. Currently mpv/gst runs unattended until EOF or smoke timeout. |
+| 11 | **Cross-build patched ffmpeg+mpv from Kwiboo/jernejsk source** | high | Fallback if gstreamer-rs path also fails. apt.undo.it remains offline. |
+
+**Closed loops** (no longer pending):
+- ~~Layer-4 keystone~~ ✅ LIVE
+- ~~Layer-4a (daemon /watch)~~ ✅
+- ~~Layer-5 (dotfiles spela-local)~~ ✅
+- ~~spela-local curl timeouts~~ ✅
+- ~~scanout handoff (Option β)~~ ✅
+- ~~MODE=blank dotfiles drift~~ ✅ `c35e194e`
+- ~~GStreamer rank-syntax gotcha~~ ✅ documented + numeric `300` used
+- ~~Rust `spela --local-renderer` path~~ ⏸ permanent hold (shell client supersedes; bring back only if signed-binary distribution becomes a need)
+
+**Chromecast retirement is PARTIAL** per research § 6 — spela + direct-URL YouTube only; Netflix/HBO/DRM apps keep the Chromecast (irreducible aarch64-Widevine gap).
 
 ### v3.6.0 Local Library Streaming + v3.6.1 race-ahead + v3.6.2 tier-3 (SHIPPED May 16, 2026; ONE user step pending) 🔧
 
