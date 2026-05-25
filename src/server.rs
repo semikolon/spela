@@ -17,7 +17,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::cast::{self, CastController};
 use crate::config::Config;
 use crate::disk;
-use crate::search::SearchEngine;
+use crate::search::{SearchEngine, SearchResult};
 use crate::state::{AppState, CurrentStream, HWM_CLEAR_FRACTION};
 use crate::subtitles;
 use crate::torrent;
@@ -735,7 +735,39 @@ async fn handle_search(
             AppState::save_last_search(&state.state_dir, &result);
             Json(serde_json::to_value(result).unwrap_or(json!({"error": "serialize failed"})))
         }
-        Err(e) => Json(json!({"error": e.to_string()})),
+        Err(e) => {
+            // 2026-05-25: clear last_search.json on search ERROR so a
+            // follow-up `/play N` returns a clean "Result #N not found in
+            // last search" error instead of replaying STALE prior-search
+            // results from a different query.
+            //
+            // Anchoring incident: 2026-05-24 evening — Fredrik pressed A
+            // on "Ex Machina" in the Shannon kiosk WatchSubmenu. Kiosk
+            // dispatched the title to spela-local, which called /search
+            // then /play 1. The /search hit a transient error (network
+            // blip / TMDB / Torrentio timeout) and returned 4xx without
+            // updating last_search.json. The stale last_search from a
+            // PRIOR session held "The Boys S05E08" at rank-1. /play 1
+            // resolved against that stale data and played The Boys —
+            // wrong content + smart-resume auto-jumped to 661s into
+            // the wrong episode. See ~/Projects/spela/TODO.md entry
+            // "stale-last-search-fallback — root cause CONFIRMED at
+            // source 2026-05-25" for full repro.
+            //
+            // The Err-branch now writes an empty SearchResult carrying
+            // the query string + error message — so the next /play N
+            // bombs cleanly instead of replaying yesterday's stream.
+            let empty = SearchResult {
+                query: q.clone(),
+                show: None,
+                searching: None,
+                error: Some(e.to_string()),
+                torrent_available: false,
+                results: vec![],
+            };
+            AppState::save_last_search(&state.state_dir, &empty);
+            Json(json!({"error": e.to_string()}))
+        }
     }
 }
 
