@@ -16,7 +16,7 @@ Architecture: Shannon plays Darwin's no-cast HLS via a local renderer; Darwin's 
 - ✅ Daemon LAN-bound (`0.0.0.0:8080` since 2026-05-23) so Darwin spela can reach it
 - ✅ Two-path renderer in spela-local: Path A (HW: fdsrc+tsdemux+h264parse+v4l2slh264dec+kmssink) with 8s preroll budget → Path B (SW: playbin3+kmssink+autoaudiosink) auto-fallback
 - ✅ MODE=blank dotfiles drift fixed (`c35e194e`)
-- 🟡 **HW decode REGRESSED 2026-05-23**: same EXACT filesrc+single-segment pipeline that engaged rkvdec on 2026-05-21 (~25% CPU + V4L2-request allocator activity in logs) now EOSes in <1s with zero allocator activity. Cause unknown. SW fallback covers (user always sees video) but playback stutters at 1080p on Shannon's 1.008 GHz cap.
+- ✅ **HW decode VERIFIED 2026-05-26 — root cause was SILENT REGRESSION, not driver issue**: 2026-05-26 diagnose-first session confirmed cage+waylandsink runs at ~33% total CPU sustained (gst-launch 24% + cage 9%) at 1080p H.264 + AAC, rkvdec engaged at /dev/video2 the whole time. The "99% CPU" was the SW fallback firing because cage exited immediately at startup with `XDG_RUNTIME_DIR is not set`. Fix shipped dotfiles `b09297d4`: scoped /run/cage-spela-local + WLR_LIBINPUT_NO_DEVICES=1. Path A v3 + Path B+ retained as fallbacks.
 
 **Open items, RE-PRIORITIZED 2026-05-23**:
 
