@@ -1780,6 +1780,18 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
 
     // Cast to Chromecast
     if target == "chromecast" {
+        // 2026-05-26 diagnose-add for cast-init silent-failure investigation.
+        // The "torrent-stream + sparse + stale state" reproducer (TODO entry
+        // 2026-05-24) left ffmpeg orphaned at 286% CPU for 13min with ZERO
+        // cast-init log lines — neither cast_url, nor HLS master hit, nor
+        // cast_health_monitor: started fired. Adding gate-by-gate tracing
+        // through the cast block so the NEXT reproduction immediately points
+        // at the exact silent-exit point. Costs ~50 bytes of log per cast;
+        // surfaces the entire decision chain.
+        tracing::info!(
+            "cast-init [1/4]: entering chromecast block — final_url={} is_transcoded={} is_local={} cast_name={}",
+            final_url, is_transcoded, is_local, cast_name
+        );
         let state_clone = state.clone();
         let cast_name_clone = cast_name.clone();
         let url_clone = final_url.clone();
@@ -1820,6 +1832,10 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
             cast::CastMetadata::default()
         };
         let cast_metadata_clone = cast_metadata.clone();
+        tracing::info!(
+            "cast-init [2/4]: about to call cast.cast_url url={} content_type={} duration={:?} seek={:?}",
+            url_clone, cast_content_type, cast_duration, seek_to
+        );
         let cast_result = tokio::task::spawn_blocking(move || {
             let mut cast = lock_recover(&state_clone.cast);
             cast.cast_url(
@@ -1834,7 +1850,9 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         .await;
 
         match cast_result {
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => {
+                tracing::info!("cast-init [3/4]: cast_url returned Ok — proceeding to state save + monitor spawn");
+            }
             Ok(Err(e)) => {
                 // Defense in depth: the post-playback reaper has not been
                 // spawned yet at this point in do_play, so without explicit
@@ -2071,6 +2089,10 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // monitor, a "blue cast icon" failure mode looks identical to a healthy
     // streaming session in `spela status`.
     if target == "chromecast" {
+        tracing::info!(
+            "cast-init [4/4]: spawning cast_health_monitor for '{}'",
+            title
+        );
         let state_for_monitor = state.clone();
         let cast_name_for_monitor = cast_name.clone();
         let title_for_monitor = title.clone();
