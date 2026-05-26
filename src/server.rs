@@ -1033,7 +1033,25 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 "error": "target=shannon requires a title (or a result_id from a previous search)"
             }));
         }
-        let body = json!({ "title": title_for_shannon });
+        // 2026-05-26 — pass magnet + file_index through to Shannon's
+        // spela-local. By this point in do_play, result_id resolution
+        // (L936-990) has populated req.magnet/file_index from
+        // last_search if the caller sent result_id. Forwarding them
+        // lets spela-local SKIP its own /search round-trip and POST
+        // /play with the EXACT magnet the user picked. Without this,
+        // Shannon's own /search + /play 1 races against the ranker
+        // (Torrentio order non-deterministic; HEVC↔H.264 mid-tier swaps
+        // observed). Title-only fallback preserved for My-Library taps
+        // and any caller that doesn't have a magnet.
+        let mut body_map = serde_json::Map::new();
+        body_map.insert("title".into(), json!(title_for_shannon));
+        if let Some(m) = req.magnet.as_deref().filter(|s| !s.is_empty()) {
+            body_map.insert("magnet".into(), json!(m));
+        }
+        if let Some(idx) = req.file_index {
+            body_map.insert("file_index".into(), json!(idx));
+        }
+        let body = serde_json::Value::Object(body_map);
         let client = reqwest::Client::new();
         let post_result = client
             .post(&shannon_url)
@@ -1044,16 +1062,20 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
             .await;
         match post_result {
             Ok(resp) if resp.status().is_success() => {
+                let direct_play = req.magnet.as_deref().is_some_and(|s| !s.is_empty());
                 tracing::info!(
-                    "target=shannon: dispatched '{}' to {}",
+                    "target=shannon: dispatched '{}' to {} (direct_play={}, file_index={:?})",
                     title_for_shannon,
-                    shannon_url
+                    shannon_url,
+                    direct_play,
+                    req.file_index
                 );
                 return Json(json!({
                     "status": "dispatched_to_shannon",
                     "target": "shannon",
                     "title": title_for_shannon,
                     "shannon_url": shannon_url,
+                    "direct_play": direct_play,
                 }));
             }
             Ok(resp) => {
