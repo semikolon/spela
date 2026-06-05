@@ -2,7 +2,7 @@
 
 **Status**: TENTATIVE — needs human review before any action.
 **Scope**: Sessions in `~/.claude/projects/-Users-fredrikbranstrom-Projects-spela/` modified between 2026-01-29 and 2026-04-29. Only 3 sessions matched the filter; all 3 inspected.
-**Cross-references**: `~/dotfiles/docs/reflections/2026-04-29-audit-master.md` (cross-project synthesis).
+**Cross-references**: `~/dotfiles/docs/2026-04-29-audit-master.md` (cross-project synthesis).
 
 ## Hanging sessions
 
