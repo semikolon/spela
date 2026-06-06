@@ -394,10 +394,13 @@ pub async fn detect_codecs(url: &str) -> Result<CodecInfo> {
         }
     }
 
-    // Pick preferred audio: first English track, else first track
+    // Pick preferred audio: first English, then first Danish (covers Nordic
+    // originals like Riders of Justice where releases ship Italian dub first
+    // and Danish original at a:1), else first track.
     let preferred = audio_streams
         .iter()
         .find(|a| a.lang == "eng" || a.lang == "en")
+        .or_else(|| audio_streams.iter().find(|a| a.lang == "dan" || a.lang == "da"))
         .or_else(|| audio_streams.first());
 
     let (audio_index, preferred_codec) = match preferred {
