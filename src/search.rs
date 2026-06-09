@@ -284,10 +284,21 @@ impl SearchEngine {
     }
 
     /// Use TMDB's /search/multi endpoint to detect whether a query is a movie or TV show.
+    ///
+    /// 2026-06-09 fix (TODO entry R, `dotfiles/TODO.md`): previously picked
+    /// the FIRST non-person result, which fails on short queries — TMDB's
+    /// popularity ordering surfaced unrelated noise (canonical bug:
+    /// `Spring` → `Send Help (2024)` instead of `Spring (2014)`). Now scores
+    /// every candidate by token-similarity + year + vote_count, and returns
+    /// the media_type of the BEST candidate. If no candidate clears the
+    /// confidence floor, falls back to the first non-person result (old
+    /// behavior) so we never regress on genuine zero-overlap cases.
     async fn tmdb_auto_detect(&self, query: &str) -> Result<String> {
+        let (q_clean, q_year) = extract_year_from_query(query);
+        let api_q = if q_clean.is_empty() { query } else { &q_clean };
         let url = format!(
             "https://api.themoviedb.org/3/search/multi?query={}&api_key={}",
-            urlencoded(query),
+            urlencoded(api_q),
             self.tmdb_key
         );
         let resp: Value = self.client.get(&url).send().await?.json().await?;
@@ -295,12 +306,22 @@ impl SearchEngine {
             .as_array()
             .ok_or_else(|| anyhow!("No multi-search results"))?;
 
-        // Find the first movie or tv result (skip "person" results)
-        for result in results {
-            if let Some(media_type) = result["media_type"].as_str() {
-                if media_type == "movie" || media_type == "tv" {
-                    return Ok(media_type.to_string());
-                }
+        // Filter to movie/tv (skip "person"), then score-then-pick.
+        let candidates: Vec<&Value> = results
+            .iter()
+            .filter(|r| matches!(r["media_type"].as_str(), Some("movie") | Some("tv")))
+            .collect();
+        if let Some(best) = pick_best_tmdb_candidate(&candidates, api_q, q_year) {
+            let mt = best["media_type"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Best multi-search candidate missing media_type"))?;
+            return Ok(mt.to_string());
+        }
+        // Fallback: confident-pick failed; preserve old "first non-person" behavior
+        // so genuinely ambiguous queries still return SOMETHING.
+        if let Some(first) = candidates.first() {
+            if let Some(mt) = first["media_type"].as_str() {
+                return Ok(mt.to_string());
             }
         }
         Err(anyhow!("No movie or TV result found"))
@@ -442,17 +463,45 @@ impl SearchEngine {
         })
     }
 
+    /// Typed TMDB search (`/search/movie` or `/search/tv`).
+    ///
+    /// 2026-06-09 fix (TODO entry R): previously picked `results.first()`,
+    /// which is wrong for short queries because TMDB orders by popularity
+    /// regardless of title match. Now strips year from query (passes via
+    /// `&year=` / `&first_air_date_year=` for precision), then scores every
+    /// candidate by token-similarity + year + vote_count and picks the
+    /// best. Falls back to first result if no candidate clears the floor,
+    /// preserving old behavior for genuine zero-overlap cases.
     async fn tmdb_search(&self, query: &str, media_type: &str) -> Result<Value> {
+        let (q_clean, q_year) = extract_year_from_query(query);
+        let api_q = if q_clean.is_empty() { query } else { &q_clean };
+        // TMDB's typed search accepts a year filter — use it when extractable.
+        // `/search/movie` uses `&year=` (primary_release_year);
+        // `/search/tv`    uses `&first_air_date_year=`.
+        let year_param = match (q_year, media_type) {
+            (Some(y), "movie") => format!("&year={}", y),
+            (Some(y), "tv") => format!("&first_air_date_year={}", y),
+            _ => String::new(),
+        };
         let url = format!(
-            "https://api.themoviedb.org/3/search/{}?query={}&api_key={}",
+            "https://api.themoviedb.org/3/search/{}?query={}{}&api_key={}",
             media_type,
-            urlencoded(query),
+            urlencoded(api_q),
+            year_param,
             self.tmdb_key
         );
         let resp: Value = self.client.get(&url).send().await?.json().await?;
-        resp["results"]
+        let results = resp["results"]
             .as_array()
-            .and_then(|r| r.first().cloned())
+            .ok_or_else(|| anyhow!("No {} found for \"{}\"", media_type, query))?;
+        let refs: Vec<&Value> = results.iter().collect();
+        if let Some(best) = pick_best_tmdb_candidate(&refs, api_q, q_year) {
+            return Ok(best.clone());
+        }
+        // Fallback preserves old behavior for queries where nothing
+        // confidently matches (e.g. typos beyond title_similarity's reach).
+        refs.first()
+            .map(|v| (*v).clone())
             .ok_or_else(|| anyhow!("No {} found for \"{}\"", media_type, query))
     }
 
@@ -1140,6 +1189,153 @@ fn title_token_score(query: &str, cand: &str) -> f32 {
         .filter(|qt| c.iter().any(|ct| title_similarity(qt, ct) >= 0.80))
         .count();
     hits as f32 / q.len() as f32
+}
+
+/// 2026-06-09: Extract a 4-digit release year (1900-2099) from a TMDB query,
+/// returning `(cleaned_query, Some(year))`. Matches both bare (`Spring 2014`)
+/// and parenthesised (`Spring (2014)`) forms. The cleaned query has the year
+/// token (and any surrounding parens/whitespace) stripped so the API call
+/// goes out as the bare title — TMDB's `/search/movie` matches title text,
+/// not "title plus year", so leaving the year in the query degrades recall.
+/// Returns `(query.to_string(), None)` when no year is present.
+///
+/// Pure — testable without TMDB.
+fn extract_year_from_query(query: &str) -> (String, Option<u32>) {
+    // Scan for a 4-digit token whose value is 1900..=2099, allowing
+    // surrounding `(` / `)` / whitespace. Use the FIRST match: a query like
+    // "2001 A Space Odyssey 1968" is rare and ambiguous; first-match prefers
+    // titles-that-open-with-a-year less than they'd suffer.
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        // Find a digit run of exactly 4
+        let is_digit = |b: u8| b.is_ascii_digit();
+        let prev_boundary = i == 0
+            || matches!(
+                bytes[i - 1],
+                b' ' | b'\t' | b'(' | b'[' | b'{' | b'-' | b'.'
+            );
+        if prev_boundary && (0..4).all(|k| is_digit(bytes[i + k])) {
+            let next_boundary = i + 4 == bytes.len()
+                || matches!(
+                    bytes[i + 4],
+                    b' ' | b'\t' | b')' | b']' | b'}' | b'-' | b'.'
+                );
+            if next_boundary {
+                let year_str = &query[i..i + 4];
+                if let Ok(year) = year_str.parse::<u32>() {
+                    if (1900..=2099).contains(&year) {
+                        // Build cleaned query: strip the year, any surrounding
+                        // parens, and collapse whitespace.
+                        let mut start = i;
+                        let mut end = i + 4;
+                        // Eat a leading `(` / `[` / `{` if it abuts the year.
+                        if start > 0 && matches!(bytes[start - 1], b'(' | b'[' | b'{') {
+                            start -= 1;
+                        }
+                        // Eat a trailing `)` / `]` / `}` if it abuts the year.
+                        if end < bytes.len() && matches!(bytes[end], b')' | b']' | b'}') {
+                            end += 1;
+                        }
+                        let cleaned = format!("{} {}", &query[..start], &query[end..]);
+                        // Collapse runs of whitespace.
+                        let cleaned: String =
+                            cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+                        return (cleaned, Some(year));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    (query.to_string(), None)
+}
+
+/// 2026-06-09: Composite score for a TMDB search candidate (movie or tv),
+/// in roughly `[0.0, 1.5]`. Combines three orthogonal signals:
+///
+///   - **title_token_score** (primary, 0.0-1.0): asymmetric token containment
+///     against the query. Reuses the same scorer poster lookup uses.
+///   - **year_bonus** (+0.20 exact / +0.10 within ±1): when the query carries
+///     a year, candidates whose `release_date` / `first_air_date` matches
+///     get a strong nudge. The ±1 tolerance covers release-name vs TMDB
+///     primary-release-year off-by-ones (common for non-US releases).
+///   - **vote_count_bonus** (+0.15 / +0.05 / 0.0): popularity signal that
+///     distinguishes "real movie everyone knows" from "obscure same-named
+///     short". Floor of 10 votes; logarithmic flattening above 100.
+///
+/// Pure. The thresholds are conservative: title token-match dominates;
+/// the bonuses break ties between same-token-score candidates rather than
+/// overriding a title mismatch.
+fn score_tmdb_candidate(item: &Value, query_norm: &str, query_year: Option<u32>) -> f32 {
+    let title = item["title"]
+        .as_str()
+        .or_else(|| item["name"].as_str())
+        .or_else(|| item["original_title"].as_str())
+        .or_else(|| item["original_name"].as_str())
+        .unwrap_or("");
+    let title_n = title_norm(title);
+    let token = title_token_score(query_norm, &title_n);
+
+    let item_year = item["release_date"]
+        .as_str()
+        .or_else(|| item["first_air_date"].as_str())
+        .and_then(|d| d.get(..4))
+        .and_then(|y| y.parse::<u32>().ok());
+    let year_bonus = match (query_year, item_year) {
+        (Some(q), Some(i)) if q == i => 0.20,
+        (Some(q), Some(i)) if (q as i32 - i as i32).abs() <= 1 => 0.10,
+        _ => 0.0,
+    };
+
+    let votes = item["vote_count"].as_u64().unwrap_or(0);
+    let vote_bonus = if votes >= 100 {
+        0.15
+    } else if votes >= 10 {
+        0.05
+    } else {
+        0.0
+    };
+
+    token + year_bonus + vote_bonus
+}
+
+/// 2026-06-09: Pick the best TMDB candidate from a slice. Returns `None`
+/// when no candidate clears the confidence floor — the caller decides whether
+/// to error out or fall back to a less-confident pick.
+///
+/// Floor logic: a candidate passes if `score >= 0.50` OR it has an exact
+/// year-match. The 0.50 floor means at least half the meaningful query
+/// tokens are matched; below that, even a popular result is more likely a
+/// false friend than the intended title. Exact year-match overrides because
+/// queries with year (e.g. `Spring 2014`) are unambiguous user intent.
+///
+/// Pure.
+fn pick_best_tmdb_candidate(
+    candidates: &[&Value],
+    query: &str,
+    query_year: Option<u32>,
+) -> Option<Value> {
+    let q_norm = title_norm(query);
+    let mut best: Option<(f32, &Value)> = None;
+    for c in candidates {
+        let score = score_tmdb_candidate(c, &q_norm, query_year);
+        if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+            best = Some((score, c));
+        }
+    }
+    let (best_score, best_item) = best?;
+    let item_year = best_item["release_date"]
+        .as_str()
+        .or_else(|| best_item["first_air_date"].as_str())
+        .and_then(|d| d.get(..4))
+        .and_then(|y| y.parse::<u32>().ok());
+    let exact_year_match = matches!((query_year, item_year), (Some(q), Some(i)) if q == i);
+    if best_score >= 0.50 || exact_year_match {
+        Some((*best_item).clone())
+    } else {
+        None
+    }
 }
 
 fn tmdb_poster_url(poster_path: Option<&str>) -> Option<String> {
@@ -2688,5 +2884,183 @@ mod tests {
             s,
             e
         );
+    }
+
+    // ============================================================
+    // 2026-06-09 TMDB short-query disambiguation tests (TODO entry R)
+    // ============================================================
+
+    #[test]
+    fn extract_year_strips_parenthesised_year() {
+        let (q, y) = extract_year_from_query("Spring (2014)");
+        assert_eq!(y, Some(2014));
+        assert_eq!(q, "Spring");
+    }
+
+    #[test]
+    fn extract_year_strips_bare_year() {
+        let (q, y) = extract_year_from_query("Spring 2014");
+        assert_eq!(y, Some(2014));
+        assert_eq!(q, "Spring");
+        let (q2, y2) = extract_year_from_query("Dune 2024 Part Two");
+        assert_eq!(y2, Some(2024));
+        assert_eq!(q2, "Dune Part Two");
+    }
+
+    #[test]
+    fn extract_year_returns_none_when_absent() {
+        let (q, y) = extract_year_from_query("The Boys");
+        assert_eq!(y, None);
+        assert_eq!(q, "The Boys");
+    }
+
+    #[test]
+    fn extract_year_rejects_out_of_range() {
+        // 1899 too old, 2100 too new → not treated as a year.
+        let (_, y1) = extract_year_from_query("Title 1899");
+        assert_eq!(y1, None);
+        let (_, y2) = extract_year_from_query("Title 2100");
+        assert_eq!(y2, None);
+    }
+
+    #[test]
+    fn extract_year_rejects_digit_run_inside_token() {
+        // "S05E06" contains "05" and "06" but NOT a 4-digit year-shaped run
+        // at a token boundary. Also "20140" should not be matched as 2014.
+        let (q, y) = extract_year_from_query("S05E06");
+        assert_eq!(y, None);
+        assert_eq!(q, "S05E06");
+        let (q2, y2) = extract_year_from_query("Movie 20140");
+        assert_eq!(y2, None);
+        assert_eq!(q2, "Movie 20140");
+    }
+
+    #[test]
+    fn extract_year_first_match_wins_for_ambiguous() {
+        // "2001 A Space Odyssey 1968" — both look year-shaped. First wins
+        // (the canonical title leader is the common case).
+        let (q, y) = extract_year_from_query("2001 A Space Odyssey 1968");
+        assert_eq!(y, Some(2001));
+        assert_eq!(q, "A Space Odyssey 1968");
+    }
+
+    fn fake_candidate(title: &str, media_type: &str, year: &str, votes: u64) -> serde_json::Value {
+        // TMDB shape: movie uses `title` + `release_date`; tv uses `name` + `first_air_date`.
+        if media_type == "tv" {
+            serde_json::json!({
+                "media_type": "tv",
+                "name": title,
+                "first_air_date": year,
+                "vote_count": votes,
+            })
+        } else {
+            serde_json::json!({
+                "media_type": "movie",
+                "title": title,
+                "release_date": year,
+                "vote_count": votes,
+            })
+        }
+    }
+
+    #[test]
+    fn score_rewards_title_match_over_noise() {
+        // The canonical TODO-entry-R fixture: query `Spring` against
+        // [Send Help (2024) — high pop, no token overlap]
+        // [Spring (2014) — modest pop, full token overlap].
+        // Spring must score higher despite lower votes.
+        let q = title_norm("Spring");
+        let send_help = fake_candidate("Send Help", "movie", "2024-01-01", 5000);
+        let spring = fake_candidate("Spring", "movie", "2014-01-01", 800);
+        let s_help = score_tmdb_candidate(&send_help, &q, None);
+        let s_spring = score_tmdb_candidate(&spring, &q, None);
+        assert!(
+            s_spring > s_help,
+            "Spring ({}) must beat Send Help ({})",
+            s_spring,
+            s_help
+        );
+    }
+
+    #[test]
+    fn score_year_match_is_strong_signal() {
+        let q = title_norm("Spring");
+        // Two candidates both titled "Spring", different years.
+        let spring_2014 = fake_candidate("Spring", "movie", "2014-01-01", 500);
+        let spring_2020 = fake_candidate("Spring", "movie", "2020-01-01", 500);
+        let s14 = score_tmdb_candidate(&spring_2014, &q, Some(2014));
+        let s20 = score_tmdb_candidate(&spring_2020, &q, Some(2014));
+        assert!(
+            s14 > s20,
+            "Exact year-match must dominate equal-title alternates: {} vs {}",
+            s14,
+            s20
+        );
+    }
+
+    #[test]
+    fn score_year_off_by_one_partial_bonus() {
+        let q = title_norm("Spring");
+        let spring_2014 = fake_candidate("Spring", "movie", "2014-01-01", 100);
+        let spring_2015 = fake_candidate("Spring", "movie", "2015-01-01", 100);
+        let spring_2020 = fake_candidate("Spring", "movie", "2020-01-01", 100);
+        let s14 = score_tmdb_candidate(&spring_2014, &q, Some(2014));
+        let s15 = score_tmdb_candidate(&spring_2015, &q, Some(2014));
+        let s20 = score_tmdb_candidate(&spring_2020, &q, Some(2014));
+        // 2014 (exact) > 2015 (±1) > 2020 (no match).
+        assert!(
+            s14 > s15 && s15 > s20,
+            "year tiers: {} > {} > {}",
+            s14,
+            s15,
+            s20
+        );
+    }
+
+    #[test]
+    fn pick_best_canonical_send_help_vs_spring() {
+        // Full TODO-R regression fixture.
+        let send_help = fake_candidate("Send Help", "movie", "2024-01-01", 5000);
+        let spring_2014 = fake_candidate("Spring", "movie", "2014-01-01", 800);
+        let candidates = vec![&send_help, &spring_2014];
+        let best = pick_best_tmdb_candidate(&candidates, "Spring", None)
+            .expect("Must return a confident pick");
+        assert_eq!(best["title"], "Spring", "Must pick Spring, not Send Help");
+    }
+
+    #[test]
+    fn pick_best_year_overrides_when_query_carries_year() {
+        // Two same-titled movies — query "Spring 2014" must pick 2014.
+        let spring_2014 = fake_candidate("Spring", "movie", "2014-01-01", 800);
+        let spring_2020 = fake_candidate("Spring", "movie", "2020-01-01", 5000);
+        let candidates = vec![&spring_2020, &spring_2014]; // pop-ordered as TMDB would
+        let best = pick_best_tmdb_candidate(&candidates, "Spring", Some(2014)).unwrap();
+        assert_eq!(best["release_date"], "2014-01-01");
+    }
+
+    #[test]
+    fn pick_best_returns_none_when_floor_not_met() {
+        // Query with no title match anywhere and no year hint → None
+        // (caller falls back to first-result old behavior).
+        let send_help = fake_candidate("Send Help", "movie", "2024-01-01", 5000);
+        let other = fake_candidate("Random Movie", "movie", "2020-01-01", 5000);
+        let candidates = vec![&send_help, &other];
+        let best = pick_best_tmdb_candidate(&candidates, "Spring", None);
+        assert!(
+            best.is_none(),
+            "No-overlap candidates must return None for caller fallback"
+        );
+    }
+
+    #[test]
+    fn pick_best_handles_multi_search_media_types() {
+        // Multi-search returns both movie and tv. The best title-match wins
+        // regardless of media_type — caller reads media_type off the winner.
+        let news_movie = fake_candidate("News at Eleven", "movie", "2024-01-01", 50);
+        let the_boys_tv = fake_candidate("The Boys", "tv", "2019-07-26", 15000);
+        let candidates = vec![&news_movie, &the_boys_tv];
+        let best = pick_best_tmdb_candidate(&candidates, "The Boys", None).unwrap();
+        assert_eq!(best["media_type"], "tv");
+        assert_eq!(best["name"], "The Boys");
     }
 }
