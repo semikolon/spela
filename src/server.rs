@@ -862,6 +862,49 @@ pub(crate) const fn magnet_required_error(has_title: bool) -> &'static str {
 /// multi-file torrent re-play re-selects librqbit's default file —
 /// acceptable: seek-retranscode's primary use is single-file library
 /// plays; documented limitation, not a regression of normal play.
+/// 2026-06-09: Build the JSON body forwarded to Shannon's
+/// `shannon-kiosk-actions.service /watch` when `target=shannon` is
+/// dispatched. Pure helper extracted from `do_play` so the body shape
+/// can be unit-tested without standing up a TCP listener.
+///
+/// Three callable shapes:
+///   - **magnet supplied** (search-based play, web-remote or CLI):
+///     `{title, magnet, file_index?}` — spela-local takes the direct-play
+///     branch (no /search, no library lookup).
+///   - **no magnet, has title** (kiosk library tile, web-remote My-Library):
+///     `{title, library:true}` — spela-local takes the library-bypass
+///     branch (no /search, no TMDB, no Torrentio; Darwin do_play routes
+///     via Local Bypass + remote-origin /library/match).
+///   - **empty-string magnet** (defensive — should never happen in
+///     practice, but a caller that passes `Some("")` instead of `None`
+///     gets the same library-bypass treatment as `None`).
+///
+/// The `library:true` signal is what closes the architectural gap that
+/// previously routed kiosk library taps through spela-local's legacy
+/// title-search branch → TMDB → Torrentio for plays that are by
+/// definition LAN-local (the 2026-06-09 `Spring` → `Send Help (2024)`
+/// incident; `fbf56c1` fixed the TMDB-side surface symptom, this helper
+/// closes the architectural gap that lets the symptom matter at all).
+pub(crate) fn build_shannon_dispatch_body(
+    title: &str,
+    magnet: Option<&str>,
+    file_index: Option<u32>,
+) -> serde_json::Value {
+    let mut body_map = serde_json::Map::new();
+    body_map.insert("title".into(), json!(title));
+    let magnet_present = magnet.is_some_and(|s| !s.is_empty());
+    if let Some(m) = magnet.filter(|s| !s.is_empty()) {
+        body_map.insert("magnet".into(), json!(m));
+    }
+    if let Some(idx) = file_index {
+        body_map.insert("file_index".into(), json!(idx));
+    }
+    if !magnet_present {
+        body_map.insert("library".into(), json!(true));
+    }
+    serde_json::Value::Object(body_map)
+}
+
 pub(crate) fn replay_request_from_current(current: &CurrentStream, seek_to: f64) -> PlayRequest {
     let (target, cast_name) = match current.target.split_once(':') {
         Some((k, n)) => (Some(k.to_string()), Some(n.to_string())),
@@ -1043,15 +1086,25 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         // (Torrentio order non-deterministic; HEVC↔H.264 mid-tier swaps
         // observed). Title-only fallback preserved for My-Library taps
         // and any caller that doesn't have a magnet.
-        let mut body_map = serde_json::Map::new();
-        body_map.insert("title".into(), json!(title_for_shannon));
-        if let Some(m) = req.magnet.as_deref().filter(|s| !s.is_empty()) {
-            body_map.insert("magnet".into(), json!(m));
-        }
-        if let Some(idx) = req.file_index {
-            body_map.insert("file_index".into(), json!(idx));
-        }
-        let body = serde_json::Value::Object(body_map);
+        //
+        // 2026-06-09 — `library` signal for the no-magnet case. By the
+        // time `target=shannon` is checked, result_id resolution (above)
+        // has filled magnet/file_index from last_search if the caller
+        // was a search-based play. So "no magnet at this point" reliably
+        // means "the user tapped a library entry" (kiosk My-Library tile
+        // or web-remote My-Library). Forwarding `library:true` lets
+        // spela-local skip its `/search` round-trip ENTIRELY and POST
+        // `/play {title, target:"vlc"}` straight to Darwin, which routes
+        // via Local Bypass + remote-origin `/library/match` — zero TMDB,
+        // zero Torrentio, zero internet for a LAN-local play. Pre-fix,
+        // every library-tile-tap hit TMDB+Torrentio through spela-local's
+        // legacy title-search branch, surfacing wrong-title bugs even
+        // for plays that should never have left the LAN (2026-06-09
+        // `Spring` → `Send Help (2024)` incident: search.rs `fbf56c1`
+        // fixed the surface symptom; this signal closes the architectural
+        // gap that lets the surface symptom matter at all).
+        let body =
+            build_shannon_dispatch_body(&title_for_shannon, req.magnet.as_deref(), req.file_index);
         let client = reqwest::Client::new();
         let post_result = client
             .post(&shannon_url)
@@ -6089,6 +6142,60 @@ mod tests {
         let r = replay_request_from_current(&_cs_fixture("", "vlc"), 0.0);
         assert_eq!(r.target.as_deref(), Some("vlc"));
         assert_eq!(r.cast_name, None);
+    }
+
+    // --- 2026-06-09: target=shannon dispatch body shape ---
+    // Pins the contract that spela-local sees, so the library-bypass
+    // signal can never regress to "always falls through to /search".
+
+    #[test]
+    fn shannon_dispatch_no_magnet_signals_library_bypass() {
+        // The canonical kiosk-library-tile-tap shape: title only, no magnet.
+        // Must carry `library:true` so spela-local takes the library branch
+        // and skips its /search round-trip.
+        let body = build_shannon_dispatch_body("Spring (2014).mkv", None, None);
+        assert_eq!(body["title"], "Spring (2014).mkv");
+        assert_eq!(body["library"], true);
+        assert!(body.get("magnet").is_none(), "no magnet on library tap");
+        assert!(body.get("file_index").is_none());
+    }
+
+    #[test]
+    fn shannon_dispatch_with_magnet_omits_library_signal() {
+        // Web-remote search-based play: magnet supplied by Darwin
+        // last_search resolution. Must NOT carry `library:true` —
+        // spela-local must take the direct-play branch, not library.
+        let body =
+            build_shannon_dispatch_body("The Boys S05E07", Some("magnet:?xt=urn:btih:abc"), None);
+        assert_eq!(body["title"], "The Boys S05E07");
+        assert_eq!(body["magnet"], "magnet:?xt=urn:btih:abc");
+        assert!(
+            body.get("library").is_none(),
+            "magnet path must not also signal library — would confuse spela-local precedence"
+        );
+    }
+
+    #[test]
+    fn shannon_dispatch_with_magnet_and_file_index() {
+        // Multi-file torrent: magnet + file_index passthrough.
+        let body =
+            build_shannon_dispatch_body("Pack Release", Some("magnet:?xt=urn:btih:def"), Some(3));
+        assert_eq!(body["title"], "Pack Release");
+        assert_eq!(body["magnet"], "magnet:?xt=urn:btih:def");
+        assert_eq!(body["file_index"], 3);
+        assert!(body.get("library").is_none());
+    }
+
+    #[test]
+    fn shannon_dispatch_empty_string_magnet_treated_as_no_magnet() {
+        // Defensive: a caller that passes `Some("")` (e.g. a JSON
+        // payload with `magnet: ""`) gets the same library-bypass
+        // treatment as `None`. Prevents an empty-magnet from sneaking
+        // through as "supplied" and triggering spela-local's direct-play
+        // branch with a useless empty magnet.
+        let body = build_shannon_dispatch_body("Some Title", Some(""), None);
+        assert_eq!(body["library"], true);
+        assert!(body.get("magnet").is_none());
     }
 
     // --- Input validation (Apr 30, 2026 — security audit cluster) ---
