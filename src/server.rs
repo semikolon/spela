@@ -1597,16 +1597,46 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // cache HIT (final_url / source_duration / is_transcoded were set
     // above). Closing brace is just before "// Cast to Chromecast".
     if cache_hit_key.is_none() {
-        let codec_info =
+        let codec_info = if is_local {
             transcode::detect_codecs(&server_url)
                 .await
-                .unwrap_or(transcode::CodecInfo {
-                    video_codec: None,
-                    audio_codec: None,
-                    duration: None,
-                    audio_stream: "0:a:0".to_string(),
-                    audio_index: 0,
-                });
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Codec detection failed for local source: {}", e);
+                    default_codec_info()
+                })
+        } else {
+            const TORRENT_CODEC_DETECT_TIMEOUT_SECS: u64 = 25;
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(TORRENT_CODEC_DETECT_TIMEOUT_SECS),
+                transcode::detect_codecs(&server_url),
+            )
+            .await
+            {
+                Ok(Ok(info)) => info,
+                Ok(Err(e)) => {
+                    tracing::warn!("Torrent codec detection failed: {}", e);
+                    stop_torrent(state, pid, true).await;
+                    disk::prune_disk(&media_dir, "");
+                    return Json(json!({
+                        "error": format!("Torrent probe failed before playback: {}", e)
+                    }));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Torrent codec detection timed out after {}s — trying next source",
+                        TORRENT_CODEC_DETECT_TIMEOUT_SECS
+                    );
+                    stop_torrent(state, pid, true).await;
+                    disk::prune_disk(&media_dir, "");
+                    return Json(json!({
+                        "error": format!(
+                            "Torrent probe timed out after {}s before playback.",
+                            TORRENT_CODEC_DETECT_TIMEOUT_SECS
+                        )
+                    }));
+                }
+            }
+        };
         let video_codec = codec_info.video_codec;
         let audio_codec = codec_info.audio_codec;
         source_duration = codec_info.duration;
@@ -5799,6 +5829,16 @@ fn should_use_hls_for_playback(
         || has_intro
         || has_subtitles
         || is_local
+}
+
+fn default_codec_info() -> transcode::CodecInfo {
+    transcode::CodecInfo {
+        video_codec: None,
+        audio_codec: None,
+        duration: None,
+        audio_stream: "0:a:0".to_string(),
+        audio_index: 0,
+    }
 }
 
 /// Local-disk + Chromecast plays enter the "smart cast-gate"

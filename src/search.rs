@@ -68,6 +68,14 @@ pub struct EpisodeRef {
     pub air_date: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TvEpisodeIntent {
+    None,
+    FirstEpisode,
+    LatestEpisode,
+    LatestSeasonFirstEpisode,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentResult {
     pub id: usize,
@@ -253,8 +261,16 @@ impl SearchEngine {
         // 97 seconds. Pre-parsing the marker on the engine side makes
         // the natural-language form work first time, every time.
         let (cleaned_query, parsed_season, parsed_episode) = parse_episode_markers(query);
+        let (cleaned_query, tv_episode_intent) = if movie {
+            (cleaned_query, TvEpisodeIntent::None)
+        } else {
+            parse_tv_episode_intent(&cleaned_query)
+        };
         let q_owned: String;
-        let q: &str = if parsed_season.is_some() || parsed_episode.is_some() {
+        let q: &str = if parsed_season.is_some()
+            || parsed_episode.is_some()
+            || tv_episode_intent != TvEpisodeIntent::None
+        {
             q_owned = cleaned_query;
             &q_owned
         } else {
@@ -267,7 +283,8 @@ impl SearchEngine {
             self.search_movie(q).await
         } else if final_season.is_some() || final_episode.is_some() {
             // Explicit season/episode = definitely TV
-            self.search_tv(q, final_season, final_episode).await
+            self.search_tv(q, final_season, final_episode, tv_episode_intent)
+                .await
         } else {
             // Auto-detect: use TMDB multi-search to determine if it's a movie or TV show
             match self.tmdb_auto_detect(q).await {
@@ -277,7 +294,8 @@ impl SearchEngine {
                 }
                 _ => {
                     // Default to TV, or if auto-detect found "tv"
-                    self.search_tv(q, final_season, final_episode).await
+                    self.search_tv(q, final_season, final_episode, tv_episode_intent)
+                        .await
                 }
             }
         }
@@ -332,6 +350,7 @@ impl SearchEngine {
         query: &str,
         season: Option<u32>,
         episode: Option<u32>,
+        intent: TvEpisodeIntent,
     ) -> Result<SearchResult> {
         // Step 1: TMDB search
         let tmdb = self.tmdb_search(query, "tv").await?;
@@ -370,23 +389,7 @@ impl SearchEngine {
             }
         };
 
-        // Determine episode to search
-        let (s, e) = match (season, episode) {
-            (Some(s), Some(e)) => (s, e),
-            _ => match &show_info.latest_episode {
-                Some(ep) => (ep.season, ep.episode),
-                None => {
-                    return Ok(SearchResult {
-                        query: query.into(),
-                        show: Some(show_info),
-                        searching: None,
-                        error: Some("Cannot determine episode to search".into()),
-                        torrent_available: false,
-                        results: vec![],
-                    })
-                }
-            },
-        };
+        let (s, e) = episode_to_search(season, episode, intent, show_info.latest_episode.as_ref());
 
         // Step 3: Torrentio lookup (filtered by show title to drop spurious
         // cross-show results — the Apr 15 "French Chef for The Boys S05E03"
@@ -1525,6 +1528,80 @@ pub(crate) fn parse_episode_markers(query: &str) -> (String, Option<u32>, Option
     }
 
     (query.to_string(), None, None)
+}
+
+fn parse_tv_episode_intent(query: &str) -> (String, TvEpisodeIntent) {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+
+    static RE_LATEST_SEASON_FIRST: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)\b(?:(?:latest|newest)\s+season\s+(?:first|1st)\s+(?:episode|ep)|(?:first|1st)\s+(?:episode|ep)\s+of\s+(?:the\s+)?(?:latest|newest)\s+season)\b",
+        )
+        .unwrap()
+    });
+    static RE_LATEST_SEASON: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)\b(?:latest|newest)\s+season\b").unwrap());
+    static RE_LATEST_EPISODE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)\b(?:latest|newest)(?:\s+(?:episode|ep))?\b").unwrap());
+    static RE_FIRST_EPISODE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)\b(?:first|1st)\s+(?:episode|ep)\b").unwrap());
+
+    fn strip_match(q: &str, mat: regex::Match) -> String {
+        let mut cleaned = String::with_capacity(q.len());
+        cleaned.push_str(&q[..mat.start()]);
+        cleaned.push_str(&q[mat.end()..]);
+        cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    let patterns = [
+        (
+            &*RE_LATEST_SEASON_FIRST,
+            TvEpisodeIntent::LatestSeasonFirstEpisode,
+        ),
+        (
+            &*RE_LATEST_SEASON,
+            TvEpisodeIntent::LatestSeasonFirstEpisode,
+        ),
+        (&*RE_LATEST_EPISODE, TvEpisodeIntent::LatestEpisode),
+        (&*RE_FIRST_EPISODE, TvEpisodeIntent::FirstEpisode),
+    ];
+
+    for (re, intent) in patterns {
+        if let Some(mat) = re.find(query) {
+            return (strip_match(query, mat), intent);
+        }
+    }
+
+    (query.to_string(), TvEpisodeIntent::None)
+}
+
+fn episode_to_search(
+    season: Option<u32>,
+    episode: Option<u32>,
+    intent: TvEpisodeIntent,
+    latest_episode: Option<&EpisodeRef>,
+) -> (u32, u32) {
+    match intent {
+        TvEpisodeIntent::LatestEpisode => {
+            let latest_season = latest_episode.map(|e| e.season).unwrap_or(1);
+            let latest_episode_num = latest_episode.map(|e| e.episode).unwrap_or(1);
+            (
+                season.unwrap_or(latest_season),
+                episode.unwrap_or(latest_episode_num),
+            )
+        }
+        TvEpisodeIntent::LatestSeasonFirstEpisode => {
+            let latest_season = latest_episode.map(|e| e.season).unwrap_or(1);
+            (season.unwrap_or(latest_season), episode.unwrap_or(1))
+        }
+        TvEpisodeIntent::FirstEpisode | TvEpisodeIntent::None => match (season, episode) {
+            (Some(s), Some(e)) => (s, e),
+            (Some(s), None) => (s, 1),
+            (None, Some(e)) => (1, e),
+            (None, None) => (1, 1),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -2807,6 +2884,111 @@ mod tests {
         assert_eq!(q, "The Boys");
         assert_eq!(s, None);
         assert_eq!(e, None);
+    }
+
+    #[test]
+    fn unspecified_tv_search_defaults_to_first_episode() {
+        assert_eq!(
+            episode_to_search(None, None, TvEpisodeIntent::None, None),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn season_only_search_defaults_to_first_episode_of_that_season() {
+        assert_eq!(
+            episode_to_search(Some(2), None, TvEpisodeIntent::None, None),
+            (2, 1)
+        );
+    }
+
+    #[test]
+    fn episode_only_search_defaults_to_first_season() {
+        assert_eq!(
+            episode_to_search(None, Some(3), TvEpisodeIntent::None, None),
+            (1, 3)
+        );
+    }
+
+    #[test]
+    fn parse_tv_intent_latest_episode() {
+        let (q, intent) = parse_tv_episode_intent("Pantheon latest");
+        assert_eq!(q, "Pantheon");
+        assert_eq!(intent, TvEpisodeIntent::LatestEpisode);
+
+        let (q, intent) = parse_tv_episode_intent("Pantheon newest episode");
+        assert_eq!(q, "Pantheon");
+        assert_eq!(intent, TvEpisodeIntent::LatestEpisode);
+    }
+
+    #[test]
+    fn parse_tv_intent_latest_season_first_episode() {
+        let (q, intent) = parse_tv_episode_intent("Pantheon latest season first episode");
+        assert_eq!(q, "Pantheon");
+        assert_eq!(intent, TvEpisodeIntent::LatestSeasonFirstEpisode);
+
+        let (q, intent) = parse_tv_episode_intent("Pantheon first episode of the latest season");
+        assert_eq!(q, "Pantheon");
+        assert_eq!(intent, TvEpisodeIntent::LatestSeasonFirstEpisode);
+    }
+
+    #[test]
+    fn parse_tv_intent_first_episode() {
+        let (q, intent) = parse_tv_episode_intent("Pantheon first episode");
+        assert_eq!(q, "Pantheon");
+        assert_eq!(intent, TvEpisodeIntent::FirstEpisode);
+    }
+
+    #[test]
+    fn latest_episode_intent_uses_tmdb_last_episode_to_air() {
+        let latest = EpisodeRef {
+            season: 2,
+            episode: 8,
+            name: None,
+            air_date: None,
+        };
+        assert_eq!(
+            episode_to_search(None, None, TvEpisodeIntent::LatestEpisode, Some(&latest)),
+            (2, 8)
+        );
+    }
+
+    #[test]
+    fn latest_season_intent_starts_latest_season() {
+        let latest = EpisodeRef {
+            season: 2,
+            episode: 8,
+            name: None,
+            air_date: None,
+        };
+        assert_eq!(
+            episode_to_search(
+                None,
+                None,
+                TvEpisodeIntent::LatestSeasonFirstEpisode,
+                Some(&latest)
+            ),
+            (2, 1)
+        );
+    }
+
+    #[test]
+    fn explicit_episode_can_combine_with_latest_season() {
+        let latest = EpisodeRef {
+            season: 2,
+            episode: 8,
+            name: None,
+            air_date: None,
+        };
+        assert_eq!(
+            episode_to_search(
+                None,
+                Some(3),
+                TvEpisodeIntent::LatestSeasonFirstEpisode,
+                Some(&latest)
+            ),
+            (2, 3)
+        );
     }
 
     #[test]
