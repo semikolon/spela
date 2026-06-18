@@ -1605,7 +1605,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                     default_codec_info()
                 })
         } else {
-            const TORRENT_CODEC_DETECT_TIMEOUT_SECS: u64 = 25;
+            const TORRENT_CODEC_DETECT_TIMEOUT_SECS: u64 = 10;
             match tokio::time::timeout(
                 tokio::time::Duration::from_secs(TORRENT_CODEC_DETECT_TIMEOUT_SECS),
                 transcode::detect_codecs(&server_url),
