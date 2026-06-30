@@ -131,7 +131,11 @@
   .nowfull{display:flex;flex-direction:column;align-items:center;gap:1rem;padding:1rem .5rem}
   .nowfull .bigposter{width:min(62vw,260px);aspect-ratio:2/3;border-radius:18px;object-fit:cover;
     background:var(--bg3);box-shadow:0 18px 50px rgba(0,0,0,.55)}
-  .phvid{width:min(94vw,640px);aspect-ratio:16/9;background:#000;border-radius:14px;box-shadow:0 14px 40px rgba(0,0,0,.5)}
+  .phvid{width:100%;aspect-ratio:16/9;background:#000;border-radius:14px;box-shadow:0 14px 40px rgba(0,0,0,.5)}
+  /* 2026-07-01: loading feedback for phone-direct — warmup screen (#phload) +
+     buffering overlay (#phbuf) over the <video> until the first frame plays. */
+  .phwrap{position:relative;width:min(94vw,640px);align-self:center}
+  .phbuf{position:absolute;inset:0;justify-content:center;background:rgba(11,11,15,.78);border-radius:14px}
   .nowfull h2{margin:.2rem 0 0;font-size:1.3rem;text-align:center}
   .nowfull .sub{color:var(--dim);font-size:.85rem;margin-top:-.4rem}
   .lu{width:1.05em;height:1.05em;display:inline-block;vertical-align:-.16em;flex:none;stroke:currentColor}
@@ -487,16 +491,22 @@ async function doShannonPlay(opts,cardForSources){
    transport (native controls = scrub/seek/fullscreen). Single backend
    stream → switching target moves it (R-1). */
 async function doPhoneDirect(opts,cardForSources,label){
-  toast(`Starting ${label||""} on this device…`.replace(/\s+/g," "));
+  const old=$("#phvid"); if(old){ old.pause(); old.remove(); }   // fresh play → rebuild player
+  // Navigate to a dedicated "Starting…" screen IMMEDIATELY (before the ~10-15s
+  // transcode-warmup await) so the user isn't left staring at the search view
+  // with only a toast. phoneLoading gates the warmup screen; the buffering
+  // overlay then covers the brief gap until the <video> first frame plays.
+  S.now.phone=true; S.now.phoneLoading=true; S.now.everRan=false; S.now.playing=true;
+  S.now.data={title:label||"Playing",quality:"",poster_url:opts.poster_url||""};
+  location.hash="#/now"; renderNowFull();
   let r;
   try{ r=await api("/play",{method:"POST",body:{...opts,target:"vlc"}}); }
-  catch{ toast("spela unreachable"); return; }
-  if(r&&r.error){ toast("Couldn’t play: "+r.error);
-    if(cardForSources&&cardForSources._openSources) cardForSources._openSources(); return; }
-  const old=$("#phvid"); if(old){ old.pause(); old.remove(); }   // fresh play → rebuild player
-  S.now.phone=true; S.now.cold=false; S.now.everRan=true;
-  S.now.data={title:label||"Playing",quality:""};                // placeholder until first /status
-  location.hash="#/now"; pollNow(true);
+  catch{ S.now.phone=false; S.now.phoneLoading=false; toast("spela unreachable"); location.hash="#/search"; return; }
+  if(r&&r.error){ S.now.phone=false; S.now.phoneLoading=false; toast("Couldn’t play: "+r.error);
+    location.hash="#/search"; if(cardForSources&&cardForSources._openSources) cardForSources._openSources(); return; }
+  S.now.phoneLoading=false; S.now.everRan=true;
+  renderNowFull();                                               // build the <video> + buffering overlay
+  pollNow(true);
 }
 let _hlsLoading;
 function attachPhoneVideo(v,src){
@@ -748,11 +758,24 @@ function renderNowFull(){
   const root=$("#nowFull"), c=S.now.data;
   if(!c){ root.innerHTML=`<div class="state"><div class="big">Nothing playing</div>Start something from Search.</div>`; return; }
   if(S.now.phone){
+    if(S.now.phoneLoading){   // warmup screen shown immediately, before the <video> exists
+      if($("#phload")) return;
+      root.innerHTML=`<div class="nowfull" id="phload">
+        ${c.poster_url?`<img class="bigposter" src="${esc(c.poster_url)}" alt="">`:""}
+        <h2>${esc(c.title||"")}</h2>
+        <div class="starting"><div class="spin"></div>Starting on this device…</div>
+        <div class="sub">Buffering the first few seconds — this is normal, not an error.</div>
+      </div>`;
+      return;
+    }
     if($("#phvid")) return;   // built once — poll re-renders must NOT rebuild the playing <video>
     root.innerHTML=`<div class="nowfull">
       <h2>${esc(c.title||"")}</h2>
       <div class="sub">${esc(c.quality||"")} · on this device</div>
-      <video id="phvid" class="phvid" controls playsinline autoplay></video>
+      <div class="phwrap">
+        <video id="phvid" class="phvid" controls playsinline autoplay></video>
+        <div id="phbuf" class="starting phbuf"><div class="spin"></div>Buffering…</div>
+      </div>
       <div class="transport">
         <button class="tbtn" id="phStop" title="Stop" aria-label="Stop">${ic("stop")}</button>
         <button class="srcbtn" id="phTo">${ic("tv")}Move to a TV…</button>
@@ -760,6 +783,7 @@ function renderNowFull(){
       <div class="sub">Single backend stream — moving to a TV stops it here.</div>
     </div>`;
     attachPhoneVideo($("#phvid"),"/hls/master.m3u8");
+    { const vEl=$("#phvid"); if(vEl) vEl.addEventListener("playing",()=>{ const b=$("#phbuf"); if(b) b.remove(); },{once:true}); }
     $("#phStop").onclick=async()=>{ const v=$("#phvid"); if(v){ v.pause(); v.remove(); }
       await api("/stop",{method:"POST"}).catch(()=>{});
       S.now.phone=false; S.now.data=null; $("#nowbar").classList.remove("on"); stopPolling(); renderNowFull(); };
