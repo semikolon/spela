@@ -478,7 +478,7 @@ async function doShannonPlay(opts,cardForSources){
    transport (native controls = scrub/seek/fullscreen). Single backend
    stream → switching target moves it (R-1). */
 async function doPhoneDirect(opts,cardForSources,label){
-  toast(`Starting ${label||""} on this phone…`.replace(/\s+/g," "));
+  toast(`Starting ${label||""} on this device…`.replace(/\s+/g," "));
   let r;
   try{ r=await api("/play",{method:"POST",body:{...opts,target:"vlc"}}); }
   catch{ toast("spela unreachable"); return; }
@@ -575,7 +575,7 @@ function isAudioOnly(d){ const n=d.name||"",m=d.model||"";
   return AUDIO_RE.test(m)||AUDIO_RE.test(n);                  // filter only clear audio; ambiguous kept
 }
 function tgtLabel(){ const t=S.target; const b=$("#tgtBtn");
-  $("#tgtLabel").textContent=t?(t.kind==="phone"?"This phone":t.name):"Pick target";
+  $("#tgtLabel").textContent=t?(t.kind==="phone"?"This device":t.name):"Pick target";
   b.classList.toggle("set",!!t); }
 tgtLabel();
 $("#tgtBtn").onclick=openSheet;
@@ -603,10 +603,10 @@ function openSheet(){
     });
     // "This phone" — in-browser HLS playback (Phase 6 / US-5).
     const ph=el("button",{className:"topt"});
-    ph.innerHTML=`<span class="ic">${ic("phone")}</span><span><span class="nm">This phone</span><br><span class="md">watch in-browser</span></span>`;
+    ph.innerHTML=`<span class="ic">${ic("phone")}</span><span><span class="nm">This device</span><br><span class="md">watch in-browser</span></span>`;
     if(S.target&&S.target.kind==="phone") ph.classList.add("sel");
     ph.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
-      S.target={kind:"phone",name:"This phone"};
+      S.target={kind:"phone",name:"This device"};
       sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
       if(resume) resume();   // the play the user originally tapped now fires (to this phone)
       else if(moving) toast("Single stream — your next play moves it here, off the TV"); };
@@ -742,7 +742,7 @@ function renderNowFull(){
     if($("#phvid")) return;   // built once — poll re-renders must NOT rebuild the playing <video>
     root.innerHTML=`<div class="nowfull">
       <h2>${esc(c.title||"")}</h2>
-      <div class="sub">${esc(c.quality||"")} · on this phone</div>
+      <div class="sub">${esc(c.quality||"")} · on this device</div>
       <video id="phvid" class="phvid" controls playsinline autoplay></video>
       <div class="transport">
         <button class="tbtn" id="phStop" title="Stop" aria-label="Stop">${ic("stop")}</button>

@@ -400,7 +400,11 @@ pub async fn detect_codecs(url: &str) -> Result<CodecInfo> {
     let preferred = audio_streams
         .iter()
         .find(|a| a.lang == "eng" || a.lang == "en")
-        .or_else(|| audio_streams.iter().find(|a| a.lang == "dan" || a.lang == "da"))
+        .or_else(|| {
+            audio_streams
+                .iter()
+                .find(|a| a.lang == "dan" || a.lang == "da")
+        })
         .or_else(|| audio_streams.first());
 
     let (audio_index, preferred_codec) = match preferred {

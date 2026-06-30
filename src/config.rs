@@ -62,13 +62,16 @@ pub struct Config {
     /// Receiver sees a complete VOD playlist with honest total duration so
     /// `current_time` doesn't inflate and HWM saves stay accurate.
     ///
-    /// **Default `false`.**  Trade-off: enables receiver-side total-duration
-    /// display (TV shows "1:23 / 2:00") at the cost of DMR rendering a
-    /// persistent progress-bar overlay.  Live mode (this flag false) = no
-    /// progress bar AND no overlay, which is spela's preferred user-facing
-    /// experience until the Custom Receiver is registered.  Full case study
-    /// + decision tree: spela CLAUDE.md § "DMR overlay is stream-type-dependent,
-    /// not metadata-dependent".
+    /// **Default `true` since 2026-06-29.**  Earlier default `false` was chosen
+    /// for the overlay-free DMR experience, but that left every non-Bypass play
+    /// (torrent sources, which transcode ~4.5x ahead of realtime) serving a bare
+    /// LIVE playlist — and browser hls.js / native Safari / Chromecast all chase
+    /// the racing live edge and stall ~15s in. Padding to a full-duration VOD
+    /// manifest with ENDLIST is the fix (player treats it as VOD, starts at 0).
+    /// Trade-off accepted: Chromecast DMR now renders a progress-bar overlay
+    /// (irrelevant to the browser/phone path, which has its own scrubber, and a
+    /// reasonable affordance for VOD anyway).  Full case study: spela CLAUDE.md
+    /// § "DMR overlay is stream-type-dependent, not metadata-dependent".
     ///
     /// Two-part implementation contract:
     ///   1. `handle_hls_playlist` parses ffmpeg's actual playlist, computes
@@ -194,7 +197,17 @@ impl Default for Config {
             cast_app_id: String::new(),
             rich_metadata_in_load: false,
             experimental_endlist_hack: false,
-            vod_manifest_padded: false,
+            // Default `true` since 2026-06-29: with it `false`, non-Bypass plays
+            // (torrent sources transcoded ~4.5x ahead of realtime) serve a bare
+            // LIVE playlist (no ENDLIST). Browser hls.js, native Safari, and
+            // Chromecast all then apply live-streaming heuristics — start at the
+            // live edge and chase it — but that "edge" races forward at 4.5x, so
+            // every player plays ~15s then stalls and never recovers. Padding to
+            // a full-duration VOD manifest with ENDLIST makes the stream
+            // indistinguishable from a complete (Bypass/movie) play, which works.
+            // `build_padded_vod_manifest`'s `had_endlist` guard makes this a no-op
+            // for already-complete playlists, so the movie path is untouched.
+            vod_manifest_padded: true,
             allowed_hosts: Vec::new(),
             shannon_watch_url: None,
             hls_cache_cap_mb: default_hls_cache_cap_mb(),
