@@ -88,6 +88,14 @@ pub struct TorrentResult {
     pub info_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_index: Option<u32>,
+    /// 2026-06-30: on-disk partial-download percentage (0-100) for THIS exact
+    /// release, set by the /search handler (server side, where media_dir is
+    /// known). `Some(pct)` with pct < 100 means a prior download of this same
+    /// torrent is partly on disk; tapping it resumes (librqbit `overwrite:
+    /// true`) and saves re-downloading that fraction. `None` = no partial /
+    /// not computed. The web remote tints such sources green.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_pct: Option<u8>,
 }
 
 pub struct SearchEngine {
@@ -578,6 +586,7 @@ impl SearchEngine {
                     ),
                     info_hash,
                     file_index: s["fileIdx"].as_u64().map(|n| n as u32),
+                    partial_pct: None, // enriched by the /search handler (media_dir scan)
                 }
             })
             .collect();
@@ -1945,6 +1954,7 @@ mod tests {
             magnet: "magnet:test".into(),
             info_hash: "test".into(),
             file_index,
+            partial_pct: None,
         }
     }
 

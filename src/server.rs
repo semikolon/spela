@@ -730,7 +730,16 @@ async fn handle_search(
         .search(&q, movie, params.season, params.episode)
         .await
     {
-        Ok(result) => {
+        Ok(mut result) => {
+            // 2026-06-30: enrich each result with its on-disk partial-download
+            // % so the web remote can tint already-(part-)downloaded sources
+            // green — tapping one resumes (librqbit overwrite:true) instead of
+            // re-downloading. Scan media_dir only (the torrent cache); a
+            // complete copy in a library_dir would already be Local-Bypassed.
+            let media_dir = resolve_media_dir(&state);
+            for r in result.results.iter_mut() {
+                r.partial_pct = result_partial_pct(&media_dir, r);
+            }
             // Save results so `play <N>` can reference them
             AppState::save_last_search(&state.state_dir, &result);
             Json(serde_json::to_value(result).unwrap_or(json!({"error": "serialize failed"})))
@@ -4354,6 +4363,97 @@ fn top_level_file_is_healthy(path: &std::path::Path, _expected_bytes: u64) -> bo
     }
 }
 
+/// 2026-06-30: physical (on-disk, Unix `blocks()*512`) and logical (`len()`)
+/// byte totals for a media path. For a FILE, that file. For a DIR, the sum
+/// across its `.mkv`/`.mp4` media files (skipping `transcoded*`). Used to
+/// gauge how much of a (possibly sparse) download is actually present.
+fn phys_logical_bytes(path: &std::path::Path) -> (u64, u64) {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return (0, 0),
+    };
+    if meta.is_file() {
+        return (meta.blocks() * 512, meta.len());
+    }
+    if meta.is_dir() {
+        let (mut phys, mut logi) = (0u64, 0u64);
+        if let Ok(rd) = std::fs::read_dir(path) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+                let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if (ext == "mkv" || ext == "mp4") && !fname.starts_with("transcoded") {
+                    if let Ok(m) = std::fs::metadata(&p) {
+                        phys += m.blocks() * 512;
+                        logi += m.len();
+                    }
+                }
+            }
+        }
+        return (phys, logi);
+    }
+    (0, 0)
+}
+
+/// Normalize a release name to lowercase ASCII alphanumerics (dropping a
+/// trailing file extension), so two names for the SAME exact release compare
+/// equal regardless of dots / brackets / spacing. Distinct releases keep
+/// distinct normals (their group tag + codec differ), so containment matching
+/// on these won't cross-match CATS vs glhf.
+fn normalize_release_name(s: &str) -> String {
+    let stem = match s.rsplit_once('.') {
+        Some((stem, ext))
+            if !ext.is_empty()
+                && ext.len() <= 4
+                && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            stem
+        }
+        _ => s,
+    };
+    stem.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// 2026-06-30: on-disk partial-download percentage (0-100) for THIS exact
+/// release, or `None` if no prior download of it is present. Matches the
+/// result's release name against `media_dir` entries (file OR folder) by
+/// normalized-name containment, then measures physically-present vs logical
+/// bytes (a librqbit partial pre-allocates the logical size and fills it
+/// sparsely as pieces arrive). Tapping a `Some(<100)` source replays the same
+/// magnet → librqbit `overwrite: true` resumes the remaining fraction instead
+/// of re-downloading it. Pure (filesystem-only) — testable via tempfiles.
+fn result_partial_pct(
+    media_dir: &std::path::Path,
+    result: &crate::search::TorrentResult,
+) -> Option<u8> {
+    let want = normalize_release_name(&result.title);
+    if want.len() < 8 {
+        return None; // too short to match a release reliably
+    }
+    for entry in std::fs::read_dir(media_dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("transcoded") {
+            continue;
+        }
+        let got = normalize_release_name(&name);
+        if got.len() < 8 || !(got.contains(&want) || want.contains(&got)) {
+            continue;
+        }
+        let (phys, logi) = phys_logical_bytes(&entry.path());
+        if logi == 0 {
+            return None;
+        }
+        let pct = ((phys as f64 / logi as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        return (pct >= 1).then_some(pct);
+    }
+    None
+}
+
 async fn handle_targets(State(state): State<SharedState>) -> Json<Value> {
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -6566,7 +6666,12 @@ mod tests {
     }
 
     #[test]
-    fn find_local_bypass_top_level_file_skips_large_expected_size_mismatch() {
+    fn find_local_bypass_top_level_file_accepts_complete_different_size_release() {
+        // 2026-06-30: the ±25% top-level size window was removed (see
+        // top_level_file_is_healthy). A COMPLETE (dense) copy of the right
+        // episode whose size differs widely from the ranked torrent is now
+        // REUSED, not re-downloaded — content identity is proven by
+        // title+year+quality, completeness by the non-sparse check.
         let root = tempfile::tempdir().unwrap();
         make_dense_mkv(
             root.path(),
@@ -6580,8 +6685,8 @@ mod tests {
             &std::collections::HashSet::new(),
         );
         assert!(
-            result.is_none(),
-            "top-level local bypass must reject clearly wrong-size episode files"
+            result.is_some(),
+            "a complete different-size release of the right episode must be reused"
         );
     }
 
@@ -6973,6 +7078,46 @@ mod tests {
         fh.set_len(300 * 1024 * 1024).unwrap(); // 300 MB logical, ~0 physical
         drop(fh);
         assert!(!top_level_file_is_healthy(&sparse, 110 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_result_partial_pct_reports_sparse_partial_and_skips_nonmatch() {
+        use std::io::Write;
+        let mk = |title: &str| crate::search::TorrentResult {
+            id: 1,
+            quality: "1080p".into(),
+            title: title.into(),
+            seeds: 10,
+            size: "1 GB".into(),
+            source: "Test".into(),
+            magnet: "magnet:test".into(),
+            info_hash: "x".into(),
+            file_index: Some(0),
+            partial_pct: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // ~32%-downloaded sparse partial named like a real release (the Pantheon
+        // glhf shape): 32 MB physically present, extended to 100 MB logical.
+        let f = dir
+            .path()
+            .join("Pantheon.S01E01.1080p.WEB.h264-glhf[eztv.re].mkv");
+        let mut fh = std::fs::File::create(&f).unwrap();
+        fh.write_all(&vec![1u8; 32 * 1024 * 1024]).unwrap();
+        fh.set_len(100 * 1024 * 1024).unwrap();
+        fh.sync_all().unwrap();
+        drop(fh);
+
+        // Same release → ~32% detected (allow filesystem block rounding).
+        let pct = result_partial_pct(dir.path(), &mk(&f.file_name().unwrap().to_string_lossy()))
+            .expect("partial should be detected for the matching release");
+        assert!((28..=36).contains(&pct), "expected ~32%, got {}", pct);
+
+        // Different release (CATS) → no cross-match, no partial.
+        assert!(result_partial_pct(
+            dir.path(),
+            &mk("Pantheon.S01E01.REPACK.1080p.WEBRip.x264-CATS.mkv")
+        )
+        .is_none());
     }
 
     #[test]

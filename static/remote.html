@@ -92,6 +92,11 @@
   .src .q{font-weight:700;color:var(--fg)}
   .src .x{color:var(--dim)}
   .src .s{margin-left:auto;color:var(--good);font-weight:700;white-space:nowrap}
+  /* 2026-06-30: a source already (part-)downloaded on disk — tapping it resumes
+     (librqbit overwrite:true) instead of re-fetching that fraction. */
+  .src.partial{border-color:var(--good);background:linear-gradient(90deg,rgba(55,200,122,.16),var(--bg3))}
+  .src .dl{color:var(--good);font-weight:800;white-space:nowrap}
+  .src-toggle.has-partial{color:var(--good)}
 
   /* ---- states ---- */
   .state{padding:3rem 1rem;text-align:center;color:var(--dim)}
@@ -345,11 +350,15 @@ function posterCard({poster,title,year,cta,onPlay,sources}){
     b.onclick=()=>onPlay(); c.appendChild(b);
   }
   if(sources&&sources.length){
-    const tg=el("button",{className:"src-toggle",textContent:`More sources (${sources.length})`});
+    const anyPartial=sources.some(s=>typeof s.partial_pct==="number");
+    const collapsed=()=>`More sources (${sources.length})`+(anyPartial?" · ↓ resume available":"");
+    const tg=el("button",{className:"src-toggle"+(anyPartial?" has-partial":""),textContent:collapsed()});
     const box=el("div",{className:"sources"});
     sources.forEach(r=>{
-      const row=el("button",{className:"src"});
+      const part=typeof r.partial_pct==="number";
+      const row=el("button",{className:"src"+(part?" partial":"")});
       row.appendChild(el("span",{className:"q",textContent:r.quality||"?"}));
+      if(part) row.appendChild(el("span",{className:"dl",textContent:r.partial_pct>=100?"✓ on disk":`↓ ${r.partial_pct}%`}));
       row.appendChild(el("span",{className:"x",textContent:codec(r.title)}));
       row.appendChild(el("span",{className:"x",textContent:r.size||""}));
       row.appendChild(el("span",{className:"x",textContent:r.source||""}));
@@ -358,7 +367,7 @@ function posterCard({poster,title,year,cta,onPlay,sources}){
       box.appendChild(row);
     });
     tg.onclick=()=>{box.classList.toggle("open");
-      tg.textContent=(box.classList.contains("open")?"Hide sources":`More sources (${sources.length})`);};
+      tg.textContent=(box.classList.contains("open")?"Hide sources":collapsed());};
     c.append(tg,box);
     c._openSources=()=>{box.classList.add("open");tg.textContent="Hide sources";};
   }
