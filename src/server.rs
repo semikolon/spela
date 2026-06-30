@@ -4320,32 +4320,24 @@ fn is_physically_full(path: &std::path::Path, expected_bytes: u64) -> bool {
 /// Sanity floor: 100 MB. Anything smaller than that is a partial download or
 /// a stub file, not a real movie file.
 ///
-/// If we know the search result's expected size, require the top-level file to
-/// be within a broad size window. This keeps the Apr 15 "different release,
-/// same content" flexibility while rejecting obviously wrong matches, like a
-/// 700 MB file standing in for a 1.6 GB request.
-fn top_level_file_is_healthy(path: &std::path::Path, expected_bytes: u64) -> bool {
+/// 2026-06-30: the expected-size WINDOW (formerly ±25% of the ranked torrent's
+/// size) was REMOVED. It contradicted this function's own intent: a complete
+/// different-release copy of the same episode legitimately varies 2x or more in
+/// size (a high-bitrate x264 vs an efficient x265 of the same 1080p episode),
+/// and the window wrongly rejected it, forcing a fresh torrent download. The
+/// Pantheon glhf(3.4GB)-vs-CATS(1.71GB) rejection was this bug. Content identity
+/// is already proven upstream (title + year + quality); the NON-SPARSE check
+/// below is the real completeness guard (a half-downloaded torrent file is
+/// sparse — physical blocks < logical size — and is rejected there). Size-vs-
+/// ranked-torrent carried no reliable signal, so it is gone. The directory-
+/// bypass path keeps its strict ±1% check (`is_physically_full`) because it
+/// must disambiguate multiple files inside a season pack.
+fn top_level_file_is_healthy(path: &std::path::Path, _expected_bytes: u64) -> bool {
     const MIN_MOVIE_SIZE_BYTES: u64 = 100 * 1024 * 1024;
-    const MIN_EXPECTED_RATIO: f64 = 0.75;
-    const MAX_EXPECTED_RATIO: f64 = 1.25;
     if let Ok(meta) = std::fs::metadata(path) {
         let logical_size = meta.len();
         if logical_size < MIN_MOVIE_SIZE_BYTES {
             return false;
-        }
-        if expected_bytes > 0 {
-            let min_expected = (expected_bytes as f64 * MIN_EXPECTED_RATIO) as u64;
-            let max_expected = (expected_bytes as f64 * MAX_EXPECTED_RATIO) as u64;
-            if logical_size < min_expected || logical_size > max_expected {
-                tracing::info!(
-                    "Local Bypass: Top-level file size {} outside expected window [{}..={}] for {:?}. Rejecting.",
-                    logical_size,
-                    min_expected,
-                    max_expected,
-                    path
-                );
-                return false;
-            }
         }
         let physical_size = meta.blocks() * 512;
         if physical_size < (logical_size as f64 * 0.95) as u64 {
@@ -6952,6 +6944,35 @@ mod tests {
         // not panic.
         let nonexistent = std::path::Path::new("/tmp/spela-nonexistent-fixture-xxxxyyyyzzzz");
         assert!(!top_level_file_is_healthy(nonexistent, 0));
+    }
+
+    #[test]
+    fn test_top_level_file_is_healthy_accepts_complete_different_bitrate_release() {
+        // 2026-06-30: a COMPLETE (non-sparse) different-RELEASE copy of the
+        // same episode whose size is far outside the ranked torrent's old
+        // ±25% window must be reused, not re-downloaded. Content identity is
+        // already proven upstream (title + year + quality); the non-sparse
+        // check is the real completeness guard. Anchors the Pantheon
+        // glhf(3.4GB)-vs-ranked-CATS(1.71GB) class of rejection.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("ep.mkv");
+        std::fs::write(&f, vec![0u8; 300 * 1024 * 1024]).unwrap(); // 300 MB, dense
+                                                                   // expected = 110 MB → file is ~2.7x, far outside the removed window.
+        assert!(top_level_file_is_healthy(&f, 110 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_top_level_file_is_healthy_rejects_sparse_partial_regardless_of_expected() {
+        // The non-sparse check — NOT the (removed) size window — is the
+        // completeness guard. A 32%-downloaded sparse partial whose logical
+        // size differs from the ranked torrent stays rejected. This is the
+        // ACTUAL Pantheon glhf shape (physical/logical ≈ 0.32).
+        let dir = tempfile::tempdir().unwrap();
+        let sparse = dir.path().join("partial.mkv");
+        let fh = std::fs::File::create(&sparse).unwrap();
+        fh.set_len(300 * 1024 * 1024).unwrap(); // 300 MB logical, ~0 physical
+        drop(fh);
+        assert!(!top_level_file_is_healthy(&sparse, 110 * 1024 * 1024));
     }
 
     #[test]
