@@ -1738,6 +1738,21 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
             .await
             {
                 Ok(hls_info) => {
+                    // 2026-07-01: persist the ffprobed source duration next to
+                    // the playlist so handle_hls_playlist's vod_manifest_padded
+                    // path can pad even if CurrentStream.duration is missing at
+                    // serve time (ffprobe race / concurrent-play state overwrite).
+                    // Without this fallback an unknown duration silently degrades
+                    // to the bare-live serve → the 15s live-edge stall returns
+                    // (the exact failure that hit the Pantheon glhf resume). The
+                    // file is co-located with the playlist, so it is auto-scoped
+                    // and auto-wiped per transcode.
+                    if let Some(d) = source_duration {
+                        let _ = std::fs::write(
+                            media_dir.join("transcoded_hls").join(".source_duration"),
+                            d.to_string(),
+                        );
+                    }
                     let manifest_path = hls_info.manifest_path.clone();
                     let ffmpeg_pid = hls_info.ffmpeg_pid;
                     let prepared_hls_for_cast =
@@ -5362,11 +5377,26 @@ async fn handle_hls_playlist(
         match tokio::fs::read_to_string(&path).await {
             Ok(body) => {
                 let app_state = AppState::load(&state.state_dir);
-                let (duration, ss_offset) = app_state
+                let (mut duration, ss_offset) = app_state
                     .current
                     .as_ref()
                     .map(|c| (c.duration.unwrap_or(0.0), c.ss_offset))
                     .unwrap_or((0.0, 0.0));
+                // 2026-07-01: fallback to the per-transcode `.source_duration`
+                // sidecar (written by do_play) when CurrentStream.duration is
+                // missing — otherwise an unknown duration falls through to the
+                // bare-live serve and reintroduces the 15s live-edge stall.
+                if duration <= 0.0 {
+                    if let Ok(s) = std::fs::read_to_string(
+                        resolve_media_dir(&state)
+                            .join("transcoded_hls")
+                            .join(".source_duration"),
+                    ) {
+                        if let Ok(d) = s.trim().parse::<f64>() {
+                            duration = d;
+                        }
+                    }
+                }
                 let remaining = (duration - ss_offset).max(0.0);
                 if remaining > 0.0 {
                     let padded = build_padded_vod_manifest(&body, remaining, 6.0);
