@@ -1,9 +1,10 @@
 # Subtitle-Audio Sync — the ingenious guarantee (research 2026-07-04)
 
 Research deliverable answering "is there an ingenious way to GUARANTEE subtitles
-are always in sync with the audio?" Sources cited inline. NOT YET IMPLEMENTED —
-this is the design for the follow-up. Verbatim subagent synthesis condensed to
-the actionable core.
+are always in sync with the audio?" Sources cited inline. **SHIPPED 2026-07-04**
+(embedded-first rung was already live; the alass external-SRT alignment rung
+landed this session — `subtitles.rs::align_srt_with_alass`, fires on local
+`file://` sources). Verbatim subagent synthesis condensed to the actionable core.
 
 ## Executive answer
 You cannot "guarantee" sync from an arbitrary external SRT — the guarantee comes
@@ -25,10 +26,14 @@ VAD speech-activity + dynamic-programming search over **offset + framerate +
 split points**. Single portable Rust binary (matches spela's stack), no Python.
 Handles: (a) constant offset ✅, (b) framerate 23.976↔25 drift ✅, (c) mid-file
 splits (ad breaks/cuts) ✅ (its defining feature; `--split-penalty` default 7,
-`--no-splits` for fast offset+framerate-only mode). Accuracy (author benchmark
-N=118): 80% of lines within 100 ms, 95% within 800 ms. Install
-`cargo install alass-cli`; point `ALASS_FFMPEG_PATH`/`ALASS_FFPROBE_PATH` at the
-binaries; use the plain (non-`ffmpeg-library`) build.
+`--no-split`/`-l` for fast offset+framerate-only mode). Accuracy (author
+benchmark N=118): 80% of lines within 100 ms, 95% within 800 ms. Install
+`cargo install alass-cli` → **binary is `alass-cli`** (not `alass`); finds
+`ffmpeg`/`ffprobe` on PATH. **SHIPPED 2026-07-04** in `subtitles.rs`
+(`align_srt_with_alass`); flag is `--no-split` (SINGULAR — alass-cli 2.0.0
+rejects the plural `--no-splits`). Verified: a +45s-desynced SRT recovered
+exactly ("shifted 942 subtitles by -0:00:45.000", output byte-identical to
+ground truth).
 
 `ffsubsync` (Python, VAD+FFT cross-correlation, `--vad=silero`, `--gss` for
 arbitrary framerate) — handles offset+framerate but NOT mid-file splits. Keep
