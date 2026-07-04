@@ -355,7 +355,9 @@ async fn align_srt_with_alass(
                 tracing::info!("alass aligned external subtitle ({size} bytes)");
                 true
             } else {
-                tracing::warn!("alass produced trivial output ({size} bytes) — keeping unaligned SRT");
+                tracing::warn!(
+                    "alass produced trivial output ({size} bytes) — keeping unaligned SRT"
+                );
                 false
             }
         }

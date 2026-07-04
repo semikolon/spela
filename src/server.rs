@@ -1522,7 +1522,12 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         // 2026-07-04: publish warmup so GET /progress can report live
         // download + transcode progress while this whole block waits
         // (peer-connect, the 12s progress check, smooth-mode full download).
-        _warmup_guard = Some(begin_warmup(state, req.title.clone(), Some(pid), &media_dir));
+        _warmup_guard = Some(begin_warmup(
+            state,
+            req.title.clone(),
+            Some(pid),
+            &media_dir,
+        ));
 
         // Self-healing: check download progress
         if !check_torrent_progress(state, pid, 12).await {
@@ -3920,7 +3925,9 @@ async fn handle_progress(State(state): State<SharedState>) -> Json<Value> {
                 .count()
         })
         .unwrap_or(0);
-    let tp = w.torrent_id.and_then(|id| state.torrent_engine.progress(id));
+    let tp = w
+        .torrent_id
+        .and_then(|id| state.torrent_engine.progress(id));
 
     let torrent_json = tp.as_ref().map(|p| {
         let percent = if p.bytes_total > 0 {
