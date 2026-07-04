@@ -1,7 +1,7 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use anyhow::Context;
 use axum::extract::{Query, Request, State};
@@ -64,10 +64,13 @@ pub struct Warmup {
     /// librqbit torrent id when the source is a torrent; `None` for Local
     /// Bypass plays (no download — straight to the transcode pre-buffer).
     pub torrent_id: Option<u32>,
-    /// Directory ffmpeg writes HLS segments into. Segment count is the
-    /// transcode-phase progress signal (`count_hls_segments`).
+    /// Directory ffmpeg writes HLS segments into. FRESH segment count (written
+    /// since `started_wall`) is the transcode-phase progress signal; the mtime
+    /// filter ignores STALE `.ts` left by a prior transcode that would else
+    /// mislabel the download phase as "transcoding".
     pub hls_dir: PathBuf,
     pub started_at: Instant,
+    pub started_wall: SystemTime,
 }
 
 /// RAII: clears `state.warmup` on drop so no do_play return path can leak a
@@ -94,6 +97,7 @@ fn begin_warmup(
         torrent_id,
         hls_dir: media_dir.join("transcoded_hls"),
         started_at: Instant::now(),
+        started_wall: SystemTime::now(),
     });
     WarmupGuard {
         state: state.clone(),
@@ -3900,7 +3904,22 @@ async fn handle_progress(State(state): State<SharedState>) -> Json<Value> {
     let Some(w) = warm else {
         return Json(json!({ "active": false }));
     };
-    let segments = count_hls_segments(&w.hls_dir);
+    // FRESH segments only — a `.ts` written since this warmup began. Ignoring
+    // stale leftovers keeps the download phase from being mislabeled
+    // "transcoding" (a 0%-downloaded torrent has produced nothing yet).
+    let segments = std::fs::read_dir(&w.hls_dir)
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "ts"))
+                .filter(|e| {
+                    e.metadata()
+                        .and_then(|m| m.modified())
+                        .map(|mt| mt >= w.started_wall)
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0);
     let tp = w.torrent_id.and_then(|id| state.torrent_engine.progress(id));
 
     let torrent_json = tp.as_ref().map(|p| {
