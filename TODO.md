@@ -1,5 +1,22 @@
 # Spela TODOs 🎬🍿
 
+### Cast UX + speed — SHIPPED (v3.13, 2026-07-04 evening, post-Bear-watch feedback)
+Fredrik watched The Bear, came back with rich feedback. Shipped + verified (Fredriks TV):
+- **Stop kills the cast** (`handle_stop` sends the Chromecast a STOP before backend teardown — was leaving the TV playing the buffered HLS). **Graceful optimistic stop** in the SPA (now-playing surface fades out = the confirmation, "Stopped" toast, per NN/g). **Crisp <100ms tap feedback** on transport buttons (scale + color `:active`).
+- **Start ~5× faster**: race-ahead lead 120s→12s (MIN_SPEED 1.5× is the real safety gate + the adaptivity — strong source starts early, weak waits) + wall-sample 8s→5s. alass alignment capped at 5s (the 19s subtitle bottleneck was a COLD-cache first-play cost — cached re-plays ~1s). Silo warm-cache start: **~13s** (was ~50s). Cold: ~17s.
+- **Rewind-to-0 works**: SPA seek BEFORE the transcode start (ss_offset) now re-transcodes instead of erroring "Cannot seek to 0s".
+- **kamal-proxy target-timeout 30s→300s** (the months-long root cause — proxy 504'd slow /play mid-cast; per-service, verified isolated).
+Full research: `docs/ux_principles_media_remote_2026_07_04.md`. Global UX principle (action-feedback thresholds) queued for global CLAUDE.md.
+
+### NEXT — intro-warmup: instant TV wake + parallel handshake (Fredrik's idea, 2026-07-04)
+The ~8s Chromecast LOAD handshake (connect + launch receiver app + buffer) runs SERIALLY *after* race-ahead. Fredrik: cast the (currently-disabled) intro clip as a warm-up placeholder the instant the transcode starts → TV lights up in ~2-3s (huge perceived-perf win) + the receiver-app-launch overlaps the transcode buildup → then LOAD the real HLS on the warm receiver. Build defensively (best-effort; any failure falls through to the normal cast, no regression). Timing caveat: intro is 5s, real-ready is ~13s → a gap where the intro ends before real content; consider looping the intro or a longer placeholder. NEEDS live-Chromecast testing (the swap-glitch) — can't fully verify without a device.
+
+### NEXT (the REAL fix for BOTH speed + subtitles) — custom Cast receiver ($5 registration)
+Fredrik's insight (correct): Cast receivers render subtitles as a **layered text track**, NOT burned in. With a custom receiver we can (a) cast the real HLS as soon as 1 segment exists (~2-3s) and let the receiver buffer gracefully — no 12s pre-buffer wait; (b) attach the subtitle track SEPARATELY, aligned in the BACKGROUND, added after playback starts — eliminating the subtitle-blocks-start cost (the 19s cold-cache alass) entirely. Blocked on the $5 Cast SDK Developer Console registration. This subsumes both the intro-warmup AND the alass-on-critical-path problem.
+
+### NEXT — cold-cache subtitle prefetch during search
+First-play subtitle cost is the cold alass audio-VAD (~15s, now capped at 5s → raw sub fallback). Prefetch + align subtitles in the BACKGROUND when the user views search results (before they tap play) → by play-time the aligned SRT is cached → fast first-play WITH aligned subs. Decouples subtitle latency from the play entirely (for the DMR-burn-in path; the custom receiver makes it moot).
+
 ### Cast reliability — SHIPPED (v3.12, 2026-07-04)
 Fixed the recurring "won't play from web remote": (1) kamal-proxy `--target-timeout` 30s→300s (the primary root cause — proxy 504'd slow `/play` mid-cast → orphan ffmpeg, no cast; evaded diagnosis for months because direct-curl bypasses the proxy); (2) `do_cleanup` orphan-ffmpeg pkill + retry-past-death-race (stale segments were polluting the next play → Chromecast buffering); (3) race-ahead primary-variant segment count (was double-counting multi-variant → cast at half the real buffer). Verified Silo → Fredriks TV reaches Playing via both paths. See CLAUDE.md Status v3.12 + Hard-Won Lessons "kamal-proxy target-timeout".
 
