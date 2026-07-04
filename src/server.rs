@@ -6233,19 +6233,20 @@ const SEG_DURATION_SECS: f64 = 6.0;
 ///
 /// Pure — unit-tested.
 fn race_ahead_safe(content_buffered_secs: f64, wall_elapsed_secs: f64) -> bool {
-    // 2026-07-04: lead cut 120s → 24s (4 segments) per Fredrik's "start ASAP,
-    // like WebTorrent did" feedback. The frontier-catch proof above only needs
-    // S ≥ 1 for the gap to GROW forever, so any positive lead is safe while the
-    // transcode stays ahead; MIN_SPEED = 1.5 is the real safety gate (jitter
-    // margin) and MIN_WALL_SAMPLE avoids trusting the NVENC spin-up burst. 24s
-    // is the receiver's typical HLS startup cushion — enough to not stutter,
-    // ~5× faster to first frame than the old 120s. cast_health_monitor remains
-    // the backstop if a torrent-fed transcode later dips below realtime.
-    const MIN_LEAD_SECS: f64 = 24.0;
+    // 2026-07-04: lead cut 120s → 12s (2 segments) per Fredrik's "start ASAP,
+    // like WebTorrent did — most torrents streamable in under 6s" feedback.
+    // The frontier-catch proof above only needs S ≥ 1 for the gap to GROW
+    // forever, so any positive lead is safe WHILE the transcode stays ahead;
+    // MIN_SPEED = 1.5 is the real safety gate AND the adaptivity Fredrik asked
+    // for — a strong source (fast transcode) clears it in seconds and starts
+    // early; a weak/uncertain source (S < 1.5) keeps waiting on its own. 12s is
+    // ~2 HLS segments — enough for the receiver to start without an immediate
+    // rebuffer. cast_health_monitor is the backstop if S later dips below 1.
+    const MIN_LEAD_SECS: f64 = 12.0;
     const MIN_SPEED: f64 = 1.5;
     // Don't trust a speed estimate from the first few seconds (ffmpeg
     // spin-up / NVENC init burst is not representative of sustained rate).
-    const MIN_WALL_SAMPLE_SECS: f64 = 8.0;
+    const MIN_WALL_SAMPLE_SECS: f64 = 5.0;
     if wall_elapsed_secs < MIN_WALL_SAMPLE_SECS || content_buffered_secs < MIN_LEAD_SECS {
         return false;
     }
@@ -7151,10 +7152,10 @@ mod tests {
 
     #[test]
     fn race_ahead_safe_false_when_lead_too_small() {
-        // 18s buffered in 9s wall = 2x (fast!) but < 24s absolute cushion.
-        assert!(!race_ahead_safe(18.0, 9.0));
-        // 24s cushion IS enough once past the min wall sample + fast enough.
-        assert!(race_ahead_safe(30.0, 9.0)); // 30s buffered, 9s wall = 3.3x
+        // 8s buffered in 5s wall = 1.6x (fast enough) but < 12s absolute cushion.
+        assert!(!race_ahead_safe(8.0, 5.0));
+        // 12s cushion IS enough once past the min wall sample + fast enough.
+        assert!(race_ahead_safe(18.0, 5.0)); // 18s buffered, 5s wall = 3.6x
     }
 
     #[test]

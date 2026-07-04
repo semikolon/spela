@@ -340,13 +340,30 @@ async fn align_srt_with_alass(
         None => source.to_path_buf(),
     };
 
-    let out = Command::new(&alass)
+    // 2026-07-04: cap alignment at 5s so it never blocks the stream start.
+    // The fast path (embedded text-subtitle reference → sub-to-sub align)
+    // finishes in <1s. The slow path (no embedded text track → alass decodes
+    // the WHOLE file's audio for VAD, ~15s+ on a 50-min episode) was the
+    // dominant start-latency bottleneck (Silo: 19s of subtitle work before the
+    // transcode even began). On timeout we keep the raw (unaligned)
+    // OpenSubtitles SRT — for a release-specific sub that's usually close, and
+    // Fredrik's stated priority is start-ASAP. `kill_on_drop` reaps the alass
+    // process when the timeout drops the future. (Follow-up: prefetch+cache the
+    // aligned SRT during search so re-plays get the aligned version for free.)
+    let alass_fut = Command::new(&alass)
         .arg("--no-split")
         .arg(&reference)
         .arg(external_srt)
         .arg(out_srt)
-        .output()
-        .await;
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(5), alass_fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!("alass alignment exceeded 5s — using unaligned SRT for a fast start");
+            return false;
+        }
+    };
 
     match out {
         Ok(o) if o.status.success() => {
