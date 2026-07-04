@@ -1,6 +1,7 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::Context;
 use axum::extract::{Query, Request, State};
@@ -44,9 +45,60 @@ pub struct ServerState {
     /// `Config` via `compute_host_allowlist`. Loopback + `darwin.home` +
     /// stream_host + config.allowed_hosts.
     pub host_allowlist: std::collections::HashSet<String>,
+    /// 2026-07-04: live warmup progress. While `do_play` blocks setting up a
+    /// stream (torrent connect → download → transcode pre-buffer → cast LOAD),
+    /// this holds enough state for a concurrent `GET /progress` request to
+    /// report second-by-second progress to the web remote's loading screen.
+    /// Published via `begin_warmup` (RAII) and cleared automatically when the
+    /// returned guard drops on ANY do_play return path (success OR the many
+    /// early error-returns) — so `/progress` can never report a stale warmup.
+    pub warmup: Mutex<Option<Warmup>>,
 }
 
 type SharedState = Arc<ServerState>;
+
+/// 2026-07-04: snapshot of an in-progress stream setup, read by `/progress`.
+#[derive(Clone)]
+pub struct Warmup {
+    pub title: String,
+    /// librqbit torrent id when the source is a torrent; `None` for Local
+    /// Bypass plays (no download — straight to the transcode pre-buffer).
+    pub torrent_id: Option<u32>,
+    /// Directory ffmpeg writes HLS segments into. Segment count is the
+    /// transcode-phase progress signal (`count_hls_segments`).
+    pub hls_dir: PathBuf,
+    pub started_at: Instant,
+}
+
+/// RAII: clears `state.warmup` on drop so no do_play return path can leak a
+/// stale "still warming up" state to `/progress`.
+struct WarmupGuard {
+    state: SharedState,
+}
+impl Drop for WarmupGuard {
+    fn drop(&mut self) {
+        *lock_recover(&self.state.warmup) = None;
+    }
+}
+
+/// Publish warmup state and return the RAII guard that clears it on drop.
+/// The caller holds the guard in `do_play`'s top scope for the whole setup.
+fn begin_warmup(
+    state: &SharedState,
+    title: Option<String>,
+    torrent_id: Option<u32>,
+    media_dir: &Path,
+) -> WarmupGuard {
+    *lock_recover(&state.warmup) = Some(Warmup {
+        title: title.unwrap_or_else(|| "Loading…".into()),
+        torrent_id,
+        hls_dir: media_dir.join("transcoded_hls"),
+        started_at: Instant::now(),
+    });
+    WarmupGuard {
+        state: state.clone(),
+    }
+}
 
 pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     // Auto-detect a routable stream host fallback if not set in config.
@@ -150,6 +202,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         ffmpeg_pid: Mutex::new(None),
         torrent_engine,
         host_allowlist,
+        warmup: Mutex::new(None),
     });
 
     // May 1, 2026 (Wilderpeople movie-night DEFINITIVE root cause): CORS
@@ -188,6 +241,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/play", post(handle_play))
         .route("/stop", post(handle_stop))
         .route("/status", get(handle_status))
+        .route("/progress", get(handle_progress))
         .route("/pause", post(handle_pause))
         .route("/resume", post(handle_resume))
         .route("/seek", post(handle_seek))
@@ -989,6 +1043,13 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // English dub (see detect_codecs). None for magnet-direct plays.
     let mut preferred_audio_lang: Option<String> = None;
 
+    // 2026-07-04: live warmup progress. Held in do_play's top scope so the RAII
+    // guard drops (clearing `state.warmup`) on EVERY return path — success or
+    // any of the many early error-returns below. Published at the point each
+    // source path begins its real work (torrent start, or the transcode for a
+    // Local Bypass play); `GET /progress` reads it for the SPA loading screen.
+    let mut _warmup_guard: Option<WarmupGuard> = None;
+
     // Resolve result_id from last search — fills magnet, file_index, and metadata automatically
     if let Some(rid) = req.result_id {
         match AppState::load_last_search(&state.state_dir) {
@@ -1454,6 +1515,11 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         pid = result.0;
         server_url = result.1;
 
+        // 2026-07-04: publish warmup so GET /progress can report live
+        // download + transcode progress while this whole block waits
+        // (peer-connect, the 12s progress check, smooth-mode full download).
+        _warmup_guard = Some(begin_warmup(state, req.title.clone(), Some(pid), &media_dir));
+
         // Self-healing: check download progress
         if !check_torrent_progress(state, pid, 12).await {
             tracing::warn!("Torrent has no download progress after 12s — dead seeds");
@@ -1492,6 +1558,14 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 }));
             }
         }
+    }
+
+    // 2026-07-04: Local Bypass plays skip the torrent branch (no download) but
+    // still have a transcode pre-buffer wait the user stares at. Publish warmup
+    // now if the torrent path didn't (torrent_id=None → /progress reports
+    // transcode-segment progress instead of download %).
+    if _warmup_guard.is_none() {
+        _warmup_guard = Some(begin_warmup(state, req.title.clone(), None, &media_dir));
     }
 
     // Fetch subtitles FIRST (needed for burn-in during transcode)
@@ -3811,6 +3885,67 @@ async fn handle_status(State(state): State<SharedState>) -> Json<Value> {
             }))
         }
     }
+}
+
+/// 2026-07-04: live warmup progress for the web remote's loading screen.
+/// Reports second-by-second phase + metrics while `do_play` is mid-setup.
+/// Returns `{"active": false}` when nothing is warming up (the SPA then falls
+/// through to its normal `/status`-driven now-playing view).
+///
+/// Phase is INFERRED from live state (torrent progress + HLS segment count)
+/// rather than mutated into `Warmup` by do_play — this keeps the do_play surface
+/// to a single `begin_warmup` call per source path (no scattered phase writes).
+async fn handle_progress(State(state): State<SharedState>) -> Json<Value> {
+    let warm = lock_recover(&state.warmup).clone();
+    let Some(w) = warm else {
+        return Json(json!({ "active": false }));
+    };
+    let segments = count_hls_segments(&w.hls_dir);
+    let tp = w.torrent_id.and_then(|id| state.torrent_engine.progress(id));
+
+    let torrent_json = tp.as_ref().map(|p| {
+        let percent = if p.bytes_total > 0 {
+            (p.bytes_downloaded as f64 / p.bytes_total as f64 * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        json!({
+            "percent": percent,
+            "downloaded": p.bytes_downloaded,
+            "total": p.bytes_total,
+            "speed_bps": p.speed_bps,
+            "peers": p.peers_connected,
+            "finished": p.finished,
+        })
+    });
+
+    // Phase inference:
+    //   segments already writing → transcode/pre-buffer phase (nearly ready)
+    //   torrent has peers/bytes  → downloading
+    //   torrent present, nothing yet → connecting
+    //   no torrent (Local Bypass), no segments → transcode spinning up
+    let phase = if segments > 0 {
+        "transcoding"
+    } else if tp
+        .as_ref()
+        .map(|p| p.bytes_downloaded > 0 || p.peers_connected > 0)
+        .unwrap_or(false)
+    {
+        "downloading"
+    } else if w.torrent_id.is_some() {
+        "connecting"
+    } else {
+        "transcoding"
+    };
+
+    Json(json!({
+        "active": true,
+        "phase": phase,
+        "title": w.title,
+        "segments": segments,
+        "torrent": torrent_json,
+        "elapsed_secs": w.started_at.elapsed().as_secs(),
+    }))
 }
 
 async fn handle_pause(State(state): State<SharedState>) -> Json<Value> {

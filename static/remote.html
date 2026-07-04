@@ -137,10 +137,12 @@
   .nowfull .bigposter{width:min(62vw,260px);aspect-ratio:2/3;border-radius:18px;object-fit:cover;
     background:var(--bg3);box-shadow:0 18px 50px rgba(0,0,0,.55)}
   .phvid{width:100%;aspect-ratio:16/9;background:#000;border-radius:14px;box-shadow:0 14px 40px rgba(0,0,0,.5)}
-  /* 2026-07-01: loading feedback for phone-direct — warmup screen (#phload) +
-     buffering overlay (#phbuf) over the <video> until the first frame plays. */
+  /* 2026-07-04: live warmup progress (#warmup, all transcoded plays) + the
+     phone-direct buffering overlay (#phbuf) over the <video> until first frame. */
   .phwrap{position:relative;width:min(94vw,640px);align-self:center}
   .phbuf{position:absolute;inset:0;justify-content:center;background:rgba(11,11,15,.78);border-radius:14px}
+  .wbar{width:min(360px,80%);height:10px;border-radius:6px;background:var(--bg3);overflow:hidden;margin:.1rem 0}
+  .wfill{height:100%;background:var(--warn);border-radius:6px;transition:width .45s ease}
   .nowfull h2{margin:.2rem 0 0;font-size:1.3rem;text-align:center}
   .nowfull .sub{color:var(--dim);font-size:.85rem;margin-top:-.4rem}
   .lu{width:1.05em;height:1.05em;display:inline-block;vertical-align:-.16em;flex:none;stroke:currentColor}
@@ -295,8 +297,9 @@ const S={
   search:{q:"",abort:null,data:null},
   library:{data:null,loading:false},
   now:{data:null,posAbs:0,dur:0,frontier:0,endlist:false,playing:false,lastSync:0,
-       everRan:false,cold:false,seekDrag:false,phone:false},
-  pollTimer:null, frontierTimer:null,
+       everRan:false,cold:false,seekDrag:false,phone:false,
+       warming:false,warmup:null,warmupData:null},   // 2026-07-04 live warmup progress
+  pollTimer:null, frontierTimer:null, warmTimer:null,
   pending:null   // deferred play: tapped before a target was set → picker → resume
 };
 
@@ -451,23 +454,48 @@ function iconizeStatic(){ document.querySelectorAll("[data-ic]").forEach(e=>{
   if(!e.querySelector(".lu")) e.insertAdjacentHTML("afterbegin", ic(e.dataset.ic)); }); }
 
 /* ---------- hybrid play ---------- */
+/* ---------- Live warmup progress (2026-07-04) ----------
+   All server-transcoded plays (chromecast, phone-direct, library) block in
+   /play for the whole torrent-download + transcode pre-buffer + cast-LOAD
+   window (30-60s+). Instead of leaving the user staring at the search view,
+   we navigate to a live progress screen IMMEDIATELY and poll GET /progress
+   every 1s while /play is awaited in the background. */
+function beginWarming(title,poster){
+  S.now.warming=true; S.now.warmup=null; S.now.warmupData={title:title||"Playing",poster:poster||""};
+  S.now.data=null; S.now.phone=false;
+  location.hash="#/now"; renderNowFull(); startWarmupPoll();
+}
+function endWarming(){ S.now.warming=false; stopWarmupPoll(); }
+function startWarmupPoll(){ if(S.warmTimer)return; pollWarmup(); S.warmTimer=setInterval(pollWarmup,1000); }
+function stopWarmupPoll(){ clearInterval(S.warmTimer); S.warmTimer=null; }
+async function pollWarmup(){
+  let p; try{ p=await api("/progress"); }catch{ return; }
+  if(!p||!p.active) return;                 // do_play hasn't published yet (race) — keep last frame
+  S.now.warmup=p;
+  if(currentView()==="now" && S.now.warming) renderNowFull();
+}
+function fmtSpeed(bps){ if(!bps) return "0 KB/s"; const mb=bps/1e6;
+  return mb>=1 ? mb.toFixed(1)+" MB/s" : Math.round(bps/1e3)+" KB/s"; }
+
 async function doPlay(opts,cardForSources){
   if(!S.target){ S.pending=()=>doPlay(opts,cardForSources); toast("Pick where to play — it starts right after"); openSheet(); return; }
   if(S.target.kind==="phone"){ return doPhoneDirect(opts,cardForSources,(S.search.data&&S.search.data.show&&S.search.data.show.title)||""); }
   if(S.target.kind==="shannon"){ return doShannonPlay(opts,cardForSources); }
+  const label=(S.search.data&&S.search.data.show&&S.search.data.show.title)||opts.title||"Playing";
+  beginWarming(label,opts.poster_url);
   const body={...opts,target:"chromecast",cast_name:S.target.name};
-  toast(`Starting on ${S.target.name}…`);
   let r;
   try{ r=await api("/play",{method:"POST",body}); }
-  catch{ toast("spela unreachable"); return; }
+  catch{ endWarming(); toast("spela unreachable"); location.hash="#/search"; return; }
+  endWarming();
   if(r&&r.error){
-    toast("Couldn’t play: "+r.error);
+    toast("Couldn’t play: "+r.error); location.hash="#/search";
     if(cardForSources&&cardForSources._openSources) cardForSources._openSources();
     return;
   }
-  toast("Playing — opening now-playing");
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
-  location.hash="#/now"; pollNow(true);
+  S.now.data={title:label,poster_url:opts.poster_url||"",quality:"",target:":"+(S.target&&S.target.name||"")};
+  renderNowFull(); pollNow(true);
 }
 
 /* ---------- Shannon-TV playback (Phase-7 / target=shannon, 2026-05-23) ----------
@@ -501,19 +529,17 @@ async function doShannonPlay(opts,cardForSources){
    stream → switching target moves it (R-1). */
 async function doPhoneDirect(opts,cardForSources,label){
   const old=$("#phvid"); if(old){ old.pause(); old.remove(); }   // fresh play → rebuild player
-  // Navigate to a dedicated "Starting…" screen IMMEDIATELY (before the ~10-15s
-  // transcode-warmup await) so the user isn't left staring at the search view
-  // with only a toast. phoneLoading gates the warmup screen; the buffering
-  // overlay then covers the brief gap until the <video> first frame plays.
-  S.now.phone=true; S.now.phoneLoading=true; S.now.everRan=false; S.now.playing=true;
-  S.now.data={title:label||"Playing",quality:"",poster_url:opts.poster_url||""};
-  location.hash="#/now"; renderNowFull();
+  // Live warmup screen (shared with chromecast/library) covers the ~10-15s
+  // transcode-warmup await; on success we build the in-page <video>.
+  beginWarming(label||opts.title||"Playing",opts.poster_url);
   let r;
   try{ r=await api("/play",{method:"POST",body:{...opts,target:"vlc"}}); }
-  catch{ S.now.phone=false; S.now.phoneLoading=false; toast("spela unreachable"); location.hash="#/search"; return; }
-  if(r&&r.error){ S.now.phone=false; S.now.phoneLoading=false; toast("Couldn’t play: "+r.error);
+  catch{ endWarming(); toast("spela unreachable"); location.hash="#/search"; return; }
+  endWarming();
+  if(r&&r.error){ toast("Couldn’t play: "+r.error);
     location.hash="#/search"; if(cardForSources&&cardForSources._openSources) cardForSources._openSources(); return; }
-  S.now.phoneLoading=false; S.now.everRan=true;
+  S.now.phone=true; S.now.phoneLoading=false; S.now.everRan=true; S.now.playing=true;
+  S.now.data={title:label||"Playing",quality:"",poster_url:opts.poster_url||""};
   renderNowFull();                                               // build the <video> + buffering overlay
   pollNow(true);
 }
@@ -538,14 +564,15 @@ async function doPlayLibrary(entry){
   if(!S.target){ S.pending=()=>doPlayLibrary(entry); toast("Pick where to play — it starts right after"); openSheet(); return; }
   if(S.target.kind==="phone"){ return doPhoneDirect({title:entry.raw_name,poster_url:entry.poster_url},null,entry.title); }
   if(S.target.kind==="shannon"){ return doShannonPlay({title:entry.raw_name,poster_url:entry.poster_url},null); }
-  toast(`Starting ${entry.title} on ${S.target.name}…`);
+  beginWarming(entry.title,entry.poster_url);
   let r;
   try{ r=await api("/play",{method:"POST",body:{title:entry.raw_name,poster_url:entry.poster_url,target:"chromecast",cast_name:S.target.name}}); }
-  catch{ toast("spela unreachable"); return; }
-  if(r&&r.error){ toast("Couldn’t play: "+r.error); return; }
-  toast("Playing — opening now-playing");
+  catch{ endWarming(); toast("spela unreachable"); location.hash="#/search"; return; }
+  endWarming();
+  if(r&&r.error){ toast("Couldn’t play: "+r.error); location.hash="#/search"; return; }
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
-  location.hash="#/now"; pollNow(true);
+  S.now.data={title:entry.title,poster_url:entry.poster_url||"",quality:"",target:":"+(S.target&&S.target.name||"")};
+  renderNowFull(); pollNow(true);
 }
 async function renderLibrary(force){
   const out=$("#libraryOut"); if(!out) return;
@@ -666,6 +693,7 @@ document.addEventListener("visibilitychange",()=>{
 });
 
 async function pollNow(force){
+  if(S.now.warming) return;   // 2026-07-04: the warmup poll owns the screen until /play resolves
   if(document.visibilityState!=="visible"&&!force) return;
   let s; try{ s=await api("/status"); }catch{ return; }
   if(!s||s.status==="idle"||!s.current){
@@ -763,20 +791,45 @@ function updateNowBar(){
 }
 
 /* ---------- now-playing: full view + scrubber ---------- */
+/* 2026-07-04: live warmup screen — phase label + progress bar + second-by-second
+   stats (download %/speed/peers OR transcode segments), fed by GET /progress. */
+function renderWarmupInto(root){
+  const w=S.now.warmup||{}, wd=S.now.warmupData||{};
+  const title=w.title||wd.title||"Loading…", poster=wd.poster||"";
+  const phase=w.phase||"connecting", t=w.torrent;
+  let label, barPct=null, sub="";
+  if(phase==="downloading" && t){
+    label="Downloading…";
+    barPct=Math.max(0,Math.min(100,t.percent||0));
+    sub=`${fmtSpeed(t.speed_bps)} · ${t.peers||0} peer${t.peers===1?"":"s"}`;
+  }else if(phase==="transcoding"){
+    label="Preparing video…";
+    const segs=w.segments||0;
+    barPct=Math.max(0,Math.min(100,segs/20*100));   // ~20-segment cast pre-buffer
+    sub=`${segs} segment${segs===1?"":"s"} ready`+((t&&!t.finished)?` · downloading ${Math.round(t.percent||0)}%`:"");
+  }else{
+    label="Connecting to peers…";
+    sub=t?`${t.peers||0} peer${t.peers===1?"":"s"}`:"finding sources";
+  }
+  const el=(w.elapsed_secs!=null)?` · ${w.elapsed_secs}s`:"";
+  root.innerHTML=`<div class="nowfull" id="warmup">
+    ${poster?`<img class="bigposter" src="${esc(poster)}" alt="">`:""}
+    <h2>${esc(title)}</h2>
+    <div class="starting"><div class="spin"></div>${esc(label)}</div>
+    ${barPct!=null?`<div class="wbar"><div class="wfill" style="width:${barPct}%"></div></div>`:""}
+    <div class="sub">${esc(sub)}${el}</div>
+    <div class="transport"><button class="srcbtn" id="wCancel">${ic("stop")}Cancel</button></div>
+  </div>`;
+  const cb=$("#wCancel");
+  if(cb) cb.onclick=async()=>{ endWarming(); S.now.data=null;
+    await api("/stop",{method:"POST"}).catch(()=>{}); location.hash="#/search"; };
+}
 function renderNowFull(){
-  const root=$("#nowFull"), c=S.now.data;
+  const root=$("#nowFull");
+  if(S.now.warming){ renderWarmupInto(root); return; }   // 2026-07-04 live warmup screen
+  const c=S.now.data;
   if(!c){ root.innerHTML=`<div class="state"><div class="big">Nothing playing</div>Start something from Search.</div>`; return; }
   if(S.now.phone){
-    if(S.now.phoneLoading){   // warmup screen shown immediately, before the <video> exists
-      if($("#phload")) return;
-      root.innerHTML=`<div class="nowfull" id="phload">
-        ${c.poster_url?`<img class="bigposter" src="${esc(c.poster_url)}" alt="">`:""}
-        <h2>${esc(c.title||"")}</h2>
-        <div class="starting"><div class="spin"></div>Starting on this device…</div>
-        <div class="sub">Buffering the first few seconds — this is normal, not an error.</div>
-      </div>`;
-      return;
-    }
     if($("#phvid")) return;   // built once — poll re-renders must NOT rebuild the playing <video>
     root.innerHTML=`<div class="nowfull">
       <h2>${esc(c.title||"")}</h2>

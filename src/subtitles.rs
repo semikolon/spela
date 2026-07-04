@@ -262,17 +262,168 @@ pub async fn fetch_subtitles(
         _ => return Ok(None),
     };
 
-    // Save SRT
+    // Save the raw external SRT.
     std::fs::create_dir_all(media_dir)?;
     let srt_path = media_dir.join(format!("subtitle_{}.srt", lang));
     std::fs::write(&srt_path, &srt_text)?;
 
-    // Convert to VTT for Chromecast
-    let vtt_text = srt_to_vtt(&srt_text);
+    // 2026-07-04: an external OpenSubtitles SRT is NOT guaranteed to share this
+    // release's timeline — it can be off by a constant offset, a framerate
+    // ratio (23.976↔25), or cut differently. When we have the local source
+    // file, ALIGN it against the media (via `alass`) before burn-in so the
+    // subtitles stay in sync with the audio. No local source (partial torrent
+    // HTTP stream) → no alignment reference → burn as-fetched. Full rationale:
+    // docs/subtitle_sync_research_2026_07_04.md.
+    if let Some(src) = source_path {
+        if src.exists() {
+            let aligned = media_dir.join(format!("subtitle_{}.aligned.srt", lang));
+            if align_srt_with_alass(src, &srt_path, &aligned, media_dir).await {
+                // do_play burns `subtitle_{lang}.srt`, so replace it in place.
+                let _ = std::fs::rename(&aligned, &srt_path);
+            }
+        }
+    }
+
+    // Convert the (now possibly-aligned) SRT to VTT for the Cast Receiver path.
+    let final_srt = std::fs::read_to_string(&srt_path).unwrap_or(srt_text);
+    let vtt_text = srt_to_vtt(&final_srt);
     let vtt_path = media_dir.join(format!("subtitle_{}.vtt", lang));
     std::fs::write(&vtt_path, &vtt_text)?;
 
     Ok(Some(vtt_path))
+}
+
+/// 2026-07-04: locate the alass binary. `cargo install alass-cli` installs it
+/// as `alass-cli` (some distro packages call it `alass`). Prefers
+/// `~/.cargo/bin/alass-cli`, then those names on PATH. If none runs, the caller
+/// degrades gracefully to the unaligned SRT.
+fn alass_binary() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        for name in ["alass-cli", "alass"] {
+            let p = PathBuf::from(&home).join(".cargo/bin").join(name);
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    PathBuf::from("alass-cli")
+}
+
+/// Align an external SRT against the media timeline with `alass`
+/// (kaegi/alass — VAD speech-activity + dynamic-programming search over
+/// offset + framerate). Returns true iff a non-trivial aligned file was
+/// written to `out_srt`.
+///
+/// Reference preference (docs/subtitle_sync_research_2026_07_04.md):
+///   1. An embedded TEXT subtitle track (any language) → sub-to-sub align,
+///      <1s, most accurate (no audio decode).
+///   2. Else the source media file → alass extracts audio itself (~5-10s CPU).
+///
+/// `--no-splits`: release files have no ad-breaks, so offset+framerate-only is
+/// the correct model and avoids over-segmentation. Any failure (alass missing,
+/// non-zero exit, trivial output) returns false → caller keeps the unaligned
+/// SRT (never worse than today's behaviour).
+async fn align_srt_with_alass(
+    source: &Path,
+    external_srt: &Path,
+    out_srt: &Path,
+    work_dir: &Path,
+) -> bool {
+    use tokio::process::Command;
+
+    let alass = alass_binary();
+
+    // Prefer an embedded text-subtitle track as the reference (fast + accurate,
+    // no audio decode). Fall back to the media file (alass extracts audio).
+    let reference = match extract_any_text_subtitle_ref(source, work_dir).await {
+        Some(p) => p,
+        None => source.to_path_buf(),
+    };
+
+    let out = Command::new(&alass)
+        .arg("--no-splits")
+        .arg(&reference)
+        .arg(external_srt)
+        .arg(out_srt)
+        .output()
+        .await;
+
+    match out {
+        Ok(o) if o.status.success() => {
+            let size = std::fs::metadata(out_srt).map(|m| m.len()).unwrap_or(0);
+            if size > 50 {
+                tracing::info!("alass aligned external subtitle ({size} bytes)");
+                true
+            } else {
+                tracing::warn!("alass produced trivial output ({size} bytes) — keeping unaligned SRT");
+                false
+            }
+        }
+        Ok(o) => {
+            tracing::warn!(
+                "alass alignment failed (keeping unaligned SRT): {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            false
+        }
+        Err(e) => {
+            tracing::debug!("alass not runnable ({e}) — keeping unaligned SRT");
+            false
+        }
+    }
+}
+
+/// Extract ANY embedded TEXT subtitle track (first non-image track) to an SRT
+/// for use as a fast, audio-free alignment reference. Image tracks (PGS/VobSub,
+/// which carry `width`/`height`) are skipped — they can't be `-c:s srt`'d.
+/// Writes into `work_dir` (spela-owned, writable) — the source may live on a
+/// read-only library drive. Returns the ref path on non-trivial output.
+async fn extract_any_text_subtitle_ref(source: &Path, work_dir: &Path) -> Option<PathBuf> {
+    use tokio::process::Command;
+
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-select_streams",
+            "s",
+        ])
+        .arg(source)
+        .output()
+        .await
+        .ok()?;
+    if !probe.status.success() {
+        return None;
+    }
+    let j: Value = serde_json::from_slice(&probe.stdout).ok()?;
+    let streams = j["streams"].as_array()?;
+    // First TEXT track (no width/height → not image-based).
+    let idx = streams.iter().find_map(|s| {
+        let is_text = s["width"].as_i64().is_none() && s["height"].as_i64().is_none();
+        if is_text {
+            s["index"].as_i64()
+        } else {
+            None
+        }
+    })?;
+
+    let ref_srt = work_dir.join(".alass_ref.srt");
+    let out = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-i"])
+        .arg(source)
+        .args(["-map", &format!("0:{idx}"), "-c:s", "srt"])
+        .arg(&ref_srt)
+        .output()
+        .await
+        .ok()?;
+    if out.status.success() && std::fs::metadata(&ref_srt).map(|m| m.len()).unwrap_or(0) > 100 {
+        Some(ref_srt)
+    } else {
+        None
+    }
 }
 
 /// Convert SRT subtitle format to WebVTT.
