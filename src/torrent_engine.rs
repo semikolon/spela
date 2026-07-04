@@ -121,6 +121,12 @@ impl TorrentEngine {
         // torrents can simultaneously bootstrap = bounded peak resource use).
         // Together these meaningfully reduce the long-running-embed FD
         // exhaustion class that rqbit issue #525 surfaced.
+        // 2026-07-04: a SECOND (test) instance can't share the production
+        // instance's DHT (fixed UDP port + shared ~/.cache/com.rqbit.dht
+        // persistence) → "librqbit engine bootstrap failed". SPELA_DISABLE_DHT
+        // lets the test instance run DHT-off (magnet trackers still supply
+        // peers, enough for cast testing); production keeps DHT on (unset).
+        let disable_dht = std::env::var("SPELA_DISABLE_DHT").is_ok();
         let opts = SessionOptions {
             peer_opts: Some(PeerConnectionOptions {
                 connect_timeout: Some(Duration::from_secs(15)),
@@ -128,6 +134,7 @@ impl TorrentEngine {
                 keep_alive_interval: Some(Duration::from_secs(120)),
             }),
             concurrent_init_limit: Some(4),
+            disable_dht,
             ..Default::default()
         };
         let session = Session::new_with_opts(media_dir.to_path_buf(), opts)
