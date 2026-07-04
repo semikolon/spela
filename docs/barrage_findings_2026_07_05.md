@@ -150,5 +150,11 @@ healthy throughout (pkill fix). Deployed to production `26b5ec2`.
 | Sicario / Arrival / Cremator / Naked / Werckmeister | 4–78 | >75s | >75s | slow swarm (never enough segments; pre-buffer doesn't help) |
 
 **Remaining slow-swarm cases** (Sicario 78, Naked 38 seeds but slow byte-0):
-these produce few/no segments in 75s — the fix is the racing-sources /
-smarter-retry design above, NOT the pre-buffer. Left for a dedicated arc.
+these are **slow-but-work, NOT broken** — the ">75s" is the barrage's poll cap,
+not a spela failure. Confirmed: Naked cast at ~60s when given a longer window
+(retry cascade eventually lands a workable result). The fix to make them
+*faster* is the racing-sources / smarter-retry design above (pick the fastest
+of N swarms in parallel instead of sequential 10s-probe retries), NOT the
+pre-buffer. Left for a dedicated arc — it changes core do_play behavior +
+resource use (parallel transcodes), so it wants Fredrik in the loop rather than
+an unattended overnight change.
