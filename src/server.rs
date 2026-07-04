@@ -1893,7 +1893,20 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                             .parent()
                             .map(|p| p.to_path_buf())
                             .unwrap_or_else(|| media_dir.join("transcoded_hls"));
-                        let min_segments: usize = if target == "chromecast" { 20 } else { 10 };
+                        // 2026-07-05: chromecast pre-buffer 20 → 10 segments.
+                        // 20 primary segments ≈ 126s of content was the dominant
+                        // torrent cold-start cost (barrage: 28–62s block time; the
+                        // pre-buffer alone was ~40s). Every PLAYED torrent in the
+                        // 20-title barrage sustained the transcode well past 20
+                        // segments (final segs=23–27), so casting at 10 (≈60s
+                        // buffer) leaves ample headroom — plus the Chromecast's own
+                        // buffer and cast_health_monitor's 15s BUFFERING tolerance.
+                        // Validated on the test instance (no new BUFFERING/STALLED
+                        // events) before production. Next step (design): unify with
+                        // the local-file `race_ahead_safe` gate so a fast swarm
+                        // casts even sooner and a slow one waits longer — see
+                        // docs/barrage_findings_2026_07_05.md.
+                        let min_segments: usize = if target == "chromecast" { 10 } else { 10 };
                         let target_segment = hls_dir.join(format!(
                             "{}{:05}.ts",
                             hls_info.primary_segment_prefix, min_segments
