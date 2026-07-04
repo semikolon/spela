@@ -319,10 +319,10 @@ fn alass_binary() -> PathBuf {
 ///      <1s, most accurate (no audio decode).
 ///   2. Else the source media file → alass extracts audio itself (~5-10s CPU).
 ///
-/// `--no-splits`: release files have no ad-breaks, so offset+framerate-only is
-/// the correct model and avoids over-segmentation. Any failure (alass missing,
-/// non-zero exit, trivial output) returns false → caller keeps the unaligned
-/// SRT (never worse than today's behaviour).
+/// `--no-split` (`-l`): release files have no ad-breaks, so offset+framerate-
+/// only is the correct model, faster, and avoids over-segmentation. Any failure
+/// (alass missing, non-zero exit, trivial output) returns false → caller keeps
+/// the unaligned SRT (never worse than today's behaviour).
 async fn align_srt_with_alass(
     source: &Path,
     external_srt: &Path,
@@ -341,7 +341,7 @@ async fn align_srt_with_alass(
     };
 
     let out = Command::new(&alass)
-        .arg("--no-splits")
+        .arg("--no-split")
         .arg(&reference)
         .arg(external_srt)
         .arg(out_srt)
