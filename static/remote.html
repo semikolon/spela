@@ -888,9 +888,15 @@ function renderNowFull(){
     S.now.seekDrag=false; S.now.posAbs=v; S.now.lastSync=Date.now();
     // Past the transcoded frontier while still transcoding → RE-TRANSCODE
     // from there (user's "play from that time", NOT clamp-to-edge).
+    // BEFORE the transcode's start point (ss_offset — e.g. an auto-resume
+    // started at 1:40 and you rewind toward 0) → ALSO re-transcode: cast.seek
+    // can't go before where ffmpeg's -ss began, so within-window /seek would
+    // fail "Cannot seek to Ns". 2026-07-04: rewind-to-start must always work.
     // Within the window (or whole file done) → instant cast.seek.
+    const ssOffset = (S.now.data && S.now.data.ss_offset) || 0;
     const pastFrontier = !S.now.endlist && S.now.frontier>0 && v>S.now.frontier;
-    if(pastFrontier){
+    const beforeStart = v < ssOffset - 1;
+    if(pastFrontier || beforeStart){
       toast(`Transcoding from ${fmt(v)}…`);
       const r=await api("/seek-retranscode",{method:"POST",body:{t:v}}).catch(()=>({error:"unreachable"}));
       if(r&&r.error){ toast("Couldn’t seek there: "+r.error); }

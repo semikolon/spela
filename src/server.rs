@@ -3903,6 +3903,23 @@ async fn cast_health_monitor(
 }
 
 async fn handle_stop(State(state): State<SharedState>) -> Json<Value> {
+    // 2026-07-04: STOP the Chromecast receiver FIRST, then tear down the
+    // backend. Previously this only ran do_cleanup (kill ffmpeg + torrent),
+    // so the Chromecast kept playing the already-buffered HLS after the user
+    // hit Stop — the cast continued on the TV with no way to halt it from the
+    // remote, and the SPA jumped to "Nothing playing" while the TV played on
+    // (confusing: crashed? disconnected?). Sending the receiver a STOP makes
+    // Stop mean stop, everywhere. Best-effort: even if the cast STOP fails
+    // (device already gone), still tear down the backend.
+    let device = get_current_device(&state);
+    if !device.is_empty() {
+        let state_clone = state.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut cast = lock_recover(&state_clone.cast);
+            cast.stop_cast(&device)
+        })
+        .await;
+    }
     do_cleanup(&state);
     Json(json!({"status": "stopped"}))
 }
@@ -6216,7 +6233,15 @@ const SEG_DURATION_SECS: f64 = 6.0;
 ///
 /// Pure — unit-tested.
 fn race_ahead_safe(content_buffered_secs: f64, wall_elapsed_secs: f64) -> bool {
-    const MIN_LEAD_SECS: f64 = 120.0;
+    // 2026-07-04: lead cut 120s → 24s (4 segments) per Fredrik's "start ASAP,
+    // like WebTorrent did" feedback. The frontier-catch proof above only needs
+    // S ≥ 1 for the gap to GROW forever, so any positive lead is safe while the
+    // transcode stays ahead; MIN_SPEED = 1.5 is the real safety gate (jitter
+    // margin) and MIN_WALL_SAMPLE avoids trusting the NVENC spin-up burst. 24s
+    // is the receiver's typical HLS startup cushion — enough to not stutter,
+    // ~5× faster to first frame than the old 120s. cast_health_monitor remains
+    // the backstop if a torrent-fed transcode later dips below realtime.
+    const MIN_LEAD_SECS: f64 = 24.0;
     const MIN_SPEED: f64 = 1.5;
     // Don't trust a speed estimate from the first few seconds (ffmpeg
     // spin-up / NVENC init burst is not representative of sustained rate).
@@ -7126,8 +7151,10 @@ mod tests {
 
     #[test]
     fn race_ahead_safe_false_when_lead_too_small() {
-        // 90s buffered in 10s wall = 9x (fast!) but < 120s absolute cushion.
-        assert!(!race_ahead_safe(90.0, 10.0));
+        // 18s buffered in 9s wall = 2x (fast!) but < 24s absolute cushion.
+        assert!(!race_ahead_safe(18.0, 9.0));
+        // 24s cushion IS enough once past the min wall sample + fast enough.
+        assert!(race_ahead_safe(30.0, 9.0)); // 30s buffered, 9s wall = 3.3x
     }
 
     #[test]
