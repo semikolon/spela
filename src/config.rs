@@ -222,22 +222,31 @@ impl Default for Config {
 impl Config {
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path();
-        if config_path.exists() {
-            let text = std::fs::read_to_string(&config_path)?;
-            let mut config: Config = toml::from_str(&text)?;
-            if config.tmdb_api_key.is_empty() {
-                if let Ok(key) = std::env::var("TMDB_API_KEY") {
-                    config.tmdb_api_key = key;
-                }
-            }
-            Ok(config)
+        let mut config: Config = if config_path.exists() {
+            toml::from_str(&std::fs::read_to_string(&config_path)?)?
         } else {
-            let mut config = Config::default();
+            Config::default()
+        };
+        if config.tmdb_api_key.is_empty() {
             if let Ok(key) = std::env::var("TMDB_API_KEY") {
                 config.tmdb_api_key = key;
             }
-            Ok(config)
         }
+        // 2026-07-04: env overrides so a SECOND (test) spela instance can run
+        // alongside production WITHOUT clobbering it — its own port + media dir
+        // (⇒ its own `media_dir/transcoded_hls`, so `do_cleanup`'s wipe never
+        // touches the live instance's HLS) + its own state dir (see
+        // `state_dir()`). This is what makes "barrage of cast tests while
+        // Fredrik watches on the main instance" safe. Unset in production.
+        if let Ok(p) = std::env::var("SPELA_PORT") {
+            if let Ok(p) = p.parse::<u16>() {
+                config.port = p;
+            }
+        }
+        if let Ok(m) = std::env::var("SPELA_MEDIA_DIR") {
+            config.media_dir = m;
+        }
+        Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -286,6 +295,13 @@ impl Config {
     }
 
     pub fn state_dir() -> PathBuf {
+        // 2026-07-04: `SPELA_STATE_DIR` override lets a test instance keep its
+        // own state.json / last_search / resume_positions, so it never clobbers
+        // the production instance's `current` stream. Unset in production.
+        if let Ok(d) = std::env::var("SPELA_STATE_DIR") {
+            let home = dirs::home_dir().unwrap_or_default();
+            return PathBuf::from(d.replace('~', &home.to_string_lossy()));
+        }
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(".spela")
