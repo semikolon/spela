@@ -92,6 +92,11 @@
   .src .q{font-weight:700;color:var(--fg)}
   .src .x{color:var(--dim)}
   .src .s{margin-left:auto;color:var(--good);font-weight:700;white-space:nowrap}
+  /* 2026-07-04: seed health — amber = low (may be slow), red = dead (likely
+     won't start). Mirrors the green "on disk" style so slow sources are visible. */
+  .src .s.low{color:var(--warn)}
+  .src .s.dead{color:var(--bad)}
+  .src.dead{border-color:var(--bad);background:linear-gradient(90deg,rgba(224,86,74,.13),var(--bg3))}
   /* 2026-06-30: a source already (part-)downloaded on disk — tapping it resumes
      (librqbit overwrite:true) instead of re-fetching that fraction. */
   .src.partial{border-color:var(--good);background:linear-gradient(90deg,rgba(55,200,122,.16),var(--bg3))}
@@ -360,13 +365,17 @@ function posterCard({poster,title,year,cta,onPlay,sources}){
     const box=el("div",{className:"sources"});
     sources.forEach(r=>{
       const part=typeof r.partial_pct==="number";
-      const row=el("button",{className:"src"+(part?" partial":"")});
+      const sc=r.seeds??0;
+      // seed health — mirrors the green "on disk" pattern. On-disk sources are
+      // never "dead" (they play from the local file regardless of swarm).
+      const health=part?"ok":(sc<5?"dead":sc<20?"low":"ok");
+      const row=el("button",{className:"src"+(part?" partial":health==="dead"?" dead":"")});
       row.appendChild(el("span",{className:"q",textContent:r.quality||"?"}));
       if(part) row.appendChild(el("span",{className:"dl",textContent:r.partial_pct>=100?"✓ on disk":`↓ ${r.partial_pct}%`}));
       row.appendChild(el("span",{className:"x",textContent:codec(r.title)}));
       row.appendChild(el("span",{className:"x",textContent:r.size||""}));
       row.appendChild(el("span",{className:"x",textContent:r.source||""}));
-      row.appendChild(el("span",{className:"s",textContent:(r.seeds??0)+"🌱"}));
+      row.appendChild(el("span",{className:"s "+health,textContent:(health==="dead"?"⚠ ":"")+sc+"🌱"}));
       row.onclick=()=>doPlay({result_id:r.id});
       box.appendChild(row);
     });

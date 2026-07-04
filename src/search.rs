@@ -794,6 +794,11 @@ pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
         b.seeds.cmp(&a.seeds)
     });
 
+    // 2026-07-04: dead swarms are NOT dropped — the web remote marks them red
+    // (mirrors the green "on disk" style) so the user SEES which sources are
+    // slow/dead and can avoid them, rather than having them silently hidden.
+    // The ranker still orders them low (effective_res_tier's ≥50-seed
+    // viability demotes them), so they surface at the BOTTOM, marked red.
     for (i, r) in results.iter_mut().enumerate() {
         r.id = i + 1;
     }
@@ -1966,6 +1971,22 @@ mod tests {
         ];
         rank_results_mut(&mut results);
         assert_eq!(results[0].seeds, 50); // single file wins despite fewer seeds
+    }
+
+    #[test]
+    fn test_ranking_keeps_dead_swarms_but_orders_them_low() {
+        // 2026-07-04: dead swarms are KEPT (the web remote marks them red so
+        // the user sees + avoids them) but ranked LOW — the well-seeded source
+        // wins. Anchor: The Last Viking 2-seed/1-seed disaster.
+        let mut results = vec![
+            make_result(1, "Movie.2025.1080p.x264.mkv", 2, Some(0)), // dead
+            make_result(2, "Movie.2025.1080p.x265.mkv", 200, Some(0)), // viable
+            make_result(3, "Movie.2025.720p.x264.mkv", 1, Some(0)),  // dead
+        ];
+        rank_results_mut(&mut results);
+        assert_eq!(results.len(), 3, "dead swarms are kept, not dropped");
+        assert_eq!(results[0].seeds, 200, "well-seeded source ranks first");
+        assert!(results.last().unwrap().seeds < 5, "a dead swarm ranks last");
     }
 
     #[test]
