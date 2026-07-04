@@ -2368,6 +2368,17 @@ fn do_cleanup(state: &SharedState) {
     let _ = std::process::Command::new("pkill")
         .args(["-f", "python3 -m http.server 8889"])
         .output();
+    // 2026-07-04: kill ANY ffmpeg still writing to the HLS scratch dir — not
+    // just the tracked `state.ffmpeg_pid`. An ORPHAN transcode (e.g. one left
+    // by a /play whose future was cancelled — the pre-300s-timeout proxy-abort
+    // class) is NOT in `ffmpeg_pid`, so without this it keeps writing segments
+    // during the remove_dir_all below → "Directory not empty" → stale segments
+    // survive and pollute the NEXT play's transcode (mismatched segments →
+    // Chromecast buffers forever). SIGKILL so it dies promptly; the retry loop
+    // on the removal absorbs the ~100ms death latency.
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", "ffmpeg.*transcoded_hls"])
+        .output();
 
     // --- CORRUPT-SOURCE DETECTION ---
     // Apr 30, 2026: scan ffmpeg.log for corruption symptoms (Hijack S02E05
@@ -2473,8 +2484,41 @@ fn do_cleanup(state: &SharedState) {
         try_promote_to_hls_cache(state, &media_dir, &app_state, &hls_dir);
 
         if hls_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&hls_dir) {
-                tracing::warn!("do_cleanup: failed to remove HLS dir {:?}: {}", hls_dir, e);
+            // 2026-07-04: retry past the ffmpeg-death race. `remove_dir_all`
+            // returns ENOTEMPTY ("Directory not empty") if a just-SIGKILLed
+            // ffmpeg writes one more segment between the signal and its exit.
+            // Retry a few times with a short sleep so the dir is genuinely
+            // wiped — a surviving dir leaks stale segments into the next play.
+            let mut removed = false;
+            for attempt in 0..4 {
+                match std::fs::remove_dir_all(&hls_dir) {
+                    Ok(()) => {
+                        removed = true;
+                        break;
+                    }
+                    Err(_) if attempt < 3 => {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "do_cleanup: failed to remove HLS dir {:?} after retries: {}",
+                            hls_dir,
+                            e
+                        );
+                    }
+                }
+            }
+            // Belt-and-suspenders: if the dir itself survived (rare), at least
+            // purge its .ts so the next play can't serve mismatched segments.
+            if !removed && hls_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&hls_dir) {
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.extension().is_some_and(|x| x == "ts" || x == "m3u8") {
+                            let _ = std::fs::remove_file(&p);
+                        }
+                    }
+                }
             }
         }
     }
@@ -6270,7 +6314,31 @@ async fn wait_for_complete_hls_before_cast(
         // `race_ahead_safe` for the proof). Cast now without waiting for
         // the whole movie — this is what makes a complete local file start
         // as fast as (or faster than) a torrent. ffmpeg keeps running.
-        let content_buffered = seg_count as f64 * SEG_DURATION_SECS;
+        //
+        // 2026-07-04: use the PRIMARY-VARIANT segment count, not the total.
+        // A multi-variant transcode (-var_stream_map) writes seg_0_*.ts AND
+        // seg_1_*.ts — each content-second produces 2 files, so `seg_count`
+        // (all .ts) DOUBLE-COUNTS the buffered duration and race_ahead would
+        // fire at HALF the real per-variant lead (the receiver plays ONE
+        // variant). Undercounting the lead risks the receiver catching the
+        // transcode frontier → buffering. Count seg_0_* when present
+        // (multi-variant), else all .ts (single-variant seg_%05d.ts).
+        let primary_seg_count = std::fs::read_dir(&hls_dir)
+            .map(|d| {
+                let names: Vec<String> = d
+                    .flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| n.ends_with(".ts"))
+                    .collect();
+                let seg0 = names.iter().filter(|n| n.starts_with("seg_0_")).count();
+                if seg0 > 0 {
+                    seg0
+                } else {
+                    names.len()
+                }
+            })
+            .unwrap_or(0);
+        let content_buffered = primary_seg_count as f64 * SEG_DURATION_SECS;
         let wall = started_at.elapsed().as_secs_f64();
         if race_ahead_safe(content_buffered, wall) {
             tracing::info!(
