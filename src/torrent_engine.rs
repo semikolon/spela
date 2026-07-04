@@ -122,11 +122,18 @@ impl TorrentEngine {
         // Together these meaningfully reduce the long-running-embed FD
         // exhaustion class that rqbit issue #525 surfaced.
         // 2026-07-04: a SECOND (test) instance can't share the production
-        // instance's DHT (fixed UDP port + shared ~/.cache/com.rqbit.dht
-        // persistence) → "librqbit engine bootstrap failed". SPELA_DISABLE_DHT
-        // lets the test instance run DHT-off (magnet trackers still supply
-        // peers, enough for cast testing); production keeps DHT on (unset).
+        // instance's DHT — the persistent DHT reloads its stored listen_addr
+        // from the shared ~/.cache/com.rqbit.dht/dht.json and tries to bind
+        // production's UDP port → "librqbit engine bootstrap failed".
+        //   SPELA_EPHEMERAL_DHT=1 → DHT stays ON but skips persistence, so
+        //     librqbit binds an ephemeral OS-assigned UDP port (0.0.0.0:0) and
+        //     gets REAL peer discovery with zero collision. USE THIS for the
+        //     test instance — trackers-only (SPELA_DISABLE_DHT) starves peer
+        //     discovery and inflates every latency measurement.
+        //   SPELA_DISABLE_DHT=1 → harder off-switch (trackers only), fallback.
+        //   Neither set (production) → normal persistent DHT.
         let disable_dht = std::env::var("SPELA_DISABLE_DHT").is_ok();
+        let ephemeral_dht = std::env::var("SPELA_EPHEMERAL_DHT").is_ok();
         let opts = SessionOptions {
             peer_opts: Some(PeerConnectionOptions {
                 connect_timeout: Some(Duration::from_secs(15)),
@@ -135,6 +142,7 @@ impl TorrentEngine {
             }),
             concurrent_init_limit: Some(4),
             disable_dht,
+            disable_dht_persistence: ephemeral_dht,
             ..Default::default()
         };
         let session = Session::new_with_opts(media_dir.to_path_buf(), opts)
