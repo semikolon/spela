@@ -984,6 +984,11 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     }
     let media_dir = std::fs::canonicalize(&media_dir).unwrap_or(media_dir);
 
+    // 2026-07-04: the title's TMDB original_language, captured here so the
+    // detect_codecs audio picker prefers the ORIGINAL-language track over an
+    // English dub (see detect_codecs). None for magnet-direct plays.
+    let mut preferred_audio_lang: Option<String> = None;
+
     // Resolve result_id from last search — fills magnet, file_index, and metadata automatically
     if let Some(rid) = req.result_id {
         match AppState::load_last_search(&state.state_dir) {
@@ -992,6 +997,10 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 match result {
                     Some(r) => {
                         req.magnet = Some(r.magnet.clone());
+                        preferred_audio_lang = search
+                            .show
+                            .as_ref()
+                            .and_then(|s| s.original_language.clone());
                         req.file_index = req.file_index.or(r.file_index);
                         // Auto-fill metadata from the search context
                         if req.title.is_none() {
@@ -1607,7 +1616,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // above). Closing brace is just before "// Cast to Chromecast".
     if cache_hit_key.is_none() {
         let codec_info = if is_local {
-            transcode::detect_codecs(&server_url)
+            transcode::detect_codecs(&server_url, preferred_audio_lang.as_deref())
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!("Codec detection failed for local source: {}", e);
@@ -1617,7 +1626,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
             const TORRENT_CODEC_DETECT_TIMEOUT_SECS: u64 = 10;
             match tokio::time::timeout(
                 tokio::time::Duration::from_secs(TORRENT_CODEC_DETECT_TIMEOUT_SECS),
-                transcode::detect_codecs(&server_url),
+                transcode::detect_codecs(&server_url, preferred_audio_lang.as_deref()),
             )
             .await
             {

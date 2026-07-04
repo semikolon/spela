@@ -34,6 +34,13 @@ pub struct ShowInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imdb_id: Option<String>,
     pub title: String,
+    /// 2026-07-04: TMDB `original_language` (ISO 639-1, e.g. "da"/"en"/"sv").
+    /// Plumbed through `do_play` → `detect_codecs` so the audio picker prefers
+    /// the film's ORIGINAL-language track over an English dub — a Danish film's
+    /// MULTI release plays in Danish, not the English dub the old eng-first
+    /// picker grabbed (The Last Viking 2026-07-03).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seasons: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -374,6 +381,7 @@ impl SearchEngine {
             tmdb_id,
             imdb_id: imdb_id.clone(),
             title: detail["name"].as_str().unwrap_or("Unknown").into(),
+            original_language: detail["original_language"].as_str().map(String::from),
             seasons: detail["number_of_seasons"].as_u64().map(|n| n as u32),
             status: detail["status"].as_str().map(String::from),
             latest_episode: extract_episode(&detail["last_episode_to_air"]),
@@ -436,6 +444,7 @@ impl SearchEngine {
             tmdb_id,
             imdb_id: imdb_id.clone(),
             title: detail["title"].as_str().unwrap_or("Unknown").into(),
+            original_language: detail["original_language"].as_str().map(String::from),
             seasons: None,
             status: None,
             latest_episode: None,

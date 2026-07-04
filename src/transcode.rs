@@ -307,8 +307,36 @@ pub struct CodecInfo {
     pub audio_index: usize,
 }
 
-/// Detect video/audio codecs, duration, and preferred English audio stream.
-pub async fn detect_codecs(url: &str) -> Result<CodecInfo> {
+/// Match an mkv audio-track language tag (usually ISO 639-2, e.g. "dan")
+/// against a wanted language (usually ISO 639-1 from TMDB, e.g. "da"), so a
+/// Danish film's "da" original_language finds the "dan"-tagged audio track.
+fn lang_tag_matches(track_lang: &str, want: &str) -> bool {
+    let t = track_lang.to_ascii_lowercase();
+    let w = want.to_ascii_lowercase();
+    if t == w || t.starts_with(&w) || w.starts_with(&t) {
+        return true;
+    }
+    matches!(
+        (w.as_str(), t.as_str()),
+        ("sv", "swe")
+            | ("de", "ger")
+            | ("fr", "fre")
+            | ("nl", "dut")
+            | ("ja", "jpn")
+            | ("zh", "chi")
+            | ("zh", "zho")
+            | ("is", "isl")
+            | ("es", "spa")
+            | ("nb", "nor")
+            | ("nn", "nor")
+    )
+}
+
+/// Detect video/audio codecs, duration, and the preferred audio stream.
+/// `preferred_lang` (ISO 639-1, from the title's TMDB `original_language`)
+/// wins when present — so foreign films play in their ORIGINAL language, not
+/// the English dub — then English, then Danish, then the first track.
+pub async fn detect_codecs(url: &str, preferred_lang: Option<&str>) -> Result<CodecInfo> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -394,12 +422,21 @@ pub async fn detect_codecs(url: &str) -> Result<CodecInfo> {
         }
     }
 
-    // Pick preferred audio: first English, then first Danish (covers Nordic
-    // originals like Riders of Justice where releases ship Italian dub first
-    // and Danish original at a:1), else first track.
-    let preferred = audio_streams
-        .iter()
-        .find(|a| a.lang == "eng" || a.lang == "en")
+    // Pick preferred audio: the title's ORIGINAL language first (so a Danish
+    // film plays in Danish, not the English dub its MULTI release ships), then
+    // English, then Danish (covers Nordic originals like Riders of Justice
+    // where releases ship an Italian dub first and Danish at a:1), else first.
+    let preferred = preferred_lang
+        .and_then(|want| {
+            audio_streams
+                .iter()
+                .find(|a| lang_tag_matches(&a.lang, want))
+        })
+        .or_else(|| {
+            audio_streams
+                .iter()
+                .find(|a| a.lang == "eng" || a.lang == "en")
+        })
         .or_else(|| {
             audio_streams
                 .iter()
