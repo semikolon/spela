@@ -131,8 +131,13 @@
   #nowbar .nt .b{color:var(--dim);font-size:.74rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .tbtn{width:40px;height:40px;border-radius:50%;background:var(--bg3);display:flex;
     align-items:center;justify-content:center;font-size:1rem;flex:none}
-  .tbtn:active{background:var(--accent2)}
+  /* 2026-07-04: crisp <100ms tap feedback (NN/g 0.1s "feels instant" rule) —
+     a clear press = color + scale-down, springs back on release. */
+  .tbtn{transition:transform .08s ease, background .12s ease}
+  .tbtn:active{background:var(--accent2);transform:scale(.88)}
   .tbtn.big{width:54px;height:54px;font-size:1.3rem;background:var(--accent2);color:#fff}
+  .tbtn.big:active{transform:scale(.92);filter:brightness(1.15)}
+  #nowbar.fading{opacity:.28;transition:opacity .28s ease}
   .nowfull{display:flex;flex-direction:column;align-items:center;gap:1rem;padding:1rem .5rem}
   .nowfull .bigposter{width:min(62vw,260px);aspect-ratio:2/3;border-radius:18px;object-fit:cover;
     background:var(--bg3);box-shadow:0 18px 50px rgba(0,0,0,.55)}
@@ -908,14 +913,32 @@ function renderNowFull(){
     }
   });
   $("#tRestart").onclick=restart;
-  $("#tStop").onclick=async()=>{ await api("/stop",{method:"POST"}).catch(()=>{});
-    S.now.data=null; $("#nowbar").classList.remove("on"); renderNowFull(); stopPolling(); };
+  $("#tStop").onclick=stopPlayback;
   $("#tPlay").onclick=togglePlay;
 }
 
 /* optimistic transport: reflect intent instantly, reconcile on next poll */
 async function transport(path){ await api(path,{method:"POST"}).catch(()=>toast("spela unreachable"));
   setTimeout(()=>pollNow(true),600); }
+/* Graceful stop (2026-07-04): the OLD stop awaited /stop then snapped to
+   "Nothing playing" — no feedback, and (pre-backend-fix) the Chromecast kept
+   playing. Now: optimistically fade the now-playing surface the instant you tap
+   (the fade-out IS the confirmation — NN/g: smooth transition, not a snap), a
+   brief "Stopped" toast, and the backend stops the cast itself. */
+async function stopPlayback(){
+  if(S.now.stopping) return;
+  S.now.stopping=true; stopPolling();
+  const nf=$("#nowFull");
+  if(nf){ nf.style.transition="opacity .28s ease"; nf.style.opacity=".28"; }
+  $("#nowbar").classList.add("fading");
+  const v=$("#phvid"); if(v){ try{ v.pause(); }catch(e){} }   // phone-direct: silence local playback immediately
+  await api("/stop",{method:"POST"}).catch(()=>{});
+  toast("Stopped");
+  S.now.data=null; S.now.phone=false; S.now.playing=false; S.now.stopping=false;
+  $("#nowbar").classList.remove("on","fading");
+  if(nf) nf.style.opacity="";
+  renderNowFull();
+}
 async function togglePlay(){
   const toPause=S.now.playing;
   S.now.playing=!toPause;
