@@ -422,15 +422,32 @@ pub async fn detect_codecs(url: &str, preferred_lang: Option<&str>) -> Result<Co
         }
     }
 
-    // Pick preferred audio: the title's ORIGINAL language first (so a Danish
-    // film plays in Danish, not the English dub its MULTI release ships), then
-    // English, then Danish (covers Nordic originals like Riders of Justice
-    // where releases ship an Italian dub first and Danish at a:1), else first.
+    // Pick preferred audio. The title's ORIGINAL language wins — foreign films
+    // play in their original language, never a dub (Ghibli in Japanese,
+    // Parasite in Korean, The Last Viking in Danish). For a foreign original
+    // whose exact tag isn't found, we STILL avoid the English dub by preferring
+    // ANY non-English track before falling back to English. Then Danish (Nordic
+    // originals like Riders of Justice ship an Italian dub first, Danish at
+    // a:1), else the first track.
+    let foreign = preferred_lang
+        .map(|l| !(l.eq_ignore_ascii_case("en") || l.eq_ignore_ascii_case("eng")))
+        .unwrap_or(false);
     let preferred = preferred_lang
         .and_then(|want| {
             audio_streams
                 .iter()
                 .find(|a| lang_tag_matches(&a.lang, want))
+        })
+        .or_else(|| {
+            // Foreign original, exact tag missing → any non-English track beats
+            // the English dub.
+            if foreign {
+                audio_streams
+                    .iter()
+                    .find(|a| a.lang != "eng" && a.lang != "en")
+            } else {
+                None
+            }
         })
         .or_else(|| {
             audio_streams
