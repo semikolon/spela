@@ -340,16 +340,17 @@ async fn align_srt_with_alass(
         None => source.to_path_buf(),
     };
 
-    // 2026-07-04: cap alignment at 5s so it never blocks the stream start.
-    // The fast path (embedded text-subtitle reference → sub-to-sub align)
-    // finishes in <1s. The slow path (no embedded text track → alass decodes
-    // the WHOLE file's audio for VAD, ~15s+ on a 50-min episode) was the
-    // dominant start-latency bottleneck (Silo: 19s of subtitle work before the
-    // transcode even began). On timeout we keep the raw (unaligned)
-    // OpenSubtitles SRT — for a release-specific sub that's usually close, and
-    // Fredrik's stated priority is start-ASAP. `kill_on_drop` reaps the alass
-    // process when the timeout drops the future. (Follow-up: prefetch+cache the
-    // aligned SRT during search so re-plays get the aligned version for free.)
+    // 2026-07-04: correctness-first cap (Fredrik: "use alass even if it
+    // requires a few more seconds ... get everything super correct"). The
+    // fast path (densest embedded text-subtitle reference → sub-to-sub align)
+    // finishes in ~2-3s and returns immediately — the ceiling never bites it.
+    // The slow path (no embedded text track → alass decodes the WHOLE file's
+    // audio for VAD, ~23s on a 50-min episode) is the only case that needs
+    // the headroom; a wrong-release SRT burned unaligned desyncs by minutes
+    // (Silo S03E01: 6-min offset), which is far worse than a ~20s wait once
+    // per file. On timeout we keep the raw SRT. `kill_on_drop` reaps alass
+    // when the future is dropped. (Follow-up: cache the aligned SRT so
+    // re-plays skip alignment entirely.)
     let alass_fut = Command::new(&alass)
         .arg("--no-split")
         .arg(&reference)
@@ -357,10 +358,10 @@ async fn align_srt_with_alass(
         .arg(out_srt)
         .kill_on_drop(true)
         .output();
-    let out = match tokio::time::timeout(std::time::Duration::from_secs(5), alass_fut).await {
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(30), alass_fut).await {
         Ok(r) => r,
         Err(_) => {
-            tracing::warn!("alass alignment exceeded 5s — using unaligned SRT for a fast start");
+            tracing::warn!("alass alignment exceeded 30s — using unaligned SRT");
             return false;
         }
     };
@@ -419,29 +420,59 @@ async fn extract_any_text_subtitle_ref(source: &Path, work_dir: &Path) -> Option
     }
     let j: Value = serde_json::from_slice(&probe.stdout).ok()?;
     let streams = j["streams"].as_array()?;
-    // First TEXT track (no width/height → not image-based).
-    let idx = streams.iter().find_map(|s| {
-        let is_text = s["width"].as_i64().is_none() && s["height"].as_i64().is_none();
-        if is_text {
-            s["index"].as_i64()
-        } else {
-            None
-        }
-    })?;
+    // All TEXT tracks (no width/height → not image-based like PGS/VobSub,
+    // which can't be `-c:s srt`'d). Bounded to keep the extract loop cheap.
+    let text_indices: Vec<i64> = streams
+        .iter()
+        .filter_map(|s| {
+            let is_text = s["width"].as_i64().is_none() && s["height"].as_i64().is_none();
+            if is_text {
+                s["index"].as_i64()
+            } else {
+                None
+            }
+        })
+        .take(8)
+        .collect();
+    if text_indices.is_empty() {
+        return None;
+    }
 
-    let ref_srt = work_dir.join(".alass_ref.srt");
-    let out = Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-i"])
-        .arg(source)
-        .args(["-map", &format!("0:{idx}"), "-c:s", "srt"])
-        .arg(&ref_srt)
-        .output()
-        .await
-        .ok()?;
-    if out.status.success() && std::fs::metadata(&ref_srt).map(|m| m.len()).unwrap_or(0) > 100 {
-        Some(ref_srt)
-    } else {
-        None
+    // Pick the DENSEST text track (most cues) as the alignment reference.
+    // A sparse FORCED track (signs/foreign-dialogue only, ~8 cues) is a
+    // terrible reference: alass matches its handful of cues and returns a
+    // near-zero shift, silently leaving a wrong-release external SRT
+    // unaligned. Silo S03E01 (2026-07-04): forced-French ref (8 cues) →
+    // -0.8s (WRONG, subs stayed 6 min off); full-French ref (663 cues) →
+    // -5:55 (CORRECT). Density is the direct signal alass needs, and
+    // picking the densest track subsumes any forced/SDH heuristic.
+    let mut best: Option<(PathBuf, usize)> = None;
+    for (n, idx) in text_indices.iter().enumerate() {
+        let cand = work_dir.join(format!(".alass_ref_{n}.srt"));
+        let ok = Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-i"])
+            .arg(source)
+            .args(["-map", &format!("0:{idx}"), "-c:s", "srt"])
+            .arg(&cand)
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            if let Ok(content) = std::fs::read_to_string(&cand) {
+                let cues = content.matches(" --> ").count();
+                if best.as_ref().map(|(_, c)| cues > *c).unwrap_or(true) {
+                    best = Some((cand, cues));
+                }
+            }
+        }
+    }
+    // Require a genuinely dense reference; a too-sparse best (only a forced
+    // track existed) is worse than no reference — return None so the caller
+    // falls back to the audio-VAD path, which handles offset correctly.
+    match best {
+        Some((p, cues)) if cues >= 20 => Some(p),
+        _ => None,
     }
 }
 
