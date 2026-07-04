@@ -420,34 +420,38 @@ async fn extract_any_text_subtitle_ref(source: &Path, work_dir: &Path) -> Option
     }
     let j: Value = serde_json::from_slice(&probe.stdout).ok()?;
     let streams = j["streams"].as_array()?;
-    // All TEXT tracks (no width/height → not image-based like PGS/VobSub,
-    // which can't be `-c:s srt`'d). Bounded to keep the extract loop cheap.
-    let text_indices: Vec<i64> = streams
-        .iter()
-        .filter_map(|s| {
-            let is_text = s["width"].as_i64().is_none() && s["height"].as_i64().is_none();
-            if is_text {
-                s["index"].as_i64()
-            } else {
-                None
-            }
-        })
-        .take(8)
-        .collect();
-    if text_indices.is_empty() {
+    // Text tracks (no width/height → not image-based PGS/VobSub, which can't
+    // be `-c:s srt`'d), ordered NON-FORCED FIRST. A sparse FORCED track
+    // (signs/foreign-dialogue only, ~8 cues) is a terrible alass reference —
+    // its handful of cues yields a near-zero WRONG shift that silently leaves
+    // a wrong-release external SRT unaligned (Silo S03E01 2026-07-04:
+    // forced-French 8-cue → -0.8s WRONG vs full-French 663-cue → -5:55
+    // correct). Extract candidates ONE AT A TIME (subtitle demux reads the
+    // whole container, ~2-3s each on a 50-min episode) and STOP at the first
+    // dense track — extracting ALL tracks to find the max was a ~16s
+    // "Preparing video…" regression on multi-track MULTI releases.
+    let mut candidates: Vec<i64> = Vec::new();
+    let mut forced: Vec<i64> = Vec::new();
+    for s in streams {
+        let is_text = s["width"].as_i64().is_none() && s["height"].as_i64().is_none();
+        if !is_text {
+            continue;
+        }
+        let Some(idx) = s["index"].as_i64() else {
+            continue;
+        };
+        if s["disposition"]["forced"].as_i64().unwrap_or(0) == 1 {
+            forced.push(idx);
+        } else {
+            candidates.push(idx);
+        }
+    }
+    candidates.extend(forced); // forced tracks only as a last resort
+    if candidates.is_empty() {
         return None;
     }
 
-    // Pick the DENSEST text track (most cues) as the alignment reference.
-    // A sparse FORCED track (signs/foreign-dialogue only, ~8 cues) is a
-    // terrible reference: alass matches its handful of cues and returns a
-    // near-zero shift, silently leaving a wrong-release external SRT
-    // unaligned. Silo S03E01 (2026-07-04): forced-French ref (8 cues) →
-    // -0.8s (WRONG, subs stayed 6 min off); full-French ref (663 cues) →
-    // -5:55 (CORRECT). Density is the direct signal alass needs, and
-    // picking the densest track subsumes any forced/SDH heuristic.
-    let mut best: Option<(PathBuf, usize)> = None;
-    for (n, idx) in text_indices.iter().enumerate() {
+    for (n, idx) in candidates.iter().take(8).enumerate() {
         let cand = work_dir.join(format!(".alass_ref_{n}.srt"));
         let ok = Command::new("ffmpeg")
             .args(["-y", "-loglevel", "error", "-i"])
@@ -460,20 +464,16 @@ async fn extract_any_text_subtitle_ref(source: &Path, work_dir: &Path) -> Option
             .unwrap_or(false);
         if ok {
             if let Ok(content) = std::fs::read_to_string(&cand) {
-                let cues = content.matches(" --> ").count();
-                if best.as_ref().map(|(_, c)| cues > *c).unwrap_or(true) {
-                    best = Some((cand, cues));
+                // A genuinely dense track is a good timing ruler; stop here.
+                if content.matches(" --> ").count() >= 20 {
+                    return Some(cand);
                 }
             }
         }
     }
-    // Require a genuinely dense reference; a too-sparse best (only a forced
-    // track existed) is worse than no reference — return None so the caller
-    // falls back to the audio-VAD path, which handles offset correctly.
-    match best {
-        Some((p, cues)) if cues >= 20 => Some(p),
-        _ => None,
-    }
+    // No dense text track → caller falls back to the audio-VAD reference,
+    // which handles the offset correctly (just slower).
+    None
 }
 
 /// Convert SRT subtitle format to WebVTT.

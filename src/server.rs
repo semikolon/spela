@@ -2376,9 +2376,30 @@ fn do_cleanup(state: &SharedState) {
     // survive and pollute the NEXT play's transcode (mismatched segments →
     // Chromecast buffers forever). SIGKILL so it dies promptly; the retry loop
     // on the removal absorbs the ~100ms death latency.
-    let _ = std::process::Command::new("pkill")
-        .args(["-9", "-f", "ffmpeg.*transcoded_hls"])
-        .output();
+    //
+    // 2026-07-05 CRITICAL SCOPING FIX: the pattern MUST include THIS instance's
+    // own media_dir. A bare "ffmpeg.*transcoded_hls" also matches a SECOND
+    // spela instance's ffmpeg (a test instance at `.../media-test/transcoded_hls`
+    // still contains "transcoded_hls"), so a test-instance cleanup SIGKILLed
+    // production's LIVE Silo transcode mid-play → it died at 3 segments → the
+    // Chromecast looped those ~18s in an endless recast loop (barrage incident).
+    // Scoping to the full `<media_dir>/transcoded_hls` path makes the two
+    // instances' patterns mutually non-matching (`media/transcoded_hls` is not
+    // a substring of `media-test/transcoded_hls` and vice-versa).
+    {
+        let mut md = state.media_dir.clone();
+        if let Ok(stripped) = md.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                md = home.join(stripped);
+            }
+        }
+        let md = std::fs::canonicalize(&md).unwrap_or(md);
+        let scoped = md.join("transcoded_hls");
+        let pattern = format!("ffmpeg.*{}", scoped.to_string_lossy());
+        let _ = std::process::Command::new("pkill")
+            .args(["-9", "-f", &pattern])
+            .output();
+    }
 
     // --- CORRUPT-SOURCE DETECTION ---
     // Apr 30, 2026: scan ffmpeg.log for corruption symptoms (Hijack S02E05
