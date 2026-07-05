@@ -1,5 +1,20 @@
 # Spela TODOs 🎬🍿
 
+### v3.14 + peer-supply — SHIPPED (2026-07-05 overnight barrage) + OPEN LOOPS
+A 20-title barrage (blockbuster → Vampyr 1932) on an isolated ephemeral-DHT test instance (7891) drove these to production:
+- **pkill cross-instance-kill fix** — `do_cleanup` scoped to `<media_dir>/transcoded_hls` (was SIGKILLing production's live ffmpeg from a *test* instance's cleanup; the ORIGINAL looping-Silo cause).
+- **alass densest-track + fast-extract** — wrong-release SRT 6-min-offset fix; picks the densest embedded text track (non-forced-first, stop at first ≥20-cue) = ~1 extraction (was extracting all 6 = 16s "Preparing").
+- **torrent pre-buffer 20→10 segments** — ~45% faster start (barrage median 44s→24s, 0 buffering; validated by a 3-min sustained play racing 4→124 segments ≈ 4× realtime).
+- **20-tracker injection** (session-wide `SessionOptions.trackers`) — peer-supply for thin swarms (Vampyr 62→23s, Hundstage 0-seed >75→22s).
+Data + research: `docs/barrage_findings_2026_07_05.md`, `docs/slow_torrent_strategies_research_2026_07_05.md`, `docs/librqbit_streaming_faststart_research_2026_07_05.md`.
+
+**OPEN LOOPS (Fredrik decisions + deferred work):**
+- **[Fredrik decision] TorBox debrid fallback** — the real cure for obscure/slow swarms (~$3/mo, ~200 lines `reqwest`). Try local torrent first → fall to TorBox if no byte-0 in N s → cached = instant HTTPS, uncached = datacenter fetch that beats the home swarm. Config-gated (absent token = today's behavior, zero regression). Full API flow + fallback-ladder design: `docs/slow_torrent_strategies_research_2026_07_05.md` § 6. Secret in a tier; SSRF-validate the `*.torbox.app` CDN host at the boundary.
+- **[Fredrik decision + NIC-fix-proven] Re-enable the WAN inbound listener** — the listener code ships + runs **LAN-only** (6881); the WAN ports are CLOSED after the 2026-07-05 e1000e incident (the WAN-open listener's inbound flood helped tip Darwin's NIC into a hardware hang → router down → physical power-cycle). Re-open only after the most-efficient-NIC-config is chosen + proven under load. See `~/dotfiles/docs/INCIDENT_REPORT_DARWIN_E1000E_NIC_HANG_2026_07_05.md`.
+- **[Fredrik decision] Public-repo personal data** — `semikolon/spela` is PUBLIC and CLAUDE.md + docs carry device names / `192.168.4.x` / `/home/fredrik` / `darwin.home` (pre-existing ~14 lines, compounded this session). Risk is LOW (private RFC-1918 IPs, no secrets, name already public via the org) but violates the repo's own NO-PERSONAL-DATA rule. Decide: make private / sanitize-to-placeholders / accept. (The test-instance launcher was deliberately kept OUT of the repo — it lives at `darwin:/home/fredrik/spela-test-instance.sh` — pending this.)
+- **[deferred, bigger arc] Racing sources** — race local-swarm vs debrid (the `tordis` pattern) and/or the top-2 ranked releases' *heads*; the systemic fix for the remaining slow-swarm cases (Sicario 78 / Naked 38 / Cremator 4 seeds: "slow-but-work" ~50-90s, NOT broken). Changes core `do_play` + GPU use → wants Fredrik in the loop.
+- **[good hygiene] deliberus-postgres binds `0.0.0.0:5432`** — WAN-blocked (INPUT drop + DOCKER-USER) so LAN-only, but should bind the LAN IP like the other DBs.
+
 ### Cast UX + speed — SHIPPED (v3.13, 2026-07-04 evening, post-Bear-watch feedback)
 Fredrik watched The Bear, came back with rich feedback. Shipped + verified (Fredriks TV):
 - **Stop kills the cast** (`handle_stop` sends the Chromecast a STOP before backend teardown — was leaving the TV playing the buffered HLS). **Graceful optimistic stop** in the SPA (now-playing surface fades out = the confirmation, "Stopped" toast, per NN/g). **Crisp <100ms tap feedback** on transport buttons (scale + color `:active`).
