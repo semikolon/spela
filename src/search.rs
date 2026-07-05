@@ -7,12 +7,35 @@ use serde_json::Value;
 /// Other Stremio addons (MediaFusion, Knightcrawler, Comet) require encrypted config URLs.
 const TORRENTIO_BASE: &str = "https://torrentio.strem.fun/sort=seeders";
 
-const PUBLIC_TRACKERS: &[&str] = &[
+// 2026-07-05: expanded 5 → 20 (ngosang/trackerslist trackers_best). More
+// trackers = more peer sources = faster bootstrap on THIN/obscure swarms (the
+// "peers connect but 0 bytes for 10-15s" cold-start). Also injected session-wide
+// via `SessionOptions.trackers` in torrent_engine.rs (the reliable path —
+// librqbit silently drops `AddTorrentOptions.trackers` on the magnet path; the
+// magnet-embedded `&tr=` here + the session-level set together cover every code
+// path). `pub` so torrent_engine can reuse the list.
+// Research: docs/librqbit_streaming_faststart_research_2026_07_05.md.
+pub const PUBLIC_TRACKERS: &[&str] = &[
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.stealth.si:80/announce",
     "udp://tracker.torrent.eu.org:451/announce",
     "udp://tracker.bittor.pw:1337/announce",
     "udp://explodie.org:6969/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://tracker2.dler.org:80/announce",
+    "udp://tracker.qu.ax:6969/announce",
+    "udp://tracker.filemail.com:6969/announce",
+    "udp://tracker-udp.gbitt.info:80/announce",
+    "udp://t.overflow.biz:6969/announce",
+    "udp://zer0day.ch:1337/announce",
+    "udp://tracker.auctor.tv:6969/announce",
+    "udp://open.free-tracker.ga:6969/announce",
+    "udp://tracker.ccp.ovh:6969/announce",
+    "udp://tracker.publictracker.xyz:6969/announce",
+    "udp://retracker01-msk-virt.corbina.net:80/announce",
+    "udp://tracker.004430.xyz:1337/announce",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

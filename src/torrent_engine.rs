@@ -143,6 +143,17 @@ impl TorrentEngine {
             concurrent_init_limit: Some(4),
             disable_dht,
             disable_dht_persistence: ephemeral_dht,
+            // 2026-07-05: inject the expanded public-tracker list session-wide.
+            // This is the RELIABLE injection path — librqbit merges
+            // SessionOptions.trackers into EVERY torrent (session.rs:1564,
+            // respecting the private flag) whereas AddTorrentOptions.trackers
+            // is silently dropped on the magnet path (which spela uses). Widens
+            // peer discovery on thin/obscure swarms = faster cold-start.
+            // Research: docs/librqbit_streaming_faststart_research_2026_07_05.md.
+            trackers: crate::search::PUBLIC_TRACKERS
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect(),
             ..Default::default()
         };
         let session = Session::new_with_opts(media_dir.to_path_buf(), opts)
