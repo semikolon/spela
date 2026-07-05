@@ -134,6 +134,17 @@ impl TorrentEngine {
         //   Neither set (production) → normal persistent DHT.
         let disable_dht = std::env::var("SPELA_DISABLE_DHT").is_ok();
         let ephemeral_dht = std::env::var("SPELA_EPHEMERAL_DHT").is_ok();
+        // 2026-07-05: enable the inbound TCP peer listener (off by default in
+        // librqbit → outbound-only). Being connectable ~doubles reachable peers
+        // on thin/obscure swarms (Report B). Darwin IS the router, so no UPnP —
+        // the port is opened manually in nftables (WAN iface) and forwarded to
+        // this listener (spela runs on Darwin, so "forward" = a WAN INPUT accept).
+        // Deterministic single port so the firewall rule matches: production
+        // 6881, test instance 6882 (SPELA_TORRENT_PORT) to avoid a collision.
+        let torrent_port: u16 = std::env::var("SPELA_TORRENT_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6881);
         let opts = SessionOptions {
             peer_opts: Some(PeerConnectionOptions {
                 connect_timeout: Some(Duration::from_secs(15)),
@@ -154,6 +165,8 @@ impl TorrentEngine {
                 .iter()
                 .filter_map(|s| s.parse().ok())
                 .collect(),
+            listen_port_range: Some(torrent_port..torrent_port + 1),
+            enable_upnp_port_forwarding: false,
             ..Default::default()
         };
         let session = Session::new_with_opts(media_dir.to_path_buf(), opts)
