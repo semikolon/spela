@@ -704,86 +704,122 @@ fn should_race_sources(
     enabled && candidate_count >= 2 && selected_seeds < seed_threshold
 }
 
-/// Pure winner-pick: among raced candidates (index, progress), the winner is
-/// the one that has actually started delivering bytes (`bytes_downloaded > 0`),
-/// with the most-delivered as tiebreak. `None` = nobody has delivered yet
-/// (keep polling, or fall back on timeout). Reported seed counts are
-/// stale/optimistic; actual byte delivery is the real "this swarm works" oracle.
-fn pick_race_winner(
-    progresses: &[(usize, crate::torrent_engine::TorrentProgress)],
-) -> Option<usize> {
-    progresses
-        .iter()
-        .filter(|(_, p)| p.bytes_downloaded > 0)
-        .max_by_key(|(_, p)| p.bytes_downloaded)
-        .map(|(idx, _)| *idx)
-}
-
 /// Race `candidates` (magnet, file_index) on the shared librqbit session: add
 /// them all, poll until one delivers real bytes (or `timeout_secs` elapses),
 /// keep the winner, stop + delete the losers. Returns the winner's
 /// `(magnet, file_index)` for `do_play` to start via the normal path — that
 /// re-`start()` returns `AlreadyManaged`, seamlessly continuing the winner's
 /// head-start download. Returns `None` (fall back to the caller's original
-/// pick) if fewer than 2 candidates actually started, so the caller's existing
-/// dead-seed check + auto-retry handle it as today.
+/// pick) when nobody delivered bytes before the timeout, so the caller's
+/// existing dead-seed check + auto-retry handle a genuinely dead race as today.
 async fn race_torrent_sources(
     state: &SharedState,
     candidates: &[(String, Option<u32>)],
     timeout_secs: u64,
 ) -> Option<(String, Option<u32>)> {
-    // (candidate_index, torrent_pid, magnet, file_index)
-    let mut started: Vec<(usize, u32, String, Option<u32>)> = Vec::new();
-    for (i, (magnet, fidx)) in candidates.iter().enumerate() {
-        match state.torrent_engine.start(magnet, *fidx).await {
-            Ok(info) => started.push((i, info.id, magnet.clone(), *fidx)),
-            Err(e) => tracing::warn!("race: candidate {} failed to start: {}", i, e),
-        }
+    // librqbit's `add_torrent` on a magnet BLOCKS until metadata resolves —
+    // for a dead/obscure swarm that can hang far past our timeout. So each
+    // candidate runs in its own task: a stuck metadata fetch on one source
+    // never blocks the others (or the deadline). Each task reports its pid the
+    // moment `start` returns (`Started`), then polls its own progress and
+    // reports the moment it delivers real bytes (`Delivered`). The winner is
+    // the first `Delivered`.
+    enum RaceMsg {
+        Started { idx: usize, pid: u32 },
+        Delivered { idx: usize },
+        Failed,
     }
-    if started.len() < 2 {
-        // Only one (or none) started — nothing to race. Stop the lone extra
-        // if it isn't the caller's intended pick? No: the caller will start
-        // its original magnet via the normal path anyway (AlreadyManaged), so
-        // leave what started and let the caller proceed.
-        tracing::info!("race: <2 candidates started, skipping race");
-        return None;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<RaceMsg>(candidates.len() * 2 + 1);
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for (idx, (magnet, fidx)) in candidates.iter().enumerate() {
+        let engine = state.torrent_engine.clone();
+        let magnet = magnet.clone();
+        let fidx = *fidx;
+        let tx = tx.clone();
+        tasks.push(tokio::spawn(async move {
+            match engine.start(&magnet, fidx).await {
+                Ok(info) => {
+                    if tx
+                        .send(RaceMsg::Started { idx, pid: info.id })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    loop {
+                        if let Some(p) = engine.progress(info.id) {
+                            if p.bytes_downloaded > 0 {
+                                let _ = tx.send(RaceMsg::Delivered { idx }).await;
+                                return;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("race: candidate {} failed to start: {}", idx, e);
+                    let _ = tx.send(RaceMsg::Failed).await;
+                }
+            }
+        }));
     }
-    tracing::info!(
-        "race: {} sources started, watching for first delivery",
-        started.len()
-    );
-    let start = std::time::Instant::now();
-    let deadline = std::time::Duration::from_secs(timeout_secs);
-    let winner_local_idx = loop {
-        let progresses: Vec<(usize, crate::torrent_engine::TorrentProgress)> = started
-            .iter()
-            .enumerate()
-            .filter_map(|(local_idx, (_, pid, _, _))| {
-                state.torrent_engine.progress(*pid).map(|p| (local_idx, p))
-            })
-            .collect();
-        if let Some(local_idx) = pick_race_winner(&progresses) {
-            break local_idx;
+    drop(tx); // so rx closes once every task has dropped its sender
+
+    let mut started: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut failed = 0usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let winner_idx: Option<usize> = loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(RaceMsg::Started { idx, pid }) => {
+                    started.insert(idx, pid);
+                }
+                Some(RaceMsg::Delivered { idx }) => break Some(idx),
+                Some(RaceMsg::Failed) => {
+                    failed += 1;
+                    if failed >= candidates.len() {
+                        tracing::warn!("race: all candidates failed to start");
+                        break None;
+                    }
+                }
+                None => break None, // every task ended without delivering
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                tracing::warn!("race: timed out with no delivery");
+                // Fall back to any started source (the caller's dead-seed check
+                // then handles a genuinely dead race, as today).
+                break started.keys().next().copied();
+            }
         }
-        if start.elapsed() >= deadline {
-            // Timeout: nobody delivered. Fall back to the first started
-            // candidate (usually the top-ranked pick) and let the caller's
-            // dead-seed check handle a genuinely dead race.
-            tracing::warn!("race: timed out with no delivery, falling back to first candidate");
-            break 0;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     };
-    let (win_ci, _win_pid, win_magnet, win_fidx) = started[winner_local_idx].clone();
-    tracing::info!("race: winner = candidate {} ({})", win_ci, win_magnet);
-    // Stop + delete every loser (raced-and-discarded partials would otherwise
-    // bloat the media cap).
-    for (local_idx, (_ci, pid, _, _)) in started.iter().enumerate() {
-        if local_idx != winner_local_idx {
-            stop_torrent(state, *pid, true).await;
+    // Stop every detector task — the winner already delivered; the losers'
+    // poll loops must not run forever.
+    for t in &tasks {
+        t.abort();
+    }
+    match winner_idx {
+        Some(win) => {
+            tracing::info!("race: winner = candidate {}", win);
+            // Stop + delete every OTHER started torrent (raced-and-discarded
+            // partials would otherwise bloat the media cap). The winner stays
+            // in the session so the caller's re-`start` gets `AlreadyManaged`.
+            for (idx, pid) in &started {
+                if *idx != win {
+                    stop_torrent(state, *pid, true).await;
+                }
+            }
+            let (magnet, fidx) = candidates[win].clone();
+            Some((magnet, fidx))
+        }
+        None => {
+            // Nobody won — stop whatever started and let the caller fall back
+            // to its original pick (then its 12s dead-seed check errors as today).
+            for pid in started.values() {
+                stop_torrent(state, *pid, true).await;
+            }
+            None
         }
     }
-    Some((win_magnet, win_fidx))
 }
 
 /// Gate + candidate-gathering wrapper called from `do_play`'s torrent branch
@@ -6667,18 +6703,6 @@ mod tests {
     use super::*;
 
     // --- 2026-07-06: source racing (local, no debrid) ---
-    use crate::torrent_engine::{TorrentProgress, TorrentState};
-
-    fn prog(bytes: u64) -> TorrentProgress {
-        TorrentProgress {
-            bytes_downloaded: bytes,
-            bytes_total: 1_000_000,
-            peers_connected: 3,
-            speed_bps: 0,
-            finished: false,
-            state: TorrentState::Live,
-        }
-    }
 
     #[test]
     fn race_gate_fires_only_on_weak_swarm_with_alternatives() {
@@ -6692,21 +6716,6 @@ mod tests {
         assert!(!should_race_sources(false, 0, 100, 5));
         // Boundary: seeds == threshold is NOT weak (strict <).
         assert!(!should_race_sources(true, 100, 100, 2));
-    }
-
-    #[test]
-    fn race_winner_is_first_actual_byte_deliverer() {
-        // Nobody has delivered yet → keep waiting.
-        assert_eq!(pick_race_winner(&[(0, prog(0)), (1, prog(0))]), None);
-        // Only candidate 1 delivered → it wins.
-        assert_eq!(pick_race_winner(&[(0, prog(0)), (1, prog(4096))]), Some(1));
-        // Both delivered → the one with MORE bytes wins (faster swarm).
-        assert_eq!(
-            pick_race_winner(&[(0, prog(8192)), (1, prog(4096))]),
-            Some(0)
-        );
-        // Empty → None.
-        assert_eq!(pick_race_winner(&[]), None);
     }
 
     // --- May 19, 2026: My-Library tap-to-play regression ---
