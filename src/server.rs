@@ -690,6 +690,147 @@ async fn stop_torrent(state: &SharedState, torrent_id: u32, delete_files: bool) 
     }
 }
 
+/// Source racing (local-only, no debrid — 2026-07-06). Pure gate: race when
+/// racing is enabled, the top pick's swarm is weak (`seeds < threshold`), and
+/// there are ≥2 candidate releases to race. Weak-gated (not always-on) so the
+/// extra concurrent peer connections stay scoped to the slow swarms that need
+/// rescuing rather than loading the NIC on every play.
+fn should_race_sources(
+    enabled: bool,
+    selected_seeds: u32,
+    seed_threshold: u32,
+    candidate_count: usize,
+) -> bool {
+    enabled && candidate_count >= 2 && selected_seeds < seed_threshold
+}
+
+/// Pure winner-pick: among raced candidates (index, progress), the winner is
+/// the one that has actually started delivering bytes (`bytes_downloaded > 0`),
+/// with the most-delivered as tiebreak. `None` = nobody has delivered yet
+/// (keep polling, or fall back on timeout). Reported seed counts are
+/// stale/optimistic; actual byte delivery is the real "this swarm works" oracle.
+fn pick_race_winner(
+    progresses: &[(usize, crate::torrent_engine::TorrentProgress)],
+) -> Option<usize> {
+    progresses
+        .iter()
+        .filter(|(_, p)| p.bytes_downloaded > 0)
+        .max_by_key(|(_, p)| p.bytes_downloaded)
+        .map(|(idx, _)| *idx)
+}
+
+/// Race `candidates` (magnet, file_index) on the shared librqbit session: add
+/// them all, poll until one delivers real bytes (or `timeout_secs` elapses),
+/// keep the winner, stop + delete the losers. Returns the winner's
+/// `(magnet, file_index)` for `do_play` to start via the normal path — that
+/// re-`start()` returns `AlreadyManaged`, seamlessly continuing the winner's
+/// head-start download. Returns `None` (fall back to the caller's original
+/// pick) if fewer than 2 candidates actually started, so the caller's existing
+/// dead-seed check + auto-retry handle it as today.
+async fn race_torrent_sources(
+    state: &SharedState,
+    candidates: &[(String, Option<u32>)],
+    timeout_secs: u64,
+) -> Option<(String, Option<u32>)> {
+    // (candidate_index, torrent_pid, magnet, file_index)
+    let mut started: Vec<(usize, u32, String, Option<u32>)> = Vec::new();
+    for (i, (magnet, fidx)) in candidates.iter().enumerate() {
+        match state.torrent_engine.start(magnet, *fidx).await {
+            Ok(info) => started.push((i, info.id, magnet.clone(), *fidx)),
+            Err(e) => tracing::warn!("race: candidate {} failed to start: {}", i, e),
+        }
+    }
+    if started.len() < 2 {
+        // Only one (or none) started — nothing to race. Stop the lone extra
+        // if it isn't the caller's intended pick? No: the caller will start
+        // its original magnet via the normal path anyway (AlreadyManaged), so
+        // leave what started and let the caller proceed.
+        tracing::info!("race: <2 candidates started, skipping race");
+        return None;
+    }
+    tracing::info!(
+        "race: {} sources started, watching for first delivery",
+        started.len()
+    );
+    let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(timeout_secs);
+    let winner_local_idx = loop {
+        let progresses: Vec<(usize, crate::torrent_engine::TorrentProgress)> = started
+            .iter()
+            .enumerate()
+            .filter_map(|(local_idx, (_, pid, _, _))| {
+                state.torrent_engine.progress(*pid).map(|p| (local_idx, p))
+            })
+            .collect();
+        if let Some(local_idx) = pick_race_winner(&progresses) {
+            break local_idx;
+        }
+        if start.elapsed() >= deadline {
+            // Timeout: nobody delivered. Fall back to the first started
+            // candidate (usually the top-ranked pick) and let the caller's
+            // dead-seed check handle a genuinely dead race.
+            tracing::warn!("race: timed out with no delivery, falling back to first candidate");
+            break 0;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+    let (win_ci, _win_pid, win_magnet, win_fidx) = started[winner_local_idx].clone();
+    tracing::info!("race: winner = candidate {} ({})", win_ci, win_magnet);
+    // Stop + delete every loser (raced-and-discarded partials would otherwise
+    // bloat the media cap).
+    for (local_idx, (_ci, pid, _, _)) in started.iter().enumerate() {
+        if local_idx != winner_local_idx {
+            stop_torrent(state, *pid, true).await;
+        }
+    }
+    Some((win_magnet, win_fidx))
+}
+
+/// Gate + candidate-gathering wrapper called from `do_play`'s torrent branch
+/// (after Local Bypass has already missed). Returns the race winner's
+/// `(magnet, file_index)` when a race ran, or `None` to use the caller's
+/// original pick (racing disabled, no `result_id`, top pick healthy, or <2
+/// candidates). Candidates = the selected result plus the next
+/// `race_max_sources − 1` in ranked order (so an explicitly-picked lower
+/// result isn't silently upgraded past what the user chose).
+async fn maybe_race_sources(
+    state: &SharedState,
+    req: &PlayRequest,
+) -> Option<(String, Option<u32>)> {
+    if !state.config.race_sources_enabled {
+        return None;
+    }
+    let rid = req.result_id?;
+    let search = AppState::load_last_search(&state.state_dir)?;
+    let selected_seeds = search
+        .results
+        .iter()
+        .find(|r| r.id == rid)
+        .map(|r| r.seeds)?;
+    let candidates: Vec<(String, Option<u32>)> = search
+        .results
+        .iter()
+        .filter(|r| r.id >= rid && !r.magnet.is_empty())
+        .take(state.config.race_max_sources)
+        .map(|r| (r.magnet.clone(), r.file_index))
+        .collect();
+    if !should_race_sources(
+        true,
+        selected_seeds,
+        state.config.race_seed_threshold,
+        candidates.len(),
+    ) {
+        return None;
+    }
+    tracing::info!(
+        "race: top pick has {} seeds (< {}), racing {} sources",
+        selected_seeds,
+        state.config.race_seed_threshold,
+        candidates.len()
+    );
+    race_torrent_sources(state, &candidates, state.config.race_timeout_secs).await
+}
+
 /// "Is the torrent worker still alive?" check used by the post-playback
 /// reaper. `pid == 0` is Local Bypass (no torrent worker); the reaper then
 /// relies entirely on ffmpeg liveness.
@@ -1502,11 +1643,29 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         // is the only remaining path, so the magnet is genuinely
         // required HERE — deferred from the old unconditional gate that
         // had made the My-Library bridge unreachable (see above).
-        let Some(magnet) = magnet.as_deref() else {
+        let Some(magnet_selected) = magnet.as_deref() else {
             return Json(json!({
                 "error": magnet_required_error(req.title.is_some())
             }));
         };
+
+        // 2026-07-06 source racing (local, no debrid): Bypass has already
+        // missed, so we're committed to a torrent. When the top pick's swarm
+        // is weak, race the top-N releases and use whichever delivers bytes
+        // first. The winner flows through the normal start path below —
+        // `AlreadyManaged` continues its head-start download; losers were
+        // stopped + deleted in-race. do_play's cleanup/cast invariants stay
+        // untouched (this only chooses WHICH magnet to start).
+        let raced_winner = maybe_race_sources(state, req).await;
+        let magnet_owned: String = match &raced_winner {
+            Some((m, fidx)) => {
+                req.file_index = *fidx;
+                m.clone()
+            }
+            None => magnet_selected.to_string(),
+        };
+        let magnet = magnet_owned.as_str();
+
         // Disk check: only required if we are going to start a NEW download
         if let Ok(Some(err)) = disk::check_space(&media_dir) {
             return Json(json!({"error": err}));
@@ -6506,6 +6665,49 @@ async fn handle_hls_cache_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- 2026-07-06: source racing (local, no debrid) ---
+    use crate::torrent_engine::{TorrentProgress, TorrentState};
+
+    fn prog(bytes: u64) -> TorrentProgress {
+        TorrentProgress {
+            bytes_downloaded: bytes,
+            bytes_total: 1_000_000,
+            peers_connected: 3,
+            speed_bps: 0,
+            finished: false,
+            state: TorrentState::Live,
+        }
+    }
+
+    #[test]
+    fn race_gate_fires_only_on_weak_swarm_with_alternatives() {
+        // Enabled + weak swarm (< threshold) + ≥2 candidates → race.
+        assert!(should_race_sources(true, 40, 100, 2));
+        // Healthy swarm (≥ threshold) → no race, even with alternatives.
+        assert!(!should_race_sources(true, 150, 100, 3));
+        // Weak swarm but only one candidate → nothing to race.
+        assert!(!should_race_sources(true, 10, 100, 1));
+        // Disabled → never race.
+        assert!(!should_race_sources(false, 0, 100, 5));
+        // Boundary: seeds == threshold is NOT weak (strict <).
+        assert!(!should_race_sources(true, 100, 100, 2));
+    }
+
+    #[test]
+    fn race_winner_is_first_actual_byte_deliverer() {
+        // Nobody has delivered yet → keep waiting.
+        assert_eq!(pick_race_winner(&[(0, prog(0)), (1, prog(0))]), None);
+        // Only candidate 1 delivered → it wins.
+        assert_eq!(pick_race_winner(&[(0, prog(0)), (1, prog(4096))]), Some(1));
+        // Both delivered → the one with MORE bytes wins (faster swarm).
+        assert_eq!(
+            pick_race_winner(&[(0, prog(8192)), (1, prog(4096))]),
+            Some(0)
+        );
+        // Empty → None.
+        assert_eq!(pick_race_winner(&[]), None);
+    }
 
     // --- May 19, 2026: My-Library tap-to-play regression ---
     // do_play's magnet gate used to fire BEFORE the local-library /

@@ -138,6 +138,35 @@ pub struct Config {
     /// once and continues serving; it never crashes on a failed alert.
     #[serde(default = "default_library_ntfy_url")]
     pub library_ntfy_url: String,
+    /// 2026-07-06 (source racing, local-only — no debrid): when the top-ranked
+    /// torrent pick has a WEAK swarm (`seeds < race_seed_threshold`), spela adds
+    /// the top `race_max_sources` releases to the shared librqbit session and
+    /// races them — the first to deliver real pieces wins, the losers are
+    /// stopped + deleted. The winner flows through the normal play path
+    /// (`AlreadyManaged` continues its head start). Gated on a weak swarm (not
+    /// always-on) to keep the extra concurrent peer connections scoped to the
+    /// slow cases that need rescuing, rather than adding NIC load to every play
+    /// (relevant after the 2026-07-05 e1000e NIC-hang fix). `false` = today's
+    /// single-source behavior, zero regression. Local Bypass plays never race
+    /// (the local file is already instant).
+    #[serde(default = "default_true")]
+    pub race_sources_enabled: bool,
+    /// Race only when the top pick's reported seed count is below this. Default
+    /// 100 catches the "slow-but-work" swarms (Sicario ~78, Naked ~38) plus the
+    /// truly-dead ones, while skipping healthy high-seed blockbusters that
+    /// already start fast. Torrentio seed counts are stale/optimistic, so this
+    /// is a coarse gate; the race itself is the real empirical delivery test.
+    #[serde(default = "default_race_seed_threshold")]
+    pub race_seed_threshold: u32,
+    /// How many top-ranked releases to race (including the top pick). 2 keeps
+    /// the concurrent-download + peer-connection load bounded.
+    #[serde(default = "default_race_max_sources")]
+    pub race_max_sources: usize,
+    /// Max seconds to wait for a race winner before falling back to the
+    /// original top pick (then `handle_play`'s existing fail-fast + auto-retry
+    /// takes over as today).
+    #[serde(default = "default_race_timeout_secs")]
+    pub race_timeout_secs: u64,
 }
 
 fn default_server() -> String {
@@ -180,6 +209,18 @@ fn default_library_ntfy_url() -> String {
     // `router-security`, `shannon-security`).
     "http://darwin.home:8099/spela-library-alerts".into()
 }
+fn default_true() -> bool {
+    true
+}
+fn default_race_seed_threshold() -> u32 {
+    100
+}
+fn default_race_max_sources() -> usize {
+    2
+}
+fn default_race_timeout_secs() -> u64 {
+    15
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -215,6 +256,10 @@ impl Default for Config {
             remote_origins: Vec::new(),
             library_serve_port: default_library_serve_port(),
             library_ntfy_url: default_library_ntfy_url(),
+            race_sources_enabled: default_true(),
+            race_seed_threshold: default_race_seed_threshold(),
+            race_max_sources: default_race_max_sources(),
+            race_timeout_secs: default_race_timeout_secs(),
         }
     }
 }
