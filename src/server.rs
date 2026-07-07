@@ -53,6 +53,24 @@ pub struct ServerState {
     /// returned guard drops on ANY do_play return path (success OR the many
     /// early error-returns) — so `/progress` can never report a stale warmup.
     pub warmup: Mutex<Option<Warmup>>,
+    /// 2026-07-07: the web-remote scrubber's LIVE playback position, distinct
+    /// from the resume HWM in state.json. The HWM (`get_position`) is
+    /// max-only (`save_position_smart` refuses to move it backward), so it can
+    /// NEVER reflect a backward seek — a scrubber reading it snaps back to the
+    /// furthest-watched point on every poll (the 2026-07-06 Spider-Noir bug:
+    /// dragging back from 26min kept jumping to 26min). This cell holds the
+    /// actual current absolute position, updated by cast_health_monitor every
+    /// poll (≤5s) AND immediately by `handle_seek`, so `/api/position` (which
+    /// ONLY the scrubber consumes) returns truth. Resume semantics are
+    /// untouched — auto-resume + no-arg seek call `get_position` directly.
+    pub live_position: Mutex<Option<LivePosition>>,
+}
+
+/// Live playback position for the web-remote scrubber (see `live_position`).
+#[derive(Clone)]
+pub struct LivePosition {
+    pub title: String,
+    pub abs_secs: f64,
 }
 
 type SharedState = Arc<ServerState>;
@@ -207,6 +225,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         torrent_engine,
         host_allowlist,
         warmup: Mutex::new(None),
+        live_position: Mutex::new(None),
     });
 
     // May 1, 2026 (Wilderpeople movie-night DEFINITIVE root cause): CORS
@@ -2572,6 +2591,10 @@ fn do_cleanup(state: &SharedState) {
     if let Some(pid) = lock_recover(&state.ffmpeg_pid).take() {
         torrent::kill_pid(pid);
     }
+    // Clear the scrubber's live-position cell — the stream is gone, so a stale
+    // reading must not leak into the next stream's scrubber (the title-match
+    // guard in handle_get_position also covers this, but clearing is cleaner).
+    *lock_recover(&state.live_position) = None;
     // Kill any lingering ffmpeg or python http servers
     let _ = std::process::Command::new("pkill")
         .args(["-f", "python3 -m http.server 8889"])
@@ -3797,6 +3820,15 @@ async fn cast_health_monitor(
                     // current_time readings — at LOAD, Chromecast briefly reports 0.
                     if info.current_time > 0.0 {
                         last_known_absolute = Some(absolute);
+                        // Feed the scrubber's LIVE position every poll (≤5s),
+                        // unthrottled + HWM-independent — this is what makes a
+                        // backward seek stick instead of snapping to the HWM.
+                        if let Some(t) = &title_snapshot {
+                            *lock_recover(&state.live_position) = Some(LivePosition {
+                                title: t.clone(),
+                                abs_secs: absolute,
+                            });
+                        }
                     }
                     let duration_hint = duration_snapshot.or_else(|| {
                         // info.duration is -1 for HLS live manifests (ENDLIST missing).
@@ -4345,6 +4377,13 @@ async fn handle_seek(
 
     match result {
         Ok(Ok(_)) => {
+            // Update the scrubber's live position IMMEDIATELY (don't wait for
+            // the monitor's next ≤5s poll) so the web remote's next /api/position
+            // reflects the seek target instead of the stale pre-seek reading.
+            *lock_recover(&state.live_position) = Some(LivePosition {
+                title: current.title.clone(),
+                abs_secs: absolute_pos,
+            });
             tracing::info!(
                 "Seek: '{}' on '{}' to absolute {:.0}s (stream {:.0}s, ss_offset={:.0}s)",
                 current.title,
@@ -6330,9 +6369,30 @@ async fn handle_get_position(
     State(state): State<SharedState>,
     Query(query): Query<PositionQuery>,
 ) -> Json<Value> {
-    let app_state = AppState::load(&state.state_dir);
-    let pos = app_state.get_position(query.imdb_id.clone(), query.title);
+    // The scrubber wants the LIVE position of the active stream, NOT the resume
+    // HWM (max-only → never reflects a backward seek → snap-back bug). Prefer
+    // the live cell when it matches the queried title; else fall back to the
+    // HWM (harmless — the scrubber always queries the active stream's title).
+    let live = scrubber_live_position(
+        lock_recover(&state.live_position).as_ref(),
+        query.title.as_deref(),
+    );
+    let pos = match live {
+        Some(p) => p,
+        None => AppState::load(&state.state_dir).get_position(query.imdb_id.clone(), query.title),
+    };
     Json(json!({"imdb_id": query.imdb_id, "t": pos}))
+}
+
+/// Pure decision for the scrubber's live position: return the live cell's
+/// absolute position ONLY when it belongs to the queried stream (title match),
+/// else `None` so the caller falls back to the resume HWM. The title guard
+/// prevents a stale live position from a prior stream leaking into a new one.
+fn scrubber_live_position(live: Option<&LivePosition>, queried_title: Option<&str>) -> Option<f64> {
+    match (live, queried_title) {
+        (Some(lp), Some(t)) if lp.title == t => Some(lp.abs_secs),
+        _ => None,
+    }
 }
 
 /// Reset resume position for a movie/show.
@@ -6716,6 +6776,32 @@ mod tests {
         assert!(!should_race_sources(false, 0, 100, 5));
         // Boundary: seeds == threshold is NOT weak (strict <).
         assert!(!should_race_sources(true, 100, 100, 2));
+    }
+
+    // --- 2026-07-07: scrubber live-position vs resume-HWM (Spider-Noir snap-back) ---
+    #[test]
+    fn scrubber_prefers_live_position_only_for_the_matching_stream() {
+        let live = LivePosition {
+            title: "Spider-Noir S01E02".into(),
+            abs_secs: 1375.0,
+        };
+        // Backward seek to 1375 on the SAME stream → live wins (would snap to
+        // the 1575 HWM without this).
+        assert_eq!(
+            scrubber_live_position(Some(&live), Some("Spider-Noir S01E02")),
+            Some(1375.0)
+        );
+        // Different stream queried → do NOT leak the old live position; caller
+        // falls back to that stream's own HWM.
+        assert_eq!(
+            scrubber_live_position(Some(&live), Some("The Boys S05E06")),
+            None
+        );
+        // No live cell (fresh/stopped) → fall back to HWM.
+        assert_eq!(
+            scrubber_live_position(None, Some("Spider-Noir S01E02")),
+            None
+        );
     }
 
     // --- May 19, 2026: My-Library tap-to-play regression ---
