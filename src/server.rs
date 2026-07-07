@@ -3854,22 +3854,11 @@ async fn cast_health_monitor(
                         // restart, etc.). See `is_position_jump_suspicious` for
                         // threshold rationale.
                         let now_wall = std::time::Instant::now();
-                        let suspicious = last_save_wall.map_or(false, |prev_wall| {
-                            let delta_wall = now_wall.duration_since(prev_wall).as_secs_f64();
-                            let delta_abs = absolute - last_saved_position;
-                            if is_position_jump_suspicious(delta_wall, delta_abs) {
-                                tracing::warn!(
-                                    "cast_health_monitor: impossible position jump for '{}': +{:.0}s in {:.0}s wall (ratio={:.1}x) — SKIPPING save, likely stale Chromecast state",
-                                    title_for_log,
-                                    delta_abs,
-                                    delta_wall,
-                                    delta_abs / delta_wall.max(0.001)
-                                );
-                                true
-                            } else {
-                                false
-                            }
-                        });
+                        let delta_wall = last_save_wall
+                            .map(|prev_wall| now_wall.duration_since(prev_wall).as_secs_f64())
+                            .unwrap_or(0.0);
+                        let delta_abs = absolute - last_saved_position;
+                        let suspicious = is_position_jump_suspicious(delta_wall, delta_abs);
 
                         // Don't bother saving if we're already past the HWM_CLEAR
                         // threshold — save_position_smart would just clear the entry,
@@ -3877,7 +3866,33 @@ async fn cast_health_monitor(
                         let past_end = duration_hint
                             .map(|d| absolute >= d * HWM_CLEAR_FRACTION)
                             .unwrap_or(false);
-                        if !suspicious && !past_end {
+
+                        if suspicious {
+                            // 2026-07-07: RE-BASELINE, don't freeze. A one-time forward
+                            // jump (a seek on the TV remote, a settled stale session, or
+                            // a DMR current_time glitch) is legitimate once playback
+                            // continues normally from the new point. The OLD code skipped
+                            // the save WITHOUT advancing the baseline, so every subsequent
+                            // poll stayed "suspicious" against the frozen baseline → this
+                            // warning spammed every 5s AND no resume position was saved
+                            // for ~JUMP seconds of playback (E01 2026-07-06: a +1187s jump
+                            // froze saves + spammed for ~19 min). Accept the new reading as
+                            // the baseline WITHOUT persisting this tick; the next tick
+                            // validates ~1x progression and saves normally. Genuine ongoing
+                            // instability keeps re-baselining and never persists garbage
+                            // (a still-climbing position IS the real position by definition;
+                            // a drop-back reads as a negative delta, which is never
+                            // "suspicious", so the correct lower value saves immediately).
+                            tracing::warn!(
+                                "cast_health_monitor: large position jump for '{}': +{:.0}s in {:.0}s wall (ratio={:.1}x) — re-baselining (not persisting this tick)",
+                                title_for_log,
+                                delta_abs,
+                                delta_wall,
+                                delta_abs / delta_wall.max(0.001)
+                            );
+                            last_saved_position = absolute;
+                            last_save_wall = Some(now_wall);
+                        } else if !past_end {
                             let mut app_state = AppState::load(&state.state_dir);
                             let (key, saved) = app_state.save_position_smart(
                                 imdb_id_snapshot.clone(),
