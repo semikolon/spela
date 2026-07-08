@@ -228,6 +228,14 @@
   .nowfull .bigposter{width:min(68vw,300px)}
   .topt{min-height:64px;padding:1rem;font-size:1rem}
 
+  /* Persistent play-start error surface (2026-07-08, UX doc §6/§9) */
+  .errbox{display:flex;flex-direction:column;align-items:center;gap:1rem;width:min(92vw,460px)}
+  .errmsg{color:var(--warn);font-size:.98rem;text-align:center;line-height:1.45;
+    background:var(--bg2);border:1px solid var(--line);border-radius:14px;padding:.9rem 1.1rem}
+  .errbox .transport{flex-wrap:wrap}
+  .srcbtn.primary{background:var(--accent2);color:#fff;border-color:transparent}
+  .srcbtn.primary:active{background:var(--accent)}
+
   /* ===== Narrow-viewport (phone) layout fixes (2026-07-08) ==============
      Symptoms (Fredrik's phone screenshots): the header (brand + labelled
      nav pills + device pill) was wider than the viewport → the whole page
@@ -328,7 +336,8 @@ const S={
   library:{data:null,loading:false},
   now:{data:null,posAbs:0,dur:0,frontier:0,endlist:false,playing:false,lastSync:0,
        everRan:false,cold:false,seekDrag:false,phone:false,
-       warming:false,warmup:null,warmupData:null},   // 2026-07-04 live warmup progress
+       warming:false,warmup:null,warmupData:null,   // 2026-07-04 live warmup progress
+       error:null},   // 2026-07-08 persistent play-start failure {title,poster,msg,retry}
   pollTimer:null, frontierTimer:null, warmTimer:null,
   pending:null   // deferred play: tapped before a target was set → picker → resume
 };
@@ -491,9 +500,21 @@ function iconizeStatic(){ document.querySelectorAll("[data-ic]").forEach(e=>{
    we navigate to a live progress screen IMMEDIATELY and poll GET /progress
    every 1s while /play is awaited in the background. */
 function beginWarming(title,poster){
+  S.now.error=null;   // a fresh attempt clears any prior failure surface
   S.now.warming=true; S.now.warmup=null; S.now.warmupData={title:title||"Playing",poster:poster||""};
   S.now.data=null; S.now.phone=false;
   location.hash="#/now"; renderNowFull(); startWarmupPoll();
+}
+/* Persistent play-START failure surface (2026-07-08, UX doc §6/§9): a failed
+   start is NOT a transient toast that bounces to Search (toast-only-critical is
+   an anti-pattern — the recovery path vanishes). Instead keep the failed item +
+   a "Tap to retry" ATTACHED to the now-playing surface until the user retries,
+   goes back, or a fresh attempt clears it. */
+function showPlayError(title,poster,msg,retry){
+  endWarming();
+  S.now.error={title:title||"Couldn’t start",poster:poster||"",msg:msg||"unknown error",retry:retry||null};
+  S.now.data=null; S.now.phone=false; S.now.cold=false; S.now.playing=false;
+  location.hash="#/now"; renderNowFull();
 }
 function endWarming(){ S.now.warming=false; stopWarmupPoll(); }
 function startWarmupPoll(){ if(S.warmTimer)return; pollWarmup(); S.warmTimer=setInterval(pollWarmup,1000); }
@@ -516,13 +537,9 @@ async function doPlay(opts,cardForSources){
   const body={...opts,target:"chromecast",cast_name:S.target.name};
   let r;
   try{ r=await api("/play",{method:"POST",body}); }
-  catch{ endWarming(); toast("spela unreachable"); location.hash="#/search"; return; }
+  catch{ showPlayError(label,opts.poster_url,"spela unreachable",()=>doPlay(opts,cardForSources)); return; }
   endWarming();
-  if(r&&r.error){
-    toast("Couldn’t play: "+r.error); location.hash="#/search";
-    if(cardForSources&&cardForSources._openSources) cardForSources._openSources();
-    return;
-  }
+  if(r&&r.error){ showPlayError(label,opts.poster_url,r.error,()=>doPlay(opts,cardForSources)); return; }
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   S.now.data={title:label,poster_url:opts.poster_url||"",quality:"",target:":"+(S.target&&S.target.name||"")};
   renderNowFull(); pollNow(true);
@@ -537,15 +554,12 @@ async function doPlay(opts,cardForSources){
    within ~5s of the dispatch), so the now-playing UI populates
    shortly. */
 async function doShannonPlay(opts,cardForSources){
+  S.now.error=null;
   toast("Starting on Shannon TV…");
   let r;
   try{ r=await api("/play",{method:"POST",body:{...opts,target:"shannon"}}); }
-  catch{ toast("spela unreachable"); return; }
-  if(r&&r.error){
-    toast("Shannon: "+r.error);
-    if(cardForSources&&cardForSources._openSources) cardForSources._openSources();
-    return;
-  }
+  catch{ showPlayError(opts.title||"Shannon TV",opts.poster_url,"spela unreachable",()=>doShannonPlay(opts,cardForSources)); return; }
+  if(r&&r.error){ showPlayError(opts.title||"Shannon TV",opts.poster_url,r.error,()=>doShannonPlay(opts,cardForSources)); return; }
   toast("Dispatched — Shannon will fetch + play in ~10s");
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   location.hash="#/now"; pollNow(true);
@@ -564,10 +578,9 @@ async function doPhoneDirect(opts,cardForSources,label){
   beginWarming(label||opts.title||"Playing",opts.poster_url);
   let r;
   try{ r=await api("/play",{method:"POST",body:{...opts,target:"vlc"}}); }
-  catch{ endWarming(); toast("spela unreachable"); location.hash="#/search"; return; }
+  catch{ showPlayError(label||opts.title,opts.poster_url,"spela unreachable",()=>doPhoneDirect(opts,cardForSources,label)); return; }
   endWarming();
-  if(r&&r.error){ toast("Couldn’t play: "+r.error);
-    location.hash="#/search"; if(cardForSources&&cardForSources._openSources) cardForSources._openSources(); return; }
+  if(r&&r.error){ showPlayError(label||opts.title,opts.poster_url,r.error,()=>doPhoneDirect(opts,cardForSources,label)); return; }
   S.now.phone=true; S.now.phoneLoading=false; S.now.everRan=true; S.now.playing=true;
   S.now.data={title:label||"Playing",quality:"",poster_url:opts.poster_url||""};
   renderNowFull();                                               // build the <video> + buffering overlay
@@ -597,9 +610,9 @@ async function doPlayLibrary(entry){
   beginWarming(entry.title,entry.poster_url);
   let r;
   try{ r=await api("/play",{method:"POST",body:{title:entry.raw_name,poster_url:entry.poster_url,target:"chromecast",cast_name:S.target.name}}); }
-  catch{ endWarming(); toast("spela unreachable"); location.hash="#/search"; return; }
+  catch{ showPlayError(entry.title,entry.poster_url,"spela unreachable",()=>doPlayLibrary(entry)); return; }
   endWarming();
-  if(r&&r.error){ toast("Couldn’t play: "+r.error); location.hash="#/search"; return; }
+  if(r&&r.error){ showPlayError(entry.title,entry.poster_url,r.error,()=>doPlayLibrary(entry)); return; }
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   S.now.data={title:entry.title,poster_url:entry.poster_url||"",quality:"",target:":"+(S.target&&S.target.name||"")};
   renderNowFull(); pollNow(true);
@@ -857,6 +870,23 @@ function renderWarmupInto(root){
 function renderNowFull(){
   const root=$("#nowFull");
   if(S.now.warming){ renderWarmupInto(root); return; }   // 2026-07-04 live warmup screen
+  if(S.now.error){                                       // 2026-07-08 persistent play-start failure
+    const e=S.now.error;
+    root.innerHTML=`<div class="nowfull">
+      ${e.poster?`<img class="bigposter" src="${esc(e.poster)}" alt="">`:""}
+      <h2>${esc(e.title)}</h2>
+      <div class="errbox">
+        <div class="errmsg">Couldn’t start — ${esc(e.msg)}</div>
+        <div class="transport">
+          ${e.retry?`<button class="srcbtn primary" id="errRetry">${ic("refresh")}Tap to retry</button>`:""}
+          <button class="srcbtn" id="errBack">${ic("search")}Back to search</button>
+        </div>
+      </div>
+    </div>`;
+    const rb=$("#errRetry"); if(rb) rb.onclick=()=>{ const fn=e.retry; S.now.error=null; if(fn) fn(); };
+    $("#errBack").onclick=()=>{ S.now.error=null; location.hash="#/search"; };
+    return;
+  }
   const c=S.now.data;
   if(!c){ root.innerHTML=`<div class="state"><div class="big">Nothing playing</div>Start something from Search.</div>`; return; }
   if(S.now.phone){
@@ -959,7 +989,7 @@ async function stopPlayback(){
   const v=$("#phvid"); if(v){ try{ v.pause(); }catch(e){} }   // phone-direct: silence local playback immediately
   await api("/stop",{method:"POST"}).catch(()=>{});
   toast("Stopped");
-  S.now.data=null; S.now.phone=false; S.now.playing=false; S.now.stopping=false;
+  S.now.data=null; S.now.phone=false; S.now.playing=false; S.now.stopping=false; S.now.error=null;
   $("#nowbar").classList.remove("on","fading");
   if(nf) nf.style.opacity="";
   renderNowFull();
