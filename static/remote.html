@@ -227,6 +227,31 @@
   .nowfull h2{font-size:1.5rem}
   .nowfull .bigposter{width:min(68vw,300px)}
   .topt{min-height:64px;padding:1rem;font-size:1rem}
+
+  /* ===== Narrow-viewport (phone) layout fixes (2026-07-08) ==============
+     Symptoms (Fredrik's phone screenshots): the header (brand + labelled
+     nav pills + device pill) was wider than the viewport → the whole page
+     scrolled sideways into dead black space; and a single search result sat
+     in one ~168px grid column = ~half width. Fix: icon-only nav + device
+     pill (labels recognizable by icon; active tab still shows via `.on`
+     background), drop the "remote" sub-brand, single-column full-width
+     search results, and a hard belt against any residual sideways scroll.
+     Scoped to phones so desktop keeps labels + the multi-column grid. */
+  @media (max-width:560px){
+    .brand small{display:none}               /* drop " remote" — saves width */
+    nav a .lbl{display:none}                 /* icon-only tabs */
+    nav a{padding:.55rem .78rem}             /* compact square-ish pills */
+    nav a .lu{margin-right:0}                /* no trailing gap w/ label gone */
+    #tgtLabel{display:none}                  /* Chromecast pill = icon only */
+    .tgt{max-width:none;padding:.5rem .72rem}
+    .tgt .lu{margin-right:0}
+    #v-search .grid{grid-template-columns:1fr}  /* full-width search result + sources */
+  }
+  /* Belt: nothing may create a sideways scroll (the header used to). `clip`
+     (not `hidden`) so it doesn't become a scroll container / break the
+     sticky header. The header now fits on its own; this just guarantees it. */
+  html{overflow-x:clip}
+  header{max-width:100%}
   .topt .ic{font-size:1.5rem}
   .topt .nm{font-size:1.02rem}
   .state{padding:3.5rem 1rem;font-size:1.02rem}
@@ -245,11 +270,11 @@
 <header>
   <div class="brand">spela<small>remote</small></div>
   <nav>
-    <a href="#/search" data-v="search" data-ic="search">Search</a>
-    <a href="#/library" data-v="library" data-ic="library">Library</a>
-    <a href="#/now" data-v="now" data-ic="tv">Now</a>
+    <a href="#/search" data-v="search" data-ic="search" aria-label="Search"><span class="lbl">Search</span></a>
+    <a href="#/library" data-v="library" data-ic="library" aria-label="Library"><span class="lbl">Library</span></a>
+    <a href="#/now" data-v="now" data-ic="tv" aria-label="Now playing"><span class="lbl">Now</span></a>
   </nav>
-  <button class="tgt" id="tgtBtn" data-ic="cast"><b id="tgtLabel">Pick target</b></button>
+  <button class="tgt" id="tgtBtn" data-ic="cast" aria-label="Cast target"><b id="tgtLabel">Pick target</b></button>
 </header>
 
 <main>
