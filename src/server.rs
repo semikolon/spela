@@ -2071,15 +2071,25 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
             // requires a filter pass (no subtitle burn-in, no intro concat) and
             // no mid-stream seek (copy starts at 0). Everything else, and the
             // whole Chromecast path (CrKey 1.56 can't do HEVC/4K), is unchanged.
+            // 2026-07-13: a >1080 HEVC source to a browser goes through stream-COPY
+            // (true 4K, no NVENC). Subtitles were previously gated OUT of this path
+            // (burn-in needs a filter/re-encode) — but that shunted every 4K-with-subs
+            // play into a 4K→1080p NVENC transcode that CHOKED on Dolby-Vision 10-bit
+            // and produced no HLS segments (20s fail-fast, "starved swarm"). For a
+            // browser 4K target, true 4K beats burned subs: prefer pass-through and
+            // DROP the burn-in. (Proper 4K subtitles = the queued WebVTT sidecar track,
+            // not burn-in.) Intro concat + mid-stream seek still force the transcode.
             let want_4k_passthrough = target != "chromecast"
                 && source_height.map_or(false, |h| h > 1080)
                 && video_codec.as_deref().map_or(false, |c| {
                     let c = c.to_ascii_lowercase();
                     c == "hevc" || c == "h265" || c == "h.265"
                 })
-                && sub_path.is_none()
                 && intro_path.is_none()
                 && seek_to.unwrap_or(0.0) <= 0.0;
+            if want_4k_passthrough && sub_path.is_some() {
+                tracing::info!("Browser 4K pass-through: dropping burn-in subtitles to keep true 4K (no re-encode)");
+            }
             let hls_result = if want_4k_passthrough {
                 tracing::info!(
                     "Browser 4K pass-through: stream-copying {}p {} (no re-encode, no downscale)",
