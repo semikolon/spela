@@ -6078,6 +6078,47 @@ async fn handle_hls_playlist(
 /// `avc1.640028`, AAC LC stereo → `mp4a.40.2`) and BANDWIDTH /
 /// RESOLUTION are also fixed by spela's standard 1920×1080 / ~6 Mbps
 /// transcode profile.
+/// Rewrite an HLS master playlist's `CODECS="..."` so HEVC codec strings are
+/// browser-accepted. ffmpeg emits e.g. `hvc1.2.4.L150.B01`; Chrome's MSE rejects
+/// that constraint-flags tail (`isTypeSupported` → false) but accepts the same
+/// string without it (`hvc1.2.4.L150`). We strip a trailing `.B..`-style
+/// component from any hvc1/hev1 codec token. Non-HEVC codecs (avc1, mp4a) and
+/// every other line pass through unchanged.
+fn normalize_hls_master_codecs(master: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in master.lines() {
+        if let Some(cstart) = line.find("CODECS=\"") {
+            let head = &line[..cstart + 8];
+            let rest = &line[cstart + 8..];
+            if let Some(qend) = rest.find('"') {
+                let codecs = &rest[..qend];
+                let tail = &rest[qend..];
+                let fixed = codecs
+                    .split(',')
+                    .map(|c| {
+                        let c = c.trim();
+                        if c.starts_with("hvc1.") || c.starts_with("hev1.") {
+                            let parts: Vec<&str> = c.split('.').collect();
+                            // hvc1 . profile . compat . Lxxx . <constraint-flags>
+                            if parts.len() >= 5 && parts[4].starts_with('B') {
+                                return parts[..4].join(".");
+                            }
+                        }
+                        c.to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                out.push(format!("{}{}{}", head, fixed, tail));
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
 async fn handle_hls_master(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -6091,6 +6132,24 @@ async fn handle_hls_master(
         .join("transcoded_hls")
         .join("master.m3u8");
     if generated_master_path.exists() {
+        // ffmpeg's -master_pl_name writes the real CODECS derived from the copied
+        // stream. For HEVC it emits a ".B01"-style constraint-flags tail that
+        // Chrome's MSE REJECTS (hvc1.2.4.L150.B01 → isTypeSupported=false), so
+        // hls.js refuses the whole manifest (manifestIncompatibleCodecsError) and
+        // 4K/HEVC won't play in the browser. Strip that tail → hvc1.2.4.L150,
+        // which IS accepted. The init.mp4 hvc1 box is untouched, so the decoder
+        // still gets the true profile/level. (2026-07-13)
+        if let Ok(raw) = tokio::fs::read_to_string(&generated_master_path).await {
+            let fixed = normalize_hls_master_codecs(&raw);
+            return axum::response::Response::builder()
+                .status(200)
+                .header("Content-Type", "application/vnd.apple.mpegurl")
+                .header("Cache-Control", "no-cache")
+                .header("Content-Length", fixed.len().to_string())
+                .header("Accept-Ranges", "bytes")
+                .body(axum::body::Body::from(fixed))
+                .unwrap();
+        }
         return serve_static_with_range(
             generated_master_path,
             "application/vnd.apple.mpegurl",
@@ -6856,6 +6915,30 @@ async fn handle_hls_cache_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- 2026-07-13: HEVC master CODECS normalization (Chrome rejects .B01 tail) ---
+
+    #[test]
+    fn normalize_strips_hevc_constraint_flags_tail() {
+        // ffmpeg's real 4K HEVC master (the exact string Chrome MSE rejected).
+        let inp = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=211200,RESOLUTION=3840x1920,CODECS=\"hvc1.2.4.L150.B01,mp4a.40.2\"\nplaylist.m3u8\n";
+        let out = normalize_hls_master_codecs(inp);
+        assert!(
+            out.contains("CODECS=\"hvc1.2.4.L150,mp4a.40.2\""),
+            "expected stripped HEVC codec, got: {out}"
+        );
+        assert!(!out.contains("B01"), "constraint-flags tail must be gone");
+    }
+
+    #[test]
+    fn normalize_leaves_h264_and_hevc_without_flags_untouched() {
+        // H.264 master (standard transcode path) is unchanged.
+        let avc = "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS=\"avc1.640028,mp4a.40.2\"\nplaylist.m3u8\n";
+        assert!(normalize_hls_master_codecs(avc).contains("avc1.640028,mp4a.40.2"));
+        // HEVC already without a constraint tail: left as-is.
+        let clean = "#EXT-X-STREAM-INF:CODECS=\"hvc1.2.4.L150,mp4a.40.2\"\nplaylist.m3u8\n";
+        assert!(normalize_hls_master_codecs(clean).contains("hvc1.2.4.L150,mp4a.40.2"));
+    }
 
     // --- 2026-07-06: source racing (local, no debrid) ---
 
