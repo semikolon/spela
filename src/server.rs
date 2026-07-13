@@ -1705,7 +1705,17 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         q.contains("2160") || q.contains("4k") || q.contains("uhd")
     });
     let progress_gate_secs = if is_large_source { 30 } else { 12 };
-    let probe_timeout_secs = if is_large_source { 30 } else { 10 };
+    // 2026-07-13: probe patience (wait ONLY when we have to). A day-one
+    // poisoned swarm stalls the FIRST bytes ~30s (decoys choke the opening)
+    // then flows — measured: HotD S03E04 1080p delivered 0 bytes for ~30s,
+    // then 11 MB. The old 10s non-large ceiling quit right before the
+    // breakthrough ("couldn't load"). ffprobe returns the INSTANT the header
+    // is readable, so a healthy source still probes in ~2s with ZERO added
+    // latency; the 30s is only ever consumed when bytes are genuinely
+    // stalled. A truly seedless source (0 peers) never reaches here — it
+    // fails fast at the progress gate above, then handle_play rotates to the
+    // next ranked source.
+    let probe_timeout_secs = 30;
     if !is_local {
         // No local-library or remote-origin source was found. A torrent
         // is the only remaining path, so the magnet is genuinely
