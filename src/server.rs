@@ -274,6 +274,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/prev", post(handle_prev))
         .route("/targets", get(handle_targets))
         .route("/history", get(handle_history))
+        .route("/recent", get(handle_recent))
         // Web-remote My Library (US-3): aggregate curated collection
         // (local library_dirs + remote serve-library origins).
         .route("/library", get(handle_library))
@@ -5074,6 +5075,39 @@ async fn handle_targets(State(state): State<SharedState>) -> Json<Value> {
 async fn handle_history(State(state): State<SharedState>) -> Json<Value> {
     let app_state = AppState::load(&state.state_dir);
     Json(json!({"history": app_state.history.iter().take(20).collect::<Vec<_>>()}))
+}
+
+/// `GET /recent` — "Continue watching" row: the distinct shows/movies played in
+/// the last 14 days, most-recent first, deduped by show (fallback title). The
+/// first slice of the spela-native watch tracker. History is newest-first, so
+/// the first occurrence per show IS the most recent. (2026-07-13)
+async fn handle_recent(State(state): State<SharedState>) -> Json<Value> {
+    let app = AppState::load(&state.state_dir);
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::new();
+    for e in &app.history {
+        if e.watched_at < cutoff {
+            continue;
+        }
+        let key = e.show.clone().unwrap_or_else(|| e.title.clone());
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        out.push(json!({
+            "label": key,
+            "query": e.show.clone().unwrap_or_else(|| e.title.clone()),
+            "show": e.show,
+            "season": e.season,
+            "episode": e.episode,
+            "imdb_id": e.imdb_id,
+            "watched_at": e.watched_at,
+        }));
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    Json(json!({ "recent": out }))
 }
 
 /// `GET /library` — aggregated curated-library browse for the web-remote

@@ -102,6 +102,19 @@
   .src.partial{border-color:var(--good);background:linear-gradient(90deg,rgba(55,200,122,.16),var(--bg3))}
   .src .dl{color:var(--good);font-weight:800;white-space:nowrap}
   .src-toggle.has-partial{color:var(--good)}
+  /* 2026-07-13: "Continue watching" row (spela-native tracker, slice 1) */
+  .recent{display:none;margin:.2rem 0 .4rem}
+  .recent.on{display:block}
+  .recent .rlab{color:var(--dim);font-size:.72rem;font-weight:700;letter-spacing:.04em;
+    text-transform:uppercase;margin:.1rem .15rem .4rem}
+  .recent .chips{display:flex;gap:.5rem;overflow-x:auto;padding-bottom:.3rem;
+    scrollbar-width:none;-webkit-overflow-scrolling:touch}
+  .recent .chips::-webkit-scrollbar{display:none}
+  .recent .chip{flex:0 0 auto;background:var(--bg3);border:1px solid var(--line);
+    border-radius:11px;padding:.5rem .8rem;font-size:.82rem;font-weight:600;color:var(--fg);
+    white-space:nowrap;max-width:62vw;overflow:hidden;text-overflow:ellipsis;touch-action:manipulation}
+  .recent .chip .ep{color:var(--dim);font-weight:500;margin-left:.35rem;font-size:.76rem}
+  .recent .chip:active{border-color:var(--accent2);transform:scale(.97)}
 
   /* ---- search detail (single result): adaptive, fills the width intelligently.
      2026-07-13: search renders ONE card (show + nested sources), so the shared
@@ -316,6 +329,7 @@
         <button data-m="tv" data-ic="tv">TV</button>
       </div>
     </div>
+    <div id="recentRow" class="recent"></div>
     <div id="searchOut"></div>
   </section>
 
@@ -416,6 +430,7 @@ function route(){
   $$("nav a").forEach(a=>a.classList.toggle("on",a.dataset.v===known));
   if(known==="now") renderNowFull();
   if(known==="library") renderLibrary();
+  if(known==="search") loadRecent();
 }
 addEventListener("hashchange",route);
 
@@ -484,6 +499,28 @@ seg.onclick=e=>{ const b=e.target.closest("button"); if(!b)return;
   S.mode=b.dataset.m; sessionStorage.setItem(MKEY,S.mode);
   [...seg.children].forEach(x=>x.classList.toggle("on",x===b));
   if(S.search.q) runSearch(S.search.q); };
+function setMode(m){ S.mode=m; sessionStorage.setItem(MKEY,S.mode);
+  [...seg.children].forEach(x=>x.classList.toggle("on",x.dataset.m===m)); }
+
+// "Continue watching" row — spela-native tracker, slice 1. Shows the distinct
+// titles played in spela over the last 14 days (from /recent); tap a chip to
+// jump straight to that show's sources. Hides when there's no recent history.
+async function loadRecent(){
+  const row=$("#recentRow"); if(!row) return;
+  let d; try{ d=await api("/recent"); }catch(e){ return; }
+  const items=(d&&d.recent)||[];
+  if(!items.length){ row.classList.remove("on"); row.innerHTML=""; return; }
+  row.innerHTML=""; row.appendChild(el("div",{className:"rlab",textContent:"Continue watching"}));
+  const chips=el("div",{className:"chips"});
+  items.forEach(it=>{
+    const c=el("button",{className:"chip"});
+    c.innerHTML=esc(it.label)+(it.season?`<span class="ep">S${String(it.season).padStart(2,"0")}E${String(it.episode||0).padStart(2,"0")}</span>`:"");
+    c.onclick=()=>{ setMode(it.season?"tv":"movie");
+      $("#q").value=it.query; S.search.q=it.query; runSearch(it.query); };
+    chips.appendChild(c);
+  });
+  row.appendChild(chips); row.classList.add("on");
+}
 
 let dT;
 $("#q").addEventListener("input",e=>{ const q=e.target.value.trim();
