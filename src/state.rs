@@ -45,6 +45,12 @@ pub struct AppState {
     /// free and lookup is O(1).
     #[serde(default)]
     pub corrupt_files: std::collections::HashSet<String>,
+    /// 2026-07-13: spela-native watch tracker (roadmap slice 2). Episodes/movies
+    /// auto-marked "watched" when a play reaches completion (~HWM_CLEAR_FRACTION),
+    /// keyed like `resume_positions`. Newest-first, deduped by key, capped. Feeds
+    /// the recommender's seen-check + a future "watched / up-next" view.
+    #[serde(default)]
+    pub watched: Vec<WatchedEntry>,
 }
 
 /// Apr 29, 2026: a queued play request for auto-firing when the current
@@ -164,6 +170,20 @@ pub struct HistoryEntry {
     pub target: Option<String>,
 }
 
+/// A completed play in the spela-native watch-ledger (roadmap slice 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchedEntry {
+    /// Same key as `resume_positions` (imdb+SxxExx suffix, or slug) — the
+    /// dedup + "have I seen this?" identity.
+    pub key: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imdb_id: Option<String>,
+    pub watched_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preferences {
     #[serde(default = "default_target")]
@@ -196,6 +216,7 @@ impl Default for AppState {
         Self {
             current: None,
             history: Vec::new(),
+            watched: Vec::new(),
             preferences: Preferences::default(),
             resume_positions: HashMap::new(),
             queue: Vec::new(),
@@ -279,6 +300,7 @@ impl AppState {
                     t,
                     dur
                 );
+                self.mark_watched(&key, imdb_id.clone(), title.clone());
                 self.reset_position(imdb_id, title);
                 return (key, true);
             }
@@ -312,6 +334,30 @@ impl AppState {
         };
         self.resume_positions.remove(&key);
         key
+    }
+
+    /// Record a completed play in the watch-ledger (dedup by key, newest-first,
+    /// capped at 500). Called from `save_position_smart`'s completion branch, so
+    /// it rides spela's existing "watched to the end" detection.
+    pub fn mark_watched(&mut self, key: &str, imdb_id: Option<String>, title: Option<String>) {
+        let title = title.unwrap_or_default();
+        let show = if title.is_empty() {
+            None
+        } else {
+            Some(crate::search::clean_title_for_tmdb(&title))
+        };
+        self.watched.retain(|w| w.key != key);
+        self.watched.insert(
+            0,
+            WatchedEntry {
+                key: key.to_string(),
+                title,
+                show,
+                imdb_id,
+                watched_at: Utc::now(),
+            },
+        );
+        self.watched.truncate(500);
     }
 }
 

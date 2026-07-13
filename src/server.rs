@@ -275,6 +275,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/targets", get(handle_targets))
         .route("/history", get(handle_history))
         .route("/recent", get(handle_recent))
+        .route("/watched", get(handle_watched))
         // Web-remote My Library (US-3): aggregate curated collection
         // (local library_dirs + remote serve-library origins).
         .route("/library", get(handle_library))
@@ -5114,6 +5115,14 @@ async fn handle_recent(State(state): State<SharedState>) -> Json<Value> {
         }
     }
     Json(json!({ "recent": out }))
+}
+
+/// `GET /watched` — the spela-native watch-ledger (roadmap slice 2): everything
+/// auto-marked watched (a play that reached ~completion), newest-first. Powers
+/// the recommender's seen-check + a future watched/up-next view.
+async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
+    let app = AppState::load(&state.state_dir);
+    Json(json!({"watched": app.watched.iter().take(200).collect::<Vec<_>>()}))
 }
 
 /// `GET /library` — aggregated curated-library browse for the web-remote
