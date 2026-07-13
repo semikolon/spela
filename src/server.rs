@@ -1693,6 +1693,19 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // `CurrentStream.pid` and `server_url` is the URL ffmpeg fetches from
     // (`http://stream_host:port/torrent/{id}/stream/{file_idx}` —
     // FileStream-backed via librqbit, served on the same axum router).
+    // 2026-07-13: 4K/large sources ramp peers slower (bigger pieces, more
+    // hashing) — the default 12s progress gate + 10s probe timeout give up
+    // before a healthy-but-slow-starting 4K swarm delivers byte-0. Give 2160p
+    // sources a longer runway on both gates. Detected from the search-result
+    // quality label (set at result_id resolution). Function-scope so both the
+    // progress gate (in the !is_local block) and the codec probe (in the
+    // cache-miss block below) can read it.
+    let is_large_source = req.quality.as_deref().map_or(false, |q| {
+        let q = q.to_lowercase();
+        q.contains("2160") || q.contains("4k") || q.contains("uhd")
+    });
+    let progress_gate_secs = if is_large_source { 30 } else { 12 };
+    let probe_timeout_secs = if is_large_source { 30 } else { 10 };
     if !is_local {
         // No local-library or remote-origin source was found. A torrent
         // is the only remaining path, so the magnet is genuinely
@@ -1744,11 +1757,16 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         ));
 
         // Self-healing: check download progress
-        if !check_torrent_progress(state, pid, 12).await {
-            tracing::warn!("Torrent has no download progress after 12s — dead seeds");
+        if !check_torrent_progress(state, pid, progress_gate_secs).await {
+            tracing::warn!(
+                "Torrent has no download progress after {}s — dead seeds",
+                progress_gate_secs
+            );
             stop_torrent(state, pid, true).await;
             disk::prune_disk(&media_dir, ""); // Clean up any dead attempt
-            return Json(json!({"error": "Torrent has no active seeds (0% after 12s)"}));
+            return Json(json!({
+                "error": format!("Torrent has no active seeds (0% after {}s)", progress_gate_secs)
+            }));
         }
 
         if smooth_mode && target == "chromecast" {
@@ -1920,9 +1938,9 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                     default_codec_info()
                 })
         } else {
-            const TORRENT_CODEC_DETECT_TIMEOUT_SECS: u64 = 10;
+            let torrent_codec_detect_timeout_secs: u64 = probe_timeout_secs;
             match tokio::time::timeout(
-                tokio::time::Duration::from_secs(TORRENT_CODEC_DETECT_TIMEOUT_SECS),
+                tokio::time::Duration::from_secs(torrent_codec_detect_timeout_secs),
                 transcode::detect_codecs(&server_url, preferred_audio_lang.as_deref()),
             )
             .await
@@ -1939,14 +1957,14 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 Err(_) => {
                     tracing::warn!(
                         "Torrent codec detection timed out after {}s — trying next source",
-                        TORRENT_CODEC_DETECT_TIMEOUT_SECS
+                        torrent_codec_detect_timeout_secs
                     );
                     stop_torrent(state, pid, true).await;
                     disk::prune_disk(&media_dir, "");
                     return Json(json!({
                         "error": format!(
                             "Torrent probe timed out after {}s before playback.",
-                            TORRENT_CODEC_DETECT_TIMEOUT_SECS
+                            torrent_codec_detect_timeout_secs
                         )
                     }));
                 }
