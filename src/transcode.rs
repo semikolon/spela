@@ -364,8 +364,15 @@ pub async fn detect_codecs(url: &str, preferred_lang: Option<&str>) -> Result<Co
     let mut audio_codec = None;
     let mut duration = None;
     let mut height: Option<u32> = None;
-    let mut current_type: Option<String> = None;
-    let mut current_lang: Option<String> = None;
+    // Per-stream buffers, finalized at [/STREAM] so parsing is INDEPENDENT of the
+    // order ffprobe emits fields. ffprobe emits codec_name BEFORE codec_type, which
+    // silently left video_codec/audio_codec unset in the old classify-at-codec_name
+    // approach → the 4K pass-through gate's HEVC check failed → every 4K play fell
+    // into the NVENC transcode that chokes on the source. (2026-07-13)
+    let mut cur_codec: Option<String> = None;
+    let mut cur_type: Option<String> = None;
+    let mut cur_lang: Option<String> = None;
+    let mut cur_height: Option<u32> = None;
 
     // Collect all audio streams with their language tags
     struct AudioStream {
@@ -376,62 +383,58 @@ pub async fn detect_codecs(url: &str, preferred_lang: Option<&str>) -> Result<Co
     let mut audio_streams: Vec<AudioStream> = Vec::new();
     let mut audio_count = 0usize;
 
-    for line in combined.lines() {
-        if line.starts_with("[STREAM]") {
-            current_type = None;
-            current_lang = None;
-        }
-        if let Some(ct) = line.strip_prefix("codec_type=") {
-            current_type = Some(ct.trim().to_string());
-        }
-        if let Some(cn) = line.strip_prefix("codec_name=") {
-            match current_type.as_deref() {
-                Some("video") if video_codec.is_none() => {
-                    video_codec = Some(cn.trim().to_string());
+    for raw in combined.lines() {
+        let line = raw.trim();
+        if line == "[STREAM]" {
+            cur_codec = None;
+            cur_type = None;
+            cur_lang = None;
+            cur_height = None;
+        } else if let Some(cn) = line.strip_prefix("codec_name=") {
+            cur_codec = Some(cn.trim().to_string());
+        } else if let Some(ct) = line.strip_prefix("codec_type=") {
+            cur_type = Some(ct.trim().to_string());
+        } else if let Some(h) = line.strip_prefix("height=") {
+            if let Ok(v) = h.trim().parse::<u32>() {
+                if v > 0 {
+                    cur_height = Some(v);
+                }
+            }
+        } else if let Some(lang) = line.strip_prefix("TAG:language=") {
+            cur_lang = Some(lang.trim().to_lowercase());
+        } else if line == "[/STREAM]" {
+            // Finalize this stream — order-independent (all fields now buffered).
+            match cur_type.as_deref() {
+                Some("video") => {
+                    if video_codec.is_none() {
+                        video_codec = cur_codec.clone();
+                    }
+                    // First video stream's height (guard against attached-pic /
+                    // thumbnail streams overwriting a real value).
+                    if height.is_none() {
+                        height = cur_height;
+                    }
                 }
                 Some("audio") => {
-                    let codec = cn.trim().to_string();
+                    let codec = cur_codec.clone().unwrap_or_default();
                     if audio_codec.is_none() {
                         audio_codec = Some(codec.clone());
                     }
-                    // We'll finalize the AudioStream at [/STREAM]
-                    // For now just note the codec
-                    current_lang = current_lang.or(Some(String::new()));
-                    // Temporarily store codec in current_lang's place
-                    // Actually, let's collect at [/STREAM]
+                    audio_streams.push(AudioStream {
+                        audio_index: audio_count,
+                        codec,
+                        lang: cur_lang.clone().unwrap_or_default(),
+                    });
+                    audio_count += 1;
                 }
                 _ => {}
             }
-        }
-        if let Some(h) = line.strip_prefix("height=") {
-            // First video stream's height only (guard against attached-pic /
-            // thumbnail streams overwriting it with a later value).
-            if current_type.as_deref() == Some("video") && height.is_none() {
-                if let Ok(v) = h.trim().parse::<u32>() {
-                    if v > 0 {
-                        height = Some(v);
-                    }
-                }
-            }
-        }
-        if let Some(lang) = line.strip_prefix("TAG:language=") {
-            current_lang = Some(lang.trim().to_lowercase());
-        }
-        if line.starts_with("[/STREAM]") {
-            if current_type.as_deref() == Some("audio") {
-                let codec = audio_codec.clone().unwrap_or_default();
-                let lang = current_lang.take().unwrap_or_default();
-                audio_streams.push(AudioStream {
-                    audio_index: audio_count,
-                    codec: codec,
-                    lang,
-                });
-                audio_count += 1;
-            }
-            current_type = None;
-            current_lang = None;
-        }
-        if let Some(dur) = line.strip_prefix("duration=") {
+            cur_codec = None;
+            cur_type = None;
+            cur_lang = None;
+            cur_height = None;
+        } else if let Some(dur) = line.strip_prefix("duration=") {
+            // In the trailing [FORMAT] block (not inside a stream).
             if let Ok(d) = dur.trim().parse::<f64>() {
                 duration = Some(d);
             }
