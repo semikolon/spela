@@ -636,7 +636,7 @@ impl SearchEngine {
         // off the list entirely — so a browser on a 4K display could never even
         // pick one. 24 keeps the well-seeded 4K reachable under "More sources"
         // while still bounding the list.
-        Ok(results.into_iter().take(24).collect())
+        Ok(results.into_iter().take(40).collect())
     }
 }
 
