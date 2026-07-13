@@ -1056,7 +1056,7 @@ fn extract_episode(val: &Value) -> Option<EpisodeRef> {
 ///     so we don't end up with `https://image.tmdb.org/t/p/w500https://...`
 ///   - Missing leading slash → still works, we insert one
 /// Web-remote T-4: strip scene-release noise so the TMDB query is the bare work title. Pure, RED-GREEN tested; boundary-only (never mutates `LibraryEntry.title`, so play/bypass is intact).
-fn clean_title_for_tmdb(raw: &str) -> String {
+pub(crate) fn clean_title_for_tmdb(raw: &str) -> String {
     // Truncate at the FIRST scene "stop token" after normalising `._-`
     // to spaces. Unambiguous markers (SxxExx / Sxx / NxNN / NNNp / WxH)
     // stop anywhere; a 4-digit year and the source/codec/tag keyword set

@@ -5090,13 +5090,19 @@ async fn handle_recent(State(state): State<SharedState>) -> Json<Value> {
         if e.watched_at < cutoff {
             continue;
         }
-        let key = e.show.clone().unwrap_or_else(|| e.title.clone());
-        if !seen.insert(key.clone()) {
+        // Clean the raw title/show (strips SxxExx + quality/release junk) so the
+        // chip reads "Silo" / "American Psycho", not "Silo S03E01" / "American
+        // Psyco (2000) 1080p" — and dedups shows whose history rows disagree on
+        // whether `show` or a raw `title` was stored.
+        let base = e.show.as_deref().unwrap_or(&e.title);
+        let label = crate::search::clean_title_for_tmdb(base);
+        let key = label.to_lowercase();
+        if label.is_empty() || !seen.insert(key.clone()) {
             continue;
         }
         out.push(json!({
-            "label": key,
-            "query": e.show.clone().unwrap_or_else(|| e.title.clone()),
+            "label": label,
+            "query": label,
             "show": e.show,
             "season": e.season,
             "episode": e.episode,
