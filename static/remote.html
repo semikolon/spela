@@ -107,9 +107,7 @@
   .recent.on{display:block}
   .recent .rlab{color:var(--dim);font-size:.72rem;font-weight:700;letter-spacing:.04em;
     text-transform:uppercase;margin:.1rem .15rem .4rem}
-  .recent .chips{display:flex;gap:.5rem;overflow-x:auto;padding-bottom:.3rem;
-    scrollbar-width:none;-webkit-overflow-scrolling:touch}
-  .recent .chips::-webkit-scrollbar{display:none}
+  .recent .chips{display:flex;flex-wrap:wrap;gap:.5rem;padding-bottom:.3rem}
   .recent .chip{flex:0 0 auto;background:var(--bg3);border:1px solid var(--line);
     border-radius:11px;padding:.5rem .8rem;font-size:.82rem;font-weight:600;color:var(--fg);
     white-space:nowrap;max-width:62vw;overflow:hidden;text-overflow:ellipsis;touch-action:manipulation}
@@ -510,7 +508,7 @@ async function loadRecent(){
   let d; try{ d=await api("/recent"); }catch(e){ return; }
   const items=(d&&d.recent)||[];
   if(!items.length){ row.classList.remove("on"); row.innerHTML=""; return; }
-  row.innerHTML=""; row.appendChild(el("div",{className:"rlab",textContent:"Continue watching"}));
+  row.innerHTML=""; row.appendChild(el("div",{className:"rlab",textContent:"Recently watched"}));
   const chips=el("div",{className:"chips"});
   items.forEach(it=>{
     const c=el("button",{className:"chip"});
