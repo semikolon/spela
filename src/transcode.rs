@@ -1261,8 +1261,15 @@ pub async fn transcode_hls_passthrough(
         "6".into(),
         "-hls_list_size".into(),
         "0".into(),
+        // VOD, not event: hls.js keys "live vs VOD" off `#EXT-X-ENDLIST`, and
+        // `event` NEVER writes ENDLIST (even on EOF) → hls.js treats the finished
+        // stream as eternally LIVE and syncs the playhead toward the far edge
+        // (60 min ahead while you're at minute 1) → frames "jump to random
+        // segments far into the source". `vod` appends ENDLIST when ffmpeg EOFs →
+        // hls.js switches to a fixed VOD timeline → plays 0→end, no live-sync.
+        // (2026-07-13)
         "-hls_playlist_type".into(),
-        "event".into(),
+        "vod".into(),
         "-hls_segment_type".into(),
         "fmp4".into(),
         "-hls_fmp4_init_filename".into(),
