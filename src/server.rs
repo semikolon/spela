@@ -5307,16 +5307,47 @@ fn process_chromecast_observations(state: &SharedState, obs: Vec<crate::cast::Ob
 /// Reads the USER-LOCAL `~/.config/spela/watchlist.json` (seeded from the RT
 /// import; curated by the Claude/CC harness). Personal data lives outside the
 /// public repo. Returns an empty list if the file is absent.
-async fn handle_watchlist() -> Json<Value> {
+async fn handle_watchlist(State(state): State<SharedState>) -> Json<Value> {
     let path = dirs::home_dir().map(|h| h.join(".config/spela/watchlist.json"));
-    if let Some(p) = path {
-        if let Ok(s) = std::fs::read_to_string(&p) {
-            if let Ok(v) = serde_json::from_str::<Value>(&s) {
-                return Json(v);
+    let mut root = path
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({"movies": [], "series": []}));
+    // Exclude what's been watched: flag any entry whose cleaned title is in the
+    // watched-ledger — the "Mark watched" button, Chromecast-confirms, and
+    // auto-track ALL land there, so this is the one place that makes them all
+    // drop out of To-Watch. The To-Watch view's existing `!watched` filter then
+    // hides them; the list's own hardcoded `watched:true` flags are preserved.
+    let app = AppState::load(&state.state_dir);
+    let seen: std::collections::HashSet<String> = app
+        .watched
+        .iter()
+        .filter_map(|w| w.show.clone())
+        .map(|s| s.to_lowercase())
+        .collect();
+    if !seen.is_empty() {
+        for key in ["movies", "series"] {
+            if let Some(arr) = root.get_mut(key).and_then(|v| v.as_array_mut()) {
+                for e in arr.iter_mut() {
+                    if e.get("watched").and_then(|v| v.as_bool()) == Some(true) {
+                        continue;
+                    }
+                    let cleaned = e
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .map(|t| crate::search::clean_title_for_tmdb(t).to_lowercase());
+                    if let Some(c) = cleaned {
+                        if seen.contains(&c) {
+                            if let Some(obj) = e.as_object_mut() {
+                                obj.insert("watched".into(), Value::Bool(true));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    Json(json!({"movies": [], "series": []}))
+    Json(root)
 }
 
 /// `GET /title-meta?title=X&tv=1` — poster URL + release year for a watchlist

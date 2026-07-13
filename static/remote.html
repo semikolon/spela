@@ -36,7 +36,7 @@
   header{position:sticky;top:0;z-index:20;background:rgba(11,11,15,.92);
     backdrop-filter:saturate(140%) blur(8px);border-bottom:1px solid var(--line);
     padding:calc(.6rem + var(--safe-t)) .8rem .6rem;display:flex;align-items:center;gap:.6rem}
-  .brand{font-weight:800;letter-spacing:-.02em;font-size:1.15rem}
+  .brand{font-weight:800;letter-spacing:-.02em;font-size:1.15rem;color:var(--fg);cursor:pointer}
   .brand small{color:var(--dim2);font-weight:600;font-size:.7rem;margin-left:.3rem}
   nav{display:flex;gap:.15rem;margin-left:.4rem;background:var(--bg2);border-radius:999px;padding:.2rem}
   nav a{color:var(--dim);padding:.32rem .7rem;border-radius:999px;font-size:.85rem;font-weight:600}
@@ -356,7 +356,7 @@
 <div class="banner" id="banner"><span id="bannerMsg">spela unreachable</span><button id="bannerRetry">Retry</button></div>
 
 <header>
-  <div class="brand">spela<small>remote</small></div>
+  <a href="#/search" class="brand" aria-label="spela — home">spela<small>remote</small></a>
   <nav>
     <a href="#/search" data-v="search" data-ic="search" aria-label="Search"><span class="lbl">Search</span></a>
     <a href="#/library" data-v="library" data-ic="library" aria-label="Library"><span class="lbl">Library</span></a>
@@ -1284,6 +1284,11 @@ setInterval(()=>{ if(S.now.data&&!S.now.cold&&!S.now.seekDrag){
   updateNowBar(); if(currentView()==="now"){ const f=$("#fFill"),cu=$("#fCur"),sl=$("#fSeek");
     if(f&&cu&&sl){ const p=livePos(),m=seekMax(); f.style.width=(m?Math.min(100,p/m*100):0)+"%";
       cu.textContent=fmt(p); if(!S.now.seekDrag) sl.value=Math.round(p); } } } },1000);
+
+/* logo → home: navigate to the search landing AND reset any active search
+   (clear the box + result so the recently-watched / to-confirm bars return). */
+$(".brand")?.addEventListener("click",()=>{ $("#q").value=""; S.search.q="";
+  $("#searchOut").innerHTML=""; if(currentView()==="search"){ loadRecent(); loadPending(); } });
 
 /* ---------- boot ---------- */
 iconizeStatic(); route(); pollNow(true);
