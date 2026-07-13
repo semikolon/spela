@@ -280,6 +280,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/history", get(handle_history))
         .route("/recent", get(handle_recent))
         .route("/watched", get(handle_watched))
+        .route("/watched-add", post(handle_watched_add))
         .route("/pending-watched", get(handle_pending_watched))
         .route(
             "/pending-watched/resolve",
@@ -5134,6 +5135,35 @@ async fn handle_recent(State(state): State<SharedState>) -> Json<Value> {
 async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
     let app = AppState::load(&state.state_dir);
     Json(json!({"watched": app.watched.iter().take(200).collect::<Vec<_>>()}))
+}
+
+/// `POST /watched-add` — mark a movie/series watched from the search detail's
+/// "Mark watched" button. Body `{title, imdb_id?}`. Show-level for a plain show
+/// title (slug key), per-episode when the title carries SxxExx.
+async fn handle_watched_add(
+    State(state): State<SharedState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        return Json(json!({"ok": false, "error": "missing title"}));
+    }
+    let imdb_id = body
+        .get("imdb_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let mut app = AppState::load(&state.state_dir);
+    let ok = app.mark_watched_auto(imdb_id, title);
+    if ok {
+        let _ = app.save(&state.state_dir);
+    }
+    Json(json!({"ok": ok}))
 }
 
 /// `GET /pending-watched` — sessions the Chromecast tracker (slice 5) detected

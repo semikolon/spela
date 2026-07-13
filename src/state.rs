@@ -389,6 +389,18 @@ impl AppState {
         self.watched.truncate(500);
     }
 
+    /// Mark a title watched by (imdb_id, title) — builds the resume-position
+    /// key itself (per-episode when the title carries SxxExx, else show/movie
+    /// level). Used by the web-remote "Mark watched" button. Returns false only
+    /// when neither imdb_id nor title is usable.
+    pub fn mark_watched_auto(&mut self, imdb_id: Option<String>, title: String) -> bool {
+        let Some(key) = resume_position_key(imdb_id.as_deref(), Some(&title)) else {
+            return false;
+        };
+        self.mark_watched(&key, imdb_id, Some(title));
+        true
+    }
+
     /// Stage a Chromecast-detected completion for Fredrik to confirm (slice 5).
     /// No-op if it's already confirmed-watched, already dismissed, or already
     /// pending (dedup by key). Returns true if a NEW pending item was added.

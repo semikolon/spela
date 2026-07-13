@@ -135,6 +135,14 @@
   #towatchOut .src .x{flex:0 0 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40%}
   #towatchOut .src .s{flex:0 0 auto}
   #towatchOut .src{transition:background-image .3s ease}
+  /* 2026-07-13: "Mark watched" secondary button on the search detail card. */
+  .markw{background:var(--bg3);border:1px solid var(--line);border-radius:12px;
+    padding:.55rem 1rem;color:var(--fg);font-weight:700;font-size:.9rem;min-height:48px;
+    display:flex;align-items:center;justify-content:center;touch-action:manipulation}
+  .markw:active{transform:scale(.97);border-color:var(--accent2)}
+  .markw.done{color:var(--good);border-color:var(--good);background:rgba(55,200,122,.1)}
+  .card .markw{margin:.5rem .7rem 0}
+  .detail .body>.markw{margin:.6rem 0 0;max-width:260px}
   /* 2026-07-13: Chromecast auto-track confirm prompt (slice 5). A house-TV
      session was detected as watched — but housemates use these TVs, so ASK
      before it enters Fredrik's ledger. */
@@ -472,7 +480,7 @@ function route(){
   $$("nav a").forEach(a=>a.classList.toggle("on",a.dataset.v===known));
   if(known==="now") renderNowFull();
   if(known==="library") renderLibrary();
-  if(known==="search"){ loadRecent(); loadPending(); }
+  if(known==="search" && !S.search.q){ loadRecent(); loadPending(); }
   if(known==="towatch") renderToWatch();
 }
 
@@ -520,7 +528,7 @@ async function enrichToWatchRow(row,title,isTV){
 addEventListener("hashchange",route);
 
 /* ---------- poster card (skeleton -> img | titled fallback) ---------- */
-function posterCard({poster,title,year,cta,onPlay,sources}){
+function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched}){
   const c=el("div",{className:"card"});
   const p=el("div",{className:"poster"});
   const sh=el("div",{className:"shimmer"});
@@ -545,6 +553,13 @@ function posterCard({poster,title,year,cta,onPlay,sources}){
   if(onPlay){
     const b=el("button",{className:"play",textContent:cta||"Play"});
     b.onclick=()=>onPlay(); body.appendChild(b);
+  }
+  if(onMarkWatched){
+    const w=el("button",{className:"markw",textContent:"✓ Mark watched"});
+    w.onclick=async()=>{ if(w.classList.contains("done")) return; w.disabled=true;
+      const ok=await onMarkWatched();
+      if(ok!==false){ w.textContent="✓ Watched"; w.classList.add("done"); } else { w.disabled=false; } };
+    body.appendChild(w);
   }
   if(sources&&sources.length){
     const anyPartial=sources.some(s=>typeof s.partial_pct==="number");
@@ -646,11 +661,23 @@ async function resolvePending(key,watched,card){
 
 let dT;
 $("#q").addEventListener("input",e=>{ const q=e.target.value.trim();
-  clearTimeout(dT); dT=setTimeout(()=>{ S.search.q=q; q?runSearch(q):($("#searchOut").innerHTML=""); },300); });
+  clearTimeout(dT); dT=setTimeout(()=>{ S.search.q=q;
+    if(q){ runSearch(q); } else { $("#searchOut").innerHTML=""; loadRecent(); loadPending(); } },300); });
+
+// Mark the shown movie/series watched (search detail button). Show-level for a
+// plain show title; the server keys per-episode if the title carries SxxExx.
+async function markWatched(title,imdb){
+  try{ const r=await api("/watched-add",{method:"POST",body:{title,imdb_id:imdb||""}});
+    if(r&&r.ok){ toast("Marked watched"); return true; } toast("Couldn’t mark watched"); return false; }
+  catch{ toast("spela unreachable"); return false; }
+}
 
 async function runSearch(q){
   if(S.search.abort) S.search.abort.abort();
   const ac=new AbortController(); S.search.abort=ac;
+  // Viewing a specific title → hide the landing bars (recently-watched +
+  // pending-confirm); they return when the search box is cleared.
+  $("#recentRow")?.classList.remove("on"); $("#pendingRow")?.classList.remove("on");
   const out=$("#searchOut");
   out.innerHTML=`<div class="detail skeleton"><div class="card"><div class="poster"><div class="shimmer"></div></div><div class="meta"><div class="t">&nbsp;</div></div></div></div>`;
   let qs="q="+encodeURIComponent(q); if(S.mode==="movie") qs+="&movie=1";
@@ -667,7 +694,8 @@ async function runSearch(q){
   const card=posterCard({
     poster:show.poster_url, title:show.title||res[0].title, year:year||undefined,
     cta:"Play best source", sources:res,
-    onPlay:()=>doPlay({result_id:res[0].id}, card)
+    onPlay:()=>doPlay({result_id:res[0].id}, card),
+    onMarkWatched:()=>markWatched(show.title||res[0].title, show.imdb_id)
   });
   grid.appendChild(card); out.innerHTML=""; out.appendChild(grid);
 }
