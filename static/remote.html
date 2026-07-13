@@ -616,7 +616,24 @@ function attachPhoneVideo(v,src){
   if(!v) return;
   if(v.canPlayType("application/vnd.apple.mpegurl")){ v.src=src; v.play().catch(()=>{}); return; }
   const go=()=>{
-    if(window.Hls&&Hls.isSupported()){ const h=new Hls();
+    if(window.Hls&&Hls.isSupported()){
+      // 2026-07-13: 4K HEVC segments are huge (7-16 MB each), so hls.js's
+      // default unbounded buffer overflows Chrome's MSE SourceBuffer quota
+      // (QuotaExceededError) → it stops appending → playback drains the buffer
+      // → SPIN, and hls.js's recovery flushes + re-seeks → "jumped to a
+      // different segment". Bound the buffer hard by BOTH seconds and bytes,
+      // evict watched buffer, start at 0 (not the EVENT-playlist live edge,
+      // which was the segment-jump), and self-heal fatal media/network errors.
+      const h=new Hls({
+        startPosition: 0,
+        maxBufferLength: 12,
+        maxMaxBufferLength: 24,
+        backBufferLength: 12,
+        maxBufferSize: 30*1000*1000
+      });
+      h.on(Hls.Events.ERROR,(_,d)=>{ if(!d.fatal) return;
+        if(d.type===Hls.ErrorTypes.MEDIA_ERROR) h.recoverMediaError();
+        else if(d.type===Hls.ErrorTypes.NETWORK_ERROR) h.startLoad(); });
       h.loadSource(src); h.attachMedia(v); h.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{})); }
     else { v.src=src; v.play().catch(()=>{}); }
   };
