@@ -6160,7 +6160,7 @@ fn resolve_local_file_for_result(
 fn resolve_result_for_vlc(
     state: &SharedState,
     rid: usize,
-) -> Option<(String, Option<u32>, String)> {
+) -> Option<(String, Option<u32>, String, String)> {
     let search = AppState::load_last_search(&state.state_dir)?;
     let r = search.results.iter().find(|r| r.id == rid)?;
     let title = match (&search.show, search.searching.as_ref()) {
@@ -6168,11 +6168,42 @@ fn resolve_result_for_vlc(
         (Some(show), None) => show.title.clone(),
         _ => r.title.clone(),
     };
+    // spela's audio rule: play the title's ORIGINAL language, never a dub. VLC
+    // picks by track language tag, so pass original_language as a 2+3-letter
+    // preference list (`--audio-language` / #EXTVLCOPT). Default English.
+    let orig = search
+        .show
+        .as_ref()
+        .and_then(|s| s.original_language.clone())
+        .unwrap_or_else(|| "en".to_string());
     Some((
         r.magnet.clone(),
         r.file_index,
         title.replace(['/', '\\'], "-"),
+        vlc_audio_lang_pref(&orig),
     ))
+}
+
+/// Map a TMDB original_language to a VLC `--audio-language` preference list (2+3
+/// letter, since embedded tracks are tagged either way). VLC tries them in order
+/// and picks the first matching track — so a Polish release of an English
+/// original still plays English. Unknown codes pass through as-is.
+fn vlc_audio_lang_pref(orig: &str) -> String {
+    match orig.to_ascii_lowercase().as_str() {
+        "en" | "eng" => "en,eng",
+        "da" | "dan" => "da,dan",
+        "ja" | "jpn" => "ja,jpn",
+        "ko" | "kor" => "ko,kor",
+        "sv" | "swe" => "sv,swe",
+        "fr" | "fre" | "fra" => "fr,fre,fra",
+        "de" | "ger" | "deu" => "de,ger,deu",
+        "es" | "spa" => "es,spa",
+        "it" | "ita" => "it,ita",
+        "no" | "nor" => "no,nor",
+        "nl" | "dut" | "nld" => "nl,dut,nld",
+        other => return other.to_string(),
+    }
+    .to_string()
 }
 
 /// `GET /vlc/{id}/stream` — stream a source to VLC with HTTP Range, for ALL
@@ -6196,7 +6227,7 @@ async fn handle_vlc_stream(
         return serve_static_with_range(path, "video/x-matroska", &headers).await;
     }
     // 2/3. Partial or fresh → start/resume the torrent + serve its FileStream.
-    let Some((magnet, file_index, _)) = resolve_result_for_vlc(&state, id) else {
+    let Some((magnet, file_index, _, _)) = resolve_result_for_vlc(&state, id) else {
         return (
             axum::http::StatusCode::NOT_FOUND,
             Json(json!({"error": "Result not found — search again."})),
@@ -6252,7 +6283,7 @@ async fn handle_vlc_playlist(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
 ) -> axum::response::Response {
-    let Some((_, _, name)) = resolve_result_for_vlc(&state, id) else {
+    let Some((_, _, name, audio_lang)) = resolve_result_for_vlc(&state, id) else {
         return (
             axum::http::StatusCode::NOT_FOUND,
             Json(json!({"error": "Result not found — search again."})),
@@ -6260,7 +6291,13 @@ async fn handle_vlc_playlist(
             .into_response();
     };
     let base = format!("http://{}:{}", state.config.stream_host, state.config.port);
-    let body = format!("#EXTM3U\n#EXTINF:-1,{}\n{}/vlc/{}/stream\n", name, base, id);
+    // `#EXTVLCOPT:audio-language` steers VLC to the original-language track on the
+    // .m3u path; `?al=` carries the same to the vlc:// handler (which forwards it
+    // as `--audio-language`). Both make VLC honor spela's "never a dub" rule.
+    let body = format!(
+        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n{}/vlc/{}/stream?al={}\n",
+        name, audio_lang, base, id, audio_lang
+    );
     axum::response::Response::builder()
         .status(200)
         .header("Content-Type", "audio/x-mpegurl")
