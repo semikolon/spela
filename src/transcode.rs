@@ -1261,15 +1261,16 @@ pub async fn transcode_hls_passthrough(
         "6".into(),
         "-hls_list_size".into(),
         "0".into(),
-        // VOD, not event: hls.js keys "live vs VOD" off `#EXT-X-ENDLIST`, and
-        // `event` NEVER writes ENDLIST (even on EOF) → hls.js treats the finished
-        // stream as eternally LIVE and syncs the playhead toward the far edge
-        // (60 min ahead while you're at minute 1) → frames "jump to random
-        // segments far into the source". `vod` appends ENDLIST when ffmpeg EOFs →
-        // hls.js switches to a fixed VOD timeline → plays 0→end, no live-sync.
-        // (2026-07-13)
-        "-hls_playlist_type".into(),
-        "vod".into(),
+        // NO -hls_playlist_type (bare live) — the established spela pattern from
+        // commit 18534f68: ffmpeg writes #EXT-X-ENDLIST automatically on exit, so
+        // the manifest is "live/growing" during the copy and becomes VOD when the
+        // transcode finishes. hls.js decides live-vs-VOD by ENDLIST presence, so
+        // on completion it stops live-syncing the playhead toward the far edge —
+        // that live-sync was the "frames jump to random segments far into the
+        // source" bug. My earlier `event` NEVER wrote ENDLIST → eternally live →
+        // jump; and both `event`/`vod` PLAYLIST-TYPE tags are HLS-v6 features that
+        // 18534f68 deliberately dropped. During the pre-ENDLIST copy window,
+        // startPosition:0 (SPA hls.js) holds the playhead at 0. (2026-07-13)
         "-hls_segment_type".into(),
         "fmp4".into(),
         "-hls_fmp4_init_filename".into(),
