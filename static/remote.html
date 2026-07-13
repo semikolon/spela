@@ -113,12 +113,13 @@
   @media (min-width:641px){
     .detail .card{display:grid;grid-template-columns:210px 1fr;align-items:start;
       padding:.9rem;column-gap:1.2rem}
-    .detail .card>.poster{grid-column:1;grid-row:1/-1;width:210px;border-radius:12px;align-self:start}
-    .detail .card>.meta{grid-column:2;padding:0}
-    .detail .card>.meta .t{font-size:1.2rem;-webkit-line-clamp:3}
-    .detail .card>.play{grid-column:2;margin:.75rem 0 0;max-width:260px}
-    .detail .card>.src-toggle{grid-column:2;text-align:left;margin:.65rem 0 0}
-    .detail .card>.sources{grid-column:2;margin:.5rem 0 0}
+    .detail .card>.poster{width:210px;border-radius:12px;align-self:start}
+    .detail .card>.body{display:flex;flex-direction:column;align-items:flex-start;min-width:0}
+    .detail .body>.meta{padding:0}
+    .detail .body>.meta .t{font-size:1.2rem;-webkit-line-clamp:3}
+    .detail .body>.play{margin:.75rem 0 0;max-width:260px}
+    .detail .body>.src-toggle{text-align:left;margin:.65rem 0 0}
+    .detail .body>.sources{margin:.5rem 0 0;align-self:stretch}
     .detail .sources.open{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.45rem}
     .detail .src{font-size:.84rem}
   }
@@ -412,13 +413,17 @@ function posterCard({poster,title,year,cta,onPlay,sources}){
     sh.remove(); p.appendChild(el("div",{className:"fallback",textContent:title||"Untitled"}));
   }
   c.appendChild(p);
+  // Content wrapper: on the desktop search "detail" layout the card is a
+  // 2-cell grid (poster | body); grouping the text/play/sources into one body
+  // cell stops the tall poster from stretching per-row heights (title↔play gap).
+  const body=el("div",{className:"body"}); c.appendChild(body);
   const m=el("div",{className:"meta"});
   m.appendChild(el("div",{className:"t",textContent:title||"Untitled"}));
   if(year) m.appendChild(el("div",{className:"y",textContent:year}));
-  c.appendChild(m);
+  body.appendChild(m);
   if(onPlay){
     const b=el("button",{className:"play",textContent:cta||"Play"});
-    b.onclick=()=>onPlay(); c.appendChild(b);
+    b.onclick=()=>onPlay(); body.appendChild(b);
   }
   if(sources&&sources.length){
     const anyPartial=sources.some(s=>typeof s.partial_pct==="number");
@@ -443,7 +448,7 @@ function posterCard({poster,title,year,cta,onPlay,sources}){
     });
     tg.onclick=()=>{box.classList.toggle("open");
       tg.textContent=(box.classList.contains("open")?"Hide sources":collapsed());};
-    c.append(tg,box);
+    body.append(tg,box);
     c._openSources=()=>{box.classList.add("open");tg.textContent="Hide sources";};
   }
   return c;
