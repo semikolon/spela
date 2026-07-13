@@ -41,6 +41,10 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    (RT score shown, <88 dimmed per the gate; already-watched hidden); tap → search
    that title. That's the ARSENAL. The HARNESS = Claude curating/ranking the list
    (reading `taste_profile.md`); still ongoing (Phase 1).
+   **UI polish (2026-07-13):** rows show a half-faded poster background + the
+   release year after the title, via `GET /title-meta` (TMDB `poster_and_year`,
+   disk-cached in `watchlist_meta.json`, lazy per-row). Search box + Movies/TV
+   selector share one line; section headers use `.twhead` (small all-caps).
    **The LLM harness IS Claude/CC now (Phase 1), exactly like DIM** (Fredrik: "the
    LLM is YOU until I say otherwise"). So spela builds the ARSENAL (the to-watch
    store + endpoints + a "To Watch" UI view + the tools: `/search`+TMDB, critics
@@ -60,7 +64,12 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    MIXES to-watch with already-watched-loved — seen-status must be confirmed, not
    assumed.
 
-5. **Auto-track any house Chromecast (non-spela casts) — 🔨 IN PROGRESS (2026-07-13, approved).**
+5. **Auto-track any house Chromecast (non-spela casts) — ✅ SHIPPED (2026-07-13).**
+   `spawn_chromecast_tracker` (60s tokio task) + `probe_device_media` (any-app,
+   read-only) + `pending_watched`/`dismissed_watched` + `GET /pending-watched`
+   + `POST /pending-watched/resolve` + the web-remote confirm prompt. Detector
+   is live; validates in production as the household uses the TVs (observe-first
+   INFO logging learns per-app metadata shapes). Design below unchanged.
    Poll each house Chromecast's media status; match to TMDB; auto-mark watched —
    so shows watched on Netflix/YouTube/Disney+ (not via spela) still land in the
    tracker with zero manual effort. **Cadence: 60s** (media state changes slowly;
