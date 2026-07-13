@@ -123,8 +123,18 @@
   .twhead:first-child{margin-top:.25rem}
   /* 2026-07-13: To-Watch rows get a half-faded poster background + the release
      year after the title (both TMDB-fetched via /title-meta, lazy + cached). */
+  /* Single-line rows: title truncates with ellipsis (it's what varies most),
+     year/note/score stay fixed → every row is the same height, titles stay
+     left-aligned (no wrap-induced centering). The grid cells are minmax(0,1fr)
+     so the flex title can shrink below its content width. */
+  #towatchOut .src{flex-wrap:nowrap;overflow:hidden}
+  #towatchOut .src .q{flex:0 1 auto;min-width:0;white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;text-align:left}
+  #towatchOut .src .ty{flex:0 0 auto;white-space:nowrap;color:var(--dim);
+    font-weight:600;font-size:.82rem;margin-left:.45rem}
+  #towatchOut .src .x{flex:0 0 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40%}
+  #towatchOut .src .s{flex:0 0 auto}
   #towatchOut .src{transition:background-image .3s ease}
-  #towatchOut .src .ty{color:var(--dim);font-weight:600;font-size:.82rem;margin-left:.45rem}
   /* 2026-07-13: Chromecast auto-track confirm prompt (slice 5). A house-TV
      session was detected as watched — but housemates use these TVs, so ASK
      before it enters Fredrik's ledger. */
