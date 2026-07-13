@@ -143,6 +143,15 @@
   .markw.done{color:var(--good);border-color:var(--good);background:rgba(55,200,122,.1)}
   .card .markw{margin:.5rem .7rem 0}
   .detail .body>.markw{margin:.6rem 0 0;max-width:260px}
+  /* 2026-07-13: "Rotten Tomatoes →" read-more link on the search detail card.
+     Uses RT's search URL (always lands on the title; hand-built /m/ slugs 404
+     on disambiguated titles). Works for movies AND series, no key. */
+  .rtlink{display:inline-flex;align-items:center;gap:.4rem;background:var(--bg3);
+    border:1px solid var(--line);border-radius:12px;padding:.55rem 1rem;color:var(--fg);
+    font-weight:700;font-size:.9rem;min-height:48px;touch-action:manipulation}
+  .rtlink:active{transform:scale(.97);border-color:var(--accent2)}
+  .card .rtlink{margin:.5rem .7rem 0}
+  .detail .body>.rtlink{margin:.6rem 0 0;max-width:260px}
   /* 2026-07-13: Chromecast auto-track confirm prompt (slice 5). A house-TV
      session was detected as watched — but housemates use these TVs, so ASK
      before it enters Fredrik's ledger. */
@@ -528,7 +537,7 @@ async function enrichToWatchRow(row,title,isTV){
 addEventListener("hashchange",route);
 
 /* ---------- poster card (skeleton -> img | titled fallback) ---------- */
-function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched}){
+function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle}){
   const c=el("div",{className:"card"});
   const p=el("div",{className:"poster"});
   const sh=el("div",{className:"shimmer"});
@@ -560,6 +569,12 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched}){
       const ok=await onMarkWatched();
       if(ok!==false){ w.textContent="✓ Watched"; w.classList.add("done"); } else { w.disabled=false; } };
     body.appendChild(w);
+  }
+  if(rtTitle){
+    const rt=el("a",{className:"rtlink",textContent:"🍅 Rotten Tomatoes →",
+      href:"https://www.rottentomatoes.com/search?search="+encodeURIComponent(rtTitle),
+      target:"_blank",rel:"noopener"});
+    body.appendChild(rt);
   }
   if(sources&&sources.length){
     const anyPartial=sources.some(s=>typeof s.partial_pct==="number");
@@ -695,7 +710,8 @@ async function runSearch(q){
     poster:show.poster_url, title:show.title||res[0].title, year:year||undefined,
     cta:"Play best source", sources:res,
     onPlay:()=>doPlay({result_id:res[0].id}, card),
-    onMarkWatched:()=>markWatched(show.title||res[0].title, show.imdb_id)
+    onMarkWatched:()=>markWatched(show.title||res[0].title, show.imdb_id),
+    rtTitle:show.title||res[0].title
   });
   grid.appendChild(card); out.innerHTML=""; out.appendChild(grid);
 }

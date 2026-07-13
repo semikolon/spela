@@ -45,6 +45,21 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    release year after the title, via `GET /title-meta` (TMDB `poster_and_year`,
    disk-cached in `watchlist_meta.json`, lazy per-row). Search box + Movies/TV
    selector share one line; section headers use `.twhead` (small all-caps).
+   **Search detail card (2026-07-13):** "✓ Mark watched" button (→ watched-ledger,
+   which now also excludes the title from To-Watch), plus a "🍅 Rotten Tomatoes →"
+   read-more link (RT *search* URL — robust for movies AND series, no key; a
+   hand-built `/m/<slug>` 404s on disambiguated titles per the research).
+
+6. **Critic blurb (LLM-written, cached) — FUTURE, deferred 2026-07-13.** RT-as-a-
+   source is out: MDBList gives scores + a link but **no consensus prose**; RT's
+   written consensus is **movies-only** (OMDb `tomatoConsensus`) and **TV consensus
+   has no clean/legal structured source** (scrape-only, against Fandango ToS — see
+   `docs/rt_score_fetch_research_2026-07-13.md`). The only path that covers movies
+   AND series is an **LLM-written critic-sentiment blurb** (the recommender's Claude
+   harness): synthesize 1-2 lines from a spread of critics/reviews, **cache to disk**
+   (like `/title-meta`), labeled as a summary (not a quote). Deferred until the
+   recommender harness work; do NOT scrape RT. Fredrik: *"Maybe an LLM-written (and
+   cached) blurb from a bunch of critics/reviews, in the future."*
    **The LLM harness IS Claude/CC now (Phase 1), exactly like DIM** (Fredrik: "the
    LLM is YOU until I say otherwise"). So spela builds the ARSENAL (the to-watch
    store + endpoints + a "To Watch" UI view + the tools: `/search`+TMDB, critics
