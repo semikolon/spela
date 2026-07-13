@@ -6154,24 +6154,90 @@ fn resolve_local_file_for_result(
     Some((path, name))
 }
 
-/// `GET /vlc/{id}/stream` — serve the resolved on-disk source with HTTP Range so
-/// VLC (or any external player) streams it directly with full seek. LAN-scoped
-/// (Host-header allowlist middleware still applies).
+/// Resolve a search-result id to `(magnet, file_index, display_title)`,
+/// REGARDLESS of download state. Lets the VLC endpoints work for fresh, partial,
+/// and fully-downloaded sources alike.
+fn resolve_result_for_vlc(
+    state: &SharedState,
+    rid: usize,
+) -> Option<(String, Option<u32>, String)> {
+    let search = AppState::load_last_search(&state.state_dir)?;
+    let r = search.results.iter().find(|r| r.id == rid)?;
+    let title = match (&search.show, search.searching.as_ref()) {
+        (Some(show), Some(ep)) => format!("{} S{:02}E{:02}", show.title, ep.season, ep.episode),
+        (Some(show), None) => show.title.clone(),
+        _ => r.title.clone(),
+    };
+    Some((
+        r.magnet.clone(),
+        r.file_index,
+        title.replace(['/', '\\'], "-"),
+    ))
+}
+
+/// `GET /vlc/{id}/stream` — stream a source to VLC with HTTP Range, for ALL
+/// three states:
+///   1. fully-downloaded  → serve the on-disk file (fastest, fully seekable);
+///   2. partially-downloaded → resume + serve the librqbit FileStream
+///      (downloaded pieces served immediately, missing pieces block until
+///      fetched — VLC buffers);
+///   3. totally-fresh → start the torrent, then serve progressively.
+/// VLC decodes HEVC/Dolby-Vision natively. LAN-scoped (Host-allowlist applies);
+/// serving an already-managed torrent's FileStream is bytes-only (no SSRF — the
+/// magnet was validated at start), so it needs no loopback gate.
 async fn handle_vlc_stream(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    match resolve_local_file_for_result(&state, id) {
-        Some((path, _)) => {
-            tracing::info!("VLC direct-stream: result #{} → {:?}", id, path);
-            serve_static_with_range(path, "video/x-matroska", &headers).await
-        }
-        None => (
+    // 1. Complete file on disk → serve directly.
+    if let Some((path, _)) = resolve_local_file_for_result(&state, id) {
+        tracing::info!("VLC: result #{} → complete local file {:?}", id, path);
+        return serve_static_with_range(path, "video/x-matroska", &headers).await;
+    }
+    // 2/3. Partial or fresh → start/resume the torrent + serve its FileStream.
+    let Some((magnet, file_index, _)) = resolve_result_for_vlc(&state, id) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": "Result not found — search again."})),
+        )
+            .into_response();
+    };
+    if magnet.is_empty() {
+        return (
             axum::http::StatusCode::CONFLICT,
-            Json(json!({
-                "error": "Source not on disk yet. Play it once to download, then Open in VLC."
-            })),
+            Json(json!({"error": "No magnet for this source."})),
+        )
+            .into_response();
+    }
+    let tid = match start_torrent_for_play(&state, &magnet, file_index).await {
+        Ok((tid, _url)) => tid,
+        Err(e) => {
+            tracing::warn!("VLC: torrent start failed for #{}: {}", id, e);
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("Couldn't start torrent: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+    tracing::info!(
+        "VLC: result #{} → torrent {} FileStream (progressive)",
+        id,
+        tid
+    );
+    match crate::torrent_stream::serve_torrent_stream(
+        &state.torrent_engine,
+        tid,
+        file_index.unwrap_or(0) as usize,
+        &headers,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(sc) => (
+            sc,
+            Json(json!({"error": "Torrent stream not ready yet — retry in a moment."})),
         )
             .into_response(),
     }
@@ -6179,35 +6245,32 @@ async fn handle_vlc_stream(
 
 /// `GET /vlc/{id}/open.m3u` — a tiny playlist file (Content-Disposition
 /// attachment) pointing at `/vlc/{id}/stream`. The browser downloads it and the
-/// OS hands it to VLC → VLC plays the raw source. This is the reliable
-/// cross-platform "launch external player from a web button" path.
+/// OS hands it to VLC → VLC plays the raw source. Emitted for ANY valid result
+/// (the /stream endpoint handles all download states), so VLC works for
+/// fresh/partial/complete sources alike.
 async fn handle_vlc_playlist(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
 ) -> axum::response::Response {
-    match resolve_local_file_for_result(&state, id) {
-        Some((_, name)) => {
-            let base = format!("http://{}:{}", state.config.stream_host, state.config.port);
-            let body = format!("#EXTM3U\n#EXTINF:-1,{}\n{}/vlc/{}/stream\n", name, base, id);
-            axum::response::Response::builder()
-                .status(200)
-                .header("Content-Type", "audio/x-mpegurl")
-                .header(
-                    "Content-Disposition",
-                    format!("attachment; filename=\"{}.m3u\"", name),
-                )
-                .header("Content-Length", body.len().to_string())
-                .body(axum::body::Body::from(body))
-                .unwrap()
-        }
-        None => (
-            axum::http::StatusCode::CONFLICT,
-            Json(json!({
-                "error": "Source not on disk yet. Play it once to download, then Open in VLC."
-            })),
+    let Some((_, _, name)) = resolve_result_for_vlc(&state, id) else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": "Result not found — search again."})),
         )
-            .into_response(),
-    }
+            .into_response();
+    };
+    let base = format!("http://{}:{}", state.config.stream_host, state.config.port);
+    let body = format!("#EXTM3U\n#EXTINF:-1,{}\n{}/vlc/{}/stream\n", name, base, id);
+    axum::response::Response::builder()
+        .status(200)
+        .header("Content-Type", "audio/x-mpegurl")
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}.m3u\"", name),
+        )
+        .header("Content-Length", body.len().to_string())
+        .body(axum::body::Body::from(body))
+        .unwrap()
 }
 
 async fn handle_hls_master(

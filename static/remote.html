@@ -102,10 +102,6 @@
   .src.partial{border-color:var(--good);background:linear-gradient(90deg,rgba(55,200,122,.16),var(--bg3))}
   .src .dl{color:var(--good);font-weight:800;white-space:nowrap}
   .src-toggle.has-partial{color:var(--good)}
-  /* 2026-07-13: per-source "Open in VLC" launcher (native 4K/HEVC/DV, full seek). */
-  .src .vlc{margin-left:.5rem;font-size:.68rem;font-weight:800;letter-spacing:.03em;
-    color:var(--accent);border:1px solid var(--line);border-radius:6px;padding:.18rem .42rem;flex:0 0 auto}
-  .src .vlc:active{border-color:var(--accent2);transform:scale(.94)}
 
   /* ---- search detail (single result): adaptive, fills the width intelligently.
      2026-07-13: search renders ONE card (show + nested sources), so the shared
@@ -393,10 +389,21 @@ let toastT;
 // to VLC. If a vlc:// protocol handler is installed (smoothest, true one-click),
 // S.vlcScheme is set and we fire that instead. 2026-07-13.
 async function openInVlc(id){
-  try{ const r=await fetch("/vlc/"+id+"/open.m3u",{method:"HEAD"});
-    if(r.status===409){ toast("Not downloaded yet — play it once, then Open in VLC"); return; } }catch(e){}
+  let m3u;
+  try{ const r=await fetch("/vlc/"+id+"/open.m3u"); if(!r.ok){ toast("Couldn't resolve that source"); return; } m3u=await r.text(); }
+  catch(e){ toast("spela unreachable"); return; }
+  const url=(m3u.split("\n").find(l=>l.startsWith("http"))||"").trim();
+  if(!url){ toast("No stream URL"); return; }
   toast("Opening in VLC…");
-  window.location.href="/vlc/"+id+"/open.m3u";
+  // Smoothest path: fire the vlc:// scheme (true one-click if the handler is
+  // installed → VLC launches, window blurs). If no handler is registered (no
+  // blur within 1.2s), fall back to downloading the .m3u, which the OS hands to
+  // any installed player. Works with OR without the one-click handler.
+  let blurred=false; const onblur=()=>{blurred=true;};
+  window.addEventListener("blur",onblur,{once:true});
+  window.location.href=url.replace(/^https?:\/\//,"vlc://");
+  setTimeout(()=>{ window.removeEventListener("blur",onblur);
+    if(!blurred) window.location.href="/vlc/"+id+"/open.m3u"; }, 1200);
 }
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("on");
   clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("on"),4200); }
@@ -457,9 +464,6 @@ function posterCard({poster,title,year,cta,onPlay,sources}){
       row.appendChild(el("span",{className:"x",textContent:r.size||""}));
       row.appendChild(el("span",{className:"x",textContent:r.source||""}));
       row.appendChild(el("span",{className:"s "+health,textContent:(health==="dead"?"⚠ ":"")+sc+"🌱"}));
-      const vlc=el("span",{className:"vlc",textContent:"VLC",title:"Open in VLC — native 4K/HEVC/Dolby-Vision, full seek"});
-      vlc.onclick=(e)=>{ e.stopPropagation(); openInVlc(r.id); };
-      row.appendChild(vlc);
       row.onclick=()=>doPlay({result_id:r.id});
       box.appendChild(row);
     });
@@ -574,6 +578,7 @@ async function doPlay(opts,cardForSources){
   if(!S.target){ S.pending=()=>doPlay(opts,cardForSources); toast("Pick where to play — it starts right after"); openSheet(); return; }
   if(S.target.kind==="phone"){ return doPhoneDirect(opts,cardForSources,(S.search.data&&S.search.data.show&&S.search.data.show.title)||""); }
   if(S.target.kind==="shannon"){ return doShannonPlay(opts,cardForSources); }
+  if(S.target.kind==="vlc"){ if(opts.result_id!=null) return openInVlc(opts.result_id); toast("Tap a source (or Play best) to open it in VLC"); return; }
   const label=(S.search.data&&S.search.data.show&&S.search.data.show.title)||opts.title||"Playing";
   beginWarming(label,opts.poster_url);
   const body={...opts,target:"chromecast",cast_name:S.target.name};
@@ -768,6 +773,18 @@ function openSheet(){
       if(resume) resume();   // the play the user originally tapped now fires (to this phone)
       else if(moving) toast("Single stream — your next play moves it here, off the TV"); };
     list.appendChild(ph);
+    // "VLC · this Mac" — opens the chosen source straight in VLC (native
+    // HEVC/Dolby-Vision, full seek, no browser transcode). Works for fresh /
+    // partial / complete sources (server streams via Range). 2026-07-13.
+    const vl=el("button",{className:"topt"});
+    vl.innerHTML=`<span class="ic">${ic("phone")}</span><span><span class="nm">VLC · this Mac</span><br><span class="md">native 4K/HEVC/Dolby-Vision · full seek</span></span>`;
+    if(S.target&&S.target.kind==="vlc") vl.classList.add("sel");
+    vl.onclick=()=>{ const resume=S.pending; S.pending=null;
+      S.target={kind:"vlc",name:"VLC"};
+      sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
+      if(resume) resume();
+      else toast("Tap a source (or Play best) to open it in VLC"); };
+    list.appendChild(vl);
     // "Shannon TV" — Phase-7 spela-thin-client (2026-05-23). Sends
     // target="shannon" → spela server POSTs to Shannon's daemon /watch
     // → Shannon's spela-local fetches HLS + decodes locally. Always
