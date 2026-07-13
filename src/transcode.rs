@@ -299,6 +299,10 @@ pub struct CodecInfo {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub duration: Option<f64>,
+    /// Source video height in pixels (first video stream). Drives the
+    /// browser-4K pass-through gate: a >1080 HEVC source to a browser target
+    /// is stream-copied (full-res, no re-encode) rather than downscaled.
+    pub height: Option<u32>,
     /// ffmpeg audio stream specifier for the preferred (English) audio track.
     /// e.g., "0:a:1" for the second audio stream. Falls back to "0:a:0" if
     /// no English track found. Used in -map and filter_complex references.
@@ -342,7 +346,7 @@ pub async fn detect_codecs(url: &str, preferred_lang: Option<&str>) -> Result<Co
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,codec_name,index",
+            "stream=codec_type,codec_name,index,width,height",
             "-show_entries",
             "stream_tags=language",
             "-show_entries",
@@ -359,6 +363,7 @@ pub async fn detect_codecs(url: &str, preferred_lang: Option<&str>) -> Result<Co
     let mut video_codec = None;
     let mut audio_codec = None;
     let mut duration = None;
+    let mut height: Option<u32> = None;
     let mut current_type: Option<String> = None;
     let mut current_lang: Option<String> = None;
 
@@ -396,6 +401,17 @@ pub async fn detect_codecs(url: &str, preferred_lang: Option<&str>) -> Result<Co
                     // Actually, let's collect at [/STREAM]
                 }
                 _ => {}
+            }
+        }
+        if let Some(h) = line.strip_prefix("height=") {
+            // First video stream's height only (guard against attached-pic /
+            // thumbnail streams overwriting it with a later value).
+            if current_type.as_deref() == Some("video") && height.is_none() {
+                if let Ok(v) = h.trim().parse::<u32>() {
+                    if v > 0 {
+                        height = Some(v);
+                    }
+                }
             }
         }
         if let Some(lang) = line.strip_prefix("TAG:language=") {
@@ -478,6 +494,7 @@ pub async fn detect_codecs(url: &str, preferred_lang: Option<&str>) -> Result<Co
         video_codec,
         audio_codec: preferred_codec.or(audio_codec),
         duration,
+        height,
         audio_stream: format!("0:a:{}", audio_index),
         audio_index,
     })
@@ -827,6 +844,9 @@ pub struct HlsTranscodeInfo {
     pub ffmpeg_pid: u32,
     pub adaptive: bool,
     pub primary_segment_prefix: String,
+    /// fMP4/CMAF segments (`.m4s` + `init.mp4`) rather than mpegts (`.ts`).
+    /// True only for the browser 4K pass-through path (HEVC requires fMP4).
+    pub fmp4: bool,
 }
 
 pub async fn transcode_hls(
@@ -1164,6 +1184,119 @@ pub async fn transcode_hls(
         } else {
             "seg_".into()
         },
+        fmp4: false,
+    })
+}
+
+/// Browser 4K pass-through (2026-07-13): stream-COPY the source video into an
+/// fMP4/CMAF HLS output — no re-encode, no downscale — so a >1080p HEVC source
+/// plays at its full native resolution + bitrate in a HEVC-capable browser
+/// (Chrome/Safari on Apple silicon decode `hvc1` via MSE). Only the audio is
+/// transcoded to AAC stereo (E-AC3/DTS aren't browser-playable) — cheap, no GPU.
+/// fMP4 is MANDATORY for HEVC-in-HLS (mpegts can't carry it to a browser), and
+/// `-master_pl_name` makes ffmpeg write a master.m3u8 whose CODECS is DERIVED
+/// from the copied stream (`hvc1…`), so hls.js requests the correct MSE type —
+/// unlike the synthetic single-variant master, which hardcodes `avc1`.
+/// `PLAYLIST-TYPE:EVENT` → the player starts at 0 and grows (no live-edge stall,
+/// no VOD-padding needed). NOT for the Chromecast path (CrKey 1.56 can't do
+/// HEVC/4K). The `.m4s`/`init.mp4` fMP4 layout also signals the playlist handler
+/// to skip VOD-padding (which is `.ts`-only).
+pub async fn transcode_hls_passthrough(
+    input_url: &str,
+    media_dir: &Path,
+    audio_index: usize,
+) -> Result<HlsTranscodeInfo> {
+    let hls_dir = media_dir.join("transcoded_hls");
+    let _ = std::fs::remove_dir_all(&hls_dir);
+    std::fs::create_dir_all(&hls_dir)?;
+
+    let mut args: Vec<String> = Vec::new();
+    let is_local_file = input_url.starts_with("file://") || input_url.starts_with("/");
+    if !is_local_file {
+        args.extend([
+            "-reconnect".into(),
+            "1".into(),
+            "-reconnect_at_eof".into(),
+            "1".into(),
+            "-reconnect_streamed".into(),
+            "1".into(),
+            "-reconnect_delay_max".into(),
+            "30".into(),
+            "-rw_timeout".into(),
+            "60000000".into(),
+        ]);
+    }
+    let ffmpeg_input = input_url
+        .strip_prefix("file://")
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| input_url.to_string());
+    args.extend(["-i".into(), ffmpeg_input]);
+
+    let manifest_path = hls_dir.join("playlist.m3u8");
+    args.extend([
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        format!("0:a:{}", audio_index),
+        "-c:v".into(),
+        "copy".into(),
+        // Force hvc1 sample-entry (not hev1) so Safari + Chrome MSE accept it.
+        "-tag:v".into(),
+        "hvc1".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-ac".into(),
+        "2".into(),
+        "-b:a".into(),
+        "192k".into(),
+        "-dn".into(),
+        "-map_metadata".into(),
+        "-1".into(),
+        "-f".into(),
+        "hls".into(),
+        "-hls_time".into(),
+        "6".into(),
+        "-hls_list_size".into(),
+        "0".into(),
+        "-hls_playlist_type".into(),
+        "event".into(),
+        "-hls_segment_type".into(),
+        "fmp4".into(),
+        "-hls_fmp4_init_filename".into(),
+        "init.mp4".into(),
+        "-hls_segment_filename".into(),
+        hls_dir.join("seg_%05d.m4s").to_string_lossy().to_string(),
+        "-master_pl_name".into(),
+        "master.m3u8".into(),
+        "-hls_flags".into(),
+        "temp_file".into(),
+        "-y".into(),
+        manifest_path.to_string_lossy().to_string(),
+    ]);
+
+    tracing::info!("ffmpeg 4K pass-through (video copy) args: {:?}", args);
+    let ffmpeg_log_path = dirs::home_dir()
+        .map(|h| h.join(".spela").join("ffmpeg.log"))
+        .unwrap_or_else(|| media_dir.join("ffmpeg.log"));
+    rotate_ffmpeg_log(&ffmpeg_log_path);
+    let stderr_file = std::fs::File::create(&ffmpeg_log_path)
+        .unwrap_or_else(|_| std::fs::File::create("/tmp/spela-ffmpeg.log").expect("log file"));
+    let mut child = Command::new("ffmpeg")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
+        .spawn()?;
+    let pid = child.id().unwrap_or(0);
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+
+    Ok(HlsTranscodeInfo {
+        manifest_path,
+        ffmpeg_pid: pid,
+        adaptive: false,
+        primary_segment_prefix: "seg_".into(),
+        fmp4: true,
     })
 }
 

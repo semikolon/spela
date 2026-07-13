@@ -630,7 +630,13 @@ impl SearchEngine {
         // routed, no cross-show data should have been possible — but it was).
         let mut results = filter_results_by_show_title(results, show_title);
         rank_results_mut(&mut results);
-        Ok(results.into_iter().take(8).collect())
+        // 2026-07-13: keep more results so 4K/2160p survives to the UI. The
+        // ranker demotes 2160p to the bottom tier (right for the 1080p-capped
+        // Chromecast path), and the old take(8) then truncated every 4K release
+        // off the list entirely — so a browser on a 4K display could never even
+        // pick one. 24 keeps the well-seeded 4K reachable under "More sources"
+        // while still bounding the list.
+        Ok(results.into_iter().take(24).collect())
     }
 }
 

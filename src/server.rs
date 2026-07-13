@@ -1955,6 +1955,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         let video_codec = codec_info.video_codec;
         let audio_codec = codec_info.audio_codec;
         source_duration = codec_info.duration;
+        let source_height = codec_info.height;
         let audio_stream = codec_info.audio_stream.clone();
         let audio_index = codec_info.audio_index;
         if let Some(dur) = source_duration {
@@ -2031,18 +2032,43 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
             // served via /hls/playlist.m3u8 with proper Content-Length + Range).
             // See ~/Projects/spela/TODO.md § "Cast Pipeline Rework" for the full
             // trade-off analysis.
-            match transcode::transcode_hls(
-                &server_url,
-                &media_dir,
-                sub_path,
-                intro_path.as_deref(),
-                need_video_tc,
-                seek_to,
-                audio_index,
-                target == "chromecast",
-            )
-            .await
-            {
+            // 2026-07-13: browser 4K pass-through. A >1080p HEVC source going to
+            // a browser (non-chromecast) target is stream-COPIED (full res +
+            // bitrate, no NVENC, no 1080p downscale) instead of re-encoded —
+            // the browser decodes HEVC natively. Only when there's nothing that
+            // requires a filter pass (no subtitle burn-in, no intro concat) and
+            // no mid-stream seek (copy starts at 0). Everything else, and the
+            // whole Chromecast path (CrKey 1.56 can't do HEVC/4K), is unchanged.
+            let want_4k_passthrough = target != "chromecast"
+                && source_height.map_or(false, |h| h > 1080)
+                && video_codec.as_deref().map_or(false, |c| {
+                    let c = c.to_ascii_lowercase();
+                    c == "hevc" || c == "h265" || c == "h.265"
+                })
+                && sub_path.is_none()
+                && intro_path.is_none()
+                && seek_to.unwrap_or(0.0) <= 0.0;
+            let hls_result = if want_4k_passthrough {
+                tracing::info!(
+                    "Browser 4K pass-through: stream-copying {}p {} (no re-encode, no downscale)",
+                    source_height.unwrap_or(0),
+                    video_codec.as_deref().unwrap_or("hevc")
+                );
+                transcode::transcode_hls_passthrough(&server_url, &media_dir, audio_index).await
+            } else {
+                transcode::transcode_hls(
+                    &server_url,
+                    &media_dir,
+                    sub_path,
+                    intro_path.as_deref(),
+                    need_video_tc,
+                    seek_to,
+                    audio_index,
+                    target == "chromecast",
+                )
+                .await
+            };
+            match hls_result {
                 Ok(hls_info) => {
                     // 2026-07-01: persist the ffprobed source duration next to
                     // the playlist so handle_hls_playlist's vod_manifest_padded
@@ -2121,9 +2147,10 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                         // casts even sooner and a slow one waits longer — see
                         // docs/barrage_findings_2026_07_05.md.
                         let min_segments: usize = if target == "chromecast" { 10 } else { 10 };
+                        let seg_ext = if hls_info.fmp4 { "m4s" } else { "ts" };
                         let target_segment = hls_dir.join(format!(
-                            "{}{:05}.ts",
-                            hls_info.primary_segment_prefix, min_segments
+                            "{}{:05}.{}",
+                            hls_info.primary_segment_prefix, min_segments, seg_ext
                         ));
                         let target_low_segment = if hls_info.adaptive {
                             Some(hls_dir.join(format!("seg_1_{:05}.ts", min_segments)))
@@ -3320,7 +3347,11 @@ pub(crate) fn count_hls_segments(hls_dir: &std::path::Path) -> usize {
         .map(|d| {
             d.filter(|e| {
                 e.as_ref()
-                    .map(|e| e.path().extension().is_some_and(|ext| ext == "ts"))
+                    .map(|e| {
+                        e.path()
+                            .extension()
+                            .is_some_and(|ext| ext == "ts" || ext == "m4s")
+                    })
                     .unwrap_or(false)
             })
             .count()
@@ -5887,7 +5918,16 @@ async fn handle_hls_playlist(
     // of DMR rendering a persistent progress-bar overlay.  Default off;
     // live mode (this path skipped) = no overlay AND no total display.
     // See spela CLAUDE.md § "DMR overlay is stream-type-dependent".
-    if state.config.vod_manifest_padded {
+    // 2026-07-13: the browser 4K pass-through emits an fMP4 EVENT playlist
+    // (init.mp4 present). VOD-padding appends `.ts` placeholder entries, which
+    // would 404 against `.m4s` segments and stall the player — so skip padding
+    // for fMP4 and serve ffmpeg's EVENT playlist raw (it already starts at 0
+    // and gains ENDLIST when the copy finishes).
+    let is_fmp4_passthrough = resolve_media_dir(&state)
+        .join("transcoded_hls")
+        .join("init.mp4")
+        .exists();
+    if state.config.vod_manifest_padded && !is_fmp4_passthrough {
         match tokio::fs::read_to_string(&path).await {
             Ok(body) => {
                 let app_state = AppState::load(&state.state_dir);
@@ -6493,6 +6533,7 @@ fn default_codec_info() -> transcode::CodecInfo {
         video_codec: None,
         audio_codec: None,
         duration: None,
+        height: None,
         audio_stream: "0:a:0".to_string(),
         audio_index: 0,
     }
