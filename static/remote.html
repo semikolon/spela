@@ -121,6 +121,10 @@
   .twhead{color:var(--dim);font-size:.7rem;font-weight:800;letter-spacing:.09em;
     text-transform:uppercase;margin:.95rem 0;padding-left:.7rem}
   .twhead:first-child{margin-top:.25rem}
+  /* 2026-07-13: To-Watch rows get a half-faded poster background + the release
+     year after the title (both TMDB-fetched via /title-meta, lazy + cached). */
+  #towatchOut .src{transition:background-image .3s ease}
+  #towatchOut .src .ty{color:var(--dim);font-weight:600;font-size:.82rem;margin-left:.45rem}
   /* 2026-07-13: Chromecast auto-track confirm prompt (slice 5). A house-TV
      session was detected as watched — but housemates use these TVs, so ASK
      before it enters Fredrik's ledger. */
@@ -476,6 +480,7 @@ async function renderToWatch(){
     if(x.note) r.appendChild(el("span",{className:"x",textContent:x.note}));
     if(x.rt!=null) r.appendChild(el("span",{className:"s "+(x.rt>=88?"":"low"),textContent:"🍅 "+x.rt}));
     r.onclick=()=>{ setMode(isTV?"tv":"movie"); $("#q").value=x.title; S.search.q=x.title; location.hash="#/search"; runSearch(x.title); };
+    enrichToWatchRow(r,x.title,isTV);
     return r;
   });
   const series=mk(d.series,true), movies=mk(d.movies,false);
@@ -487,6 +492,20 @@ async function renderToWatch(){
     const box=el("div",{className:"sources open"}); movies.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
   if(!series.length&&!movies.length) wrap.appendChild(el("div",{className:"state",textContent:"To-watch list is empty."}));
   out.appendChild(wrap);
+}
+// Lazily enrich a To-Watch row with its poster (as a half-faded background) and
+// release year (after the title) — TMDB via /title-meta, cached server-side so
+// it's one lookup per title then instant. Progressive: rows show immediately,
+// posters/years fill in as they resolve. 2026-07-13.
+async function enrichToWatchRow(row,title,isTV){
+  let m; try{ m=await api("/title-meta?title="+encodeURIComponent(title)+(isTV?"&tv=1":"")); }catch{ return; }
+  if(!m) return;
+  if(m.year){ const q=row.querySelector(".q");
+    if(q && !row.querySelector(".ty")) q.after(el("span",{className:"ty",textContent:String(m.year)})); }
+  if(m.poster_url){ const img=new Image();
+    img.onload=()=>{ row.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.88),rgba(15,15,20,.62)),url('${m.poster_url}')`;
+      row.style.backgroundSize="cover"; row.style.backgroundPosition="center 20%"; };
+    img.src=m.poster_url; }
 }
 addEventListener("hashchange",route);
 

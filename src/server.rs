@@ -286,6 +286,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
             post(handle_pending_watched_resolve),
         )
         .route("/watchlist", get(handle_watchlist).post(handle_watchlist_add))
+        .route("/title-meta", get(handle_title_meta))
         // Web-remote My Library (US-3): aggregate curated collection
         // (local library_dirs + remote serve-library origins).
         .route("/library", get(handle_library))
@@ -5286,6 +5287,38 @@ async fn handle_watchlist() -> Json<Value> {
         }
     }
     Json(json!({"movies": [], "series": []}))
+}
+
+/// `GET /title-meta?title=X&tv=1` — poster URL + release year for a watchlist
+/// title, TMDB-looked-up and DISK-CACHED (`~/.config/spela/watchlist_meta.json`)
+/// so the To-Watch view's per-row lazy fetches hit TMDB once per title, then
+/// serve instantly. Gives each row a poster background + the year (slice 5).
+async fn handle_title_meta(
+    State(state): State<SharedState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let title = q.get("title").cloned().unwrap_or_default();
+    let is_tv = q.get("tv").map(|v| v == "1").unwrap_or(false);
+    if title.trim().is_empty() {
+        return Json(json!({}));
+    }
+    let cache_key = format!("{}:{}", if is_tv { "tv" } else { "movie" }, title.to_lowercase());
+    let path = dirs::home_dir().map(|h| h.join(".config/spela/watchlist_meta.json"));
+    let mut cache: serde_json::Map<String, Value> = path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if let Some(hit) = cache.get(&cache_key) {
+        return Json(hit.clone());
+    }
+    let (poster, year) = state.search_engine.poster_and_year(&title, is_tv).await;
+    let val = json!({"poster_url": poster, "year": year});
+    cache.insert(cache_key, val.clone());
+    if let Some(p) = path {
+        let _ = std::fs::write(&p, serde_json::to_string(&cache).unwrap_or_default());
+    }
+    Json(val)
 }
 
 /// `POST /watchlist` — add a title to the to-watch list from the UI (grow it

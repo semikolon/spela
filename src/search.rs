@@ -267,6 +267,82 @@ impl SearchEngine {
         best.filter(|(s, _)| *s >= ACCEPT).map(|(_, p)| p)
     }
 
+    /// 2026-07-13 (slice 5 / To-Watch view): poster URL + release year for a
+    /// watchlist title (movie OR tv). Same best-overlap scoring as
+    /// `movie_poster`, but returns the YEAR too and honors the movie/tv split.
+    /// Backs the cached `/title-meta` endpoint that gives the To-Watch rows a
+    /// poster background + year. One TMDB call in the common case.
+    pub async fn poster_and_year(&self, title: &str, is_tv: bool) -> (Option<String>, Option<u32>) {
+        if self.tmdb_key.is_empty() || title.trim().is_empty() {
+            return (None, None);
+        }
+        let cleaned = clean_title_for_tmdb(title);
+        let title = if cleaned.is_empty() {
+            title
+        } else {
+            cleaned.as_str()
+        };
+        let q = urlencoded(title);
+        let kind = if is_tv { "tv" } else { "movie" };
+        let mut urls = vec![
+            format!(
+                "https://api.themoviedb.org/3/search/{}?query={}&api_key={}",
+                kind, q, self.tmdb_key
+            ),
+            format!(
+                "https://api.themoviedb.org/3/search/multi?query={}&api_key={}",
+                q, self.tmdb_key
+            ),
+        ];
+        let words: Vec<&str> = title.split_whitespace().collect();
+        if words.len() >= 2 {
+            let head = urlencoded(&words[..words.len() - 1].join(" "));
+            urls.push(format!(
+                "https://api.themoviedb.org/3/search/multi?query={}&api_key={}",
+                head, self.tmdb_key
+            ));
+        }
+        const STRONG: f32 = 1.0;
+        const ACCEPT: f32 = 0.01;
+        let want = title_norm(title);
+        let mut best: Option<(f32, Option<String>, Option<u32>)> = None;
+        for url in urls {
+            let Ok(resp) = self.client.get(&url).send().await else {
+                continue;
+            };
+            let Ok(v) = resp.json::<Value>().await else {
+                continue;
+            };
+            let Some(arr) = v["results"].as_array() else {
+                continue;
+            };
+            for item in arr {
+                let poster = tmdb_poster_url(item["poster_path"].as_str());
+                let cand = item["title"]
+                    .as_str()
+                    .or_else(|| item["name"].as_str())
+                    .or_else(|| item["original_title"].as_str())
+                    .unwrap_or("");
+                let year = item["release_date"]
+                    .as_str()
+                    .or_else(|| item["first_air_date"].as_str())
+                    .and_then(|d| d.get(0..4))
+                    .and_then(|y| y.parse::<u32>().ok());
+                let s = title_token_score(&want, &title_norm(cand));
+                if s >= STRONG {
+                    return (poster, year);
+                }
+                if best.as_ref().is_none_or(|(bs, _, _)| s > *bs) {
+                    best = Some((s, poster, year));
+                }
+            }
+        }
+        match best.filter(|(s, _, _)| *s >= ACCEPT) {
+            Some((_, p, y)) => (p, y),
+            None => (None, None),
+        }
+    }
+
     pub async fn search(
         &self,
         query: &str,
