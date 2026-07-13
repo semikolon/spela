@@ -145,6 +145,24 @@ impl TorrentEngine {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(6881);
+        // 2026-07-13: anti-piracy swarm-poisoning defense (Lever 1). librqbit
+        // fetches a PeerGuardian P2P-format list (Name:start-end, gzip OK,
+        // IPv4+IPv6 via ip_ranges.rs) and BANS matching peers at connect time.
+        // Day-one decoy floods (anti-p2p firms + datacenter ranges) work by
+        // filling connection slots with peers that handshake + advertise pieces
+        // but never send bytes, so real seeders can't get in. Banning the known
+        // ranges frees those slots. Default = the maintained Naunter aggregate
+        // (~686k ranges: iblocklist level1 + bt). Override via SPELA_BLOCKLIST_URL;
+        // set it empty to disable. Fetched once at session creation; a fetch
+        // failure is non-fatal (librqbit logs + continues with no filter).
+        let blocklist_url = match std::env::var("SPELA_BLOCKLIST_URL") {
+            Ok(s) if s.trim().is_empty() => None,
+            Ok(s) => Some(s),
+            Err(_) => Some(
+                "https://raw.githubusercontent.com/Naunter/BT_BlockLists/master/bt_blocklists.gz"
+                    .to_string(),
+            ),
+        };
         let opts = SessionOptions {
             peer_opts: Some(PeerConnectionOptions {
                 connect_timeout: Some(Duration::from_secs(15)),
@@ -167,6 +185,7 @@ impl TorrentEngine {
                 .collect(),
             listen_port_range: Some(torrent_port..torrent_port + 1),
             enable_upnp_port_forwarding: false,
+            blocklist_url,
             ..Default::default()
         };
         let session = Session::new_with_opts(media_dir.to_path_buf(), opts)
