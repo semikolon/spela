@@ -1719,7 +1719,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     let probe_timeout_secs: u64 = std::env::var("SPELA_PROBE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
+        .unwrap_or(if is_large_source { 120 } else { 30 });
     if !is_local {
         // No local-library or remote-origin source was found. A torrent
         // is the only remaining path, so the magnet is genuinely
