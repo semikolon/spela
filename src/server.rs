@@ -1714,8 +1714,12 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // latency; the 30s is only ever consumed when bytes are genuinely
     // stalled. A truly seedless source (0 peers) never reaches here — it
     // fails fast at the progress gate above, then handle_play rotates to the
-    // next ranked source.
-    let probe_timeout_secs = 30;
+    // next ranked source. Env-overridable (SPELA_PROBE_TIMEOUT_SECS) so a
+    // "patient" deployment can trade start-latency for a stubborn swarm.
+    let probe_timeout_secs: u64 = std::env::var("SPELA_PROBE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
     if !is_local {
         // No local-library or remote-origin source was found. A torrent
         // is the only remaining path, so the magnet is genuinely
