@@ -276,6 +276,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/history", get(handle_history))
         .route("/recent", get(handle_recent))
         .route("/watched", get(handle_watched))
+        .route("/watchlist", get(handle_watchlist))
         // Web-remote My Library (US-3): aggregate curated collection
         // (local library_dirs + remote serve-library origins).
         .route("/library", get(handle_library))
@@ -5123,6 +5124,22 @@ async fn handle_recent(State(state): State<SharedState>) -> Json<Value> {
 async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
     let app = AppState::load(&state.state_dir);
     Json(json!({"watched": app.watched.iter().take(200).collect::<Vec<_>>()}))
+}
+
+/// `GET /watchlist` — the to-watch list (roadmap slice 3, recommender arsenal).
+/// Reads the USER-LOCAL `~/.config/spela/watchlist.json` (seeded from the RT
+/// import; curated by the Claude/CC harness). Personal data lives outside the
+/// public repo. Returns an empty list if the file is absent.
+async fn handle_watchlist() -> Json<Value> {
+    let path = dirs::home_dir().map(|h| h.join(".config/spela/watchlist.json"));
+    if let Some(p) = path {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<Value>(&s) {
+                return Json(v);
+            }
+        }
+    }
+    Json(json!({"movies": [], "series": []}))
 }
 
 /// `GET /library` — aggregated curated-library browse for the web-remote

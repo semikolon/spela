@@ -313,6 +313,7 @@
     <a href="#/search" data-v="search" data-ic="search" aria-label="Search"><span class="lbl">Search</span></a>
     <a href="#/library" data-v="library" data-ic="library" aria-label="Library"><span class="lbl">Library</span></a>
     <a href="#/now" data-v="now" data-ic="tv" aria-label="Now playing"><span class="lbl">Now</span></a>
+    <a href="#/towatch" data-v="towatch" data-ic="film" aria-label="To Watch"><span class="lbl">To Watch</span></a>
   </nav>
   <button class="tgt" id="tgtBtn" data-ic="cast" aria-label="Cast target"><b id="tgtLabel">Pick target</b></button>
 </header>
@@ -332,6 +333,8 @@
   </section>
 
   <section class="view" id="v-library"><div id="libraryOut"></div></section>
+
+  <section class="view" id="v-towatch"><div id="towatchOut"></div></section>
 
   <section class="view" id="v-now">
     <div id="nowFull"></div>
@@ -423,12 +426,40 @@ function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("on
 /* ---------- router ---------- */
 function route(){
   const v=(location.hash.replace(/^#\//,"")||"search").split("?")[0];
-  const known=["search","library","now"].includes(v)?v:"search";
+  const known=["search","library","now","towatch"].includes(v)?v:"search";
   $$(".view").forEach(s=>s.classList.toggle("on",s.id==="v-"+known));
   $$("nav a").forEach(a=>a.classList.toggle("on",a.dataset.v===known));
   if(known==="now") renderNowFull();
   if(known==="library") renderLibrary();
   if(known==="search") loadRecent();
+  if(known==="towatch") renderToWatch();
+}
+
+// "To Watch" view — the recommender's to-watch list (slice 3 arsenal), from
+// /watchlist (seeded from the RT import; curated by the Claude harness). Series
+// + movies as tappable rows (RT critic score shown); already-watched are hidden.
+// Tap → search that title. 2026-07-13.
+async function renderToWatch(){
+  const out=$("#towatchOut"); if(!out) return;
+  out.innerHTML=`<div class="state">Loading…</div>`;
+  let d; try{ d=await api("/watchlist"); }catch(e){ out.innerHTML=`<div class="state"><div class="big">spela unreachable</div></div>`; return; }
+  const mk=(arr,isTV)=>(arr||[]).filter(x=>!x.watched).map(x=>{
+    const r=el("button",{className:"src"});
+    r.appendChild(el("span",{className:"q",textContent:x.title}));
+    if(x.note) r.appendChild(el("span",{className:"x",textContent:x.note}));
+    if(x.rt!=null) r.appendChild(el("span",{className:"s "+(x.rt>=88?"":"low"),textContent:"🍅 "+x.rt}));
+    r.onclick=()=>{ setMode(isTV?"tv":"movie"); $("#q").value=x.title; S.search.q=x.title; location.hash="#/search"; runSearch(x.title); };
+    return r;
+  });
+  const series=mk(d.series,true), movies=mk(d.movies,false);
+  out.innerHTML="";
+  const wrap=el("div",{className:"detail"});
+  if(series.length){ wrap.appendChild(el("div",{className:"rlab",textContent:`Series · ${series.length}`}));
+    const box=el("div",{className:"sources open"}); series.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
+  if(movies.length){ wrap.appendChild(el("div",{className:"rlab",textContent:`Movies · ${movies.length}`,style:"margin-top:1rem"}));
+    const box=el("div",{className:"sources open"}); movies.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
+  if(!series.length&&!movies.length) wrap.appendChild(el("div",{className:"state",textContent:"To-watch list is empty."}));
+  out.appendChild(wrap);
 }
 addEventListener("hashchange",route);
 
