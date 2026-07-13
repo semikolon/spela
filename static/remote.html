@@ -53,12 +53,15 @@
   @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 
   /* ---- search ---- */
-  .searchbar{display:flex;flex-direction:column;gap:.6rem;margin-bottom:1rem}
-  .searchbar input{width:100%;background:var(--bg2);border:1px solid var(--line);
+  /* 2026-07-13: search box + Movies/TV selector always on ONE line (row, no
+     wrap) — input flexes to fill, selector keeps intrinsic width. Fits phone→
+     desktop (input shrinks; selector never does). */
+  .searchbar{display:flex;flex-direction:row;align-items:center;gap:.6rem;margin-bottom:1rem}
+  .searchbar input{flex:1 1 auto;min-width:0;background:var(--bg2);border:1px solid var(--line);
     border-radius:var(--r);padding:.85rem 1rem;color:var(--fg)}
   .searchbar input:focus{outline:2px solid var(--accent2);outline-offset:0}
   .seg{display:flex;background:var(--bg2);border:1px solid var(--line);border-radius:999px;
-    padding:.2rem;align-self:flex-start}
+    padding:.2rem;flex:0 0 auto}
   .seg button{padding:.3rem .9rem;border-radius:999px;color:var(--dim);font-size:.84rem;font-weight:600}
   .seg button.on{background:var(--accent2);color:#fff}
 
@@ -113,6 +116,11 @@
     white-space:nowrap;max-width:62vw;overflow:hidden;text-overflow:ellipsis;touch-action:manipulation}
   .recent .chip .ep{color:var(--dim);font-weight:500;margin-left:.35rem;font-size:.76rem}
   .recent .chip:active{border-color:var(--accent2);transform:scale(.97)}
+  /* To-Watch section headers — small all-caps, x-aligned with row titles
+     (padding-left matches .src row inner padding), equal vertical margins. */
+  .twhead{color:var(--dim);font-size:.7rem;font-weight:800;letter-spacing:.09em;
+    text-transform:uppercase;margin:.95rem 0;padding-left:.7rem}
+  .twhead:first-child{margin-top:.25rem}
 
   /* ---- search detail (single result): adaptive, fills the width intelligently.
      2026-07-13: search renders ONE card (show + nested sources), so the shared
@@ -454,9 +462,9 @@ async function renderToWatch(){
   const series=mk(d.series,true), movies=mk(d.movies,false);
   out.innerHTML="";
   const wrap=el("div",{className:"detail"});
-  if(series.length){ wrap.appendChild(el("div",{className:"rlab",textContent:`Series · ${series.length}`}));
+  if(series.length){ wrap.appendChild(el("div",{className:"twhead",textContent:`Series · ${series.length}`}));
     const box=el("div",{className:"sources open"}); series.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
-  if(movies.length){ wrap.appendChild(el("div",{className:"rlab",textContent:`Movies · ${movies.length}`,style:"margin-top:1rem"}));
+  if(movies.length){ wrap.appendChild(el("div",{className:"twhead",textContent:`Movies · ${movies.length}`}));
     const box=el("div",{className:"sources open"}); movies.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
   if(!series.length&&!movies.length) wrap.appendChild(el("div",{className:"state",textContent:"To-watch list is empty."}));
   out.appendChild(wrap);

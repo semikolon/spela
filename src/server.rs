@@ -276,7 +276,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/history", get(handle_history))
         .route("/recent", get(handle_recent))
         .route("/watched", get(handle_watched))
-        .route("/watchlist", get(handle_watchlist))
+        .route("/watchlist", get(handle_watchlist).post(handle_watchlist_add))
         // Web-remote My Library (US-3): aggregate curated collection
         // (local library_dirs + remote serve-library origins).
         .route("/library", get(handle_library))
@@ -5140,6 +5140,46 @@ async fn handle_watchlist() -> Json<Value> {
         }
     }
     Json(json!({"movies": [], "series": []}))
+}
+
+/// `POST /watchlist` — add a title to the to-watch list from the UI (grow it
+/// beyond the RT seed). Body `{title, type:"series"|"movie"}`. Appends to the
+/// SPELA-HOST `~/.config/spela/watchlist.json` (spela reads+writes its own host's
+/// file — no Mac-sync issue). Dedup by case-insensitive title. Marks source:"user".
+async fn handle_watchlist_add(Json(body): Json<Value>) -> Json<Value> {
+    let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if title.is_empty() {
+        return Json(json!({"ok": false, "error": "missing title"}));
+    }
+    let is_series = body.get("type").and_then(|v| v.as_str()) == Some("series");
+    let Some(path) = dirs::home_dir().map(|h| h.join(".config/spela/watchlist.json")) else {
+        return Json(json!({"ok": false, "error": "no home dir"}));
+    };
+    let mut root: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({"movies": [], "series": []}));
+    let arr_key = if is_series { "series" } else { "movies" };
+    let arr = root
+        .get_mut(arr_key)
+        .and_then(|v| v.as_array_mut());
+    let Some(arr) = arr else {
+        return Json(json!({"ok": false, "error": "bad watchlist shape"}));
+    };
+    let exists = arr.iter().any(|e| {
+        e.get("title")
+            .and_then(|v| v.as_str())
+            .map(|t| t.eq_ignore_ascii_case(title))
+            .unwrap_or(false)
+    });
+    if exists {
+        return Json(json!({"ok": true, "added": false, "reason": "already on list"}));
+    }
+    arr.push(json!({"title": title, "source": "user"}));
+    match serde_json::to_string_pretty(&root).ok().and_then(|s| std::fs::write(&path, s).ok()) {
+        Some(_) => Json(json!({"ok": true, "added": true})),
+        None => Json(json!({"ok": false, "error": "write failed"})),
+    }
 }
 
 /// `GET /library` — aggregated curated-library browse for the web-remote
