@@ -58,8 +58,15 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    AND series is an **LLM-written critic-sentiment blurb** (the recommender's Claude
    harness): synthesize 1-2 lines from a spread of critics/reviews, **cache to disk**
    (like `/title-meta`), labeled as a summary (not a quote). Deferred until the
-   recommender harness work; do NOT scrape RT. Fredrik: *"Maybe an LLM-written (and
-   cached) blurb from a bunch of critics/reviews, in the future."*
+   recommender harness work. **Prefer NOT to scrape RT** — not forbidden, just
+   (a) brittle: Cloudflare-fronted Next.js that re-skins → silent breakage
+   (decay-horizon), (b) ToS-tainted (negligible enforcement risk for personal
+   cached use, but a real term), and above all (c) MOOT: the LLM-from-a-spread
+   approach covers movies AND TV without depending on RT's page, so a dedicated
+   RT scraper buys nothing and is strictly more fragile. Scraping is only the sole
+   option if a VERBATIM RT consensus quote is wanted — then (a)/(b) are the
+   tradeoff. Fredrik: *"Maybe an LLM-written (and cached) blurb from a bunch of
+   critics/reviews, in the future."*
    **The LLM harness IS Claude/CC now (Phase 1), exactly like DIM** (Fredrik: "the
    LLM is YOU until I say otherwise"). So spela builds the ARSENAL (the to-watch
    store + endpoints + a "To Watch" UI view + the tools: `/search`+TMDB, critics
