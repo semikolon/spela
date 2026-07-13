@@ -103,6 +103,26 @@
   .src .dl{color:var(--good);font-weight:800;white-space:nowrap}
   .src-toggle.has-partial{color:var(--good)}
 
+  /* ---- search detail (single result): adaptive, fills the width intelligently.
+     2026-07-13: search renders ONE card (show + nested sources), so the shared
+     auto-fill poster grid collapsed it into one 150px left column on desktop
+     (80% of the screen empty) while the phone media query forced full width —
+     backwards. Give search its own layout: poster left + body right on wide,
+     sources in two columns when there's room; stacked full-width on phones. */
+  .detail{max-width:940px}
+  @media (min-width:641px){
+    .detail .card{display:grid;grid-template-columns:210px 1fr;align-items:start;
+      padding:.9rem;column-gap:1.2rem}
+    .detail .card>.poster{grid-column:1;grid-row:1/-1;width:210px;border-radius:12px;align-self:start}
+    .detail .card>.meta{grid-column:2;padding:0}
+    .detail .card>.meta .t{font-size:1.2rem;-webkit-line-clamp:3}
+    .detail .card>.play{grid-column:2;margin:.75rem 0 0;max-width:260px}
+    .detail .card>.src-toggle{grid-column:2;text-align:left;margin:.65rem 0 0}
+    .detail .card>.sources{grid-column:2;margin:.5rem 0 0}
+    .detail .sources.open{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.45rem}
+    .detail .src{font-size:.84rem}
+  }
+
   /* ---- states ---- */
   .state{padding:3rem 1rem;text-align:center;color:var(--dim)}
   .libbar{display:flex;align-items:center;justify-content:space-between;color:var(--dim);font-size:.82rem;margin:.1rem .15rem .7rem}
@@ -447,7 +467,7 @@ async function runSearch(q){
   if(S.search.abort) S.search.abort.abort();
   const ac=new AbortController(); S.search.abort=ac;
   const out=$("#searchOut");
-  out.innerHTML=`<div class="grid skeleton"><div class="card"><div class="poster"><div class="shimmer"></div></div><div class="meta"><div class="t">&nbsp;</div></div></div></div>`;
+  out.innerHTML=`<div class="detail skeleton"><div class="card"><div class="poster"><div class="shimmer"></div></div><div class="meta"><div class="t">&nbsp;</div></div></div></div>`;
   let qs="q="+encodeURIComponent(q); if(S.mode==="movie") qs+="&movie=1";
   let d;
   try{ d=await api("/search?"+qs,{signal:ac.signal}); }
@@ -458,7 +478,7 @@ async function runSearch(q){
   const res=d.results||[];
   if(!res.length){ out.innerHTML=`<div class="state"><div class="big">No playable sources</div>Nothing found for “${esc(q)}”. Try the Movies / TV toggle.</div>`; return; }
   const show=d.show||{}, year=(show.release_date||"").slice(0,4);
-  const grid=el("div",{className:"grid"});
+  const grid=el("div",{className:"detail"});
   const card=posterCard({
     poster:show.poster_url, title:show.title||res[0].title, year:year||undefined,
     cta:"Play best source", sources:res,
