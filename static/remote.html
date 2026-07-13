@@ -121,6 +121,24 @@
   .twhead{color:var(--dim);font-size:.7rem;font-weight:800;letter-spacing:.09em;
     text-transform:uppercase;margin:.95rem 0;padding-left:.7rem}
   .twhead:first-child{margin-top:.25rem}
+  /* 2026-07-13: Chromecast auto-track confirm prompt (slice 5). A house-TV
+     session was detected as watched — but housemates use these TVs, so ASK
+     before it enters Fredrik's ledger. */
+  .pending{display:none;margin:.2rem 0 .6rem}
+  .pending.on{display:block}
+  .pending .rlab{color:var(--warn);font-size:.72rem;font-weight:800;letter-spacing:.05em;
+    text-transform:uppercase;margin:.1rem .15rem .45rem}
+  .pconf{display:flex;align-items:center;gap:.6rem;background:var(--bg2);
+    border:1px solid var(--line);border-radius:12px;padding:.7rem .8rem;margin-bottom:.5rem}
+  .pconf .pt{flex:1;min-width:0}
+  .pconf .pt .a{font-weight:700;font-size:.92rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pconf .pt .b{color:var(--dim);font-size:.76rem;margin-top:.1rem}
+  .pconf .pb{display:flex;gap:.5rem;flex:0 0 auto}
+  .pconf .yes,.pconf .no{border-radius:10px;padding:.55rem .9rem;font-weight:700;font-size:.86rem;
+    min-height:44px;display:flex;align-items:center;touch-action:manipulation}
+  .pconf .yes{background:var(--good);color:#04120a}
+  .pconf .no{background:var(--bg3);border:1px solid var(--line);color:var(--fg)}
+  .pconf .yes:active,.pconf .no:active{transform:scale(.95)}
 
   /* ---- search detail (single result): adaptive, fills the width intelligently.
      2026-07-13: search renders ONE card (show + nested sources), so the shared
@@ -336,6 +354,7 @@
         <button data-m="tv" data-ic="tv">TV</button>
       </div>
     </div>
+    <div id="pendingRow" class="pending"></div>
     <div id="recentRow" class="recent"></div>
     <div id="searchOut"></div>
   </section>
@@ -439,7 +458,7 @@ function route(){
   $$("nav a").forEach(a=>a.classList.toggle("on",a.dataset.v===known));
   if(known==="now") renderNowFull();
   if(known==="library") renderLibrary();
-  if(known==="search") loadRecent();
+  if(known==="search"){ loadRecent(); loadPending(); }
   if(known==="towatch") renderToWatch();
 }
 
@@ -557,6 +576,43 @@ async function loadRecent(){
     chips.appendChild(c);
   });
   row.appendChild(chips); row.classList.add("on");
+}
+
+// Chromecast auto-track confirm prompt (slice 5). The tracker detects
+// near-complete sessions on the house TVs, but housemates watch those too — so
+// nothing enters Fredrik's watched-ledger without a "Yes". Surfaced on the
+// search/landing view; each item gets Yes (→ mark watched) / No (→ dismiss,
+// won't re-nag that episode).
+async function loadPending(){
+  const row=$("#pendingRow"); if(!row) return;
+  let d; try{ d=await api("/pending-watched"); }catch(e){ return; }
+  const items=(d&&d.pending)||[];
+  if(!items.length){ row.classList.remove("on"); row.innerHTML=""; return; }
+  row.innerHTML=""; row.appendChild(el("div",{className:"rlab",textContent:"Watched on a TV? Confirm to track"}));
+  items.forEach(it=>{
+    const card=el("div",{className:"pconf"});
+    const t=el("div",{className:"pt"});
+    t.appendChild(el("div",{className:"a",textContent:it.title}));
+    t.appendChild(el("div",{className:"b",textContent:"on "+(it.device||"a TV")}));
+    card.appendChild(t);
+    const pb=el("div",{className:"pb"});
+    const yes=el("button",{className:"yes",textContent:"Yes"});
+    const no=el("button",{className:"no",textContent:"No"});
+    yes.onclick=()=>resolvePending(it.key,true,card);
+    no.onclick=()=>resolvePending(it.key,false,card);
+    pb.append(yes,no); card.appendChild(pb);
+    row.appendChild(card);
+  });
+  row.classList.add("on");
+}
+async function resolvePending(key,watched,card){
+  card.style.opacity=".4";
+  try{ await api("/pending-watched/resolve",{method:"POST",body:{key,watched}}); }
+  catch{ card.style.opacity="1"; toast("spela unreachable"); return; }
+  card.remove();
+  const row=$("#pendingRow");
+  if(row && !row.querySelector(".pconf")){ row.classList.remove("on"); row.innerHTML=""; }
+  toast(watched?"Marked watched":"Dismissed");
 }
 
 let dT;

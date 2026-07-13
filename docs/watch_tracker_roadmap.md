@@ -60,11 +60,73 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    MIXES to-watch with already-watched-loved — seen-status must be confirmed, not
    assumed.
 
-5. **Auto-track any house Chromecast (non-spela casts) — later, feasible.** Poll
-   each Chromecast's media status (rust_cast/pychromecast) for app + title/series/
-   episode; match to TMDB; mark watched. Caveat: metadata quality varies by app
-   (Netflix/Disney report well; some report little) → partial but real. Self-
-   referential-safety: read-only polling, no control actions.
+5. **Auto-track any house Chromecast (non-spela casts) — 🔨 IN PROGRESS (2026-07-13, approved).**
+   Poll each house Chromecast's media status; match to TMDB; auto-mark watched —
+   so shows watched on Netflix/YouTube/Disney+ (not via spela) still land in the
+   tracker with zero manual effort. **Cadence: 60s** (media state changes slowly;
+   Darwin is the router so keep the poll light; configurable via
+   `auto_track_poll_secs`). **Config gate:** `auto_track_chromecasts` (default
+   **true** — Fredrik approved). **Self-referential-safety:** READ-ONLY polling
+   (`receiver.get_status` + `media.get_status`), NO control actions, only writes
+   the local watched-ledger — a standing tokio-independent std-thread loop with no
+   external side effects (bg-task-guard's concern is mutating side effects; this
+   has none).
+
+   **Design (implementation spec):**
+   - A dedicated `std::thread` spawned at server start (rust_cast is BLOCKING —
+     must NOT run on the axum runtime; mirrors `connect_with_retry`'s blocking
+     model). 60s loop; gated off if `auto_track_chromecasts=false`.
+   - For each configured video Chromecast (reuse `Chromecast Devices` list —
+     Fredriks TV + Vardagsrum; hardcoded fallback IPs in cast.rs), connect +
+     `receiver.get_status()` → `applications[]`.
+   - **Read media status for ANY app_id, not just CC1AD845.** The media namespace
+     `urn:x-cast:com.google.cast.media` is standard, so `device.media.get_status(
+     transport_id, None)` works for any app implementing it. **Per-app metadata
+     quality varies** (roadmap caveat, now concrete): the Default Media Receiver
+     + Disney/YouTube expose title/series/season/episode + current_time/duration
+     well; **Netflix uses a PRIVATE namespace and often reports little/nothing via
+     the standard media namespace** → partial coverage, honest. So: OBSERVE-FIRST
+     — log every observed `{app_id, title, series, S/E, player_state, ct/dur}` at
+     INFO for the first while so we learn real per-app shapes before hardening the
+     matcher (Observe-don't-predict; the shapes can't be predicted from docs).
+   - **Skip spela's OWN casts** (already tracked via `save_position_smart`): skip
+     when `content_id` contains the stream host / `/hls/` (spela's HLS URL), so we
+     never double-count.
+   - **Match** the observed title (+ year if present) → `tmdb_auto_detect` /
+     `tmdb_search` → imdb_id + season/episode; TV metadata already carries S/E.
+   - **STAGE, don't auto-mark — a Chromecast observation is HEURISTIC, not proof
+     it was FREDRIK (2026-07-13, load-bearing correction).** Housemates watch the
+     house TVs too (anchor: they're mid-Euphoria — episodes Fredrik's already
+     seen). So a near-complete session (`current_time/duration ≥ 0.96`) is
+     appended to a **pending-confirmation queue**, NOT the watched-ledger. On
+     Fredrik's next web-UI load, the remote surfaces the pending items — "Watched
+     on a TV recently? [title] — Yes, I watched it / No (someone else)". Only a
+     **Yes** calls `AppState::mark_watched` (into HIS ledger). `Observable user
+     intent dominates inferred/heuristic state` — his confirmation is the
+     authority; the poll is only the detector. **spela's OWN casts are the
+     exception** — those ARE provably his (he started them via spela) and stay
+     auto-marked via `save_position_smart`; the confirm-flow is ONLY for
+     externally-detected (non-spela) Chromecast sessions.
+   - **Pending queue model:** `AppState.pending_watched: Vec<PendingWatch>`
+     ({key, title, series/S/E, device, first_seen, last_seen}) in state.json.
+     Dedup by key. **Don't re-queue** a key that's already in the watched-ledger
+     (he's seen it) OR in a `dismissed_watched` set (he said "No" — so a housemate
+     binge doesn't re-nag every poll; each NEW episode is a new key, so genuinely
+     new episodes still surface). Endpoints: `GET /pending-watched` (list),
+     `POST /pending-watched/resolve` ({key, watched:bool} → yes: mark_watched +
+     dequeue; no: dequeue + add to `dismissed_watched`).
+   - Conservative near-complete gate (0.96) means a brief tune-in never stages.
+     No live-Chromecast test needed to ship the detector — it self-observes in
+     production; the confirm-prompt validates every stage against Fredrik's real
+     intent, so a mis-detection costs one "No" tap, never a wrong ledger entry.
+
+   **rust_cast API (verified in cast.rs `get_info`, lines 442-496):**
+   `device.receiver.get_status()?.applications[]` → each `{app_id, transport_id}`;
+   `device.connection.connect(transport_id)?` then
+   `device.media.get_status(transport_id, None)?.entries.first()` →
+   `{player_state, current_time, media:{duration, content_id, metadata}}`;
+   `extract_metadata_title(&Metadata)` (cast.rs:560) pulls the title;
+   `Metadata::TvShow{series_title, episode_title, season, episode}` carries S/E.
 
 ## Notes
 - **⚠ Arsenal data lives on the SPELA HOST (Darwin `~/.config/spela/`), not the Mac.**

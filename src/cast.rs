@@ -555,6 +555,130 @@ impl CastController {
         }
         Err(anyhow!("No media app running on device"))
     }
+
+    /// 2026-07-13 (slice 5): resolve the set of devices to poll for the watch
+    /// tracker → (name, ip, port). `configured` = `config.auto_track_devices`;
+    /// empty falls back to the known-devices map ∪ `default_device`. Best-effort
+    /// (unresolvable names are skipped). Deduped by name.
+    pub fn resolve_track_targets(
+        &mut self,
+        configured: &[String],
+        default_device: &str,
+    ) -> Vec<(String, String, u16)> {
+        let mut names: Vec<String> = if !configured.is_empty() {
+            configured.to_vec()
+        } else {
+            let mut v: Vec<String> = self.known_devices.keys().cloned().collect();
+            if !default_device.is_empty() && !v.iter().any(|n| n == default_device) {
+                v.push(default_device.to_string());
+            }
+            v
+        };
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .filter_map(|n| self.resolve_device(&n).ok().map(|(ip, port)| (n, ip, port)))
+            .collect()
+    }
+}
+
+/// 2026-07-13 (slice 5): a media session observed on a house Chromecast by the
+/// watch tracker. Read-only snapshot; NOT proof it was Fredrik (housemates use
+/// these TVs) — the server stages it for confirmation.
+#[derive(Debug, Clone)]
+pub struct ObservedPlayback {
+    pub device: String,
+    pub app_id: String,
+    /// "movie" | "tv" | "other" — only movie/tv are trackable.
+    pub kind: &'static str,
+    /// Canonical title used for keying: a movie title, or "Series SxxEyy".
+    pub title: String,
+    pub series: Option<String>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub current_time: f64,
+    pub duration: f64,
+    pub content_id: String,
+    pub player_state: String,
+}
+
+/// Classify a Cast media `Metadata` into (kind, key-title, series, season,
+/// episode). Movies + TV shows are trackable; music/photo/generic are "other".
+fn classify_metadata(md: &Metadata) -> (&'static str, String, Option<String>, Option<u32>, Option<u32>) {
+    match md {
+        Metadata::Movie(m) => ("movie", m.title.clone().unwrap_or_default(), None, None, None),
+        Metadata::TvShow(m) => {
+            let series = m.series_title.clone();
+            let title = match (&series, m.season, m.episode) {
+                (Some(s), Some(se), Some(ep)) => format!("{} S{:02}E{:02}", s, se, ep),
+                _ => m
+                    .episode_title
+                    .clone()
+                    .or_else(|| series.clone())
+                    .unwrap_or_default(),
+            };
+            ("tv", title, series, m.season, m.episode)
+        }
+        other => ("other", extract_metadata_title(other), None, None, None),
+    }
+}
+
+/// 2026-07-13 (slice 5): probe ONE Chromecast for what's playing across ANY app
+/// (not just spela's Default Media Receiver). Single connect attempt (best-effort
+/// — this runs every 60s, retries aren't worth blocking the poll), reads the
+/// standard media namespace for each running app. Netflix uses a private
+/// namespace and often reports nothing here → partial-but-honest coverage. Never
+/// controls anything (read-only). Returns every app that answered with media.
+pub fn probe_device_media(device_name: &str, ip: &str, port: u16) -> Vec<ObservedPlayback> {
+    let mut out = Vec::new();
+    let device = match CastDevice::connect_without_host_verification(ip.to_string(), port) {
+        Ok(d) => d,
+        Err(_) => return out,
+    };
+    if device.connection.connect("receiver-0").is_err() {
+        return out;
+    }
+    let status = match device.receiver.get_status() {
+        Ok(s) => s,
+        Err(_) => return out,
+    };
+    for app in &status.applications {
+        if device.connection.connect(app.transport_id.as_str()).is_err() {
+            continue;
+        }
+        let media_status = match device.media.get_status(app.transport_id.as_str(), None) {
+            Ok(ms) => ms,
+            Err(_) => continue,
+        };
+        let Some(entry) = media_status.entries.first() else {
+            continue;
+        };
+        let (kind, title, series, season, episode) = entry
+            .media
+            .as_ref()
+            .and_then(|m| m.metadata.as_ref())
+            .map(classify_metadata)
+            .unwrap_or(("other", String::new(), None, None, None));
+        out.push(ObservedPlayback {
+            device: device_name.to_string(),
+            app_id: app.app_id.clone(),
+            kind,
+            title,
+            series,
+            season,
+            episode,
+            current_time: entry.current_time.unwrap_or(0.0) as f64,
+            duration: entry.media.as_ref().and_then(|m| m.duration).unwrap_or(0.0) as f64,
+            content_id: entry
+                .media
+                .as_ref()
+                .map(|m| m.content_id.clone())
+                .unwrap_or_default(),
+            player_state: format!("{:?}", entry.player_state),
+        });
+    }
+    out
 }
 
 fn extract_metadata_title(metadata: &Metadata) -> String {

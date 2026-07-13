@@ -51,6 +51,33 @@ pub struct AppState {
     /// the recommender's seen-check + a future "watched / up-next" view.
     #[serde(default)]
     pub watched: Vec<WatchedEntry>,
+    /// 2026-07-13 (slice 5): sessions DETECTED on a house Chromecast (incl.
+    /// non-spela apps) that reached completion but are NOT yet confirmed as
+    /// Fredrik's — housemates watch these TVs too. Surfaced on his next web-UI
+    /// load; only a "Yes, I watched it" promotes one into `watched`. Deduped by
+    /// key; newest-first; capped.
+    #[serde(default)]
+    pub pending_watched: Vec<PendingWatch>,
+    /// Keys Fredrik answered "No (someone else)" to — so a housemate's binge
+    /// doesn't re-nag every poll. A genuinely new episode is a new key, so it
+    /// still surfaces. Capped.
+    #[serde(default)]
+    pub dismissed_watched: std::collections::HashSet<String>,
+}
+
+/// A Chromecast-detected completion awaiting Fredrik's confirmation (slice 5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingWatch {
+    pub key: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub season: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode: Option<u32>,
+    pub device: String,
+    pub detected_at: DateTime<Utc>,
 }
 
 /// Apr 29, 2026: a queued play request for auto-firing when the current
@@ -221,6 +248,8 @@ impl Default for AppState {
             resume_positions: HashMap::new(),
             queue: Vec::new(),
             corrupt_files: std::collections::HashSet::new(),
+            pending_watched: Vec::new(),
+            dismissed_watched: std::collections::HashSet::new(),
         }
     }
 }
@@ -358,6 +387,65 @@ impl AppState {
             },
         );
         self.watched.truncate(500);
+    }
+
+    /// Stage a Chromecast-detected completion for Fredrik to confirm (slice 5).
+    /// No-op if it's already confirmed-watched, already dismissed, or already
+    /// pending (dedup by key). Returns true if a NEW pending item was added.
+    pub fn stage_pending_watch(
+        &mut self,
+        title: String,
+        series: Option<String>,
+        season: Option<u32>,
+        episode: Option<u32>,
+        device: String,
+    ) -> bool {
+        let Some(key) = resume_position_key(None, Some(&title)) else {
+            return false;
+        };
+        if self.watched.iter().any(|w| w.key == key)
+            || self.dismissed_watched.contains(&key)
+            || self.pending_watched.iter().any(|p| p.key == key)
+        {
+            return false;
+        }
+        self.pending_watched.insert(
+            0,
+            PendingWatch {
+                key,
+                title,
+                series,
+                season,
+                episode,
+                device,
+                detected_at: Utc::now(),
+            },
+        );
+        self.pending_watched.truncate(100);
+        true
+    }
+
+    /// Resolve a pending Chromecast detection. `watched=true` → promote into the
+    /// watched-ledger (it WAS Fredrik); `false` → drop it + remember the "no"
+    /// so a housemate's binge of the same episode doesn't re-nag. Returns true
+    /// if the key was found pending.
+    pub fn resolve_pending(&mut self, key: &str, watched: bool) -> bool {
+        let Some(pos) = self.pending_watched.iter().position(|p| p.key == key) else {
+            return false;
+        };
+        let item = self.pending_watched.remove(pos);
+        if watched {
+            self.mark_watched(&item.key, None, Some(item.title));
+        } else {
+            self.dismissed_watched.insert(item.key);
+            // keep the dismissed set bounded (drop oldest arbitrary once large)
+            if self.dismissed_watched.len() > 500 {
+                if let Some(k) = self.dismissed_watched.iter().next().cloned() {
+                    self.dismissed_watched.remove(&k);
+                }
+            }
+        }
+        true
     }
 }
 

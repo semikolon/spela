@@ -228,6 +228,10 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         live_position: Mutex::new(None),
     });
 
+    // 2026-07-13 (slice 5): background watch tracker — polls house Chromecasts,
+    // stages near-complete non-spela sessions for Fredrik to confirm on load.
+    spawn_chromecast_tracker(state.clone());
+
     // May 1, 2026 (Wilderpeople movie-night DEFINITIVE root cause): CORS
     // origin must be `Any` for Chromecast/Cast Receiver playback to work.
     // The H2 commit (Apr 30, 14671d4) tightened CORS from `allow_origin(Any)`
@@ -276,6 +280,11 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/history", get(handle_history))
         .route("/recent", get(handle_recent))
         .route("/watched", get(handle_watched))
+        .route("/pending-watched", get(handle_pending_watched))
+        .route(
+            "/pending-watched/resolve",
+            post(handle_pending_watched_resolve),
+        )
         .route("/watchlist", get(handle_watchlist).post(handle_watchlist_add))
         // Web-remote My Library (US-3): aggregate curated collection
         // (local library_dirs + remote serve-library origins).
@@ -5124,6 +5133,143 @@ async fn handle_recent(State(state): State<SharedState>) -> Json<Value> {
 async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
     let app = AppState::load(&state.state_dir);
     Json(json!({"watched": app.watched.iter().take(200).collect::<Vec<_>>()}))
+}
+
+/// `GET /pending-watched` — sessions the Chromecast tracker (slice 5) detected
+/// as completed on a house TV but that AREN'T yet confirmed as Fredrik's
+/// (housemates use these TVs too). The web remote surfaces these on load with a
+/// Yes/No prompt; only a Yes promotes one into the watched-ledger.
+async fn handle_pending_watched(State(state): State<SharedState>) -> Json<Value> {
+    let app = AppState::load(&state.state_dir);
+    Json(json!({"pending": app.pending_watched}))
+}
+
+/// `POST /pending-watched/resolve` — `{key, watched:bool}`. Yes → mark_watched
+/// (it WAS Fredrik); No → drop it + remember the dismissal so a housemate's
+/// binge of the same episode doesn't re-nag.
+async fn handle_pending_watched_resolve(
+    State(state): State<SharedState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let key = body.get("key").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let watched = body
+        .get("watched")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if key.is_empty() {
+        return Json(json!({"ok": false, "error": "missing key"}));
+    }
+    let mut app = AppState::load(&state.state_dir);
+    let found = app.resolve_pending(key, watched);
+    if found {
+        let _ = app.save(&state.state_dir);
+    }
+    Json(json!({"ok": found}))
+}
+
+/// 2026-07-13 (slice 5): background watch tracker. A tokio task on a fixed
+/// cadence polls each house Chromecast's media status (READ-ONLY) across ALL
+/// apps and STAGES near-complete Movie/TvShow sessions for Fredrik to confirm.
+/// It never controls anything and never auto-marks (housemates watch these TVs)
+/// — spela's OWN casts are excluded here (already tracked via
+/// `save_position_smart`) by skipping content served from spela's own stream.
+fn spawn_chromecast_tracker(state: SharedState) {
+    if !state.config.auto_track_chromecasts {
+        tracing::info!("chromecast watch-tracker: disabled (auto_track_chromecasts=false)");
+        return;
+    }
+    let poll = state.config.auto_track_poll_secs.max(15);
+    tracing::info!("chromecast watch-tracker: enabled (poll every {}s)", poll);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(poll));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            // Resolve targets under a brief cast-lock, then probe OFF the lock
+            // (a hung Chromecast connection must never block do_play's casts).
+            let targets = {
+                let mut cast = lock_recover(&state.cast);
+                cast.resolve_track_targets(
+                    &state.config.auto_track_devices,
+                    &state.config.default_device,
+                )
+            };
+            if targets.is_empty() {
+                continue;
+            }
+            let observations = tokio::task::spawn_blocking(move || {
+                let mut all = Vec::new();
+                for (name, ip, port) in targets {
+                    all.extend(cast::probe_device_media(&name, &ip, port));
+                }
+                all
+            })
+            .await
+            .unwrap_or_default();
+            process_chromecast_observations(&state, observations);
+        }
+    });
+}
+
+/// Stage the trackable, near-complete, non-spela observations for confirmation.
+/// Observe-first: every observation is logged at INFO so per-app metadata shapes
+/// (Netflix reports little; Disney/YouTube report well) are learned in prod.
+fn process_chromecast_observations(state: &SharedState, obs: Vec<crate::cast::ObservedPlayback>) {
+    let stream_host = state.config.stream_host.to_lowercase();
+    let mut to_stage: Vec<crate::cast::ObservedPlayback> = Vec::new();
+    for o in &obs {
+        tracing::info!(
+            "cc-track: {} app={} kind={} state={} {:.0}/{:.0}s '{}'",
+            o.device,
+            o.app_id,
+            o.kind,
+            o.player_state,
+            o.current_time,
+            o.duration,
+            o.title
+        );
+        if o.kind == "other" || o.duration <= 0.0 || o.title.trim().is_empty() {
+            continue;
+        }
+        if o.current_time / o.duration < HWM_CLEAR_FRACTION {
+            continue; // only a near-complete session counts as "watched"
+        }
+        // Skip spela's OWN casts — those are provably Fredrik's and already
+        // tracked via save_position_smart. Spela serves HLS from its own stream
+        // host on :7890 with a `/hls/` path; anything else is an external app.
+        let cid = o.content_id.to_lowercase();
+        let is_spela_own = cid.contains("/hls/")
+            || cid.contains(":7890")
+            || (!stream_host.is_empty() && cid.contains(&stream_host));
+        if is_spela_own {
+            continue;
+        }
+        to_stage.push(o.clone());
+    }
+    if to_stage.is_empty() {
+        return;
+    }
+    let mut app = AppState::load(&state.state_dir);
+    let mut changed = false;
+    for o in to_stage {
+        if app.stage_pending_watch(
+            o.title.clone(),
+            o.series.clone(),
+            o.season,
+            o.episode,
+            o.device.clone(),
+        ) {
+            tracing::info!(
+                "cc-track: staged '{}' from {} for confirmation",
+                o.title,
+                o.device
+            );
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = app.save(&state.state_dir);
+    }
 }
 
 /// `GET /watchlist` — the to-watch list (roadmap slice 3, recommender arsenal).

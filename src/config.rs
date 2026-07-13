@@ -167,6 +167,21 @@ pub struct Config {
     /// takes over as today).
     #[serde(default = "default_race_timeout_secs")]
     pub race_timeout_secs: u64,
+    /// 2026-07-13 (watch-tracker slice 5): auto-detect what's playing on the
+    /// house Chromecasts (incl. non-spela apps) so it can be tracked. READ-ONLY
+    /// polling; externally-detected sessions are STAGED for Fredrik to confirm
+    /// on his next UI load (housemates watch these TVs too), never auto-marked.
+    #[serde(default = "default_true")]
+    pub auto_track_chromecasts: bool,
+    /// Poll cadence in seconds (media state changes slowly; Darwin's the router,
+    /// keep it light).
+    #[serde(default = "default_auto_track_poll_secs")]
+    pub auto_track_poll_secs: u64,
+    /// Which devices to poll. Empty = the configured `known_devices` ∪
+    /// `default_device` (audio-only sessions are skipped by the Movie/TvShow
+    /// metadata filter regardless).
+    #[serde(default)]
+    pub auto_track_devices: Vec<String>,
 }
 
 fn default_server() -> String {
@@ -221,6 +236,9 @@ fn default_race_max_sources() -> usize {
 fn default_race_timeout_secs() -> u64 {
     15
 }
+fn default_auto_track_poll_secs() -> u64 {
+    60
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -260,6 +278,9 @@ impl Default for Config {
             race_seed_threshold: default_race_seed_threshold(),
             race_max_sources: default_race_max_sources(),
             race_timeout_secs: default_race_timeout_secs(),
+            auto_track_chromecasts: default_true(),
+            auto_track_poll_secs: default_auto_track_poll_secs(),
+            auto_track_devices: Vec::new(),
         }
     }
 }
