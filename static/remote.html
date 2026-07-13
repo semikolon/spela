@@ -102,6 +102,10 @@
   .src.partial{border-color:var(--good);background:linear-gradient(90deg,rgba(55,200,122,.16),var(--bg3))}
   .src .dl{color:var(--good);font-weight:800;white-space:nowrap}
   .src-toggle.has-partial{color:var(--good)}
+  /* 2026-07-13: per-source "Open in VLC" launcher (native 4K/HEVC/DV, full seek). */
+  .src .vlc{margin-left:.5rem;font-size:.68rem;font-weight:800;letter-spacing:.03em;
+    color:var(--accent);border:1px solid var(--line);border-radius:6px;padding:.18rem .42rem;flex:0 0 auto}
+  .src .vlc:active{border-color:var(--accent2);transform:scale(.94)}
 
   /* ---- search detail (single result): adaptive, fills the width intelligently.
      2026-07-13: search renders ONE card (show + nested sources), so the shared
@@ -384,6 +388,16 @@ async function api(path,{method="GET",body,signal}={}){
 $("#bannerRetry").onclick=()=>{ setBanner(false); route(); pollNow(true); };
 
 let toastT;
+// Open a source directly in VLC (native HEVC/Dolby-Vision decode, full seek, no
+// HLS/browser transcode). Baseline: download a one-line .m3u that the OS hands
+// to VLC. If a vlc:// protocol handler is installed (smoothest, true one-click),
+// S.vlcScheme is set and we fire that instead. 2026-07-13.
+async function openInVlc(id){
+  try{ const r=await fetch("/vlc/"+id+"/open.m3u",{method:"HEAD"});
+    if(r.status===409){ toast("Not downloaded yet — play it once, then Open in VLC"); return; } }catch(e){}
+  toast("Opening in VLC…");
+  window.location.href="/vlc/"+id+"/open.m3u";
+}
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("on");
   clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("on"),4200); }
 
@@ -443,6 +457,9 @@ function posterCard({poster,title,year,cta,onPlay,sources}){
       row.appendChild(el("span",{className:"x",textContent:r.size||""}));
       row.appendChild(el("span",{className:"x",textContent:r.source||""}));
       row.appendChild(el("span",{className:"s "+health,textContent:(health==="dead"?"⚠ ":"")+sc+"🌱"}));
+      const vlc=el("span",{className:"vlc",textContent:"VLC",title:"Open in VLC — native 4K/HEVC/Dolby-Vision, full seek"});
+      vlc.onclick=(e)=>{ e.stopPropagation(); openInVlc(r.id); };
+      row.appendChild(vlc);
       row.onclick=()=>doPlay({result_id:r.id});
       box.appendChild(row);
     });

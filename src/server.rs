@@ -300,6 +300,10 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         // directly without explicit CODECS / RESOLUTION / BANDWIDTH hints.
         // The master playlist is generated synthetically in handle_hls_master
         // and references the ffmpeg-written media playlist by relative path.
+        // 2026-07-13: "Open in VLC" — serve any resolved on-disk source raw
+        // (Range) for direct VLC playback (native HEVC/DV, full seek, no HLS).
+        .route("/vlc/{id}/stream", get(handle_vlc_stream))
+        .route("/vlc/{id}/open.m3u", get(handle_vlc_playlist))
         .route("/hls/master.m3u8", get(handle_hls_master))
         .route("/hls/playlist.m3u8", get(handle_hls_playlist))
         .route("/hls/init.mp4", get(handle_hls_init))
@@ -6117,6 +6121,93 @@ fn normalize_hls_master_codecs(master: &str) -> String {
     let mut s = out.join("\n");
     s.push('\n');
     s
+}
+
+/// Resolve a search-result id to a COMPLETE on-disk source file (Local Bypass /
+/// library match) for DIRECT VLC streaming — no transcode, no HLS. Returns the
+/// path + a human display name. None if the source isn't downloaded yet.
+/// (2026-07-13: "Open in VLC" feature — VLC decodes HEVC/DV/anything natively
+/// with full seek, sidestepping the browser HLS pipeline entirely.)
+fn resolve_local_file_for_result(
+    state: &SharedState,
+    rid: usize,
+) -> Option<(std::path::PathBuf, String)> {
+    let search = AppState::load_last_search(&state.state_dir)?;
+    let r = search.results.iter().find(|r| r.id == rid)?;
+    let title = match (&search.show, search.searching.as_ref()) {
+        (Some(show), Some(ep)) => format!("{} S{:02}E{:02}", show.title, ep.season, ep.episode),
+        (Some(show), None) => show.title.clone(),
+        _ => r.title.clone(),
+    };
+    let expected_bytes = parse_size_to_bytes(&r.size).unwrap_or(0);
+    let corrupt = AppState::load(&state.state_dir).corrupt_files;
+    let mut roots = vec![resolve_media_dir(state)];
+    roots.extend(state.config.library_dirs());
+    let path = first_local_bypass_match(
+        &roots,
+        &title,
+        Some(r.quality.as_str()),
+        expected_bytes,
+        &corrupt,
+    )?;
+    let name = title.replace(['/', '\\'], "-");
+    Some((path, name))
+}
+
+/// `GET /vlc/{id}/stream` — serve the resolved on-disk source with HTTP Range so
+/// VLC (or any external player) streams it directly with full seek. LAN-scoped
+/// (Host-header allowlist middleware still applies).
+async fn handle_vlc_stream(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<usize>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    match resolve_local_file_for_result(&state, id) {
+        Some((path, _)) => {
+            tracing::info!("VLC direct-stream: result #{} → {:?}", id, path);
+            serve_static_with_range(path, "video/x-matroska", &headers).await
+        }
+        None => (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Source not on disk yet. Play it once to download, then Open in VLC."
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /vlc/{id}/open.m3u` — a tiny playlist file (Content-Disposition
+/// attachment) pointing at `/vlc/{id}/stream`. The browser downloads it and the
+/// OS hands it to VLC → VLC plays the raw source. This is the reliable
+/// cross-platform "launch external player from a web button" path.
+async fn handle_vlc_playlist(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<usize>,
+) -> axum::response::Response {
+    match resolve_local_file_for_result(&state, id) {
+        Some((_, name)) => {
+            let base = format!("http://{}:{}", state.config.stream_host, state.config.port);
+            let body = format!("#EXTM3U\n#EXTINF:-1,{}\n{}/vlc/{}/stream\n", name, base, id);
+            axum::response::Response::builder()
+                .status(200)
+                .header("Content-Type", "audio/x-mpegurl")
+                .header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"{}.m3u\"", name),
+                )
+                .header("Content-Length", body.len().to_string())
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
+        None => (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Source not on disk yet. Play it once to download, then Open in VLC."
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn handle_hls_master(
