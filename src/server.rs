@@ -2064,23 +2064,20 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
             // served via /hls/playlist.m3u8 with proper Content-Length + Range).
             // See ~/Projects/spela/TODO.md § "Cast Pipeline Rework" for the full
             // trade-off analysis.
-            // 2026-07-13: browser 4K pass-through. A >1080p HEVC source going to
-            // a browser (non-chromecast) target is stream-COPIED (full res +
-            // bitrate, no NVENC, no 1080p downscale) instead of re-encoded —
-            // the browser decodes HEVC natively. Only when there's nothing that
-            // requires a filter pass (no subtitle burn-in, no intro concat) and
-            // no mid-stream seek (copy starts at 0). Everything else, and the
-            // whole Chromecast path (CrKey 1.56 can't do HEVC/4K), is unchanged.
-            // 2026-07-13: a >1080 HEVC source to a browser goes through stream-COPY
-            // (true 4K, no NVENC). Subtitles were previously gated OUT of this path
-            // (burn-in needs a filter/re-encode) — but that shunted every 4K-with-subs
-            // play into a 4K→1080p NVENC transcode that CHOKED on Dolby-Vision 10-bit
-            // and produced no HLS segments (20s fail-fast, "starved swarm"). For a
-            // browser 4K target, true 4K beats burned subs: prefer pass-through and
-            // DROP the burn-in. (Proper 4K subtitles = the queued WebVTT sidecar track,
-            // not burn-in.) Intro concat + mid-stream seek still force the transcode.
+            // 2026-07-13: browser HEVC pass-through (fmp4 stream-copy). Any HEVC
+            // source to a browser (non-chromecast) target is stream-COPIED into
+            // fMP4/CMAF (full res + bitrate, no NVENC, no downscale); the browser
+            // decodes HEVC natively via MSE. The invariant is HEVC→browser, NOT
+            // "4K": ffmpeg's regular transcode_hls copies HEVC into MPEG-TS, which
+            // a browser CANNOT play (and often emits 0 segments → 20s fail-fast),
+            // so every HEVC-to-browser play MUST take this fmp4 path — regardless
+            // of resolution, and regardless of whether height was detected (a
+            // still-downloading torrent stream yields codec but often not height).
+            // Subtitles are dropped here (burn-in needs a filter/re-encode; proper
+            // subs = the queued WebVTT sidecar). Intro concat + mid-stream seek are
+            // the only things that still force the re-encode path. The whole
+            // Chromecast path (CrKey 1.56 can't do HEVC/4K) is unchanged.
             let want_4k_passthrough = target != "chromecast"
-                && source_height.map_or(false, |h| h > 1080)
                 && video_codec.as_deref().map_or(false, |c| {
                     let c = c.to_ascii_lowercase();
                     c == "hevc" || c == "h265" || c == "h.265"
@@ -2088,11 +2085,11 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 && intro_path.is_none()
                 && seek_to.unwrap_or(0.0) <= 0.0;
             if want_4k_passthrough && sub_path.is_some() {
-                tracing::info!("Browser 4K pass-through: dropping burn-in subtitles to keep true 4K (no re-encode)");
+                tracing::info!("Browser HEVC pass-through: dropping burn-in subtitles (fmp4 stream-copy, no re-encode)");
             }
             let hls_result = if want_4k_passthrough {
                 tracing::info!(
-                    "Browser 4K pass-through: stream-copying {}p {} (no re-encode, no downscale)",
+                    "Browser HEVC pass-through: fmp4 stream-copying {}p {} (no re-encode, no downscale)",
                     source_height.unwrap_or(0),
                     video_codec.as_deref().unwrap_or("hevc")
                 );
