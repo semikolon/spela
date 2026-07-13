@@ -35,7 +35,12 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    watching" the row can't do yet. Surfaces "new episode aired" too (TMDB
    airdates → notification, like TV Time's reminders).
 
-3. **To-watch list + recommender — NEXT (arsenal built, harness = Claude).**
+3. **To-watch list + recommender — arsenal ✅ SHIPPED (2026-07-13, `b4fed13`); harness (curation) = Claude, ongoing.**
+   `GET /watchlist` serves `~/.config/spela/watchlist.json` (seeded from the RT
+   import). A "To Watch" nav tab + view lists series + movies as tappable rows
+   (RT score shown, <88 dimmed per the gate; already-watched hidden); tap → search
+   that title. That's the ARSENAL. The HARNESS = Claude curating/ranking the list
+   (reading `taste_profile.md`); still ongoing (Phase 1).
    **The LLM harness IS Claude/CC now (Phase 1), exactly like DIM** (Fredrik: "the
    LLM is YOU until I say otherwise"). So spela builds the ARSENAL (the to-watch
    store + endpoints + a "To Watch" UI view + the tools: `/search`+TMDB, critics
@@ -62,6 +67,13 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    referential-safety: read-only polling, no control actions.
 
 ## Notes
+- **⚠ Arsenal data lives on the SPELA HOST (Darwin `~/.config/spela/`), not the Mac.**
+  spela serves `watchlist.json` from the host it runs on (Darwin). Authoring these
+  files on the Mac (this repo's dev box) does NOT reach spela — `/watchlist` reads
+  Darwin's copy. Edit on Darwin, or `scp` the file over after editing. (Bit us
+  2026-07-13: wrote `watchlist.json` on the Mac, `/watchlist` returned empty until
+  scp'd to Darwin.) `taste_profile.md` + `rt_watchlist_*.md` are the Claude-harness's
+  inputs — keep a copy wherever the harness runs; canonical = Darwin.
 - **User-local personal data** (all in `~/.config/spela/`, NOT the public repo):
   `taste_profile.md` (the recommender SSoT — meta-rules + genre map + "watched &
   loved" anchors), `rt_watchlist_2026-07-13.md` (RT watchlist import → slice-3 seed),
