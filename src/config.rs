@@ -305,6 +305,11 @@ impl Config {
                 config.tmdb_api_key = key;
             }
         }
+        if config.mdblist_api_key.is_empty() {
+            if let Ok(key) = std::env::var("MDBLIST_API_KEY") {
+                config.mdblist_api_key = key;
+            }
+        }
         // 2026-07-04: env overrides so a SECOND (test) spela instance can run
         // alongside production WITHOUT clobbering it — its own port + media dir
         // (⇒ its own `media_dir/transcoded_hls`, so `do_cleanup`'s wipe never
