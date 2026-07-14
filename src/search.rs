@@ -345,6 +345,7 @@ impl SearchEngine {
             ));
         }
         let want = title_norm(title);
+        let want_words = want.split_whitespace().count().max(1) as f32;
         let mut best: Option<(f32, u64)> = None;
         for url in &urls {
             let Ok(resp) = self.client.get(url).send().await else {
@@ -366,13 +367,24 @@ impl SearchEngine {
                     .or_else(|| item["name"].as_str())
                     .or_else(|| item["original_title"].as_str())
                     .unwrap_or("");
-                let s = title_token_score(&want, &title_norm(cand));
-                if best.as_ref().is_none_or(|(bs, _)| s > *bs) {
-                    best = Some((s, id));
+                let cand_norm = title_norm(cand);
+                // Prefer an EXACT title over a partial-containment match. Without
+                // this, "The Beasts" scores 1.0 against the popular
+                // "Transformers: Rise of the Beasts" (both contain the words) and
+                // wins on popularity order. Exact = 2.0; otherwise penalize a
+                // candidate that carries far more words than the query.
+                let score = if cand_norm == want {
+                    2.0
+                } else {
+                    let cand_words = cand_norm.split_whitespace().count().max(1) as f32;
+                    title_token_score(&want, &cand_norm) * (want_words / cand_words.max(want_words))
+                };
+                if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+                    best = Some((score, id));
                 }
             }
-            if best.as_ref().is_some_and(|(s, _)| *s >= 1.0) {
-                break; // strong match — no need for the fallback query
+            if best.as_ref().is_some_and(|(s, _)| *s >= 2.0) {
+                break; // exact match — no need for the fallback query
             }
         }
         let Some((score, id)) = best.filter(|(s, _)| *s >= 0.01) else {

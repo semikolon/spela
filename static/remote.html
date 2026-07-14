@@ -763,7 +763,6 @@ async function fillDetailLine(card, title, isTV){
   if(m.genres&&m.genres.length) parts.push(m.genres.slice(0,3).join(", "));
   if(isTV && m.seasons) parts.push(m.seasons+" season"+(m.seasons>1?"s":""));
   else if(m.runtime) parts.push(m.runtime+" min");
-  if(m.tmdb) parts.push("⭐ "+m.tmdb.toFixed(1));
   dl.textContent=parts.join("  ·  ");
   // live RT score (MDBList) → the compact tomato shows the number + links to
   // the real RT page. Without a key m.rt is absent → the tomato stays a search
