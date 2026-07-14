@@ -131,14 +131,58 @@ pub struct TorrentResult {
 pub struct SearchEngine {
     client: reqwest::Client,
     tmdb_key: String,
+    mdblist_key: String,
 }
 
 impl SearchEngine {
-    pub fn new(tmdb_key: String) -> Self {
+    pub fn new(tmdb_key: String, mdblist_key: String) -> Self {
         Self {
             client: reqwest::Client::new(),
             tmdb_key,
+            mdblist_key,
         }
+    }
+
+    /// 2026-07-14: live Rotten Tomatoes scores via MDBList (the de-facto RT-for-TV
+    /// source; free key). Returns (critic %, audience %, RT deep-link). Keyed by
+    /// TMDB id (spela always has it). Empty key or any error → all None (the
+    /// caller falls back to curated scores / TMDB rating). Best-effort.
+    async fn mdblist_rt(&self, tmdb_id: u64, is_tv: bool) -> (Option<u32>, Option<u32>, Option<String>) {
+        if self.mdblist_key.is_empty() {
+            return (None, None, None);
+        }
+        let media = if is_tv { "show" } else { "movie" };
+        let url = format!(
+            "https://api.mdblist.com/tmdb/{}/{}?apikey={}",
+            media, tmdb_id, self.mdblist_key
+        );
+        let Ok(resp) = self.client.get(&url).send().await else {
+            return (None, None, None);
+        };
+        let Ok(v) = resp.json::<Value>().await else {
+            return (None, None, None);
+        };
+        let pct = |r: &Value| {
+            r["value"]
+                .as_u64()
+                .or_else(|| r["score"].as_u64())
+                .or_else(|| r["value"].as_f64().map(|f| f.round() as u64))
+                .map(|x| x as u32)
+        };
+        let (mut critic, mut audience, mut rt_url) = (None, None, None);
+        if let Some(arr) = v["ratings"].as_array() {
+            for r in arr {
+                match r["source"].as_str() {
+                    Some("tomatoes") => {
+                        critic = pct(r);
+                        rt_url = r["url"].as_str().filter(|s| !s.is_empty()).map(String::from);
+                    }
+                    Some("popcorn") => audience = pct(r),
+                    _ => {}
+                }
+            }
+        }
+        (critic, audience, rt_url)
     }
 
     /// Web-remote T-4: best-effort TMDB poster for a library entry by
@@ -389,8 +433,12 @@ impl SearchEngine {
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_u64())
         });
+        let (rt, rt_audience, rt_url) = self.mdblist_rt(id, is_tv).await;
         json!({
             "poster_url": poster,
+            "rt": rt,
+            "rt_audience": rt_audience,
+            "rt_url": rt_url,
             "year": if year.is_empty() { Value::Null } else { Value::String(year) },
             "genres": genres,
             "tmdb": tmdb,
@@ -1845,13 +1893,13 @@ mod tests {
     // `tmdb_poster_url_*` tests above.
     #[tokio::test]
     async fn movie_poster_empty_key_is_none_no_network() {
-        let e = SearchEngine::new(String::new());
+        let e = SearchEngine::new(String::new(), String::new());
         assert_eq!(e.movie_poster("Blade Runner", Some(1982)).await, None);
     }
 
     #[tokio::test]
     async fn movie_poster_blank_title_is_none_no_network() {
-        let e = SearchEngine::new("dummy-key-never-used".into());
+        let e = SearchEngine::new("dummy-key-never-used".into(), String::new());
         assert_eq!(e.movie_poster("   ", None).await, None);
         assert_eq!(e.movie_poster("", Some(2000)).await, None);
     }

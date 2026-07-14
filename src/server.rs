@@ -202,7 +202,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
 
     reconcile_session_state_on_startup(&state_dir);
 
-    let search_engine = SearchEngine::new(config.tmdb_api_key.clone());
+    let search_engine = SearchEngine::new(config.tmdb_api_key.clone(), config.mdblist_api_key.clone());
     let cast = Mutex::new(CastController::new(
         &state_dir,
         config.known_devices.clone(),
@@ -5641,6 +5641,7 @@ async fn handle_library(State(state): State<SharedState>) -> Json<Value> {
     if !library.is_empty() {
         let engine = std::sync::Arc::new(crate::search::SearchEngine::new(
             state.config.tmdb_api_key.clone(),
+            state.config.mdblist_api_key.clone(),
         ));
         let mut want: Vec<(String, Option<u32>)> = library
             .iter()

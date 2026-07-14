@@ -182,6 +182,12 @@ pub struct Config {
     /// metadata filter regardless).
     #[serde(default)]
     pub auto_track_devices: Vec<String>,
+    /// 2026-07-14: free MDBList API key (mdblist.com/preferences) → live RT
+    /// critic + audience scores + the RT deep link for movies AND TV, on the
+    /// search card + To-Watch. Empty = no RT enrichment (falls back to the
+    /// curated watchlist scores + TMDB rating). The de-facto RT-for-TV source.
+    #[serde(default)]
+    pub mdblist_api_key: String,
 }
 
 fn default_server() -> String {
@@ -281,6 +287,7 @@ impl Default for Config {
             auto_track_chromecasts: default_true(),
             auto_track_poll_secs: default_auto_track_poll_secs(),
             auto_track_devices: Vec::new(),
+            mdblist_api_key: String::new(),
         }
     }
 }

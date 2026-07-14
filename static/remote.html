@@ -565,6 +565,10 @@ async function enrichToWatchRow(row,title,isTV){
   let m; try{ m=await api("/title-meta?title="+encodeURIComponent(title)+(isTV?"&tv=1":"")); }catch{ return; }
   if(!m) return;
   const q=row.querySelector(".q");
+  // live RT (MDBList) overrides the static curated score when present; also
+  // gives a score to entries that had none.
+  if(m.rt!=null){ let s=row.querySelector(".s"); if(!s){ s=el("span",{className:"s"}); row.appendChild(s); }
+    s.textContent="🍅 "+m.rt; s.className="s "+(m.rt>=88?"":"low"); }
   if(m.year && q && !row.querySelector(".ty")) q.after(el("span",{className:"ty",textContent:String(m.year)}));
   if(m.genres && m.genres.length && !row.querySelector(".gx")){
     const g=el("span",{className:"x gx",textContent:m.genres.slice(0,2).join(", ")});
@@ -762,6 +766,11 @@ async function fillDetailLine(card, title, isTV){
   else if(m.runtime) parts.push(m.runtime+" min");
   if(m.tmdb) parts.push("⭐ "+m.tmdb.toFixed(1));
   dl.textContent=parts.join("  ·  ");
+  // live RT score (MDBList) → the compact tomato shows the number + links to
+  // the real RT page. Without a key m.rt is absent → the tomato stays a search
+  // link (unchanged).
+  if(m.rt!=null){ const rl=card.querySelector(".rtlink");
+    if(rl){ rl.textContent="🍅 "+m.rt+" →"; if(m.rt_url) rl.href=m.rt_url; } }
 }
 
 async function runSearch(q){
