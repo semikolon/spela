@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 use anyhow::Context;
-use axum::extract::{Query, Request, State};
+use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Json};
@@ -288,6 +288,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         )
         .route("/watchlist", get(handle_watchlist).post(handle_watchlist_add))
         .route("/title-meta", get(handle_title_meta))
+        .route("/poster/{size}/{file}", get(handle_poster))
         // Web-remote My Library (US-3): aggregate curated collection
         // (local library_dirs + remote serve-library origins).
         .route("/library", get(handle_library))
@@ -5135,6 +5136,61 @@ async fn handle_recent(State(state): State<SharedState>) -> Json<Value> {
 async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
     let app = AppState::load(&state.state_dir);
     Json(json!({"watched": app.watched.iter().take(200).collect::<Vec<_>>()}))
+}
+
+/// `GET /poster/{size}/{file}` — self-hosted TMDB poster proxy + disk cache.
+/// Fetches `https://image.tmdb.org/t/p/{size}/{file}` ONCE, stores it under
+/// `~/.config/spela/poster_cache/`, and serves it locally with immutable
+/// year-long cache headers — so after the first view every device loads posters
+/// from the LAN, not TMDB's CDN. SSRF-safe: host is hardcoded to TMDB, `size` is
+/// allow-listed, `file` is a single charset-validated segment (no `/`, no `..`).
+async fn handle_poster(AxumPath((size, file)): AxumPath<(String, String)>) -> axum::response::Response {
+    const SIZES: &[&str] = &["w92", "w154", "w185", "w342", "w500", "w780", "original"];
+    let file_ok = !file.is_empty()
+        && file
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        && !file.contains("..");
+    if !SIZES.contains(&size.as_str()) || !file_ok {
+        return (StatusCode::BAD_REQUEST, "bad poster path").into_response();
+    }
+    let ctype = if file.ends_with(".png") {
+        "image/png"
+    } else {
+        "image/jpeg"
+    };
+    let Some(dir) = dirs::home_dir().map(|h| h.join(".config/spela/poster_cache")) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let cached = dir.join(format!("{}_{}", size, file));
+    if let Ok(bytes) = std::fs::read(&cached) {
+        return serve_poster_bytes(bytes, ctype);
+    }
+    let url = format!("https://image.tmdb.org/t/p/{}/{}", size, file);
+    let bytes = match reqwest::get(&url).await {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(ok) => match ok.bytes().await {
+                Ok(b) => b,
+                Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+            },
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        },
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&cached, &bytes);
+    serve_poster_bytes(bytes.to_vec(), ctype)
+}
+
+fn serve_poster_bytes(bytes: Vec<u8>, ctype: &'static str) -> axum::response::Response {
+    (
+        [
+            (header::CONTENT_TYPE, ctype),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 /// `POST /watched-add` — mark a movie/series watched from the search detail's

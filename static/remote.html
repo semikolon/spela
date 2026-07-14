@@ -418,6 +418,11 @@
 "use strict";
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const el=(t,p={})=>Object.assign(document.createElement(t),p);
+// Route TMDB CDN posters through spela's self-hosted proxy+cache (/poster/...)
+// so they're served from the LAN after the first view, not image.tmdb.org.
+// Non-TMDB / already-local URLs pass through unchanged.
+const posterSrc=u=>{ if(!u) return u;
+  const m=/^https?:\/\/image\.tmdb\.org\/t\/p\/(.+)$/.exec(u); return m?"/poster/"+m[1]:u; };
 const fmt=s=>{ s=Math.max(0,Math.round(s||0)); const h=s/3600|0,m=(s%3600)/60|0,x=s%60;
   return (h?h+":"+String(m).padStart(2,"0"):m)+":"+String(x).padStart(2,"0"); };
 
@@ -529,10 +534,10 @@ async function enrichToWatchRow(row,title,isTV){
   if(!m) return;
   if(m.year){ const q=row.querySelector(".q");
     if(q && !row.querySelector(".ty")) q.after(el("span",{className:"ty",textContent:String(m.year)})); }
-  if(m.poster_url){ const img=new Image();
-    img.onload=()=>{ row.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.88),rgba(15,15,20,.62)),url('${m.poster_url}')`;
+  if(m.poster_url){ const ps=posterSrc(m.poster_url); const img=new Image();
+    img.onload=()=>{ row.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.88),rgba(15,15,20,.62)),url('${ps}')`;
       row.style.backgroundSize="cover"; row.style.backgroundPosition="center 20%"; };
-    img.src=m.poster_url; }
+    img.src=ps; }
 }
 addEventListener("hashchange",route);
 
@@ -546,7 +551,7 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle}
     const img=el("img",{loading:"lazy",decoding:"async",alt:title||""});
     img.onload=()=>{img.classList.add("in");sh.remove();};
     img.onerror=()=>{sh.remove();p.appendChild(el("div",{className:"fallback",textContent:title||"Untitled"}));};
-    img.src=poster; p.appendChild(img);
+    img.src=posterSrc(poster); p.appendChild(img);
   }else{
     sh.remove(); p.appendChild(el("div",{className:"fallback",textContent:title||"Untitled"}));
   }
@@ -1106,7 +1111,7 @@ function seekMax(){ return S.now.endlist? (S.now.dur||0)
 
 function updateNowBar(){
   const c=S.now.data; if(!c)return;
-  $("#nbPoster").src=c.poster_url||""; $("#nbTitle").textContent=c.title||"—";
+  $("#nbPoster").src=posterSrc(c.poster_url||""); $("#nbTitle").textContent=c.title||"—";
   $("#nbState").textContent = S.now.cold ? "Starting…"
     : `${fmt(livePos())} / ${fmt(S.now.dur)}`;
   $("#nbPlay").innerHTML = S.now.cold ? "…" : ic(S.now.playing?"pause":"play");
@@ -1135,7 +1140,7 @@ function renderWarmupInto(root){
   }
   const el=(w.elapsed_secs!=null)?` · ${w.elapsed_secs}s`:"";
   root.innerHTML=`<div class="nowfull" id="warmup">
-    ${poster?`<img class="bigposter" src="${esc(poster)}" alt="">`:""}
+    ${poster?`<img class="bigposter" src="${esc(posterSrc(poster))}" alt="">`:""}
     <h2>${esc(title)}</h2>
     <div class="starting"><div class="spin"></div>${esc(label)}</div>
     ${barPct!=null?`<div class="wbar"><div class="wfill" style="width:${barPct}%"></div></div>`:""}
@@ -1152,7 +1157,7 @@ function renderNowFull(){
   if(S.now.error){                                       // 2026-07-08 persistent play-start failure
     const e=S.now.error;
     root.innerHTML=`<div class="nowfull">
-      ${e.poster?`<img class="bigposter" src="${esc(e.poster)}" alt="">`:""}
+      ${e.poster?`<img class="bigposter" src="${esc(posterSrc(e.poster))}" alt="">`:""}
       <h2>${esc(e.title)}</h2>
       <div class="errbox">
         <div class="errmsg">Couldn’t start — ${esc(e.msg)}</div>
@@ -1193,7 +1198,7 @@ function renderNowFull(){
   }
   if(S.now.cold){
     root.innerHTML=`<div class="nowfull">
-      <img class="bigposter" src="${esc(c.poster_url||"")}" alt="">
+      <img class="bigposter" src="${esc(posterSrc(c.poster_url||""))}" alt="">
       <h2>${esc(c.title||"")}</h2>
       <div class="starting"><div class="spin"></div>Starting on ${esc((c.target||"").split(":")[1]||S.target?.name||"TV")}…</div>
       <div class="sub">Cold-start can take up to a minute — this is normal, not an error.</div>
@@ -1203,7 +1208,7 @@ function renderNowFull(){
   const max=seekMax(), pos=livePos(), pct=max?Math.min(100,pos/max*100):0;
   const fpct=(S.now.dur&&!S.now.endlist&&S.now.frontier)?Math.min(100,S.now.frontier/S.now.dur*100):100;
   root.innerHTML=`<div class="nowfull">
-    <img class="bigposter" src="${esc(c.poster_url||"")}" alt="">
+    <img class="bigposter" src="${esc(posterSrc(c.poster_url||""))}" alt="">
     <h2>${esc(c.title||"")}</h2>
     <div class="sub">${esc(c.quality||"")} · ${esc((c.target||"").split(":")[1]||"")}</div>
     <div class="scrub">
