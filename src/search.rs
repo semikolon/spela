@@ -175,7 +175,13 @@ impl SearchEngine {
                 match r["source"].as_str() {
                     Some("tomatoes") => {
                         critic = pct(r);
-                        rt_url = r["url"].as_str().filter(|s| !s.is_empty()).map(String::from);
+                        rt_url = r["url"].as_str().filter(|s| !s.is_empty()).map(|u| {
+                            if u.starts_with("http") {
+                                u.to_string()
+                            } else {
+                                format!("https://www.rottentomatoes.com{}", u)
+                            }
+                        });
                     }
                     Some("popcorn") => audience = pct(r),
                     _ => {}
