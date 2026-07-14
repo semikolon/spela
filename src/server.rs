@@ -5426,16 +5426,31 @@ async fn handle_title_meta(
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    // 30-day TTL so posters (TMDB re-uploads), year-ranges (new seasons air),
+    // and series status refresh. Entries are {_ts, data}; the old flat format
+    // has no _ts → treated stale → re-fetched into the new rich format.
+    const TTL_SECS: u64 = 30 * 24 * 3600;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     if let Some(hit) = cache.get(&cache_key) {
-        return Json(hit.clone());
+        let fresh = hit
+            .get("_ts")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|ts| now.saturating_sub(ts) < TTL_SECS);
+        if fresh {
+            if let Some(data) = hit.get("data") {
+                return Json(data.clone());
+            }
+        }
     }
-    let (poster, year) = state.search_engine.poster_and_year(&title, is_tv).await;
-    let val = json!({"poster_url": poster, "year": year});
-    cache.insert(cache_key, val.clone());
+    let data = state.search_engine.title_meta(&title, is_tv).await;
+    cache.insert(cache_key, json!({"_ts": now, "data": data.clone()}));
     if let Some(p) = path {
         let _ = std::fs::write(&p, serde_json::to_string(&cache).unwrap_or_default());
     }
-    Json(val)
+    Json(data)
 }
 
 /// `POST /watchlist` — add a title to the to-watch list from the UI (grow it

@@ -509,7 +509,8 @@ async function renderToWatch(){
   const mk=(arr,isTV)=>(arr||[]).filter(x=>!x.watched).map(x=>{
     const r=el("button",{className:"src"});
     r.appendChild(el("span",{className:"q",textContent:x.title}));
-    if(x.note) r.appendChild(el("span",{className:"x",textContent:x.note}));
+    // year + real TMDB genre are filled in by enrichToWatchRow (the old hand-
+    // written `note` was inconsistent + jargon-y, replaced by real genres).
     if(x.rt!=null) r.appendChild(el("span",{className:"s "+(x.rt>=88?"":"low"),textContent:"🍅 "+x.rt}));
     r.onclick=()=>{ setMode(isTV?"tv":"movie"); $("#q").value=x.title; S.search.q=x.title; location.hash="#/search"; runSearch(x.title); };
     enrichToWatchRow(r,x.title,isTV);
@@ -532,8 +533,12 @@ async function renderToWatch(){
 async function enrichToWatchRow(row,title,isTV){
   let m; try{ m=await api("/title-meta?title="+encodeURIComponent(title)+(isTV?"&tv=1":"")); }catch{ return; }
   if(!m) return;
-  if(m.year){ const q=row.querySelector(".q");
-    if(q && !row.querySelector(".ty")) q.after(el("span",{className:"ty",textContent:String(m.year)})); }
+  const q=row.querySelector(".q");
+  if(m.year && q && !row.querySelector(".ty")) q.after(el("span",{className:"ty",textContent:String(m.year)}));
+  if(m.genres && m.genres.length && !row.querySelector(".gx")){
+    const g=el("span",{className:"x gx",textContent:m.genres.slice(0,2).join(", ")});
+    (row.querySelector(".ty")||q).after(g);
+  }
   if(m.poster_url){ const ps=posterSrc(m.poster_url); const img=new Image();
     img.onload=()=>{ row.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.88),rgba(15,15,20,.62)),url('${ps}')`;
       row.style.backgroundSize="cover"; row.style.backgroundPosition="center 20%"; };

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Torrentio API — aggregates 24 torrent sites (TPB, 1337x, YTS, RARBG, TorrentGalaxy, etc.)
 /// Default providers already return 76+ results per movie. All-providers URL doesn't add more.
@@ -267,14 +267,16 @@ impl SearchEngine {
         best.filter(|(s, _)| *s >= ACCEPT).map(|(_, p)| p)
     }
 
-    /// 2026-07-13 (slice 5 / To-Watch view): poster URL + release year for a
-    /// watchlist title (movie OR tv). Same best-overlap scoring as
-    /// `movie_poster`, but returns the YEAR too and honors the movie/tv split.
-    /// Backs the cached `/title-meta` endpoint that gives the To-Watch rows a
-    /// poster background + year. One TMDB call in the common case.
-    pub async fn poster_and_year(&self, title: &str, is_tv: bool) -> (Option<String>, Option<u32>) {
+    /// 2026-07-13 (slice 5 / To-Watch view): RICH metadata for a watchlist title
+    /// (movie OR tv), backing the cached `/title-meta` endpoint. Finds the best
+    /// TMDB match (best-overlap scoring), then fetches the DETAIL endpoint for
+    /// the full field set. Returns a JSON object (empty `{}` on no match) with:
+    /// `poster_url`, `year` (a RANGE for series: "2014–2022" / "2014–present"),
+    /// `genres` (real TMDB names), `tmdb` (vote_average 0–10), `status`,
+    /// `seasons`, `episodes`, `runtime`, `overview`. Two TMDB calls, then cached.
+    pub async fn title_meta(&self, title: &str, is_tv: bool) -> Value {
         if self.tmdb_key.is_empty() || title.trim().is_empty() {
-            return (None, None);
+            return json!({});
         }
         let cleaned = clean_title_for_tmdb(title);
         let title = if cleaned.is_empty() {
@@ -284,30 +286,24 @@ impl SearchEngine {
         };
         let q = urlencoded(title);
         let kind = if is_tv { "tv" } else { "movie" };
-        let mut urls = vec![
-            format!(
-                "https://api.themoviedb.org/3/search/{}?query={}&api_key={}",
-                kind, q, self.tmdb_key
-            ),
-            format!(
-                "https://api.themoviedb.org/3/search/multi?query={}&api_key={}",
-                q, self.tmdb_key
-            ),
-        ];
+        // Find the best-overlap candidate's id (search endpoint), then fetch its
+        // detail. Two attempts: typed search, then a shortened multi query.
         let words: Vec<&str> = title.split_whitespace().collect();
+        let mut urls = vec![format!(
+            "https://api.themoviedb.org/3/search/{}?query={}&api_key={}",
+            kind, q, self.tmdb_key
+        )];
         if words.len() >= 2 {
             let head = urlencoded(&words[..words.len() - 1].join(" "));
             urls.push(format!(
-                "https://api.themoviedb.org/3/search/multi?query={}&api_key={}",
-                head, self.tmdb_key
+                "https://api.themoviedb.org/3/search/{}?query={}&api_key={}",
+                kind, head, self.tmdb_key
             ));
         }
-        const STRONG: f32 = 1.0;
-        const ACCEPT: f32 = 0.01;
         let want = title_norm(title);
-        let mut best: Option<(f32, Option<String>, Option<u32>)> = None;
-        for url in urls {
-            let Ok(resp) = self.client.get(&url).send().await else {
+        let mut best: Option<(f32, u64)> = None;
+        for url in &urls {
+            let Ok(resp) = self.client.get(url).send().await else {
                 continue;
             };
             let Ok(v) = resp.json::<Value>().await else {
@@ -317,30 +313,93 @@ impl SearchEngine {
                 continue;
             };
             for item in arr {
-                let poster = tmdb_poster_url(item["poster_path"].as_str());
+                let id = item["id"].as_u64().unwrap_or(0);
+                if id == 0 {
+                    continue;
+                }
                 let cand = item["title"]
                     .as_str()
                     .or_else(|| item["name"].as_str())
                     .or_else(|| item["original_title"].as_str())
                     .unwrap_or("");
-                let year = item["release_date"]
-                    .as_str()
-                    .or_else(|| item["first_air_date"].as_str())
-                    .and_then(|d| d.get(0..4))
-                    .and_then(|y| y.parse::<u32>().ok());
                 let s = title_token_score(&want, &title_norm(cand));
-                if s >= STRONG {
-                    return (poster, year);
-                }
-                if best.as_ref().is_none_or(|(bs, _, _)| s > *bs) {
-                    best = Some((s, poster, year));
+                if best.as_ref().is_none_or(|(bs, _)| s > *bs) {
+                    best = Some((s, id));
                 }
             }
+            if best.as_ref().is_some_and(|(s, _)| *s >= 1.0) {
+                break; // strong match — no need for the fallback query
+            }
         }
-        match best.filter(|(s, _, _)| *s >= ACCEPT) {
-            Some((_, p, y)) => (p, y),
-            None => (None, None),
-        }
+        let Some((score, id)) = best.filter(|(s, _)| *s >= 0.01) else {
+            return json!({});
+        };
+        let _ = score;
+        // Detail endpoint — the full field set.
+        let durl = format!(
+            "https://api.themoviedb.org/3/{}/{}?api_key={}",
+            kind, id, self.tmdb_key
+        );
+        let Ok(resp) = self.client.get(&durl).send().await else {
+            return json!({});
+        };
+        let Ok(d) = resp.json::<Value>().await else {
+            return json!({});
+        };
+        let poster = tmdb_poster_url(d["poster_path"].as_str());
+        let genres: Vec<String> = d["genres"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| g["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tmdb = d["vote_average"].as_f64().filter(|v| *v > 0.0);
+        let overview = d["overview"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let status = d["status"].as_str().map(String::from);
+        let year = if is_tv {
+            let first = d["first_air_date"].as_str().and_then(|s| s.get(0..4));
+            let last = d["last_air_date"].as_str().and_then(|s| s.get(0..4));
+            let ongoing = matches!(
+                d["status"].as_str(),
+                Some("Returning Series") | Some("In Production") | Some("Planned")
+            );
+            match (first, last) {
+                (Some(f), _) if ongoing => format!("{}\u{2013}present", f),
+                (Some(f), Some(l)) if f != l => format!("{}\u{2013}{}", f, l),
+                (Some(f), _) => f.to_string(),
+                _ => String::new(),
+            }
+        } else {
+            d["release_date"]
+                .as_str()
+                .and_then(|s| s.get(0..4))
+                .unwrap_or("")
+                .to_string()
+        };
+        let seasons = d["number_of_seasons"].as_u64();
+        let episodes = d["number_of_episodes"].as_u64();
+        let runtime = d["runtime"].as_u64().or_else(|| {
+            d["episode_run_time"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_u64())
+        });
+        json!({
+            "poster_url": poster,
+            "year": if year.is_empty() { Value::Null } else { Value::String(year) },
+            "genres": genres,
+            "tmdb": tmdb,
+            "status": status,
+            "seasons": seasons,
+            "episodes": episodes,
+            "runtime": runtime,
+            "overview": overview,
+        })
     }
 
     pub async fn search(
