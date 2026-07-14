@@ -132,7 +132,7 @@
     text-overflow:ellipsis;text-align:left}
   #towatchOut .src .ty{flex:0 0 auto;white-space:nowrap;color:var(--dim);
     font-weight:600;font-size:.82rem;margin-left:.45rem}
-  #towatchOut .src .x{flex:0 0 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40%}
+  #towatchOut .src .x{flex:0 0 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34%}
   #towatchOut .src .s{flex:0 0 auto}
   #towatchOut .src{transition:background-image .3s ease}
   /* 2026-07-14: list fills the viewport (was capped at .detail's 940px, leaving
@@ -153,9 +153,8 @@
      genre), so the title keeps its space instead of collapsing to "C". Year +
      RT score + title always stay. Row-width based (container query), so it's
      correct at any column width / viewport. */
-  @container (max-width:520px){ #towatchOut .src .stx{display:none} }
-  @container (max-width:450px){ #towatchOut .src .mx{display:none} }
-  @container (max-width:390px){ #towatchOut .src .gx{display:none} }
+  @container (max-width:1080px){ #towatchOut .src .mx,#towatchOut .src .stx{display:none} }
+  @container (max-width:620px){ #towatchOut .src .gx{display:none} }
   /* 2026-07-13: "Mark watched" secondary button on the search detail card. */
   .markw{background:var(--bg3);border:1px solid var(--line);border-radius:12px;
     padding:.55rem 1rem;color:var(--fg);font-weight:700;font-size:.9rem;min-height:48px;
