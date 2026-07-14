@@ -140,15 +140,22 @@
      (runtime/seasons + status) ride along, hidden on narrow phones where there's
      no room. */
   #towatchOut .detail{max-width:none;padding-right:2vw}
-  /* fill the viewport with WIDER rows (2 cols, 3 on very wide screens) so all
-     the fields fit without extra title truncation — the existing 2-col rule
-     handles ≥641px; this just adds a 3rd column past 1500px. */
-  @media (min-width:1500px){ #towatchOut .sources.open{grid-template-columns:repeat(3,minmax(0,1fr))} }
+  /* Fill the viewport at 2 columns max (wider viewport = wider rows, never
+     narrower — 3 columns made cells narrower than 2-col-at-medium and starved
+     the title). Each row is a query CONTAINER so the extras drop by the ROW's
+     own width (below), keeping the title readable at any width. */
+  #towatchOut .src{container-type:inline-size}
   #towatchOut .src .mx{flex:0 0 auto;white-space:nowrap;color:var(--dim);font-size:.8rem;margin-left:.45rem}
   #towatchOut .src .stx{flex:0 0 auto;white-space:nowrap;font-size:.68rem;font-weight:700;margin-left:.5rem;
     padding:.1rem .42rem;border-radius:6px;border:1px solid var(--line);color:var(--dim)}
   #towatchOut .src .stx.on{color:var(--good);border-color:rgba(55,200,122,.5)}
-  @media (max-width:560px){ #towatchOut .src .mx,#towatchOut .src .stx{display:none} }
+  /* Drop the lower-priority extras as the ROW narrows (status → seasons →
+     genre), so the title keeps its space instead of collapsing to "C". Year +
+     RT score + title always stay. Row-width based (container query), so it's
+     correct at any column width / viewport. */
+  @container (max-width:520px){ #towatchOut .src .stx{display:none} }
+  @container (max-width:450px){ #towatchOut .src .mx{display:none} }
+  @container (max-width:390px){ #towatchOut .src .gx{display:none} }
   /* 2026-07-13: "Mark watched" secondary button on the search detail card. */
   .markw{background:var(--bg3);border:1px solid var(--line);border-radius:12px;
     padding:.55rem 1rem;color:var(--fg);font-weight:700;font-size:.9rem;min-height:48px;
