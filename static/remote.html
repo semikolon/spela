@@ -135,6 +135,20 @@
   #towatchOut .src .x{flex:0 0 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40%}
   #towatchOut .src .s{flex:0 0 auto}
   #towatchOut .src{transition:background-image .3s ease}
+  /* 2026-07-14: list fills the viewport (was capped at .detail's 940px, leaving
+     the right half empty), responsive columns, ~2% right margin. Extra fields
+     (runtime/seasons + status) ride along, hidden on narrow phones where there's
+     no room. */
+  #towatchOut .detail{max-width:none;padding-right:2vw}
+  /* fill the viewport with WIDER rows (2 cols, 3 on very wide screens) so all
+     the fields fit without extra title truncation — the existing 2-col rule
+     handles ≥641px; this just adds a 3rd column past 1500px. */
+  @media (min-width:1500px){ #towatchOut .sources.open{grid-template-columns:repeat(3,minmax(0,1fr))} }
+  #towatchOut .src .mx{flex:0 0 auto;white-space:nowrap;color:var(--dim);font-size:.8rem;margin-left:.45rem}
+  #towatchOut .src .stx{flex:0 0 auto;white-space:nowrap;font-size:.68rem;font-weight:700;margin-left:.5rem;
+    padding:.1rem .42rem;border-radius:6px;border:1px solid var(--line);color:var(--dim)}
+  #towatchOut .src .stx.on{color:var(--good);border-color:rgba(55,200,122,.5)}
+  @media (max-width:560px){ #towatchOut .src .mx,#towatchOut .src .stx{display:none} }
   /* 2026-07-13: "Mark watched" secondary button on the search detail card. */
   .markw{background:var(--bg3);border:1px solid var(--line);border-radius:12px;
     padding:.55rem 1rem;color:var(--fg);font-weight:700;font-size:.9rem;min-height:48px;
@@ -150,8 +164,18 @@
     border:1px solid var(--line);border-radius:12px;padding:.55rem 1rem;color:var(--fg);
     font-weight:700;font-size:.9rem;min-height:48px;touch-action:manipulation}
   .rtlink:active{transform:scale(.97);border-color:var(--accent2)}
-  .card .rtlink{margin:.5rem .7rem 0}
-  .detail .body>.rtlink{margin:.6rem 0 0;max-width:260px}
+  /* button row (Play · Mark-watched · RT-tomato-right); More-sources sits below.
+     The compact "🍅 →" RT link is pushed to the right edge. */
+  .actions{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+  .actions>*{margin:0!important}
+  .card .actions{margin:.55rem .7rem 0}
+  .detail .body>.actions{margin:.75rem 0 0}
+  .actions .rtlink{margin-left:auto!important;padding:.55rem .8rem}
+  .actions .play{max-width:none}
+  /* metadata detail line on the search card: year-range · genres · runtime · ⭐ */
+  .dline{color:var(--dim);font-size:.92rem;line-height:1.45}
+  .card .dline{margin:.2rem .7rem 0}
+  .detail .body>.dline{margin:.35rem 0 .1rem}
   /* 2026-07-13: Chromecast auto-track confirm prompt (slice 5). A house-TV
      session was detected as watched — but housemates use these TVs, so ASK
      before it enters Fredrik's ledger. */
@@ -539,6 +563,19 @@ async function enrichToWatchRow(row,title,isTV){
     const g=el("span",{className:"x gx",textContent:m.genres.slice(0,2).join(", ")});
     (row.querySelector(".ty")||q).after(g);
   }
+  if(!row.querySelector(".mx")){
+    let extra="";
+    if(isTV && m.seasons) extra=m.seasons+" season"+(m.seasons>1?"s":"");
+    else if(m.runtime) extra=m.runtime+" min";
+    if(extra){ const ex=el("span",{className:"mx",textContent:extra});
+      (row.querySelector(".gx")||row.querySelector(".ty")||q).after(ex); }
+  }
+  if(isTV && m.status && !row.querySelector(".stx")){
+    const st=({"Returning Series":"Returning","Ended":"Ended","Canceled":"Canceled",
+      "In Production":"Upcoming","Planned":"Upcoming"})[m.status];
+    if(st){ const sx=el("span",{className:"stx"+(st==="Returning"||st==="Upcoming"?" on":""),textContent:st});
+      (row.querySelector(".mx")||row.querySelector(".gx")||row.querySelector(".ty")||q).after(sx); }
+  }
   if(m.poster_url){ const ps=posterSrc(m.poster_url); const img=new Image();
     img.onload=()=>{ row.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.88),rgba(15,15,20,.62)),url('${ps}')`;
       row.style.backgroundSize="cover"; row.style.backgroundPosition="center 20%"; };
@@ -547,7 +584,7 @@ async function enrichToWatchRow(row,title,isTV){
 addEventListener("hashchange",route);
 
 /* ---------- poster card (skeleton -> img | titled fallback) ---------- */
-function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle}){
+function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,detailLine}){
   const c=el("div",{className:"card"});
   const p=el("div",{className:"poster"});
   const sh=el("div",{className:"shimmer"});
@@ -569,23 +606,30 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle}
   m.appendChild(el("div",{className:"t",textContent:title||"Untitled"}));
   if(year) m.appendChild(el("div",{className:"y",textContent:year}));
   body.appendChild(m);
+  // metadata detail line (year-range · genres · runtime · rating), below the
+  // title + above the buttons — filled async by the caller (fillDetailLine).
+  if(detailLine){ body.appendChild(el("div",{className:"dline"})); }
+  // Button row: Play + Mark-watched, with the RT link a compact tomato pushed
+  // to the right. "More sources" stays BELOW this row (appended after).
+  const actions=el("div",{className:"actions"});
   if(onPlay){
     const b=el("button",{className:"play",textContent:cta||"Play"});
-    b.onclick=()=>onPlay(); body.appendChild(b);
+    b.onclick=()=>onPlay(); actions.appendChild(b);
   }
   if(onMarkWatched){
     const w=el("button",{className:"markw",textContent:"✓ Mark watched"});
     w.onclick=async()=>{ if(w.classList.contains("done")) return; w.disabled=true;
       const ok=await onMarkWatched();
       if(ok!==false){ w.textContent="✓ Watched"; w.classList.add("done"); } else { w.disabled=false; } };
-    body.appendChild(w);
+    actions.appendChild(w);
   }
   if(rtTitle){
-    const rt=el("a",{className:"rtlink",textContent:"🍅 Rotten Tomatoes →",
+    const rt=el("a",{className:"rtlink",textContent:"🍅 →",title:"Open on Rotten Tomatoes",
       href:"https://www.rottentomatoes.com/search?search="+encodeURIComponent(rtTitle),
       target:"_blank",rel:"noopener"});
-    body.appendChild(rt);
+    actions.appendChild(rt);
   }
+  if(actions.children.length) body.appendChild(actions);
   if(sources&&sources.length){
     const anyPartial=sources.some(s=>typeof s.partial_pct==="number");
     const collapsed=()=>`More sources (${sources.length})`+(anyPartial?" · ↓ resume available":"");
@@ -697,6 +741,22 @@ async function markWatched(title,imdb){
   catch{ toast("spela unreachable"); return false; }
 }
 
+// Fill the search-detail metadata line (year-range · genres · runtime/seasons ·
+// TMDB rating) from the cached /title-meta arsenal. TMDB rating (⭐) is shown
+// because a real RT score isn't available for arbitrary search results.
+async function fillDetailLine(card, title, isTV){
+  const dl=card.querySelector(".dline"); if(!dl) return;
+  let m; try{ m=await api("/title-meta?title="+encodeURIComponent(title)+(isTV?"&tv=1":"")); }catch{ return; }
+  if(!m) return;
+  const parts=[];
+  if(m.year) parts.push(String(m.year));
+  if(m.genres&&m.genres.length) parts.push(m.genres.slice(0,3).join(", "));
+  if(isTV && m.seasons) parts.push(m.seasons+" season"+(m.seasons>1?"s":""));
+  else if(m.runtime) parts.push(m.runtime+" min");
+  if(m.tmdb) parts.push("⭐ "+m.tmdb.toFixed(1));
+  dl.textContent=parts.join("  ·  ");
+}
+
 async function runSearch(q){
   if(S.search.abort) S.search.abort.abort();
   const ac=new AbortController(); S.search.abort=ac;
@@ -717,13 +777,14 @@ async function runSearch(q){
   const show=d.show||{}, year=(show.release_date||"").slice(0,4);
   const grid=el("div",{className:"detail"});
   const card=posterCard({
-    poster:show.poster_url, title:show.title||res[0].title, year:year||undefined,
+    poster:show.poster_url, title:show.title||res[0].title, detailLine:true,
     cta:"Play best source", sources:res,
     onPlay:()=>doPlay({result_id:res[0].id}, card),
     onMarkWatched:()=>markWatched(show.title||res[0].title, show.imdb_id),
     rtTitle:show.title||res[0].title
   });
   grid.appendChild(card); out.innerHTML=""; out.appendChild(grid);
+  fillDetailLine(card, show.title||res[0].title, S.mode==="tv");
 }
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
