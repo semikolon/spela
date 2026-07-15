@@ -5167,7 +5167,7 @@ async fn handle_poster(AxumPath((size, file)): AxumPath<(String, String)>) -> ax
         return serve_poster_bytes(bytes, ctype);
     }
     let url = format!("https://image.tmdb.org/t/p/{}/{}", size, file);
-    let bytes = match reqwest::get(&url).await {
+    let bytes = match poster_http_client().get(&url).send().await {
         Ok(resp) => match resp.error_for_status() {
             Ok(ok) => match ok.bytes().await {
                 Ok(b) => b,
@@ -5180,6 +5180,22 @@ async fn handle_poster(AxumPath((size, file)): AxumPath<(String, String)>) -> ax
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(&cached, &bytes);
     serve_poster_bytes(bytes.to_vec(), ctype)
+}
+
+/// Shared, connection-pooled HTTP client for the poster proxy — built ONCE.
+/// The old `reqwest::get()` constructed a fresh client per request, which
+/// reloaded the OS TLS trust store + did a full DNS+TLS handshake every time
+/// (~1s/miss, measured). Pooling reuses the TMDB connection across misses
+/// (~100-150ms after warm-up).
+fn poster_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(8)
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 fn serve_poster_bytes(bytes: Vec<u8>, ctype: &'static str) -> axum::response::Response {
