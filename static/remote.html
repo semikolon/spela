@@ -786,7 +786,12 @@ async function runSearch(q){
   // pending-confirm); they return when the search box is cleared.
   $("#recentRow")?.classList.remove("on"); $("#pendingRow")?.classList.remove("on");
   const out=$("#searchOut");
-  out.innerHTML=`<div class="detail skeleton"><div class="card"><div class="poster"><div class="shimmer"></div></div><div class="meta"><div class="t">&nbsp;</div></div></div></div>`;
+  // Instant interpretation: mirror the server's SxxExx parse client-side so the
+  // "Season N Episode M" tag shows in the loading skeleton BEFORE the /search
+  // round-trip returns (server d.searching stays authoritative for the final card).
+  const seGuess=seFromQuery(q);
+  const tSkel=seGuess?`<span class="se">${seGuess}</span>`:"&nbsp;";
+  out.innerHTML=`<div class="detail skeleton"><div class="card"><div class="poster"><div class="shimmer"></div></div><div class="meta"><div class="t">${tSkel}</div></div></div></div>`;
   let qs="q="+encodeURIComponent(q); if(S.mode==="movie") qs+="&movie=1";
   let d;
   try{ d=await api("/search?"+qs,{signal:ac.signal}); }
@@ -800,7 +805,7 @@ async function runSearch(q){
   // Server parsed SxxExx out of the query (search.rs parse_episode_markers) and
   // echoes it as d.searching {season, episode}. Render it inline with the title.
   const se=d.searching;
-  const seLabel=se?`Season ${se.season} Episode ${se.episode}`:"";
+  const seLabel=se?`Season ${se.season} Episode ${se.episode}`:seFromQuery(q);
   const grid=el("div",{className:"detail"});
   const card=posterCard({
     poster:show.poster_url, title:show.title||res[0].title, detailLine:true, seLabel,
@@ -813,6 +818,18 @@ async function runSearch(q){
   fillDetailLine(card, show.title||res[0].title, S.mode==="tv");
 }
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+// Client-side mirror of search.rs parse_episode_markers (SxxExx / NxM /
+// "season N episode M"). Returns "Season N Episode M" or "" — paints the
+// interpreted episode into the loading skeleton instantly (booster; the
+// server's d.searching is authoritative on the rendered card).
+function seFromQuery(q){
+  let m;
+  if((m=q.match(/\bs(\d{1,3})e(\d{1,3})\b/i))
+   ||(m=q.match(/\b(\d{1,3})x(\d{1,3})\b/i))
+   ||(m=q.match(/\bseason\s+(\d{1,3})\s+(?:and\s+|,\s*)?episode\s+(\d{1,3})\b/i)))
+    return `Season ${+m[1]} Episode ${+m[2]}`;
+  return "";
+}
 
 /* ---------- Lucide icons (inlined — no CDN dep; single-asset mandate;
    currentColor = theme/accent-aware; SVG = crisp at the huge touch
