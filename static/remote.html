@@ -82,6 +82,12 @@
   .meta{padding:.6rem .7rem}
   .meta .t{font-weight:700;font-size:.95rem;line-height:1.25;
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  /* Season/episode tag inline with the title (e.g. "Fargo SEASON 1 EPISODE 1").
+     60% of the title size + .7 opacity + uppercase so it reads as a recessive
+     qualifier on the same line, not a competing heading. Only rendered when the
+     query carried SxxExx (server -> d.searching). */
+  .meta .t .se{font-size:60%;opacity:.7;text-transform:uppercase;font-weight:600;
+    letter-spacing:.03em;margin-left:.5em;white-space:nowrap}
   .meta .y{color:var(--dim);font-size:.8rem;margin-top:.15rem}
   .card .play{margin:.55rem .7rem .7rem;background:var(--accent2);color:#fff;
     border-radius:10px;padding:.55rem;font-weight:700;font-size:.88rem;text-align:center}
@@ -594,7 +600,7 @@ async function enrichToWatchRow(row,title,isTV){
 addEventListener("hashchange",route);
 
 /* ---------- poster card (skeleton -> img | titled fallback) ---------- */
-function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,detailLine}){
+function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,detailLine,seLabel}){
   const c=el("div",{className:"card"});
   const p=el("div",{className:"poster"});
   const sh=el("div",{className:"shimmer"});
@@ -613,7 +619,9 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
   // cell stops the tall poster from stretching per-row heights (title↔play gap).
   const body=el("div",{className:"body"}); c.appendChild(body);
   const m=el("div",{className:"meta"});
-  m.appendChild(el("div",{className:"t",textContent:title||"Untitled"}));
+  const tEl=el("div",{className:"t",textContent:title||"Untitled"});
+  if(seLabel) tEl.appendChild(el("span",{className:"se",textContent:seLabel}));
+  m.appendChild(tEl);
   if(year) m.appendChild(el("div",{className:"y",textContent:year}));
   body.appendChild(m);
   // metadata detail line (year-range · genres · runtime · rating), below the
@@ -789,9 +797,13 @@ async function runSearch(q){
   const res=d.results||[];
   if(!res.length){ out.innerHTML=`<div class="state"><div class="big">No playable sources</div>Nothing found for “${esc(q)}”. Try the Movies / TV toggle.</div>`; return; }
   const show=d.show||{}, year=(show.release_date||"").slice(0,4);
+  // Server parsed SxxExx out of the query (search.rs parse_episode_markers) and
+  // echoes it as d.searching {season, episode}. Render it inline with the title.
+  const se=d.searching;
+  const seLabel=se?`Season ${se.season} Episode ${se.episode}`:"";
   const grid=el("div",{className:"detail"});
   const card=posterCard({
-    poster:show.poster_url, title:show.title||res[0].title, detailLine:true,
+    poster:show.poster_url, title:show.title||res[0].title, detailLine:true, seLabel,
     cta:"Play best source", sources:res,
     onPlay:()=>doPlay({result_id:res[0].id}, card),
     onMarkWatched:()=>markWatched(show.title||res[0].title, show.imdb_id),
