@@ -122,6 +122,26 @@
     white-space:nowrap;max-width:62vw;overflow:hidden;text-overflow:ellipsis;touch-action:manipulation}
   .recent .chip .ep{color:var(--dim);font-weight:500;margin-left:.35rem;font-size:.76rem}
   .recent .chip:active{border-color:var(--accent2);transform:scale(.97)}
+  /* 2026-07-28: "New episodes" of followed series (slice 2b — TVTime replacement) */
+  .following{display:none;margin:.2rem 0 .5rem}
+  .following.on{display:block}
+  .following .rlab{color:var(--dim);font-size:.72rem;font-weight:700;letter-spacing:.04em;
+    text-transform:uppercase;margin:.1rem .15rem .4rem}
+  .folist{display:flex;flex-direction:column;gap:.4rem}
+  .foitem{display:flex;align-items:stretch;gap:.4rem}
+  .fotap{flex:1 1 auto;text-align:left;background:var(--bg3);border:1px solid var(--line);
+    border-radius:11px;padding:.55rem .75rem;display:flex;flex-direction:column;gap:.15rem;
+    min-width:0;touch-action:manipulation}
+  .fotap:active{border-color:var(--accent2);transform:scale(.99)}
+  .fotitle{font-weight:700;font-size:.9rem;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .fometa{font-size:.78rem;color:var(--dim)}
+  .fometa b{color:var(--accent);font-weight:800}
+  .fomark{flex:0 0 46px;border:1px solid var(--line);border-radius:11px;background:var(--bg3);
+    color:var(--good);font-size:1.2rem;font-weight:800;touch-action:manipulation}
+  .fomark:active{transform:scale(.95)}
+  .fomark:disabled{opacity:.4}
+  .newbadge{align-self:center;margin-left:.5rem;background:var(--accent2);color:#fff;font-size:.7rem;
+    font-weight:800;border-radius:999px;padding:.15rem .5rem;white-space:nowrap;text-decoration:none;line-height:1.6}
   /* To-Watch section headers — small all-caps, x-aligned with row titles
      (padding-left matches .src row inner padding), equal vertical margins. */
   .twhead{color:var(--dim);font-size:.7rem;font-weight:800;letter-spacing:.09em;
@@ -402,6 +422,7 @@
 
 <header>
   <a href="#/search" class="brand" aria-label="spela — home">spela<small>remote</small></a>
+  <a href="#/search" id="newEpBadge" class="newbadge" hidden aria-label="New episodes of followed shows"></a>
   <nav>
     <a href="#/search" data-v="search" data-ic="search" aria-label="Search"><span class="lbl">Search</span></a>
     <a href="#/library" data-v="library" data-ic="library" aria-label="Library"><span class="lbl">Library</span></a>
@@ -423,6 +444,7 @@
     </div>
     <div id="pendingRow" class="pending"></div>
     <div id="recentRow" class="recent"></div>
+    <div id="followingRow" class="following"></div>
     <div id="searchOut"></div>
   </section>
 
@@ -530,7 +552,7 @@ function route(){
   $$("nav a").forEach(a=>a.classList.toggle("on",a.dataset.v===known));
   if(known==="now") renderNowFull();
   if(known==="library") renderLibrary();
-  if(known==="search" && !S.search.q){ loadRecent(); loadPending(); }
+  if(known==="search" && !S.search.q){ loadRecent(); loadPending(); loadFollowing(); }
   if(known==="towatch") renderToWatch();
 }
 
@@ -709,6 +731,44 @@ async function loadRecent(){
   row.appendChild(chips); row.classList.add("on");
 }
 
+// New episodes of followed series (slice 2b). GET /following joins the follow-list
+// with TMDB air-dates + the watched_through baseline. Renders shows that have
+// unwatched-aired episodes as a landing row (tap → search that next episode) with a
+// ✓ to mark it watched (for a view on a phone / friend's TV that spela can't see),
+// and a subtle header count badge. Marking sets watched_through to EXACTLY that
+// episode — the next one stays new.
+async function loadFollowing(){
+  const row=$("#followingRow"), badge=$("#newEpBadge");
+  let d; try{ d=await api("/following"); }catch(e){ return; }
+  const shows=(d&&d.shows)||[], totalNew=(d&&d.total_new)||0;
+  if(badge){ if(totalNew>0){ badge.textContent="▶ "+totalNew+" new"; badge.hidden=false; } else badge.hidden=true; }
+  if(!row) return;
+  const withNew=shows.filter(s=>s.new_count>0);
+  if(!withNew.length){ row.classList.remove("on"); row.innerHTML=""; return; }
+  row.innerHTML=""; row.appendChild(el("div",{className:"rlab",textContent:"New episodes"}));
+  const list=el("div",{className:"folist"});
+  withNew.forEach(s=>{
+    const item=el("div",{className:"foitem"});
+    const nu=s.next_unwatched||"";
+    const tap=el("button",{className:"fotap"});
+    tap.innerHTML=`<span class="fotitle">${esc(s.title)}</span>`
+      +`<span class="fometa"><b>${s.new_count} new</b>${nu?` · next ${esc(nu)}`:""}</span>`;
+    tap.onclick=()=>{ setMode("tv"); const q=s.title+(nu?" "+nu:""); $("#q").value=q; S.search.q=q; runSearch(q); };
+    item.appendChild(tap);
+    if(s.next_unwatched_season!=null){
+      const mk=el("button",{className:"fomark",textContent:"✓",title:"Mark "+nu+" watched"});
+      mk.setAttribute("aria-label","Mark "+nu+" watched");
+      mk.onclick=async(ev)=>{ ev.stopPropagation(); mk.disabled=true;
+        try{ await api("/following/mark",{method:"POST",body:{tmdb_id:s.tmdb_id,season:s.next_unwatched_season,episode:s.next_unwatched_episode}});
+          loadFollowing(); }
+        catch{ mk.disabled=false; toast("Couldn’t mark watched"); } };
+      item.appendChild(mk);
+    }
+    list.appendChild(item);
+  });
+  row.appendChild(list); row.classList.add("on");
+}
+
 // Chromecast auto-track confirm prompt (slice 5). The tracker detects
 // near-complete sessions on the house TVs, but housemates watch those too — so
 // nothing enters Fredrik's watched-ledger without a "Yes". Surfaced on the
@@ -749,7 +809,7 @@ async function resolvePending(key,watched,card){
 let dT;
 $("#q").addEventListener("input",e=>{ const q=e.target.value.trim();
   clearTimeout(dT); dT=setTimeout(()=>{ S.search.q=q;
-    if(q){ runSearch(q); } else { $("#searchOut").innerHTML=""; loadRecent(); loadPending(); } },300); });
+    if(q){ runSearch(q); } else { $("#searchOut").innerHTML=""; loadRecent(); loadPending(); loadFollowing(); } },300); });
 
 // Mark the shown movie/series watched (search detail button). Show-level for a
 // plain show title; the server keys per-episode if the title carries SxxExx.
@@ -784,7 +844,7 @@ async function runSearch(q){
   const ac=new AbortController(); S.search.abort=ac;
   // Viewing a specific title → hide the landing bars (recently-watched +
   // pending-confirm); they return when the search box is cleared.
-  $("#recentRow")?.classList.remove("on"); $("#pendingRow")?.classList.remove("on");
+  $("#recentRow")?.classList.remove("on"); $("#pendingRow")?.classList.remove("on"); $("#followingRow")?.classList.remove("on");
   const out=$("#searchOut");
   // Instant interpretation: mirror the server's SxxExx parse client-side so the
   // "Season N Episode M" tag shows in the loading skeleton BEFORE the /search
@@ -1425,7 +1485,7 @@ setInterval(()=>{ if(S.now.data&&!S.now.cold&&!S.now.seekDrag){
 /* logo → home: navigate to the search landing AND reset any active search
    (clear the box + result so the recently-watched / to-confirm bars return). */
 $(".brand")?.addEventListener("click",()=>{ $("#q").value=""; S.search.q="";
-  $("#searchOut").innerHTML=""; if(currentView()==="search"){ loadRecent(); loadPending(); } });
+  $("#searchOut").innerHTML=""; if(currentView()==="search"){ loadRecent(); loadPending(); loadFollowing(); } });
 
 /* ---------- boot ---------- */
 iconizeStatic(); route(); pollNow(true);

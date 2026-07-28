@@ -330,6 +330,15 @@ impl AppState {
                     dur
                 );
                 self.mark_watched(&key, imdb_id.clone(), title.clone());
+                // Auto-advance a followed show's baseline when finished via spela —
+                // only ever to the episode actually watched, never past it (the
+                // followed-shows tracker / slice 2b).
+                if let Some(t) = title.as_deref() {
+                    let (show, s, e) = crate::search::parse_episode_markers(t);
+                    if let (Some(season), Some(episode)) = (s, e) {
+                        crate::following::advance_by_title(&show, season, episode);
+                    }
+                }
                 self.reset_position(imdb_id, title);
                 return (key, true);
             }

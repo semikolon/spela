@@ -208,7 +208,8 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
 
     reconcile_session_state_on_startup(&state_dir);
 
-    let search_engine = SearchEngine::new(config.tmdb_api_key.clone(), config.mdblist_api_key.clone());
+    let search_engine =
+        SearchEngine::new(config.tmdb_api_key.clone(), config.mdblist_api_key.clone());
     let cast = Mutex::new(CastController::new(
         &state_dir,
         config.known_devices.clone(),
@@ -293,8 +294,13 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
             "/pending-watched/resolve",
             post(handle_pending_watched_resolve),
         )
-        .route("/watchlist", get(handle_watchlist).post(handle_watchlist_add))
+        .route(
+            "/watchlist",
+            get(handle_watchlist).post(handle_watchlist_add),
+        )
         .route("/title-meta", get(handle_title_meta))
+        .route("/following", get(handle_following))
+        .route("/following/mark", post(handle_following_mark))
         .route("/poster/{size}/{file}", get(handle_poster))
         // Web-remote My Library (US-3): aggregate curated collection
         // (local library_dirs + remote serve-library origins).
@@ -4362,6 +4368,132 @@ async fn handle_status(State(state): State<SharedState>) -> Json<Value> {
     }
 }
 
+/// Count episodes that aired strictly AFTER `watched` up to and including `last`,
+/// respecting per-season episode counts (specials excluded upstream). Same-season
+/// is the common ongoing case (`le - we`); the cross-season branch sums whole
+/// intermediate seasons.
+fn episodes_between(watched: (u32, u32), last: (u32, u32), seasons: &[(u32, u32)]) -> u32 {
+    if last <= watched {
+        return 0;
+    }
+    let (ws, we) = watched;
+    let (ls, le) = last;
+    if ws == ls {
+        return le.saturating_sub(we);
+    }
+    let ep_count = |s: u32| {
+        seasons
+            .iter()
+            .find(|(n, _)| *n == s)
+            .map(|(_, c)| *c)
+            .unwrap_or(0)
+    };
+    let mut n = ep_count(ws).saturating_sub(we);
+    for s in (ws + 1)..ls {
+        n += ep_count(s);
+    }
+    n + le
+}
+
+/// The episode immediately after `watched`, rolling over season boundaries via
+/// per-season episode counts. `watched == (0, _)` (nothing watched) → the first
+/// real season's E01.
+fn next_unwatched_ep(watched: (u32, u32), seasons: &[(u32, u32)]) -> (u32, u32) {
+    let (ws, we) = watched;
+    if ws == 0 {
+        let first = seasons.iter().map(|(n, _)| *n).min().unwrap_or(1);
+        return (first, 1);
+    }
+    let ep_count = |s: u32| {
+        seasons
+            .iter()
+            .find(|(n, _)| *n == s)
+            .map(|(_, c)| *c)
+            .unwrap_or(0)
+    };
+    if we < ep_count(ws) {
+        (ws, we + 1)
+    } else {
+        (ws + 1, 1)
+    }
+}
+
+/// `GET /following` — followed-series tracker (slice 2b). For each show in
+/// `following.json`, join TMDB air-dates with the `watched_through` baseline to
+/// report new-episode count + the next unwatched episode + next air date. Sorted
+/// most-new-first. Personal data (the follow-list) lives only on the spela host.
+async fn handle_following(State(state): State<SharedState>) -> Json<Value> {
+    let following = crate::following::load();
+    let mut shows = Vec::new();
+    let mut total_new: u32 = 0;
+    for show in &following.shows {
+        let Some(st) = state.search_engine.tv_status(show.tmdb_id).await else {
+            continue;
+        };
+        let watched = show
+            .watched_through
+            .as_deref()
+            .and_then(crate::following::parse_se)
+            .unwrap_or((0, 0));
+        let (new_count, next_se) = match st.last_aired {
+            Some((ls, le, _, _)) => {
+                let nc = episodes_between(watched, (ls, le), &st.seasons);
+                let ns = if nc > 0 {
+                    Some(next_unwatched_ep(watched, &st.seasons))
+                } else {
+                    None
+                };
+                (nc, ns)
+            }
+            None => (0, None),
+        };
+        total_new += new_count;
+        let next_air = st
+            .next_episode
+            .as_ref()
+            .map(|(s, e, _, a)| json!({ "se": crate::following::fmt_se(*s, *e), "air_date": a }));
+        shows.push(json!({
+            "title": if st.name.is_empty() { show.title.clone() } else { st.name },
+            "tmdb_id": show.tmdb_id,
+            "poster_url": st.poster_url,
+            "status": st.status,
+            "watched_through": show.watched_through,
+            "new_count": new_count,
+            "next_unwatched": next_se.map(|(s, e)| crate::following::fmt_se(s, e)),
+            "next_unwatched_season": next_se.map(|(s, _)| s),
+            "next_unwatched_episode": next_se.map(|(_, e)| e),
+            "next_air": next_air,
+        }));
+    }
+    // Most new first; ties keep TMDB/insertion order.
+    shows.sort_by(|a, b| {
+        b["new_count"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["new_count"].as_u64().unwrap_or(0))
+    });
+    Json(json!({ "shows": shows, "total_new": total_new }))
+}
+
+#[derive(Deserialize)]
+struct FollowingMarkRequest {
+    tmdb_id: u64,
+    season: u32,
+    episode: u32,
+}
+
+/// `POST /following/mark` {tmdb_id, season, episode} — manually mark a specific
+/// episode of a followed show as watched (for a view on a phone / a friend's
+/// Chromecast / another app spela can't see). Sets `watched_through` to EXACTLY
+/// that episode (never past it), `max`-semantics so it can't rewind.
+async fn handle_following_mark(
+    State(_state): State<SharedState>,
+    Json(req): Json<FollowingMarkRequest>,
+) -> Json<Value> {
+    let ok = crate::following::set_watched_through(req.tmdb_id, req.season, req.episode);
+    Json(json!({ "ok": ok }))
+}
+
 /// 2026-07-04: live warmup progress for the web remote's loading screen.
 /// Reports second-by-second phase + metrics while `do_play` is mid-setup.
 /// Returns `{"active": false}` when nothing is warming up (the SPA then falls
@@ -5184,7 +5316,9 @@ async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
 /// year-long cache headers — so after the first view every device loads posters
 /// from the LAN, not TMDB's CDN. SSRF-safe: host is hardcoded to TMDB, `size` is
 /// allow-listed, `file` is a single charset-validated segment (no `/`, no `..`).
-async fn handle_poster(AxumPath((size, file)): AxumPath<(String, String)>) -> axum::response::Response {
+async fn handle_poster(
+    AxumPath((size, file)): AxumPath<(String, String)>,
+) -> axum::response::Response {
     const SIZES: &[&str] = &["w92", "w154", "w185", "w342", "w500", "w780", "original"];
     let file_ok = !file.is_empty()
         && file
@@ -5294,7 +5428,11 @@ async fn handle_pending_watched_resolve(
     State(state): State<SharedState>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let key = body.get("key").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let key = body
+        .get("key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     let watched = body
         .get("watched")
         .and_then(|v| v.as_bool())
@@ -5475,7 +5613,11 @@ async fn handle_title_meta(
     if title.trim().is_empty() {
         return Json(json!({}));
     }
-    let cache_key = format!("{}:{}", if is_tv { "tv" } else { "movie" }, title.to_lowercase());
+    let cache_key = format!(
+        "{}:{}",
+        if is_tv { "tv" } else { "movie" },
+        title.to_lowercase()
+    );
     let path = dirs::home_dir().map(|h| h.join(".config/spela/watchlist_meta.json"));
     let mut cache: serde_json::Map<String, Value> = path
         .as_ref()
@@ -5514,7 +5656,11 @@ async fn handle_title_meta(
 /// SPELA-HOST `~/.config/spela/watchlist.json` (spela reads+writes its own host's
 /// file — no Mac-sync issue). Dedup by case-insensitive title. Marks source:"user".
 async fn handle_watchlist_add(Json(body): Json<Value>) -> Json<Value> {
-    let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     if title.is_empty() {
         return Json(json!({"ok": false, "error": "missing title"}));
     }
@@ -5527,9 +5673,7 @@ async fn handle_watchlist_add(Json(body): Json<Value>) -> Json<Value> {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({"movies": [], "series": []}));
     let arr_key = if is_series { "series" } else { "movies" };
-    let arr = root
-        .get_mut(arr_key)
-        .and_then(|v| v.as_array_mut());
+    let arr = root.get_mut(arr_key).and_then(|v| v.as_array_mut());
     let Some(arr) = arr else {
         return Json(json!({"ok": false, "error": "bad watchlist shape"}));
     };
@@ -5543,7 +5687,10 @@ async fn handle_watchlist_add(Json(body): Json<Value>) -> Json<Value> {
         return Json(json!({"ok": true, "added": false, "reason": "already on list"}));
     }
     arr.push(json!({"title": title, "source": "user"}));
-    match serde_json::to_string_pretty(&root).ok().and_then(|s| std::fs::write(&path, s).ok()) {
+    match serde_json::to_string_pretty(&root)
+        .ok()
+        .and_then(|s| std::fs::write(&path, s).ok())
+    {
         Some(_) => Json(json!({"ok": true, "added": true})),
         None => Json(json!({"ok": false, "error": "write failed"})),
     }

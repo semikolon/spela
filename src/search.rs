@@ -134,6 +134,21 @@ pub struct SearchEngine {
     mdblist_key: String,
 }
 
+/// TMDB air-date snapshot for a followed series (slice 2b, the followed-shows
+/// tracker). `seasons` = (season_number, episode_count) with specials (season 0)
+/// excluded, so the handler can count "new since watched" across season boundaries.
+#[derive(Debug, Clone, Serialize)]
+pub struct TvStatus {
+    pub name: String,
+    pub poster_url: Option<String>,
+    pub status: String,
+    /// (season, episode, name, air_date) of the latest AIRED episode.
+    pub last_aired: Option<(u32, u32, String, String)>,
+    /// (season, episode, name, air_date) of the next upcoming episode.
+    pub next_episode: Option<(u32, u32, String, String)>,
+    pub seasons: Vec<(u32, u32)>,
+}
+
 impl SearchEngine {
     pub fn new(tmdb_key: String, mdblist_key: String) -> Self {
         Self {
@@ -147,7 +162,11 @@ impl SearchEngine {
     /// source; free key). Returns (critic %, audience %, RT deep-link). Keyed by
     /// TMDB id (spela always has it). Empty key or any error → all None (the
     /// caller falls back to curated scores / TMDB rating). Best-effort.
-    async fn mdblist_rt(&self, tmdb_id: u64, is_tv: bool) -> (Option<u32>, Option<u32>, Option<String>) {
+    async fn mdblist_rt(
+        &self,
+        tmdb_id: u64,
+        is_tv: bool,
+    ) -> (Option<u32>, Option<u32>, Option<String>) {
         if self.mdblist_key.is_empty() {
             return (None, None, None);
         }
@@ -838,6 +857,57 @@ impl SearchEngine {
         // pick one. 24 keeps the well-seeded 4K reachable under "More sources"
         // while still bounding the list.
         Ok(results.into_iter().take(40).collect())
+    }
+
+    /// TMDB air-date status for a followed series (slice 2b). None on any TMDB /
+    /// network error — the caller treats the show as unknown rather than failing
+    /// the whole /following response.
+    pub async fn tv_status(&self, tmdb_id: u64) -> Option<TvStatus> {
+        if self.tmdb_key.is_empty() {
+            return None;
+        }
+        let url = format!(
+            "https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={}",
+            self.tmdb_key
+        );
+        let resp = self.client.get(&url).send().await.ok()?;
+        let d: serde_json::Value = resp.json().await.ok()?;
+        d.get("id")?; // absent → not a valid show payload
+        let ep = |v: &serde_json::Value| -> Option<(u32, u32, String, String)> {
+            let o = v.as_object()?;
+            Some((
+                o.get("season_number")?.as_u64()? as u32,
+                o.get("episode_number")?.as_u64()? as u32,
+                o.get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                o.get("air_date")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ))
+        };
+        let seasons = d["seasons"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| {
+                        let sn = s.get("season_number")?.as_u64()? as u32;
+                        let ec = s.get("episode_count")?.as_u64()? as u32;
+                        (sn > 0).then_some((sn, ec)) // exclude specials (season 0)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(TvStatus {
+            name: d["name"].as_str().unwrap_or("").to_string(),
+            poster_url: tmdb_poster_url(d["poster_path"].as_str()),
+            status: d["status"].as_str().unwrap_or("").to_string(),
+            last_aired: ep(&d["last_episode_to_air"]),
+            next_episode: ep(&d["next_episode_to_air"]),
+            seasons,
+        })
     }
 }
 

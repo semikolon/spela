@@ -1,6 +1,7 @@
 mod cast;
 mod config;
 mod disk;
+mod following;
 mod hls_cache;
 mod library_origin;
 mod search;
