@@ -4489,20 +4489,37 @@ async fn handle_following(State(state): State<SharedState>) -> Json<Value> {
 
 #[derive(Deserialize)]
 struct FollowingMarkRequest {
-    tmdb_id: u64,
-    season: u32,
-    episode: u32,
+    /// Explicit episode by tmdb_id (the web-remote ✓ button uses this).
+    tmdb_id: Option<u64>,
+    season: Option<u32>,
+    episode: Option<u32>,
+    /// Raw stream/playlist title ("House of the Dragon S03E06") — spela parses the
+    /// SxxExx + show name itself (via `parse_episode_markers`) and advances the
+    /// matching followed show. The VLC-completion watcher uses this: it observes
+    /// playhead ≥90% but only knows the title spela put in the `.m3u`.
+    stream_title: Option<String>,
 }
 
-/// `POST /following/mark` {tmdb_id, season, episode} — manually mark a specific
-/// episode of a followed show as watched (for a view on a phone / a friend's
-/// Chromecast / another app spela can't see). Sets `watched_through` to EXACTLY
-/// that episode (never past it), `max`-semantics so it can't rewind.
+/// `POST /following/mark` — mark a followed episode watched. Two shapes:
+///   • `{tmdb_id, season, episode}` — the web-remote ✓ (exact episode).
+///   • `{stream_title}` — the VLC watcher; spela parses SxxExx + title itself.
+/// Sets `watched_through` to EXACTLY that episode (never past it), `max`-semantics
+/// so it can't rewind. For a view spela can't see (phone / friend's TV / VLC).
 async fn handle_following_mark(
     State(_state): State<SharedState>,
     Json(req): Json<FollowingMarkRequest>,
 ) -> Json<Value> {
-    let ok = crate::following::set_watched_through(req.tmdb_id, req.season, req.episode);
+    let ok = if let (Some(id), Some(s), Some(e)) = (req.tmdb_id, req.season, req.episode) {
+        crate::following::set_watched_through(id, s, e)
+    } else if let Some(t) = req.stream_title.as_deref() {
+        let (show, s, e) = crate::search::parse_episode_markers(t);
+        match (s, e) {
+            (Some(s), Some(e)) => crate::following::advance_by_title(&show, s, e),
+            _ => false,
+        }
+    } else {
+        false
+    };
     Json(json!({ "ok": ok }))
 }
 
