@@ -30,10 +30,27 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    /watched` exposes it (newest-first). Lives in `state.json` (user-local). This is
    the tracker's spine; the recommender's seen-check + slice 2b derive from it.
 
-2b. **"Up Next" view — NEXT.** Per followed show, the next UNWATCHED episode
-   (watched-ledger + TMDB episode list + airdates). This is the real "continue
-   watching" the row can't do yet. Surfaces "new episode aired" too (TMDB
-   airdates → notification, like TV Time's reminders).
+2b. **Followed-shows "New Episodes" tracker — ✅ SHIPPED (2026-07-28→29, v3.19).**
+   The TVTime replacement, deterministic (no LLM). `following.rs` +
+   `~/.config/spela/following.json` (user-local: {title, tmdb_id, `watched_through`
+   "SxxExx" baseline}, seeded from the TVTime export). `GET /following` joins it
+   with TMDB air-dates (`tv_status` = /tv/{id} last/next-aired + per-season
+   episode_count; `episode_detail` = next-unwatched ep name+air-date) → per show:
+   new-episode count (season-aware), next-unwatched (SxxExx + title + aired-date),
+   next upcoming air-date. UI: a "New Episodes" landing row + subtle header count
+   badge + the same section atop To-Watch (poster-bg rows, ep title, air dates;
+   tap → search the next ep). `watched_through` advances 3 ways (forward-only,
+   max-semantics): the **✓ button** (`POST /following/mark {tmdb_id,season,episode}`,
+   exact ep); **spela completion** (`save_position_smart` → `advance_by_title`, the
+   Chromecast/HLS path spela position-tracks); and **VLC completion** — the Mac-side
+   `spela-vlc-watcher` launchd agent, since Open-in-VLC serves raw byte-ranges
+   (spela is blind to VLC's playhead). VLC's HTTP control interface exposes the
+   playhead (`vlcrc extraintf=http` + password on the Mac → `127.0.0.1:8080/requests/
+   status.json`); the agent polls it + spela `/status` for the title, and at ≥90%
+   POSTs `/following/mark {stream_title}`. VLC is NOT opaque — the byte-progress
+   proxy was rejected (MKV tail-reads/seeks) in favour of the true playhead. Setup
+   step to reproduce on a fresh Mac: enable VLC's web interface in vlcrc + install
+   the agent plist (`com.fredrikbranstrom.spela-vlc-watcher`).
 
 3. **To-watch list + recommender — arsenal ✅ SHIPPED (2026-07-13, `b4fed13`); harness (curation) = Claude, ongoing.**
    `GET /watchlist` serves `~/.config/spela/watchlist.json` (seeded from the RT
