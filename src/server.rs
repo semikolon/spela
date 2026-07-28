@@ -69,7 +69,7 @@ pub struct ServerState {
     /// CurrentStream, so `/status` was blind to VLC playback. Each stream
     /// request stamps this; `/status` reports `vlc_active` when recent (<30s),
     /// so consumers (Ruby, the desk-dim daemon) can see VLC-on-this-Mac.
-    pub vlc_activity: Mutex<Option<(Instant, String)>>,
+    pub vlc_activity: Mutex<Option<(Instant, String, Option<String>)>>,
 }
 
 /// Live playback position for the web-remote scrubber (see `live_position`).
@@ -301,6 +301,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/title-meta", get(handle_title_meta))
         .route("/following", get(handle_following))
         .route("/following/mark", post(handle_following_mark))
+        .route("/position", post(handle_position))
         .route("/poster/{size}/{file}", get(handle_poster))
         // Web-remote My Library (US-3): aggregate curated collection
         // (local library_dirs + remote serve-library origins).
@@ -4324,17 +4325,17 @@ async fn handle_status(State(state): State<SharedState>) -> Json<Value> {
     let app_state = AppState::load(&state.state_dir);
     // 2026-07-28: Open-in-VLC serves /vlc/stream directly (no CurrentStream), so
     // surface it here from the vlc_activity stamp (recent = VLC actively pulling).
-    let vlc_title: Option<String> = {
+    let vlc: Option<(String, Option<String>)> = {
         let g = lock_recover(&state.vlc_activity);
         g.as_ref()
-            .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(30))
-            .map(|(_, t)| t.clone())
+            .filter(|(at, _, _)| at.elapsed() < std::time::Duration::from_secs(30))
+            .map(|(_, t, i)| (t.clone(), i.clone()))
     };
     match &app_state.current {
-        None => match &vlc_title {
-            Some(title) => Json(json!({
+        None => match &vlc {
+            Some((title, imdb)) => Json(json!({
                 "status": "streaming", "target": "vlc",
-                "vlc_active": true, "title": title,
+                "vlc_active": true, "title": title, "imdb_id": imdb,
             })),
             None => Json(json!({"status": "idle"})),
         },
@@ -4362,7 +4363,7 @@ async fn handle_status(State(state): State<SharedState>) -> Json<Value> {
                 "running": running,
                 "ffmpeg_alive": ffmpeg_alive,
                 "torrent_alive": torrent_alive,
-                "vlc_active": vlc_title.is_some(),
+                "vlc_active": vlc.is_some(),
             }))
         }
     }
@@ -4521,6 +4522,34 @@ async fn handle_following_mark(
         false
     };
     Json(json!({ "ok": ok }))
+}
+
+#[derive(Deserialize)]
+struct SetResumeRequest {
+    imdb_id: Option<String>,
+    title: Option<String>,
+    seconds: f64,
+    duration: Option<f64>,
+}
+
+/// `POST /position` {imdb_id, title, seconds, duration} — set the resume high-water
+/// mark from an EXTERNAL playhead. The VLC-completion watcher POSTs VLC's live
+/// position every poll (Open-in-VLC byte-serves, so spela can't see the playhead
+/// itself). Routes straight through `save_position_smart`, so it lands on the SAME
+/// key the web/phone play reads (cross-device resume), keeps HWM max-semantics, AND
+/// triggers completion at ≥HWM_CLEAR_FRACTION (clears resume + marks watched +
+/// advances the followed show). So a mid-episode VLC quit now auto-resumes on the
+/// phone, and a finished VLC watch auto-marks — the same as a Chromecast play.
+async fn handle_position(
+    State(state): State<SharedState>,
+    Json(req): Json<SetResumeRequest>,
+) -> Json<Value> {
+    let mut app = AppState::load(&state.state_dir);
+    let (key, changed) = app.save_position_smart(req.imdb_id, req.title, req.seconds, req.duration);
+    if changed {
+        let _ = app.save(&state.state_dir);
+    }
+    Json(json!({ "ok": changed, "key": key }))
 }
 
 /// 2026-07-04: live warmup progress for the web remote's loading screen.
@@ -6874,7 +6903,10 @@ async fn handle_vlc_stream(
     // 2026-07-28: stamp VLC activity so /status can report vlc_active — this path
     // serves VLC directly and never creates a CurrentStream.
     if let Some((_, _, name, _)) = resolve_result_for_vlc(&state, id) {
-        *lock_recover(&state.vlc_activity) = Some((Instant::now(), name));
+        let imdb = AppState::load_last_search(&state.state_dir)
+            .and_then(|s| s.show)
+            .and_then(|sh| sh.imdb_id);
+        *lock_recover(&state.vlc_activity) = Some((Instant::now(), name, imdb));
     }
     // 1. Complete file on disk → serve directly.
     if let Some((path, _)) = resolve_local_file_for_result(&state, id) {
