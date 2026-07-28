@@ -136,6 +136,8 @@
   .fotitle{font-weight:700;font-size:.9rem;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .fometa{font-size:.78rem;color:var(--dim)}
   .fometa b{color:var(--accent);font-weight:800}
+  .fosub{font-size:.72rem;color:var(--dim2);margin-top:.03rem}
+  .fotap{min-height:64px;justify-content:center}
   .fomark{flex:0 0 46px;border:1px solid var(--line);border-radius:11px;background:var(--bg3);
     color:var(--good);font-size:1.2rem;font-weight:800;touch-action:manipulation}
   .fomark:active{transform:scale(.95)}
@@ -731,6 +733,13 @@ async function loadRecent(){
   row.appendChild(chips); row.classList.add("on");
 }
 
+// "2026-07-26" → "Jul 26" (+ ", YYYY" when not the current year). For followed rows.
+function fmtDate(iso){ if(!iso) return ""; const p=String(iso).split("-").map(Number);
+  if(p.length<3||!p[1]) return String(iso);
+  const mo=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][p[1]-1];
+  const yr=(p[0]===new Date().getFullYear())?"":(", "+p[0]);
+  return mo+" "+p[2]+yr; }
+
 // New episodes of followed series (slice 2b). GET /following joins the follow-list
 // with TMDB air-dates + the watched_through baseline. Renders shows that have
 // unwatched-aired episodes as a landing row (tap → search that next episode) with a
@@ -751,9 +760,19 @@ async function loadFollowing(){
     const item=el("div",{className:"foitem"});
     const nu=s.next_unwatched||"";
     const tap=el("button",{className:"fotap"});
+    const epName=s.next_unwatched_name?` · ${esc(s.next_unwatched_name)}`:"";
+    const airedNu=s.next_unwatched_air?`aired ${fmtDate(s.next_unwatched_air)}`:"";
+    const nextUp=s.next_air?`next ${esc(s.next_air.se)} · ${fmtDate(s.next_air.air_date)}`:"";
+    const line2=[airedNu,nextUp].filter(Boolean).join("  ·  ");
     tap.innerHTML=`<span class="fotitle">${esc(s.title)}</span>`
-      +`<span class="fometa"><b>${s.new_count} new</b>${nu?` · next ${esc(nu)}`:""}</span>`;
+      +`<span class="fometa"><b>${s.new_count} new</b>${nu?` · ${esc(nu)}`:""}${epName}</span>`
+      +(line2?`<span class="fosub">${line2}</span>`:"");
     tap.onclick=()=>{ setMode("tv"); const q=s.title+(nu?" "+nu:""); $("#q").value=q; S.search.q=q; runSearch(q); };
+    // Poster as a half-faded background — same treatment as the To-Watch rows.
+    if(s.poster_url){ const ps=posterSrc(s.poster_url); const img=new Image();
+      img.onload=()=>{ tap.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.9),rgba(15,15,20,.66)),url('${ps}')`;
+        tap.style.backgroundSize="cover"; tap.style.backgroundPosition="center 20%"; };
+      img.src=ps; }
     item.appendChild(tap);
     if(s.next_unwatched_season!=null){
       const mk=el("button",{className:"fomark",textContent:"✓",title:"Mark "+nu+" watched"});

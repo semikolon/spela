@@ -909,6 +909,32 @@ impl SearchEngine {
             seasons,
         })
     }
+
+    /// A single episode's (name, air_date) via TMDB — used for the followed-shows
+    /// tracker to show the NEXT-UNWATCHED episode's title + air date (which isn't
+    /// in the show payload when it's earlier than `last_episode_to_air`). None on
+    /// any error, and ("", "") fields tolerated (episode name/date can be blank).
+    pub async fn episode_detail(
+        &self,
+        tmdb_id: u64,
+        season: u32,
+        episode: u32,
+    ) -> Option<(String, String)> {
+        if self.tmdb_key.is_empty() {
+            return None;
+        }
+        let url = format!(
+            "https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}/episode/{episode}?api_key={}",
+            self.tmdb_key
+        );
+        let resp = self.client.get(&url).send().await.ok()?;
+        let d: serde_json::Value = resp.json().await.ok()?;
+        d.get("id")?;
+        Some((
+            d["name"].as_str().unwrap_or("").to_string(),
+            d["air_date"].as_str().unwrap_or("").to_string(),
+        ))
+    }
 }
 
 /// Detect HEVC/x265 from torrent filename — these need NVENC re-encoding

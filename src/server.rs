@@ -4448,6 +4448,16 @@ async fn handle_following(State(state): State<SharedState>) -> Json<Value> {
             None => (0, None),
         };
         total_new += new_count;
+        // Next-unwatched episode's title + air date — a separate TMDB call, since the
+        // show payload only carries last/next AIRED, not an arbitrary earlier episode.
+        let (nu_name, nu_air) = match next_se {
+            Some((s, e)) => state
+                .search_engine
+                .episode_detail(show.tmdb_id, s, e)
+                .await
+                .unwrap_or_default(),
+            None => (String::new(), String::new()),
+        };
         let next_air = st
             .next_episode
             .as_ref()
@@ -4462,6 +4472,8 @@ async fn handle_following(State(state): State<SharedState>) -> Json<Value> {
             "next_unwatched": next_se.map(|(s, e)| crate::following::fmt_se(s, e)),
             "next_unwatched_season": next_se.map(|(s, _)| s),
             "next_unwatched_episode": next_se.map(|(_, e)| e),
+            "next_unwatched_name": (!nu_name.is_empty()).then_some(nu_name),
+            "next_unwatched_air": (!nu_air.is_empty()).then_some(nu_air),
             "next_air": next_air,
         }));
     }
