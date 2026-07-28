@@ -168,6 +168,10 @@
      (runtime/seasons + status) ride along, hidden on narrow phones where there's
      no room. */
   #towatchOut .detail{max-width:none;padding-right:2vw}
+  /* On To-Watch, inset the New-Episodes section by .55rem to match the .sources
+     box (series/movies rows) — rows align at .55rem, the label at .70rem (= .twhead
+     padding-left). The search-landing .following keeps its full-width alignment. */
+  #towatchOut .following{margin-left:.55rem;margin-right:.55rem}
   /* Fill the viewport at 2 columns max (wider viewport = wider rows, never
      narrower — 3 columns made cells narrower than 2-col-at-medium and starved
      the title). Each row is a query CONTAINER so the extras drop by the ROW's
