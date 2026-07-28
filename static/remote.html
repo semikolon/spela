@@ -579,6 +579,10 @@ async function renderToWatch(){
   const series=mk(d.series,true), movies=mk(d.movies,false);
   out.innerHTML="";
   const wrap=el("div",{className:"detail"});
+  // New episodes of followed shows at the top — same section as the search landing.
+  try{ const fd=await api("/following"); const fc=el("div",{className:"following"});
+    if(fillFollowing(fc,(fd&&fd.shows)||[],refreshFollowing)>0){ fc.classList.add("on"); wrap.appendChild(fc); }
+  }catch{}
   if(series.length){ wrap.appendChild(el("div",{className:"twhead",textContent:`Series · ${series.length}`}));
     const box=el("div",{className:"sources open"}); series.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
   if(movies.length){ wrap.appendChild(el("div",{className:"twhead",textContent:`Movies · ${movies.length}`}));
@@ -746,46 +750,63 @@ function fmtDate(iso){ if(!iso) return ""; const p=String(iso).split("-").map(Nu
 // ✓ to mark it watched (for a view on a phone / friend's TV that spela can't see),
 // and a subtle header count badge. Marking sets watched_through to EXACTLY that
 // episode — the next one stays new.
+// One followed-show row (.foitem): poster-bg tap-to-play + a ✓ mark. `onMarked`
+// runs after a successful mark so the caller can refresh whichever view it's in.
+function followingItem(s, onMarked){
+  const item=el("div",{className:"foitem"});
+  const nu=s.next_unwatched||"";
+  const tap=el("button",{className:"fotap"});
+  const epName=s.next_unwatched_name?` · ${esc(s.next_unwatched_name)}`:"";
+  const airedNu=s.next_unwatched_air?`aired ${fmtDate(s.next_unwatched_air)}`:"";
+  const nextUp=s.next_air?`next ${esc(s.next_air.se)} · ${fmtDate(s.next_air.air_date)}`:"";
+  const line2=[airedNu,nextUp].filter(Boolean).join("  ·  ");
+  tap.innerHTML=`<span class="fotitle">${esc(s.title)}</span>`
+    +`<span class="fometa"><b>${s.new_count} new</b>${nu?` · ${esc(nu)}`:""}${epName}</span>`
+    +(line2?`<span class="fosub">${line2}</span>`:"");
+  tap.onclick=()=>{ setMode("tv"); const q=s.title+(nu?" "+nu:""); $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
+  // Poster as a half-faded background — same treatment as the To-Watch rows.
+  if(s.poster_url){ const ps=posterSrc(s.poster_url); const img=new Image();
+    img.onload=()=>{ tap.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.9),rgba(15,15,20,.66)),url('${ps}')`;
+      tap.style.backgroundSize="cover"; tap.style.backgroundPosition="center 20%"; };
+    img.src=ps; }
+  item.appendChild(tap);
+  if(s.next_unwatched_season!=null){
+    const mk=el("button",{className:"fomark",textContent:"✓",title:"Mark "+nu+" watched"});
+    mk.setAttribute("aria-label","Mark "+nu+" watched");
+    mk.onclick=async(ev)=>{ ev.stopPropagation(); mk.disabled=true;
+      try{ await api("/following/mark",{method:"POST",body:{tmdb_id:s.tmdb_id,season:s.next_unwatched_season,episode:s.next_unwatched_episode}});
+        if(onMarked) onMarked(); }
+      catch{ mk.disabled=false; toast("Couldn’t mark watched"); } };
+    item.appendChild(mk);
+  }
+  return item;
+}
+
+// Fill `container` with the "New episodes" label + rows for shows with new eps.
+// Returns how many rows were rendered (0 → container left empty).
+function fillFollowing(container, shows, onMarked){
+  container.innerHTML="";
+  const withNew=(shows||[]).filter(s=>s.new_count>0);
+  if(!withNew.length) return 0;
+  container.appendChild(el("div",{className:"rlab",textContent:"New episodes"}));
+  const list=el("div",{className:"folist"});
+  withNew.forEach(s=>list.appendChild(followingItem(s, onMarked)));
+  container.appendChild(list);
+  return withNew.length;
+}
+
+// Refresh the section wherever it's shown (search landing row + header badge, and
+// the To-Watch view if that's current).
+function refreshFollowing(){ loadFollowing(); if(currentView()==="towatch") renderToWatch(); }
+
 async function loadFollowing(){
   const row=$("#followingRow"), badge=$("#newEpBadge");
   let d; try{ d=await api("/following"); }catch(e){ return; }
   const shows=(d&&d.shows)||[], totalNew=(d&&d.total_new)||0;
   if(badge){ if(totalNew>0){ badge.textContent="▶ "+totalNew+" new"; badge.hidden=false; } else badge.hidden=true; }
   if(!row) return;
-  const withNew=shows.filter(s=>s.new_count>0);
-  if(!withNew.length){ row.classList.remove("on"); row.innerHTML=""; return; }
-  row.innerHTML=""; row.appendChild(el("div",{className:"rlab",textContent:"New episodes"}));
-  const list=el("div",{className:"folist"});
-  withNew.forEach(s=>{
-    const item=el("div",{className:"foitem"});
-    const nu=s.next_unwatched||"";
-    const tap=el("button",{className:"fotap"});
-    const epName=s.next_unwatched_name?` · ${esc(s.next_unwatched_name)}`:"";
-    const airedNu=s.next_unwatched_air?`aired ${fmtDate(s.next_unwatched_air)}`:"";
-    const nextUp=s.next_air?`next ${esc(s.next_air.se)} · ${fmtDate(s.next_air.air_date)}`:"";
-    const line2=[airedNu,nextUp].filter(Boolean).join("  ·  ");
-    tap.innerHTML=`<span class="fotitle">${esc(s.title)}</span>`
-      +`<span class="fometa"><b>${s.new_count} new</b>${nu?` · ${esc(nu)}`:""}${epName}</span>`
-      +(line2?`<span class="fosub">${line2}</span>`:"");
-    tap.onclick=()=>{ setMode("tv"); const q=s.title+(nu?" "+nu:""); $("#q").value=q; S.search.q=q; runSearch(q); };
-    // Poster as a half-faded background — same treatment as the To-Watch rows.
-    if(s.poster_url){ const ps=posterSrc(s.poster_url); const img=new Image();
-      img.onload=()=>{ tap.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.9),rgba(15,15,20,.66)),url('${ps}')`;
-        tap.style.backgroundSize="cover"; tap.style.backgroundPosition="center 20%"; };
-      img.src=ps; }
-    item.appendChild(tap);
-    if(s.next_unwatched_season!=null){
-      const mk=el("button",{className:"fomark",textContent:"✓",title:"Mark "+nu+" watched"});
-      mk.setAttribute("aria-label","Mark "+nu+" watched");
-      mk.onclick=async(ev)=>{ ev.stopPropagation(); mk.disabled=true;
-        try{ await api("/following/mark",{method:"POST",body:{tmdb_id:s.tmdb_id,season:s.next_unwatched_season,episode:s.next_unwatched_episode}});
-          loadFollowing(); }
-        catch{ mk.disabled=false; toast("Couldn’t mark watched"); } };
-      item.appendChild(mk);
-    }
-    list.appendChild(item);
-  });
-  row.appendChild(list); row.classList.add("on");
+  const n=fillFollowing(row, shows, refreshFollowing);
+  row.classList.toggle("on", n>0);
 }
 
 // Chromecast auto-track confirm prompt (slice 5). The tracker detects
