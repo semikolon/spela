@@ -942,6 +942,19 @@ pub(crate) fn effective_res_tier(r: &TorrentResult) -> u32 {
 }
 
 pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
+    // Default preserves the historical behaviour (Chromecast/NVENC needs H.264).
+    // CLI + Ruby default to the Chromecast target, so this is the right default.
+    rank_results_mut_prefer(results, true);
+}
+
+/// `prefer_h264`: when true (Chromecast — NVENC can't cheaply decode HEVC, so an
+/// H.264 release insta-plays), tier 4 prefers H.264 over HEVC (with the 30× seed-
+/// disparity override). When false (VLC / browser / phone — native HEVC decode,
+/// no transcode), tier 4 is SKIPPED, so HEVC and H.264 rank purely by seeds — a
+/// well-seeded HEVC (e.g. 253-seed x265) beats a starved H.264 (18-seed). The
+/// original H.264 preference (v3.0.0) predates non-Chromecast targets; scoping it
+/// to Chromecast is the correct refinement now that VLC/browser handle HEVC.
+pub fn rank_results_mut_prefer(results: &mut Vec<TorrentResult>, prefer_h264: bool) {
     const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
     // May 13, 2026 v3.4.0: when the HEVC alternative has ≥SEED_DISPARITY_OVERRIDE×
     // the seeds of the H.264 tier-4 winner, override the codec preference. See
@@ -999,7 +1012,10 @@ pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
         // codec WITHIN the same resolution + DV bucket.
         let a_hevc = is_hevc_from_title(&a.title);
         let b_hevc = is_hevc_from_title(&b.title);
-        if a_hevc != b_hevc {
+        // Tier 4 fires ONLY for the Chromecast target (prefer_h264). Native-HEVC
+        // targets (VLC / browser / phone) fall through to Tier 5 (seed count), so a
+        // well-seeded HEVC wins instead of being demoted below a starved H.264.
+        if prefer_h264 && a_hevc != b_hevc {
             let (h264_seeds, hevc_seeds, h264_is_a) = if a_hevc {
                 (b.seeds, a.seeds, false)
             } else {

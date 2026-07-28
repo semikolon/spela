@@ -945,6 +945,10 @@ struct SearchParams {
     movie: Option<String>,
     season: Option<u32>,
     episode: Option<u32>,
+    /// Play target the web remote currently has selected (chromecast / vlc / phone
+    /// / shannon). Only "chromecast" keeps the tier-4 H.264 preference; native-HEVC
+    /// targets re-rank by seed count so a well-seeded HEVC isn't demoted.
+    target: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1011,6 +1015,20 @@ async fn handle_search(
         .await
     {
         Ok(mut result) => {
+            // 2026-07-28: the ranker prefers H.264 because NVENC-transcoding targets
+            // (chromecast + shannon, which pull Darwin NVENC H.264) insta-play it. For
+            // native-HEVC-decode targets (vlc + phone/browser) re-rank WITHOUT that
+            // preference, so a well-seeded HEVC isn't demoted below a starved H.264.
+            // (Re-ranking reassigns result ids, so it must precede the partial-download
+            // enrichment + save_last_search below.) Axis = needs-H.264-transcode, not
+            // the literal "chromecast".
+            if params
+                .target
+                .as_deref()
+                .is_some_and(|t| matches!(t, "vlc" | "phone"))
+            {
+                crate::search::rank_results_mut_prefer(&mut result.results, false);
+            }
             // 2026-06-30: enrich each result with its on-disk partial-download
             // % so the web remote can tint already-(part-)downloaded sources
             // green — tapping one resumes (librqbit overwrite:true) instead of

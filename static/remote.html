@@ -793,6 +793,9 @@ async function runSearch(q){
   const tSkel=seGuess?`<span class="se">${seGuess}</span>`:"&nbsp;";
   out.innerHTML=`<div class="detail skeleton"><div class="card"><div class="poster"><div class="shimmer"></div></div><div class="meta"><div class="t">${tSkel}</div></div></div></div>`;
   let qs="q="+encodeURIComponent(q); if(S.mode==="movie") qs+="&movie=1";
+  // Pass the selected target so the server ranks for it: native-HEVC targets
+  // (vlc/phone) rank by seeds; NVENC targets (chromecast/shannon) prefer H.264.
+  if(S.target&&S.target.kind) qs+="&target="+encodeURIComponent(S.target.kind);
   let d;
   try{ d=await api("/search?"+qs,{signal:ac.signal}); }
   catch(e){ if(e.name==="AbortError")return;
@@ -1076,6 +1079,7 @@ function openSheet(){
       o.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
         S.target={kind:"chromecast",name:d2.name};
         sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
+      if(!resume && S.search && S.search.q) runSearch(S.search.q);  // re-rank for the new target
         if(resume) resume();   // the play the user originally tapped now fires (to this target)
         else if(moving) toast("Single stream — your next play moves it to "+d2.name); };
       list.appendChild(o);
@@ -1087,6 +1091,7 @@ function openSheet(){
     ph.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
       S.target={kind:"phone",name:"This device"};
       sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
+      if(!resume && S.search && S.search.q) runSearch(S.search.q);  // re-rank for the new target
       if(resume) resume();   // the play the user originally tapped now fires (to this phone)
       else if(moving) toast("Single stream — your next play moves it here, off the TV"); };
     list.appendChild(ph);
@@ -1099,6 +1104,7 @@ function openSheet(){
     vl.onclick=()=>{ const resume=S.pending; S.pending=null;
       S.target={kind:"vlc",name:"VLC"};
       sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
+      if(!resume && S.search && S.search.q) runSearch(S.search.q);  // re-rank for the new target
       if(resume) resume();
       else toast("Tap a source (or Play best) to open it in VLC"); };
     list.appendChild(vl);
@@ -1114,6 +1120,7 @@ function openSheet(){
     sh.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
       S.target={kind:"shannon",name:"Shannon TV"};
       sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
+      if(!resume && S.search && S.search.q) runSearch(S.search.q);  // re-rank for the new target
       if(resume) resume();
       else if(moving) toast("Single stream — your next play moves it to Shannon"); };
     list.appendChild(sh);
