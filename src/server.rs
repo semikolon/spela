@@ -64,6 +64,12 @@ pub struct ServerState {
     /// ONLY the scrubber consumes) returns truth. Resume semantics are
     /// untouched — auto-resume + no-arg seek call `get_position` directly.
     pub live_position: Mutex<Option<LivePosition>>,
+    /// 2026-07-28: last Open-in-VLC stream activity (Instant + title). The
+    /// `/vlc/{id}/stream` path serves VLC directly and never registers a
+    /// CurrentStream, so `/status` was blind to VLC playback. Each stream
+    /// request stamps this; `/status` reports `vlc_active` when recent (<30s),
+    /// so consumers (Ruby, the desk-dim daemon) can see VLC-on-this-Mac.
+    pub vlc_activity: Mutex<Option<(Instant, String)>>,
 }
 
 /// Live playback position for the web-remote scrubber (see `live_position`).
@@ -226,6 +232,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         host_allowlist,
         warmup: Mutex::new(None),
         live_position: Mutex::new(None),
+        vlc_activity: Mutex::new(None),
     });
 
     // 2026-07-13 (slice 5): background watch tracker — polls house Chromecasts,
@@ -4291,8 +4298,22 @@ async fn handle_stop(State(state): State<SharedState>) -> Json<Value> {
 
 async fn handle_status(State(state): State<SharedState>) -> Json<Value> {
     let app_state = AppState::load(&state.state_dir);
+    // 2026-07-28: Open-in-VLC serves /vlc/stream directly (no CurrentStream), so
+    // surface it here from the vlc_activity stamp (recent = VLC actively pulling).
+    let vlc_title: Option<String> = {
+        let g = lock_recover(&state.vlc_activity);
+        g.as_ref()
+            .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(30))
+            .map(|(_, t)| t.clone())
+    };
     match &app_state.current {
-        None => Json(json!({"status": "idle"})),
+        None => match &vlc_title {
+            Some(title) => Json(json!({
+                "status": "streaming", "target": "vlc",
+                "vlc_active": true, "title": title,
+            })),
+            None => Json(json!({"status": "idle"})),
+        },
         Some(current) => {
             // Liveness ground truth: ffmpeg is producing HLS segments
             // (or transcoded_aac.mp4 for the legacy CCR path) IFF the
@@ -4317,6 +4338,7 @@ async fn handle_status(State(state): State<SharedState>) -> Json<Value> {
                 "running": running,
                 "ffmpeg_alive": ffmpeg_alive,
                 "torrent_alive": torrent_alive,
+                "vlc_active": vlc_title.is_some(),
             }))
         }
     }
@@ -6655,6 +6677,11 @@ async fn handle_vlc_stream(
     axum::extract::Path(id): axum::extract::Path<usize>,
     headers: HeaderMap,
 ) -> axum::response::Response {
+    // 2026-07-28: stamp VLC activity so /status can report vlc_active — this path
+    // serves VLC directly and never creates a CurrentStream.
+    if let Some((_, _, name, _)) = resolve_result_for_vlc(&state, id) {
+        *lock_recover(&state.vlc_activity) = Some((Instant::now(), name));
+    }
     // 1. Complete file on disk → serve directly.
     if let Some((path, _)) = resolve_local_file_for_result(&state, id) {
         tracing::info!("VLC: result #{} → complete local file {:?}", id, path);
