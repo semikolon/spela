@@ -46,11 +46,17 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    `spela-vlc-watcher` launchd agent, since Open-in-VLC serves raw byte-ranges
    (spela is blind to VLC's playhead). VLC's HTTP control interface exposes the
    playhead (`vlcrc extraintf=http` + password on the Mac → `127.0.0.1:8080/requests/
-   status.json`); the agent polls it + spela `/status` for the title, and at ≥90%
-   POSTs `/following/mark {stream_title}`. VLC is NOT opaque — the byte-progress
-   proxy was rejected (MKV tail-reads/seeks) in favour of the true playhead. Setup
-   step to reproduce on a fresh Mac: enable VLC's web interface in vlcrc + install
-   the agent plist (`com.fredrikbranstrom.spela-vlc-watcher`).
+   status.json`); the agent gets the show identity from spela `/status` and POSTs
+   `/position {imdb_id,title,seconds,duration}` EVERY poll → `save_position_smart`
+   updates the resume HWM (mid-episode cross-device resume) AND at ≥`HWM_CLEAR_FRACTION`
+   clears the resume + marks watched + advances the followed show. **Gotcha
+   (2026-07-29):** spela's `/status` reports `vlc_active` only ~30s after VLC's last
+   byte-range fetch, so a fully-buffered episode goes quiet and the identity vanishes
+   there → the watcher must hold identity STICKY (tied to the media's length) and post
+   to the end, else completion never fires (Silo S03E03 froze at 70% before this fix).
+   VLC is NOT opaque — the byte-progress proxy was rejected (MKV tail-reads/seeks) in
+   favour of the true playhead. Setup step to reproduce on a fresh Mac: enable VLC's
+   web interface in vlcrc + install the agent plist (`com.fredrikbranstrom.spela-vlc-watcher`).
 
 3. **To-watch list + recommender — arsenal ✅ SHIPPED (2026-07-13, `b4fed13`); harness (curation) = Claude, ongoing.**
    `GET /watchlist` serves `~/.config/spela/watchlist.json` (seeded from the RT
