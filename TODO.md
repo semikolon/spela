@@ -1,5 +1,13 @@
 # Spela TODOs 🎬🍿
 
+### v3.19 open loops (2026-07-29 — followed-shows tracker + VLC playback tracking)
+- **VLC-torrent FD leak (the deeper fix behind the FD-limit bump).** Open-in-VLC (`/vlc/{id}/stream`) starts a torrent but never tears it down when VLC disconnects, so torrents + peer connections accumulate. Overnight ~1000 FDs piled up and hit the OLD 1024 **soft** limit → `EMFILE` ("too many open files") → VLC streams failed (HTTP 000). Raised the limit (drop-in `LimitNOFILE=524288`; soft was 1024 while hard was already 524288; mirrored to `system/darwin/.../spela.service.d/limits.conf` in the hemma overlay) — but the **leak remains**. Close it: reap idle VLC torrents (the watcher already sees VLC `state=stopped` → could hit a `/vlc/{id}/stop`, or a TTL torrent-reaper in a sweep).
+- **Follow-list curation.** `~/.config/spela/following.json` (on Darwin, user-local — never the public repo, per NO PERSONAL DATA) holds the ongoing shows to track. Add/prune series as viewing changes; the ✓ button + spela/VLC completion advance each baseline automatically.
+- **VLC watcher end-to-end validation.** Confirm on a real VLC watch that `/position` syncs the resume HWM live + completion auto-marks (heartbeat in `~/.local/share/spela-vlc-watcher.log`).
+- **VLC web-interface persistence.** Verify `vlcrc extraintf=http` + `http-password` survive normal VLC quits (VLC rewrites `vlcrc` on quit — it may need re-setting or a guard).
+- **spela-vlc-watcher plist not nit-tracked.** `~/Library/LaunchAgents/*.plist` is gitignored; the watcher *script* IS nit-tracked but the plist isn't → add a deploy trigger so a fresh Mac provision installs the agent (fresh-provision gap).
+- **Opus 5 / CC auto-update — self-heals, NO action.** The z.ai `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` var (which had frozen the native updater at 2.1.172) was stripped; the updater resumes on fresh `claude` launches, so ≥2.1.219 + Opus 5 lands on its own. Just confirm eventually.
+
 ### v3.14 + peer-supply — SHIPPED (2026-07-05 overnight barrage) + OPEN LOOPS
 A 20-title barrage (blockbuster → Vampyr 1932) on an isolated ephemeral-DHT test instance (7891) drove these to production:
 - **pkill cross-instance-kill fix** — `do_cleanup` scoped to `<media_dir>/transcoded_hls` (was SIGKILLing production's live ffmpeg from a *test* instance's cleanup; the ORIGINAL looping-Silo cause).
