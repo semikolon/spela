@@ -605,9 +605,23 @@ pub struct ObservedPlayback {
 
 /// Classify a Cast media `Metadata` into (kind, key-title, series, season,
 /// episode). Movies + TV shows are trackable; music/photo/generic are "other".
-fn classify_metadata(md: &Metadata) -> (&'static str, String, Option<String>, Option<u32>, Option<u32>) {
+fn classify_metadata(
+    md: &Metadata,
+) -> (
+    &'static str,
+    String,
+    Option<String>,
+    Option<u32>,
+    Option<u32>,
+) {
     match md {
-        Metadata::Movie(m) => ("movie", m.title.clone().unwrap_or_default(), None, None, None),
+        Metadata::Movie(m) => (
+            "movie",
+            m.title.clone().unwrap_or_default(),
+            None,
+            None,
+            None,
+        ),
         Metadata::TvShow(m) => {
             let series = m.series_title.clone();
             let title = match (&series, m.season, m.episode) {
@@ -644,7 +658,11 @@ pub fn probe_device_media(device_name: &str, ip: &str, port: u16) -> Vec<Observe
         Err(_) => return out,
     };
     for app in &status.applications {
-        if device.connection.connect(app.transport_id.as_str()).is_err() {
+        if device
+            .connection
+            .connect(app.transport_id.as_str())
+            .is_err()
+        {
             continue;
         }
         let media_status = match device.media.get_status(app.transport_id.as_str(), None) {
