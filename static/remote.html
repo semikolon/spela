@@ -142,6 +142,9 @@
     color:var(--good);font-size:1.2rem;font-weight:800;touch-action:manipulation}
   .fomark:active{transform:scale(.95)}
   .fomark:disabled{opacity:.4}
+  .founfollow{flex:0 0 40px;border:1px solid var(--line);border-radius:11px;background:var(--bg3);
+    color:var(--dim);font-size:1.05rem;cursor:pointer;transition:transform .06s}
+  .founfollow:active{transform:scale(.95)} .founfollow:disabled{opacity:.4}
   .newbadge{align-self:center;margin-left:.5rem;background:var(--accent2);color:#fff;font-size:.7rem;
     font-weight:800;border-radius:999px;padding:.15rem .5rem;white-space:nowrap;text-decoration:none;line-height:1.6}
   /* To-Watch section headers — small all-caps, x-aligned with row titles
@@ -195,6 +198,12 @@
   .markw.done{color:var(--good);border-color:var(--good);background:rgba(55,200,122,.1)}
   .card .markw{margin:.5rem .7rem 0}
   .detail .body>.markw{margin:.6rem 0 0;max-width:260px}
+  .followbtn{background:var(--bg3);border:1px solid var(--line);border-radius:12px;
+    color:var(--fg);padding:.55rem .8rem;font-size:.9rem;cursor:pointer;transition:transform .06s,border-color .1s}
+  .followbtn:active{transform:scale(.97)} .followbtn:disabled{opacity:.5}
+  .followbtn.on{color:var(--good);border-color:var(--good);background:rgba(55,200,122,.1)}
+  .epname{color:var(--dim);font-size:.9rem;margin-top:.15rem}
+  .airs{color:var(--accent2);font-weight:600;font-size:.95rem;padding:.55rem 0}
   /* 2026-07-13: "Rotten Tomatoes →" read-more link on the search detail card.
      Uses RT's search URL (always lands on the title; hand-built /m/ slugs 404
      on disambiguated titles). Works for movies AND series, no key. */
@@ -502,7 +511,8 @@ const S={
        warming:false,warmup:null,warmupData:null,   // 2026-07-04 live warmup progress
        error:null},   // 2026-07-08 persistent play-start failure {title,poster,msg,retry}
   pollTimer:null, frontierTimer:null, warmTimer:null,
-  pending:null   // deferred play: tapped before a target was set → picker → resume
+  pending:null,   // deferred play: tapped before a target was set → picker → resume
+  followedIds:null   // Set<tmdb_id> of followed shows; lazily loaded (ensureFollowedIds)
 };
 
 /* ---------- API client (abortable; network err -> banner) ---------- */
@@ -632,7 +642,7 @@ async function enrichToWatchRow(row,title,isTV){
 addEventListener("hashchange",route);
 
 /* ---------- poster card (skeleton -> img | titled fallback) ---------- */
-function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,detailLine,seLabel}){
+function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,detailLine,seLabel,epName,airsNote,followBtn}){
   const c=el("div",{className:"card"});
   const p=el("div",{className:"poster"});
   const sh=el("div",{className:"shimmer"});
@@ -655,6 +665,7 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
   if(seLabel) tEl.appendChild(el("span",{className:"se",textContent:seLabel}));
   m.appendChild(tEl);
   if(year) m.appendChild(el("div",{className:"y",textContent:year}));
+  if(epName) m.appendChild(el("div",{className:"epname",textContent:epName}));
   body.appendChild(m);
   // metadata detail line (year-range · genres · runtime · rating), below the
   // title + above the buttons — filled async by the caller (fillDetailLine).
@@ -662,6 +673,7 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
   // Button row: Play + Mark-watched, with the RT link a compact tomato pushed
   // to the right. "More sources" stays BELOW this row (appended after).
   const actions=el("div",{className:"actions"});
+  if(airsNote){ actions.appendChild(el("span",{className:"airs",textContent:airsNote})); }
   if(onPlay){
     const b=el("button",{className:"play",textContent:cta||"Play"});
     b.onclick=()=>onPlay(); actions.appendChild(b);
@@ -672,6 +684,11 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
       const ok=await onMarkWatched();
       if(ok!==false){ w.textContent="✓ Watched"; w.classList.add("done"); } else { w.disabled=false; } };
     actions.appendChild(w);
+  }
+  if(followBtn){
+    const fb=el("button",{className:"followbtn"+(followBtn.followed?" on":""),textContent:followBtn.followed?"✓ Following":"+ Follow"});
+    fb.onclick=async()=>{ fb.disabled=true; const ok=await followBtn.onToggle(); if(ok===false) fb.disabled=false; };
+    actions.appendChild(fb);
   }
   if(rtTitle){
     const rt=el("a",{className:"rtlink",textContent:"🍅 →",title:"Open on Rotten Tomatoes",
@@ -778,11 +795,24 @@ function followingItem(s, onMarked){
     const mk=el("button",{className:"fomark",textContent:"✓",title:"Mark "+nu+" watched"});
     mk.setAttribute("aria-label","Mark "+nu+" watched");
     mk.onclick=async(ev)=>{ ev.stopPropagation(); mk.disabled=true;
-      try{ await api("/following/mark",{method:"POST",body:{tmdb_id:s.tmdb_id,season:s.next_unwatched_season,episode:s.next_unwatched_episode}});
-        if(onMarked) onMarked(); }
-      catch{ mk.disabled=false; toast("Couldn’t mark watched"); } };
+      let r; try{ r=await api("/following/mark",{method:"POST",body:{tmdb_id:s.tmdb_id,season:s.next_unwatched_season,episode:s.next_unwatched_episode}}); }
+      catch{ mk.disabled=false; toast("Couldn’t mark watched"); return; }
+      if(!r||!r.ok){ mk.disabled=false; toast("Couldn’t mark watched"); return; }
+      if(onMarked) onMarked(); };
     item.appendChild(mk);
   }
+  // Unfollow ✕ — membership only; the ledger keeps progress, so re-following later
+  // resumes where he left off.
+  const uf=el("button",{className:"founfollow",textContent:"✕",title:"Unfollow "+s.title});
+  uf.setAttribute("aria-label","Unfollow "+s.title);
+  uf.onclick=async(ev)=>{ ev.stopPropagation(); uf.disabled=true;
+    let r; try{ r=await api("/following/remove",{method:"POST",body:{tmdb_id:s.tmdb_id}}); }
+    catch{ uf.disabled=false; toast("Couldn’t unfollow"); return; }
+    if(!r||!r.ok){ uf.disabled=false; toast("Couldn’t unfollow"); return; }
+    if(S.followedIds) S.followedIds.delete(s.tmdb_id);
+    toast("Unfollowed");
+    if(onMarked) onMarked(); };
+  item.appendChild(uf);
   return item;
 }
 
@@ -807,6 +837,7 @@ async function loadFollowing(){
   const row=$("#followingRow"), badge=$("#newEpBadge");
   let d; try{ d=await api("/following"); }catch(e){ return; }
   const shows=(d&&d.shows)||[], totalNew=(d&&d.total_new)||0;
+  S.followedIds=new Set(shows.map(s=>s.tmdb_id));
   if(badge){ if(totalNew>0){ badge.textContent="▶ "+totalNew+" new"; badge.hidden=false; } else badge.hidden=true; }
   if(!row) return;
   const n=fillFollowing(row, shows, refreshFollowing);
@@ -907,22 +938,69 @@ async function runSearch(q){
   S.search.data=d;
   if(d.error){ out.innerHTML=`<div class="state"><div class="big">No match</div>${esc(d.error)}<div style="margin-top:.6rem;font-size:.82rem">Try the Movies / TV toggle above.</div></div>`; return; }
   const res=d.results||[];
-  if(!res.length){ out.innerHTML=`<div class="state"><div class="big">No playable sources</div>Nothing found for “${esc(q)}”. Try the Movies / TV toggle.</div>`; return; }
   const show=d.show||{}, year=(show.release_date||"").slice(0,4);
   // Server parsed SxxExx out of the query (search.rs parse_episode_markers) and
-  // echoes it as d.searching {season, episode}. Render it inline with the title.
+  // echoes it as d.searching {season, episode, name, air_date}.
   const se=d.searching;
   const seLabel=se?`Season ${se.season} Episode ${se.episode}`:seFromQuery(q);
+  const fb=await followBtnFor(show);
+  // Unaired-episode guard: the server skips Torrentio for a future air_date (so
+  // `res` is empty by design). Show "Airs <date>" instead of a dead Play + junk
+  // sources (the S04E03 "no worky" incident, 2026-08-02).
+  const today=new Date().toISOString().slice(0,10);
+  if(se && se.air_date && se.air_date>today){
+    const grid=el("div",{className:"detail"});
+    const card=posterCard({poster:show.poster_url, title:show.title||"", detailLine:true, seLabel,
+      epName:se.name, airsNote:"Airs "+fmtDate(se.air_date), followBtn:fb});
+    grid.appendChild(card); out.innerHTML=""; out.appendChild(grid);
+    fillDetailLine(card, show.title||"", true);
+    return;
+  }
+  if(!res.length){ out.innerHTML=`<div class="state"><div class="big">No playable sources</div>Nothing found for “${esc(q)}”. Try the Movies / TV toggle.</div>`; return; }
   const grid=el("div",{className:"detail"});
   const card=posterCard({
     poster:show.poster_url, title:show.title||res[0].title, detailLine:true, seLabel,
+    epName: se&&se.name?se.name:undefined,
     cta:"Play best source", sources:res,
     onPlay:()=>doPlay({result_id:res[0].id}, card),
     onMarkWatched:()=>markWatched(show.title||res[0].title, show.imdb_id),
-    rtTitle:show.title||res[0].title
+    rtTitle:show.title||res[0].title, followBtn:fb
   });
   grid.appendChild(card); out.innerHTML=""; out.appendChild(grid);
   fillDetailLine(card, show.title||res[0].title, S.mode==="tv");
+}
+
+// Build a Follow/Unfollow control for a search-result show — TV only (movies have
+// no episodes to follow; detected via `show.seasons`). Toggling hits
+// /following/add | /following/remove (membership only; progress lives in the
+// ledger, so re-following resumes where he left off) then refreshes.
+async function followBtnFor(show){
+  if(!show || !show.tmdb_id || show.seasons==null) return undefined;
+  await ensureFollowedIds();
+  const id=show.tmdb_id;
+  return {
+    followed: S.followedIds.has(id),
+    onToggle: async()=>{
+      const on=S.followedIds.has(id);
+      const r=on
+        ? await api("/following/remove",{method:"POST",body:{tmdb_id:id}})
+        : await api("/following/add",{method:"POST",body:{tmdb_id:id,imdb_id:show.imdb_id||"",title:show.title||""}});
+      if(!r||!r.ok){ toast(on?"Couldn’t unfollow":"Couldn’t follow"); return false; }
+      if(on) S.followedIds.delete(id); else S.followedIds.add(id);
+      toast(on?"Unfollowed":"Following ✓");
+      loadFollowing();
+      if(S.search.q) runSearch(S.search.q);   // re-render the button state
+      return true;
+    }
+  };
+}
+// Followed tmdb_id set — lazily fetched once, kept in sync by add/remove +
+// loadFollowing. Lets the search card show Follow vs Unfollow without a per-card
+// round-trip.
+async function ensureFollowedIds(){
+  if(S.followedIds) return;
+  try{ const d=await api("/following"); S.followedIds=new Set((d.shows||[]).map(s=>s.tmdb_id)); }
+  catch{ S.followedIds=new Set(); }
 }
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 // Client-side mirror of search.rs parse_episode_markers (SxxExx / NxM /

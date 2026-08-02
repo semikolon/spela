@@ -650,20 +650,31 @@ impl SearchEngine {
 
         let (s, e) = episode_to_search(season, episode, intent, show_info.latest_episode.as_ref());
 
+        // Episode name + air date (for the card, and the unaired guard). A future
+        // air_date means the episode isn't out yet: skip Torrentio entirely — its
+        // only "results" for an unaired episode are mislabeled junk the title-filter
+        // would reject anyway (the S04E03 "no worky" incident, 2026-08-02) — and let
+        // the UI show "Airs <date>" instead of a dead Play button.
+        let (ep_name, ep_air) = self.episode_detail(tmdb_id, s, e).await.unwrap_or_default();
+        let unaired = is_future_date(&ep_air);
+
         // Step 3: Torrentio lookup (filtered by show title to drop spurious
         // cross-show results — the Apr 15 "French Chef for The Boys S05E03"
-        // incident).
-        let results = self
-            .torrentio_streams(&imdb_id, &show_info.title, Some(s), Some(e))
-            .await?;
+        // incident). Skipped entirely for an unaired episode.
+        let results = if unaired {
+            Vec::new()
+        } else {
+            self.torrentio_streams(&imdb_id, &show_info.title, Some(s), Some(e))
+                .await?
+        };
         Ok(SearchResult {
             query: query.into(),
             show: Some(show_info),
             searching: Some(EpisodeRef {
                 season: s,
                 episode: e,
-                name: None,
-                air_date: None,
+                name: (!ep_name.is_empty()).then_some(ep_name),
+                air_date: (!ep_air.is_empty()).then_some(ep_air),
             }),
             error: None,
             torrent_available: !results.is_empty(),
@@ -1175,6 +1186,17 @@ pub fn rank_results_mut_prefer(results: &mut Vec<TorrentResult>, prefer_h264: bo
 ///   filter applied, returns the full list.
 /// - Filter drops everything: returns the full list with a warning,
 ///   because "some spurious results" is less bad than "no results at all".
+/// True if `air_date` (TMDB "YYYY-MM-DD") is strictly after today (UTC). Empty /
+/// unparseable → false (fail open: treat as aired). Lexicographic comparison is
+/// valid for zero-padded ISO dates.
+fn is_future_date(air_date: &str) -> bool {
+    if air_date.len() < 10 {
+        return false;
+    }
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    air_date > today.as_str()
+}
+
 fn filter_results_by_show_title(
     results: Vec<TorrentResult>,
     show_title: &str,
@@ -1972,6 +1994,14 @@ fn episode_to_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_future_date_guards_unaired_episodes() {
+        assert!(!is_future_date(""), "empty air_date → treat as aired (fail open)");
+        assert!(!is_future_date("2000-01-01"), "long-past date is not future");
+        assert!(is_future_date("2099-12-31"), "far-future date is unaired");
+        assert!(!is_future_date("bad"), "unparseable (too short) → not future");
+    }
 
     // ----- Apr 28, 2026: tmdb_poster_url regression suite -----
     //

@@ -208,6 +208,11 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
 
     reconcile_session_state_on_startup(&state_dir);
 
+    // One-time: move legacy following.json `watched_through` baselines into the
+    // watch-ledger (the single source of truth for progress). Idempotent — no-op
+    // after the first run (gated on schema_version). See following::migrate_if_needed.
+    crate::following::migrate_if_needed(&state_dir);
+
     let search_engine =
         SearchEngine::new(config.tmdb_api_key.clone(), config.mdblist_api_key.clone());
     let cast = Mutex::new(CastController::new(
@@ -301,6 +306,8 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/title-meta", get(handle_title_meta))
         .route("/following", get(handle_following))
         .route("/following/mark", post(handle_following_mark))
+        .route("/following/add", post(handle_following_add))
+        .route("/following/remove", post(handle_following_remove))
         .route("/position", post(handle_position))
         .route("/poster/{size}/{file}", get(handle_poster))
         // Web-remote My Library (US-3): aggregate curated collection
@@ -4425,17 +4432,17 @@ fn next_unwatched_ep(watched: (u32, u32), seasons: &[(u32, u32)]) -> (u32, u32) 
 /// most-new-first. Personal data (the follow-list) lives only on the spela host.
 async fn handle_following(State(state): State<SharedState>) -> Json<Value> {
     let following = crate::following::load();
+    let app = AppState::load(&state.state_dir);
     let mut shows = Vec::new();
     let mut total_new: u32 = 0;
     for show in &following.shows {
         let Some(st) = state.search_engine.tv_status(show.tmdb_id).await else {
             continue;
         };
-        let watched = show
-            .watched_through
-            .as_deref()
-            .and_then(crate::following::parse_se)
-            .unwrap_or((0, 0));
+        // Progress DERIVES from the ledger (single source of truth) — never a stored
+        // field — so unfollow/re-follow can't lose the place.
+        let watched_opt = app.derive_watched_through(show.imdb_id.as_deref(), &show.title);
+        let watched = watched_opt.unwrap_or((0, 0));
         let (new_count, next_se) = match st.last_aired {
             Some((ls, le, _, _)) => {
                 let nc = episodes_between(watched, (ls, le), &st.seasons);
@@ -4468,7 +4475,7 @@ async fn handle_following(State(state): State<SharedState>) -> Json<Value> {
             "tmdb_id": show.tmdb_id,
             "poster_url": st.poster_url,
             "status": st.status,
-            "watched_through": show.watched_through,
+            "watched_through": watched_opt.map(|(s, e)| crate::following::fmt_se(s, e)),
             "new_count": new_count,
             "next_unwatched": next_se.map(|(s, e)| crate::following::fmt_se(s, e)),
             "next_unwatched_season": next_se.map(|(s, _)| s),
@@ -4504,23 +4511,72 @@ struct FollowingMarkRequest {
 /// `POST /following/mark` — mark a followed episode watched. Two shapes:
 ///   • `{tmdb_id, season, episode}` — the web-remote ✓ (exact episode).
 ///   • `{stream_title}` — the VLC watcher; spela parses SxxExx + title itself.
-/// Sets `watched_through` to EXACTLY that episode (never past it), `max`-semantics
-/// so it can't rewind. For a view spela can't see (phone / friend's TV / VLC).
+/// Records that episode into the watch-ledger (the single source of truth); the
+/// follow view then DERIVES `watched_through` from it. For a view spela can't see
+/// (phone / friend's TV / VLC). Ledger dedup makes a re-mark idempotent.
 async fn handle_following_mark(
-    State(_state): State<SharedState>,
+    State(state): State<SharedState>,
     Json(req): Json<FollowingMarkRequest>,
 ) -> Json<Value> {
+    // Marking a followed episode watched is now just a LEDGER append — the follow
+    // view derives `watched_through` from the ledger — so this records the episode
+    // exactly like a completion, and New Episodes recomputes. (Was: a separate
+    // write into following.json's watched_through, the store we've since retired.)
+    let mut app = AppState::load(&state.state_dir);
     let ok = if let (Some(id), Some(s), Some(e)) = (req.tmdb_id, req.season, req.episode) {
-        crate::following::set_watched_through(id, s, e)
+        // Resolve the followed show's title + imdb so the ledger entry lands on the
+        // same identity `derive_watched_through` joins on.
+        let following = crate::following::load();
+        match following.shows.iter().find(|sh| sh.tmdb_id == id) {
+            Some(sh) => {
+                let title = format!("{} {}", sh.title, crate::following::fmt_se(s, e));
+                app.mark_watched_auto(sh.imdb_id.clone(), title)
+            }
+            None => false,
+        }
     } else if let Some(t) = req.stream_title.as_deref() {
-        let (show, s, e) = crate::search::parse_episode_markers(t);
+        let (_show, s, e) = crate::search::parse_episode_markers(t);
         match (s, e) {
-            (Some(s), Some(e)) => crate::following::advance_by_title(&show, s, e),
+            (Some(_), Some(_)) => app.mark_watched_auto(None, t.to_string()),
             _ => false,
         }
     } else {
         false
     };
+    if ok {
+        let _ = app.save(&state.state_dir);
+    }
+    Json(json!({ "ok": ok }))
+}
+
+#[derive(Deserialize)]
+struct FollowingAddRequest {
+    tmdb_id: u64,
+    #[serde(default)]
+    imdb_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// `POST /following/add` {tmdb_id, imdb_id?, title} — follow a show (MEMBERSHIP
+/// only). Progress derives from the ledger, so a previously-watched show shows the
+/// correct new-count immediately; a fresh one shows all aired episodes as new.
+async fn handle_following_add(Json(req): Json<FollowingAddRequest>) -> Json<Value> {
+    let title = req.title.unwrap_or_default();
+    let ok = crate::following::add_show(&title, req.tmdb_id, req.imdb_id);
+    Json(json!({ "ok": ok }))
+}
+
+#[derive(Deserialize)]
+struct FollowingRemoveRequest {
+    tmdb_id: u64,
+}
+
+/// `POST /following/remove` {tmdb_id} — unfollow. MEMBERSHIP only; the ledger (and
+/// thus all watched progress) is untouched, so re-following resumes where he left
+/// off (the whole point of the single-source-of-truth refactor).
+async fn handle_following_remove(Json(req): Json<FollowingRemoveRequest>) -> Json<Value> {
+    let ok = crate::following::remove_show(req.tmdb_id);
     Json(json!({ "ok": ok }))
 }
 

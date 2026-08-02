@@ -209,6 +209,11 @@ pub struct WatchedEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imdb_id: Option<String>,
     pub watched_at: DateTime<Utc>,
+    /// True for baseline entries written by the following.json→ledger migration
+    /// (a pre-spela TVTime high-water mark), not a real spela completion. Kept out
+    /// of "recently watched"-style displays; still counts for progress + seen-check.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub seed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,16 +334,11 @@ impl AppState {
                     t,
                     dur
                 );
+                // Progress derives from the ledger now (the single source of truth),
+                // so recording the completion here is all that's needed — the
+                // followed-shows tracker recomputes `watched_through` from this write
+                // (see `derive_watched_through`). No separate follow-store update.
                 self.mark_watched(&key, imdb_id.clone(), title.clone());
-                // Auto-advance a followed show's baseline when finished via spela —
-                // only ever to the episode actually watched, never past it (the
-                // followed-shows tracker / slice 2b).
-                if let Some(t) = title.as_deref() {
-                    let (show, s, e) = crate::search::parse_episode_markers(t);
-                    if let (Some(season), Some(episode)) = (s, e) {
-                        crate::following::advance_by_title(&show, season, episode);
-                    }
-                }
                 self.reset_position(imdb_id, title);
                 return (key, true);
             }
@@ -393,6 +393,7 @@ impl AppState {
                 show,
                 imdb_id,
                 watched_at: Utc::now(),
+                seed: false,
             },
         );
         self.watched.truncate(500);
@@ -408,6 +409,71 @@ impl AppState {
         };
         self.mark_watched(&key, imdb_id, Some(title));
         true
+    }
+
+    /// Write a baseline (seed) ledger entry from the following.json→ledger
+    /// migration: a pre-spela high-water mark ("<show> S03E02"). Deduped — never
+    /// overwrites a real completion already at that key. Returns true if inserted.
+    pub fn mark_watched_seed(&mut self, imdb_id: Option<String>, title: String) -> bool {
+        let Some(key) = resume_position_key(imdb_id.as_deref(), Some(&title)) else {
+            return false;
+        };
+        if self.watched.iter().any(|w| w.key == key) {
+            return false;
+        }
+        let show = Some(crate::search::clean_title_for_tmdb(&title));
+        self.watched.insert(
+            0,
+            WatchedEntry {
+                key,
+                title,
+                show,
+                imdb_id,
+                watched_at: Utc::now(),
+                seed: true,
+            },
+        );
+        self.watched.truncate(500);
+        true
+    }
+
+    /// Derive how far a followed show has been watched, FROM THE LEDGER (the single
+    /// source of truth for progress). Matches ledger entries to the show by IMDb id
+    /// when both carry one (exact), else by cleaned title; parses the SxxExx from
+    /// each matched entry and returns the highest (season, episode). None = nothing
+    /// watched yet. Replaces the old `following.json` `watched_through` field, so
+    /// unfollowing a show can't lose progress (the ledger survives unfollow).
+    pub fn derive_watched_through(
+        &self,
+        follow_imdb: Option<&str>,
+        follow_title: &str,
+    ) -> Option<(u32, u32)> {
+        let want = crate::following::clean_title(follow_title);
+        let fi = follow_imdb.filter(|s| !s.is_empty());
+        let mut best: Option<(u32, u32)> = None;
+        for w in &self.watched {
+            let matched = match (fi, w.imdb_id.as_deref().filter(|s| !s.is_empty())) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                _ => {
+                    let show_name = w
+                        .show
+                        .clone()
+                        .unwrap_or_else(|| crate::search::clean_title_for_tmdb(&w.title));
+                    crate::following::clean_title(&show_name) == want
+                }
+            };
+            if !matched {
+                continue;
+            }
+            let (_show, s, e) = crate::search::parse_episode_markers(&w.title);
+            if let (Some(s), Some(e)) = (s, e) {
+                match best {
+                    Some(b) if (s, e) <= b => {}
+                    _ => best = Some((s, e)),
+                }
+            }
+        }
+        best
     }
 
     /// Stage a Chromecast-detected completion for Fredrik to confirm (slice 5).
@@ -588,6 +654,56 @@ mod tests {
             None,
             "HWM must clear at 97.1% — past HWM_CLEAR_FRACTION"
         );
+    }
+
+    #[test]
+    fn test_derive_watched_through() {
+        let mut state = AppState::default();
+        // Real spela completions (title carries SxxExx; imdb = the show's id).
+        state.mark_watched(
+            "tt14688458_s03e01",
+            Some("tt14688458".into()),
+            Some("Silo S03E01".into()),
+        );
+        state.mark_watched(
+            "tt14688458_s03e03",
+            Some("tt14688458".into()),
+            Some("Silo S03E03".into()),
+        );
+        state.mark_watched(
+            "tt14688458_s03e02",
+            Some("tt14688458".into()),
+            Some("Silo S03E02".into()),
+        );
+        // A different show must not leak into Silo's progress.
+        state.mark_watched(
+            "tt0000001_s09e09",
+            Some("tt0000001".into()),
+            Some("Rick and Morty S09E09".into()),
+        );
+
+        // Exact IMDb join → highest episode across entries (order-independent).
+        assert_eq!(
+            state.derive_watched_through(Some("tt14688458"), "Silo"),
+            Some((3, 3))
+        );
+        // Title fallback (no imdb on the follow side) still resolves.
+        assert_eq!(state.derive_watched_through(None, "Silo"), Some((3, 3)));
+        // The other show resolves independently — no cross-contamination.
+        assert_eq!(
+            state.derive_watched_through(Some("tt0000001"), "Rick and Morty"),
+            Some((9, 9))
+        );
+
+        // A migration seed (imdb unknown, title-keyed) counts as progress too.
+        let mut seeded = AppState::default();
+        assert!(seeded.mark_watched_seed(None, "Foundation S03E10".into()));
+        assert_eq!(
+            seeded.derive_watched_through(None, "Foundation"),
+            Some((3, 10))
+        );
+        // Nothing watched → None (all aired episodes count as new).
+        assert_eq!(seeded.derive_watched_through(None, "Severance"), None);
     }
 
     /// Apr 19, 2026: the HWM clear threshold must be at least 0.96. Lower values
