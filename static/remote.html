@@ -203,6 +203,7 @@
   .followbtn:active{transform:scale(.97)} .followbtn:disabled{opacity:.5}
   .followbtn.on{color:var(--good);border-color:var(--good);background:rgba(55,200,122,.1)}
   .epname{color:var(--dim);font-size:.9rem;margin-top:.15rem}
+  .airinfo{color:var(--dim);font-size:.82rem;margin-top:.25rem;opacity:.8}
   .airs{color:var(--accent2);font-weight:600;font-size:.95rem;padding:.55rem 0}
   /* 2026-07-13: "Rotten Tomatoes →" read-more link on the search detail card.
      Uses RT's search URL (always lands on the title; hand-built /m/ slugs 404
@@ -642,7 +643,7 @@ async function enrichToWatchRow(row,title,isTV){
 addEventListener("hashchange",route);
 
 /* ---------- poster card (skeleton -> img | titled fallback) ---------- */
-function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,detailLine,seLabel,epName,airsNote,followBtn}){
+function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,detailLine,seLabel,epName,airsNote,followBtn,airInfo}){
   const c=el("div",{className:"card"});
   const p=el("div",{className:"poster"});
   const sh=el("div",{className:"shimmer"});
@@ -666,6 +667,7 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
   m.appendChild(tEl);
   if(year) m.appendChild(el("div",{className:"y",textContent:year}));
   if(epName) m.appendChild(el("div",{className:"epname",textContent:epName}));
+  if(airInfo) m.appendChild(el("div",{className:"airinfo",textContent:airInfo}));
   body.appendChild(m);
   // metadata detail line (year-range · genres · runtime · rating), below the
   // title + above the buttons — filled async by the caller (fillDetailLine).
@@ -764,6 +766,19 @@ function fmtDate(iso){ if(!iso) return ""; const p=String(iso).split("-").map(Nu
   const mo=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][p[1]-1];
   const yr=(p[0]===new Date().getFullYear())?"":(", "+p[0]);
   return mo+" "+p[2]+yr; }
+
+// "Latest S03E06 · aired Jul 26 · next S03E07 Aug 2" from show.latest_episode +
+// next_episode — shown on the search card so you see how current the show is,
+// regardless of which episode the query resolved to. TV only (movies → undefined).
+function latestAirLine(show){
+  if(!show || show.seasons==null) return undefined;
+  const le=show.latest_episode; if(!le) return undefined;
+  const se=(s,e)=>"S"+String(s).padStart(2,"0")+"E"+String(e).padStart(2,"0");
+  let s="Latest "+se(le.season,le.episode)+(le.air_date?" · aired "+fmtDate(le.air_date):"");
+  const ne=show.next_episode, t=new Date().toISOString().slice(0,10);
+  if(ne && ne.air_date && ne.air_date>t) s+=" · next "+se(ne.season,ne.episode)+" "+fmtDate(ne.air_date);
+  return s;
+}
 
 // New episodes of followed series (slice 2b). GET /following joins the follow-list
 // with TMDB air-dates + the watched_through baseline. Renders shows that have
@@ -944,6 +959,7 @@ async function runSearch(q){
   const se=d.searching;
   const seLabel=se?`Season ${se.season} Episode ${se.episode}`:seFromQuery(q);
   const fb=await followBtnFor(show);
+  const airInfo=latestAirLine(show);
   // Unaired-episode guard: the server skips Torrentio for a future air_date (so
   // `res` is empty by design). Show "Airs <date>" instead of a dead Play + junk
   // sources (the S04E03 "no worky" incident, 2026-08-02).
@@ -951,7 +967,7 @@ async function runSearch(q){
   if(se && se.air_date && se.air_date>today){
     const grid=el("div",{className:"detail"});
     const card=posterCard({poster:show.poster_url, title:show.title||"", detailLine:true, seLabel,
-      epName:se.name, airsNote:"Airs "+fmtDate(se.air_date), followBtn:fb});
+      epName:se.name, airsNote:"Airs "+fmtDate(se.air_date), followBtn:fb, airInfo});
     grid.appendChild(card); out.innerHTML=""; out.appendChild(grid);
     fillDetailLine(card, show.title||"", true);
     return;
@@ -964,7 +980,7 @@ async function runSearch(q){
     cta:"Play best source", sources:res,
     onPlay:()=>doPlay({result_id:res[0].id}, card),
     onMarkWatched:()=>markWatched(show.title||res[0].title, show.imdb_id),
-    rtTitle:show.title||res[0].title, followBtn:fb
+    rtTitle:show.title||res[0].title, followBtn:fb, airInfo
   });
   grid.appendChild(card); out.innerHTML=""; out.appendChild(grid);
   fillDetailLine(card, show.title||res[0].title, S.mode==="tv");
