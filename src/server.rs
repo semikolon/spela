@@ -6867,6 +6867,28 @@ fn resolve_local_file_for_result(
     state: &SharedState,
     rid: usize,
 ) -> Option<(std::path::PathBuf, String)> {
+    resolve_local_file_impl(state, rid, false)
+}
+
+/// Like `resolve_local_file_for_result` but IGNORES the result's expected size.
+/// Used by the VLC path once librqbit reports the selected file FINISHED: a
+/// season-pack episode's on-disk size won't match the result's (whole-pack)
+/// size, so the strict resolver misses it — but a finished torrent IS complete,
+/// so the lenient (non-sparse, title+quality) match is safe and lets us serve
+/// the file STATICALLY (fully seekable) instead of via the progressive
+/// FileStream (which VLC seeking storms/restarts on — 2026-08-02 Fargo).
+fn resolve_local_file_lenient(
+    state: &SharedState,
+    rid: usize,
+) -> Option<(std::path::PathBuf, String)> {
+    resolve_local_file_impl(state, rid, true)
+}
+
+fn resolve_local_file_impl(
+    state: &SharedState,
+    rid: usize,
+    ignore_size: bool,
+) -> Option<(std::path::PathBuf, String)> {
     let search = AppState::load_last_search(&state.state_dir)?;
     let r = search.results.iter().find(|r| r.id == rid)?;
     let title = match (&search.show, search.searching.as_ref()) {
@@ -6874,7 +6896,11 @@ fn resolve_local_file_for_result(
         (Some(show), None) => show.title.clone(),
         _ => r.title.clone(),
     };
-    let expected_bytes = parse_size_to_bytes(&r.size).unwrap_or(0);
+    let expected_bytes = if ignore_size {
+        0
+    } else {
+        parse_size_to_bytes(&r.size).unwrap_or(0)
+    };
     let corrupt = AppState::load(&state.state_dir).corrupt_files;
     let mut roots = vec![resolve_media_dir(state)];
     roots.extend(state.config.library_dirs());
@@ -6964,9 +6990,14 @@ async fn handle_vlc_stream(
             .and_then(|sh| sh.imdb_id);
         *lock_recover(&state.vlc_activity) = Some((Instant::now(), name, imdb));
     }
-    // 1. Complete file on disk → serve directly.
+    // 1. Complete file on disk (strict match) → serve directly (fully seekable).
     if let Some((path, _)) = resolve_local_file_for_result(&state, id) {
-        tracing::info!("VLC: result #{} → complete local file {:?}", id, path);
+        tracing::info!(
+            "VLC: result #{} → complete local file {:?} (range={:?})",
+            id,
+            path,
+            headers.get("range")
+        );
         return serve_static_with_range(path, "video/x-matroska", &headers).await;
     }
     // 2/3. Partial or fresh → start/resume the torrent + serve its FileStream.
@@ -6995,10 +7026,35 @@ async fn handle_vlc_stream(
                 .into_response();
         }
     };
+    // 2026-08-03: if the selected file is FULLY downloaded, serve it STATICALLY
+    // (fully seekable) rather than via the progressive FileStream. The strict
+    // complete-file resolver above misses a season-pack episode (its on-disk size
+    // ≠ the result's whole-pack size), so a finished season-pack landed on the
+    // FileStream — and VLC seeking on the FileStream stormed/restarted (2026-08-02
+    // Fargo: ~20 reopens in 7s, playhead reset to the start on skip). A finished
+    // torrent IS complete on disk, so the size-lenient match is safe.
+    if state
+        .torrent_engine
+        .progress(tid)
+        .map(|p| p.finished)
+        .unwrap_or(false)
+    {
+        if let Some((path, _)) = resolve_local_file_lenient(&state, id) {
+            tracing::info!(
+                "VLC: result #{} → finished torrent {} served as STATIC file {:?} (range={:?})",
+                id,
+                tid,
+                path,
+                headers.get("range")
+            );
+            return serve_static_with_range(path, "video/x-matroska", &headers).await;
+        }
+    }
     tracing::info!(
-        "VLC: result #{} → torrent {} FileStream (progressive)",
+        "VLC: result #{} → torrent {} FileStream (progressive) (range={:?})",
         id,
-        tid
+        tid,
+        headers.get("range")
     );
     match crate::torrent_stream::serve_torrent_stream(
         &state.torrent_engine,
