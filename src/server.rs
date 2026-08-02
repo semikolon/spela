@@ -7093,8 +7093,13 @@ async fn handle_vlc_playlist(
     // `#EXTVLCOPT:audio-language` steers VLC to the original-language track on the
     // .m3u path; `?al=` carries the same to the vlc:// handler (which forwards it
     // as `--audio-language`). Both make VLC honor spela's "never a dub" rule.
+    // `network-caching=3000`: VLC's default HTTP buffer is ~1000ms, which underruns
+    // on seeks/jitter and triggers the macOS auhal audio-output resets (VideoLAN
+    // #8556) + stream drops we chased 2026-08-03. A 3s buffer is the research-backed
+    // mitigation (partial — it can't cure auhal's internal race, but cuts its
+    // frequency). Mirrored as `--network-caching=3000` in the vlc:// handler.
     let body = format!(
-        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n{}/vlc/{}/stream?al={}\n",
+        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:network-caching=3000\n{}/vlc/{}/stream?al={}\n",
         name, audio_lang, base, id, audio_lang
     );
     axum::response::Response::builder()
