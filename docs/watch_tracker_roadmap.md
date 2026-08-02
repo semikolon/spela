@@ -31,25 +31,32 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    the tracker's spine; the recommender's seen-check + slice 2b derive from it.
 
 2b. **Followed-shows "New Episodes" tracker — ✅ SHIPPED (2026-07-28→29, v3.19).**
+   **Progress model reworked v3.20 (2026-08-02): unified into the watch-ledger as the
+   single source of truth — `following.json` is now a MEMBERSHIP set only, unfollow
+   no longer loses progress, re-following resumes it. Full design + tasks:
+   `.claude/specs/unify-watch-progress/`. The description below reflects the v3.20 model.**
    The TVTime replacement, deterministic (no LLM). `following.rs` +
-   `~/.config/spela/following.json` (user-local: {title, tmdb_id, `watched_through`
-   "SxxExx" baseline}, seeded from the TVTime export). `GET /following` joins it
+   `~/.config/spela/following.json` (user-local: {title, tmdb_id, imdb_id} — a
+   MEMBERSHIP set; progress DERIVES from the watch-ledger via
+   `AppState::derive_watched_through`, not stored here). `GET /following` joins it
    with TMDB air-dates (`tv_status` = /tv/{id} last/next-aired + per-season
    episode_count; `episode_detail` = next-unwatched ep name+air-date) → per show:
    new-episode count (season-aware), next-unwatched (SxxExx + title + aired-date),
    next upcoming air-date. UI: a "New Episodes" landing row + subtle header count
    badge + the same section atop To-Watch (poster-bg rows, ep title, air dates;
-   tap → search the next ep). `watched_through` advances 3 ways (forward-only,
-   max-semantics): the **✓ button** (`POST /following/mark {tmdb_id,season,episode}`,
-   exact ep); **spela completion** (`save_position_smart` → `advance_by_title`, the
-   Chromecast/HLS path spela position-tracks); and **VLC completion** — the Mac-side
+   tap → search the next ep). Progress advances via the watch-ledger (v3.20 — ONE
+   write path; the follow view derives `watched_through`): the **✓ button** (`POST
+   /following/mark {tmdb_id,season,episode}`, next ep → `mark_watched_auto`); **spela
+   completion** (`save_position_smart` → `mark_watched`, the Chromecast/HLS path spela
+   position-tracks); and **VLC completion** — the Mac-side
    `spela-vlc-watcher` launchd agent, since Open-in-VLC serves raw byte-ranges
    (spela is blind to VLC's playhead). VLC's HTTP control interface exposes the
    playhead (`vlcrc extraintf=http` + password on the Mac → `127.0.0.1:8080/requests/
    status.json`); the agent gets the show identity from spela `/status` and POSTs
    `/position {imdb_id,title,seconds,duration}` EVERY poll → `save_position_smart`
    updates the resume HWM (mid-episode cross-device resume) AND at ≥`HWM_CLEAR_FRACTION`
-   clears the resume + marks watched + advances the followed show. **Gotcha
+   clears the resume + marks watched (the follow view then DERIVES the advance from the
+   ledger — v3.20). **Gotcha
    (2026-07-29):** spela's `/status` reports `vlc_active` only ~30s after VLC's last
    byte-range fetch, so a fully-buffered episode goes quiet and the identity vanishes
    there → the watcher must hold identity STICKY (tied to the media's length) and post
