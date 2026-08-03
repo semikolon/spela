@@ -950,25 +950,27 @@ function recItem(it){
   const tap=el("button",{className:"fotap"});
   const isTV=it.media_type==="tv";
   const yr=it.year?`<span class="ep">${it.year}</span>`:"";
-  const rt=(it.rt_score!=null)?` · 🍅 ${it.rt_score}`:"";
+  const rtInit=(it.rt_score!=null)?" · 🍅 "+it.rt_score:"";
   tap.innerHTML=`<span class="fotitle">${esc(it.title)}${yr}</span>`
     +(it.why?`<span class="fosub">${esc(it.why)}</span>`:"")
-    +`<span class="fometa">${isTV?"Series":"Movie"}${rt}</span>`;
+    +`<span class="fometa">${isTV?"Series":"Movie"}<span class="rrt">${rtInit}</span></span>`;
   tap.onclick=()=>{ setMode(isTV?"tv":"movie");
     $("#q").value=it.title; S.search.q=it.title; location.hash="#/search"; runSearch(it.title); };
-  if(it.poster_url) paintPoster(tap,it.poster_url); else enrichRec(tap,it.title,isTV);
+  if(it.poster_url) paintPoster(tap,it.poster_url);
+  enrichRec(tap,it.title,isTV);
   item.appendChild(tap); return item;
 }
 
-// Lazy poster + year for a recommendation row via /title-meta — the same
-// server-cached TMDB lookup the To-Watch rows use. Paints the poster-bg and
-// appends the year chip. (The harness can also set poster_url directly; then this
-// is skipped.)
+// Lazy enrich a recommendation row via /title-meta — the same server-cached
+// lookup To-Watch uses: paints the poster-bg, appends the year, and OVERRIDES the
+// curated 🍅 with the LIVE MDBList score so Home matches the search card + To-Watch
+// (a curated score can be months stale; live is the truth spela shows elsewhere).
 async function enrichRec(tap, title, isTV){
   let m; try{ m=await api("/title-meta?title="+encodeURIComponent(title)+(isTV?"&tv=1":"")); }catch{ return; }
   if(!m) return;
   if(m.poster_url) paintPoster(tap, m.poster_url);
   if(m.year){ const t=tap.querySelector(".fotitle"); if(t && !t.querySelector(".ep")) t.appendChild(el("span",{className:"ep",textContent:String(m.year)})); }
+  if(m.rt!=null){ const r=tap.querySelector(".rrt"); if(r) r.textContent=" · 🍅 "+m.rt; }
 }
 
 // Shared poster-as-faded-background (same treatment as followingItem / To-Watch).
