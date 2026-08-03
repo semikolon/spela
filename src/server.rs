@@ -4520,37 +4520,53 @@ async fn compute_following_shows(state: &SharedState, app: &AppState) -> (Vec<Va
 async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
     let app = AppState::load(&state.state_dir);
 
-    // Continue — in-progress plays, most-recently-advanced first, with a percent.
-    let cont: Vec<Value> = app
-        .in_progress_list()
-        .into_iter()
-        .map(|e| {
-            let pct = match e.duration {
-                Some(d) if d > 0.0 => {
-                    Some(((e.position / d) * 100.0).clamp(0.0, 100.0).round() as u32)
-                }
-                _ => None,
-            };
-            json!({
-                "title": e.title,
-                "show": e.show,
-                "imdb_id": e.imdb_id,
-                "season": e.season,
-                "episode": e.episode,
-                "position": e.position,
-                "duration": e.duration,
-                "pct": pct,
-                "poster_url": e.poster_url,
-            })
-        })
-        .collect();
-
-    // New Episodes — reuse the followed-shows derivation; keep only shows with news.
+    // New Episodes first — so a Continue episode that IS a followed show's
+    // next-unwatched folds into its New-Episodes row (a subtle partway indicator)
+    // instead of appearing as a duplicate Continue entry.
     let (all_following, total_new) = compute_following_shows(&state, &app).await;
-    let new_eps: Vec<Value> = all_following
+    let mut new_eps: Vec<Value> = all_following
         .into_iter()
         .filter(|s| s["new_count"].as_u64().unwrap_or(0) > 0)
         .collect();
+
+    // Continue — in-progress plays, most-recently-advanced first, with a percent.
+    // A match against a New-Episodes next-unwatched folds in (annotate + skip);
+    // everything else (movies, non-followed, older episodes) stays a Continue row.
+    let mut cont: Vec<Value> = Vec::new();
+    for e in app.in_progress_list() {
+        let pct = match e.duration {
+            Some(d) if d > 0.0 => Some(((e.position / d) * 100.0).clamp(0.0, 100.0).round() as u64),
+            _ => None,
+        };
+        let e_title =
+            crate::search::clean_title_for_tmdb(e.show.as_deref().unwrap_or(&e.title)).to_lowercase();
+        let folded = new_eps.iter_mut().find(|r| {
+            e.season.is_some()
+                && r["next_unwatched_season"].as_u64() == e.season.map(|v| v as u64)
+                && r["next_unwatched_episode"].as_u64() == e.episode.map(|v| v as u64)
+                && r["title"]
+                    .as_str()
+                    .map(|t| crate::search::clean_title_for_tmdb(t).to_lowercase())
+                    == Some(e_title.clone())
+        });
+        if let Some(row) = folded {
+            if let Some(p) = pct {
+                row["partway"] = json!(p);
+            }
+            continue;
+        }
+        cont.push(json!({
+            "title": e.title,
+            "show": e.show,
+            "imdb_id": e.imdb_id,
+            "season": e.season,
+            "episode": e.episode,
+            "position": e.position,
+            "duration": e.duration,
+            "pct": pct,
+            "poster_url": e.poster_url,
+        }));
+    }
 
     // Recommended — harness picks minus already-seen and minus anything already
     // surfaced above (so the queue never repeats a title across sections).
