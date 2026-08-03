@@ -311,12 +311,10 @@ impl TorrentEngine {
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             const CHUNK: u64 = 2 * 1024 * 1024; // 2 MB per end
-            // Tail first — the MKV Cues live at the end; that's the piece VLC blocks on.
+                                                // Tail first — the MKV Cues live at the end; that's the piece VLC blocks on.
             if let Ok(mut s) = handle.clone().stream(file_idx) {
                 let len = s.len();
-                if len > CHUNK
-                    && s.seek(std::io::SeekFrom::Start(len - CHUNK)).await.is_ok()
-                {
+                if len > CHUNK && s.seek(std::io::SeekFrom::Start(len - CHUNK)).await.is_ok() {
                     let mut buf = vec![0u8; CHUNK as usize];
                     let _ = s.read_exact(&mut buf).await;
                 }
@@ -344,8 +342,7 @@ impl TorrentEngine {
             const WINDOW: usize = 8 * 1024 * 1024; // ~13s at 5 Mbps of runway
             if let Ok(mut s) = handle.stream(file_idx) {
                 let len = s.len();
-                if byte_offset < len
-                    && s.seek(std::io::SeekFrom::Start(byte_offset)).await.is_ok()
+                if byte_offset < len && s.seek(std::io::SeekFrom::Start(byte_offset)).await.is_ok()
                 {
                     let want = WINDOW.min((len - byte_offset) as usize);
                     let mut buf = vec![0u8; want];

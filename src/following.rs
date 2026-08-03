@@ -159,7 +159,10 @@ pub fn migrate_if_needed(state_dir: &std::path::Path) {
     }
     let path = following_path();
     let stamp = chrono::Utc::now().timestamp();
-    let _ = std::fs::copy(&path, path.with_file_name(format!("following.json.bak-{stamp}")));
+    let _ = std::fs::copy(
+        &path,
+        path.with_file_name(format!("following.json.bak-{stamp}")),
+    );
 
     let sd = state_dir.to_path_buf();
     let mut app = crate::state::AppState::load(&sd);

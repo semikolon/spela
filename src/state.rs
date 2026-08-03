@@ -1059,11 +1059,21 @@ mod tests {
             cache_key: None,
         });
         // Mid-play HWM advance → an in-progress entry appears.
-        app.save_position_smart(Some("tt15239678".into()), Some("Dune Part Two".into()), 1200.0, Some(9000.0));
+        app.save_position_smart(
+            Some("tt15239678".into()),
+            Some("Dune Part Two".into()),
+            1200.0,
+            Some(9000.0),
+        );
         assert_eq!(app.in_progress_list().len(), 1);
         assert_eq!(app.in_progress_list()[0].position, 1200.0);
         // Reaching the end clears it (completion branch → reset_position).
-        app.save_position_smart(Some("tt15239678".into()), Some("Dune Part Two".into()), 8900.0, Some(9000.0));
+        app.save_position_smart(
+            Some("tt15239678".into()),
+            Some("Dune Part Two".into()),
+            8900.0,
+            Some(9000.0),
+        );
         assert!(app.in_progress_list().is_empty());
     }
 

@@ -1997,10 +1997,19 @@ mod tests {
 
     #[test]
     fn is_future_date_guards_unaired_episodes() {
-        assert!(!is_future_date(""), "empty air_date → treat as aired (fail open)");
-        assert!(!is_future_date("2000-01-01"), "long-past date is not future");
+        assert!(
+            !is_future_date(""),
+            "empty air_date → treat as aired (fail open)"
+        );
+        assert!(
+            !is_future_date("2000-01-01"),
+            "long-past date is not future"
+        );
         assert!(is_future_date("2099-12-31"), "far-future date is unaired");
-        assert!(!is_future_date("bad"), "unparseable (too short) → not future");
+        assert!(
+            !is_future_date("bad"),
+            "unparseable (too short) → not future"
+        );
     }
 
     // ----- Apr 28, 2026: tmdb_poster_url regression suite -----
