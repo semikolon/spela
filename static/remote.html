@@ -6,6 +6,7 @@
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#0b0b0f">
 <title>spela remote</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230b0b0f'/><path d='M12 9l11 7-11 7z' fill='%235b8cff'/></svg>">
 <!--
   web-remote SPA — Phase 3 (shell + grid + API client) + Phase 4 (search +
   hybrid play + target picker + now-playing + scrubber). Single no-build
@@ -955,8 +956,19 @@ function recItem(it){
     +`<span class="fometa">${isTV?"Series":"Movie"}${rt}</span>`;
   tap.onclick=()=>{ setMode(isTV?"tv":"movie");
     $("#q").value=it.title; S.search.q=it.title; location.hash="#/search"; runSearch(it.title); };
-  paintPoster(tap,it.poster_url);
+  if(it.poster_url) paintPoster(tap,it.poster_url); else enrichRec(tap,it.title,isTV);
   item.appendChild(tap); return item;
+}
+
+// Lazy poster + year for a recommendation row via /title-meta — the same
+// server-cached TMDB lookup the To-Watch rows use. Paints the poster-bg and
+// appends the year chip. (The harness can also set poster_url directly; then this
+// is skipped.)
+async function enrichRec(tap, title, isTV){
+  let m; try{ m=await api("/title-meta?title="+encodeURIComponent(title)+(isTV?"&tv=1":"")); }catch{ return; }
+  if(!m) return;
+  if(m.poster_url) paintPoster(tap, m.poster_url);
+  if(m.year){ const t=tap.querySelector(".fotitle"); if(t && !t.querySelector(".ep")) t.appendChild(el("span",{className:"ep",textContent:String(m.year)})); }
 }
 
 // Shared poster-as-faded-background (same treatment as followingItem / To-Watch).
