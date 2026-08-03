@@ -7353,7 +7353,17 @@ async fn handle_vlc_ready(
         0.0
     };
     const MIN_BUFFER: u64 = 64 * 1024 * 1024;
-    let ready = finished || (frac >= 0.15 && bytes >= MIN_BUFFER);
+    // Byte-fraction is necessary but NOT sufficient: VLC probes the head + the MKV
+    // tail (Cues) before playback, and a torrent can hit 15%+64MB with the tail
+    // still missing → VLC opens and hangs probing hundreds of MB deep (Silo S03E04,
+    // Aug 3). Only declare ready once both ends are actually downloaded.
+    let ready = finished
+        || (frac >= 0.15
+            && bytes >= MIN_BUFFER
+            && state
+                .torrent_engine
+                .ends_present(tid, file_index.unwrap_or(0) as usize)
+                .await);
     Json(json!({
         "ready": ready,
         "pct": (frac * 100.0) as u32,

@@ -329,6 +329,56 @@ impl TorrentEngine {
         });
     }
 
+    /// True only if BOTH the file's head (container header / track info) AND its
+    /// tail (the MKV Cues / MP4 moov seek-index) are actually downloaded — the two
+    /// regions a player probes before playback. A `FileStream` read blocks until
+    /// the covering pieces arrive, so a short-timeout read that COMPLETES proves
+    /// presence; one that times out means "not yet" (and the read keeps those
+    /// pieces prioritized). Gates `/vlc/ready` so VLC never opens onto a
+    /// still-downloading tail and hangs probing hundreds of MB deep.
+    pub async fn ends_present(&self, id: u32, file_idx: usize) -> bool {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        const PROBE: usize = 64 * 1024;
+        const T: std::time::Duration = std::time::Duration::from_millis(400);
+        let Some(handle) = self.handle(id) else {
+            return false;
+        };
+        // Tail first — the region VLC actually blocks on.
+        let tail_ok = if let Ok(mut s) = handle.clone().stream(file_idx) {
+            let len = s.len();
+            if len <= PROBE as u64 {
+                true
+            } else if tokio::time::timeout(T, s.seek(std::io::SeekFrom::Start(len - PROBE as u64)))
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false)
+            {
+                let mut buf = vec![0u8; PROBE];
+                tokio::time::timeout(T, s.read_exact(&mut buf))
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !tail_ok {
+            return false;
+        }
+        // Head — container header, served first for playback.
+        if let Ok(mut s) = handle.stream(file_idx) {
+            let mut buf = vec![0u8; PROBE];
+            tokio::time::timeout(T, s.read_exact(&mut buf))
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
     pub fn started_count(&self) -> u32 {
         self.started_count.load(Ordering::Relaxed)
     }
