@@ -1480,7 +1480,12 @@ function openSheet(){
     // HEVC/Dolby-Vision, full seek, no browser transcode). Works for fresh /
     // partial / complete sources (server streams via Range). 2026-07-13.
     const vl=el("button",{className:"topt"});
-    vl.innerHTML=`<span class="ic">${ic("phone")}</span><span><span class="nm">VLC · this Mac</span><br><span class="md">native 4K/HEVC/Dolby-Vision · full seek</span></span>`;
+    // Device-appropriate label: vlc:// runs on WHATEVER device tapped it, not the
+    // Mac — so "this Mac" is wrong on an iPhone (would open VLC-for-iOS).
+    const _ios=/iPhone|iPad|iPod/.test(navigator.userAgent);
+    const _mac=/Macintosh|Mac OS X/.test(navigator.userAgent)&&!_ios;
+    const _vlcLabel=_mac?"VLC · this Mac":_ios?"VLC · this device":"VLC";
+    vl.innerHTML=`<span class="ic">${ic("phone")}</span><span><span class="nm">${_vlcLabel}</span><br><span class="md">native 4K/HEVC/Dolby-Vision · full seek</span></span>`;
     if(S.target&&S.target.kind==="vlc") vl.classList.add("sel");
     vl.onclick=()=>{ const resume=S.pending; S.pending=null;
       S.target={kind:"vlc",name:"VLC"};

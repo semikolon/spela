@@ -7139,7 +7139,7 @@ fn resolve_local_file_impl(
 fn resolve_result_for_vlc(
     state: &SharedState,
     rid: usize,
-) -> Option<(String, Option<u32>, String, String)> {
+) -> Option<(String, Option<u32>, String, String, Option<String>)> {
     let search = AppState::load_last_search(&state.state_dir)?;
     let r = search.results.iter().find(|r| r.id == rid)?;
     let title = match (&search.show, search.searching.as_ref()) {
@@ -7160,6 +7160,7 @@ fn resolve_result_for_vlc(
         r.file_index,
         title.replace(['/', '\\'], "-"),
         vlc_audio_lang_pref(&orig),
+        search.show.as_ref().and_then(|s| s.imdb_id.clone()),
     ))
 }
 
@@ -7202,7 +7203,7 @@ async fn handle_vlc_stream(
 ) -> axum::response::Response {
     // 2026-07-28: stamp VLC activity so /status can report vlc_active — this path
     // serves VLC directly and never creates a CurrentStream.
-    if let Some((_, _, name, _)) = resolve_result_for_vlc(&state, id) {
+    if let Some((_, _, name, _, _)) = resolve_result_for_vlc(&state, id) {
         let imdb = AppState::load_last_search(&state.state_dir)
             .and_then(|s| s.show)
             .and_then(|sh| sh.imdb_id);
@@ -7219,7 +7220,7 @@ async fn handle_vlc_stream(
         return serve_static_with_range(path, "video/x-matroska", &headers).await;
     }
     // 2/3. Partial or fresh → start/resume the torrent + serve its FileStream.
-    let Some((magnet, file_index, _, _)) = resolve_result_for_vlc(&state, id) else {
+    let Some((magnet, file_index, _, _, _)) = resolve_result_for_vlc(&state, id) else {
         return (
             axum::http::StatusCode::NOT_FOUND,
             Json(json!({"error": "Result not found — search again."})),
@@ -7328,7 +7329,7 @@ async fn handle_vlc_ready(
     {
         return Json(json!({ "ready": true, "pct": 100, "phase": "on disk" }));
     }
-    let Some((magnet, file_index, _, _)) = resolve_result_for_vlc(&state, id) else {
+    let Some((magnet, file_index, _, _, _)) = resolve_result_for_vlc(&state, id) else {
         return Json(json!({ "ready": false, "error": "Result not found — search again." }));
     };
     if magnet.is_empty() {
@@ -7377,7 +7378,7 @@ async fn handle_vlc_playlist(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
 ) -> axum::response::Response {
-    let Some((_, _, name, audio_lang)) = resolve_result_for_vlc(&state, id) else {
+    let Some((_, _, name, audio_lang, resume_imdb)) = resolve_result_for_vlc(&state, id) else {
         return (
             axum::http::StatusCode::NOT_FOUND,
             Json(json!({"error": "Result not found — search again."})),
@@ -7385,6 +7386,17 @@ async fn handle_vlc_playlist(
             .into_response();
     };
     let base = format!("http://{}:{}", state.config.stream_host, state.config.port);
+    // Auto-resume: seek VLC to the saved position (like Chromecast does). /vlc/ready
+    // already gates head+tail present, so VLC can read the Cues to map the seek; it
+    // then buffers the seek-offset pieces (librqbit prioritizes them on the range
+    // request) and plays. A completed watch has its HWM cleared, so any >30s value is
+    // a genuine mid-episode; skip a near-start position.
+    let resume = AppState::load(&state.state_dir).get_position(resume_imdb, Some(name.clone()));
+    let start_opt = if resume > 30.0 {
+        format!("#EXTVLCOPT:start-time={}\n", resume as u64)
+    } else {
+        String::new()
+    };
     // `#EXTVLCOPT:audio-language` steers VLC to the original-language track on the
     // .m3u path; `?al=` carries the same to the vlc:// handler (which forwards it
     // as `--audio-language`). Both make VLC honor spela's "never a dub" rule.
@@ -7394,8 +7406,8 @@ async fn handle_vlc_playlist(
     // mitigation (partial — it can't cure auhal's internal race, but cuts its
     // frequency). Mirrored as `--network-caching=3000` in the vlc:// handler.
     let body = format!(
-        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:network-caching=3000\n{}/vlc/{}/stream?al={}\n",
-        name, audio_lang, base, id, audio_lang
+        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:network-caching=3000\n{}{}/vlc/{}/stream?al={}\n",
+        name, audio_lang, start_opt, base, id, audio_lang
     );
     axum::response::Response::builder()
         .status(200)
