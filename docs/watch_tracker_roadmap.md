@@ -221,10 +221,17 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    - **First curated pass** (LIVE): 13 picks POSTed from `taste_profile.md` + `watchlist.json`,
      RT≥89, tone-first `why` lines, the watched-loved excluded. Re-run any time by POSTing a new
      list to `/recommendations` (replace semantics).
-   - **NEXT (refinements, not blockers)**: (a) poster + year enrichment on rec rows (a TMDB
-     lookup per pick → `poster_url`/`year`/`tmdb_id`, so rec rows get the poster-bg treatment
-     the Continue/New-Eps rows already have); (b) Continue populates naturally as episodes are
-     watched partway (no action needed — verify on first real mid-play); (c) an optional
+   - **Poster + live-score enrichment on rec rows — ✅ SHIPPED (2026-08-03).** `enrichRec`
+     lazy-fetches `/title-meta` per row (server-cached, same as To-Watch): poster-bg + year +
+     OVERRIDES the curated 🍅 with the LIVE MDBList score (a curated score goes stale — Outer
+     Range read 92 curated vs 85 live; Home now matches the search card everywhere). Verified in
+     Chrome: 10 rec posters 200, Outer Range→85. Also: inline SVG favicon (quiets the
+     `/favicon.ico` probe). Continue verified live too (HotD S03E07 @ 73% + progress bar).
+   - **NEXT (refinements, not blockers)**: (a) two display nuances Fredrik flagged 2026-08-03 —
+     an episode you're mid-way through shows in BOTH Continue and New Episodes (dedup could hide
+     the New-Eps row); and the New-Episodes count treats a barely-started show's whole backlog as
+     "new" (Fargo = 47 → the "50 new" badge is mostly backlog; "new since caught up" would read
+     truer); (b) an optional
      `/recommend`-style refresh affordance (button that re-triggers the harness), or a mood
      input ("how much do you have tonight?") the profile's meta-rules call for; (d) a Phase-2
      model-swappable autonomous harness (same POST surface).
