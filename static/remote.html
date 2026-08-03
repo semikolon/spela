@@ -971,8 +971,11 @@ function fillContinue(container, items){
 function continueItem(it){
   const item=el("div",{className:"foitem"});
   const tap=el("button",{className:"fotap"});
-  const isTV=it.season!=null&&it.episode!=null;
-  const se=isTV?`S${String(it.season).padStart(2,"0")}E${String(it.episode).padStart(2,"0")}`:"";
+  // isTV from the struct fields OR the title's SxxExx — a legacy in-progress entry
+  // (pre the season/episode source-fix) has null fields but "Show SxxExx" in the
+  // title, and without this the tap searched in Movies mode → "No playable sources".
+  const isTV=(it.season!=null&&it.episode!=null)||/S\d{1,2}E\d{1,3}/i.test(it.title||"");
+  const se=(it.season!=null&&it.episode!=null)?`S${String(it.season).padStart(2,"0")}E${String(it.episode).padStart(2,"0")}`:"";
   const name=it.show||it.title||"";
   const meta=(it.pct!=null)?`${it.pct}% watched`:"Resume";
   tap.innerHTML=`<span class="fotitle">${esc(name)}${se?`<span class="ep">${se}</span>`:""}</span>`

@@ -2263,8 +2263,15 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                         } else {
                             None
                         };
-                        let prebuffer_timeout_secs: u64 =
-                            if intro_path.is_some() { 90 } else { 60 };
+                        let prebuffer_timeout_secs: u64 = if intro_path.is_some() {
+                            90
+                        } else if !is_local && seek_to.unwrap_or(0.0) > 1.0 {
+                            // Resumed torrent play — buffering 10 segments from a
+                            // mid-file seek offset is slower; give it room.
+                            150
+                        } else {
+                            60
+                        };
                         let prebuffer_start = tokio::time::Instant::now();
                         let prebuffer_deadline = prebuffer_start
                             + tokio::time::Duration::from_secs(prebuffer_timeout_secs);
@@ -2278,7 +2285,16 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                             // root cause + Apr/May 2026 incident anchor.
                             let elapsed_secs = prebuffer_start.elapsed().as_secs();
                             let seg_count = count_hls_segments(&hls_dir);
-                            if should_fail_fast_stream_start(elapsed_secs, seg_count) {
+                            // A resumed torrent play seeks to a mid-file offset whose
+                            // pieces download slower than a cold start's — give it a
+                            // longer window before declaring "bad source" (else every
+                            // source fails identically, as Fargo S01E05 did Aug 3).
+                            let fail_fast_secs = if !is_local && seek_to.unwrap_or(0.0) > 1.0 {
+                                RESUMED_TORRENT_FAIL_FAST_SECS
+                            } else {
+                                FAIL_FAST_STREAM_START_SECS
+                            };
+                            if should_fail_fast_with_deadline(elapsed_secs, seg_count, fail_fast_secs) {
                                 tracing::error!(
                                     "HLS stream-start fail-fast: {}s elapsed with 0 segments. \
                                  Likely starved swarm or bad source — returning error so \
@@ -3439,8 +3455,27 @@ pub fn compute_cast_seek_target(
 /// reduces incidence at the ranker layer; this fail-fast catches the
 /// residue when the ranker's top pick still has issues.
 pub fn should_fail_fast_stream_start(elapsed_secs: u64, segments_count: usize) -> bool {
-    elapsed_secs >= FAIL_FAST_STREAM_START_SECS && segments_count == 0
+    should_fail_fast_with_deadline(elapsed_secs, segments_count, FAIL_FAST_STREAM_START_SECS)
 }
+
+/// Deadline-parameterised fail-fast. A resumed torrent play (`seek_to > 0` on a
+/// non-local source) needs the seek-offset pieces to download before ffmpeg can
+/// emit a segment — much slower than a cold-start's first piece — so it uses
+/// `RESUMED_TORRENT_FAIL_FAST_SECS` instead of the 20s default. Aug 3 2026: a
+/// Fargo S01E05 resume-to-41min failed EVERY source at 20s/0-segments; the seek
+/// pieces simply hadn't arrived, and the "bad source" fail-fast killed each one.
+pub fn should_fail_fast_with_deadline(
+    elapsed_secs: u64,
+    segments_count: usize,
+    deadline_secs: u64,
+) -> bool {
+    elapsed_secs >= deadline_secs && segments_count == 0
+}
+
+/// Fail-fast deadline for a resumed torrent play — long enough for librqbit to
+/// fetch the seek-offset pieces (prioritised via ffmpeg's Range request), the
+/// warmup UI showing progress meanwhile.
+pub const RESUMED_TORRENT_FAIL_FAST_SECS: u64 = 90;
 
 /// Count `.ts` HLS segment files in the transcoded output directory.
 /// Returns 0 on any filesystem error — the count is used for progress
