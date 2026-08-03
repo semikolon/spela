@@ -152,6 +152,11 @@
   .foseaschips{display:flex;flex-wrap:wrap;gap:.4rem}
   .foseaschip{background:var(--bg3);border:1px solid var(--line);border-radius:1rem;color:var(--dim);padding:.3rem .7rem;font-size:.8rem;min-height:34px}
   .foseaschip.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
+  .play.playicon{display:inline-flex;align-items:center;justify-content:center;min-width:56px;padding:.55rem 1rem}
+  .play.playicon .lu{width:1.4em;height:1.4em}
+  .foplay{flex:0 0 auto;background:var(--accent);border:1px solid var(--accent);border-radius:.55rem;color:#fff;min-width:44px;display:inline-flex;align-items:center;justify-content:center}
+  .foplay .lu{width:1.25em;height:1.25em}
+  .foplay:active{transform:scale(.96)}
   .fomark{flex:0 0 46px;border:1px solid var(--line);border-radius:11px;background:var(--bg3);
     color:var(--good);font-size:1.2rem;font-weight:800;touch-action:manipulation}
   .fomark:active{transform:scale(.95)}
@@ -567,30 +572,33 @@ let toastT;
 // Progress via a re-fired toast (stays visible); a complete file returns on poll 0.
 async function vlcWaitReady(id){
   for(let i=0;i<600;i++){   // ~15 min cap at 1.5s/poll
-    let d; try{ d=await api("/vlc/"+id+"/ready"); }catch(e){ toast("spela unreachable"); return false; }
-    if(d && d.error){ toast(d.error); return false; }
+    let d; try{ d=await api("/vlc/"+id+"/ready"); }catch(e){ S.now.vlcErr="spela unreachable"; return false; }
+    if(d && d.error){ S.now.vlcErr=d.error; return false; }
     if(d && d.ready) return true;
-    toast(i===0 ? "Buffering… VLC opens automatically when ready"
-                : "Buffering "+((d&&d.pct!=null)?d.pct+"% ":"")+"— VLC opens automatically");
+    // Drive the loading surface (not a transient toast) — matches the Chromecast warmup.
+    S.now.warmup={active:true, vlc:true, pct:(d&&d.pct!=null)?d.pct:0};
+    if(S.now.warming) renderNowFull();
     await new Promise(r=>setTimeout(r,1500));
   }
-  toast("Still buffering — give it a moment, then tap again"); return false;
+  S.now.vlcErr="Still buffering — the swarm may be slow."; return false;
 }
-async function openInVlc(id){
-  // Wait until spela says the source is ready (complete file, or enough buffered +
-  // head/tail Cues primed via prefetch) BEFORE firing VLC — so a fresh 4K torrent
-  // never opens to a hung player. Auto-launches when ready; no manual re-click.
-  if((await vlcWaitReady(id))!==true) return;
+async function openInVlc(id,title,poster){
+  // Immediate loading surface (like the Chromecast warmup), THEN wait until spela
+  // says the source is ready (head/tail Cues primed) before firing VLC — so a fresh
+  // torrent never opens to a hung player, and the user always sees progress.
+  beginWarming(title||"Opening in VLC…", poster); stopWarmupPoll();  // /progress isn't the VLC source; vlcWaitReady drives the screen
+  S.now.vlcErr=null;
+  if((await vlcWaitReady(id))!==true){
+    showPlayError(title||"VLC", poster, S.now.vlcErr||"Couldn’t buffer this source.", ()=>openInVlc(id,title,poster)); return;
+  }
   let m3u;
-  try{ const r=await fetch("/vlc/"+id+"/open.m3u"); if(!r.ok){ toast("Couldn't resolve that source"); return; } m3u=await r.text(); }
-  catch(e){ toast("spela unreachable"); return; }
+  try{ const r=await fetch("/vlc/"+id+"/open.m3u"); if(!r.ok){ showPlayError(title||"VLC",poster,"Couldn’t resolve that source.",()=>openInVlc(id,title,poster)); return; } m3u=await r.text(); }
+  catch(e){ showPlayError(title||"VLC",poster,"spela unreachable",()=>openInVlc(id,title,poster)); return; }
   const url=(m3u.split("\n").find(l=>l.startsWith("http"))||"").trim();
-  if(!url){ toast("No stream URL"); return; }
-  toast("Opening in VLC…");
-  // Smoothest path: fire the vlc:// scheme (true one-click if the handler is
-  // installed → VLC launches, window blurs). If no handler is registered (no
-  // blur within 1.2s), fall back to downloading the .m3u, which the OS hands to
-  // any installed player. Works with OR without the one-click handler.
+  if(!url){ showPlayError(title||"VLC",poster,"No stream URL.",()=>openInVlc(id,title,poster)); return; }
+  endWarming(); toast("Opening in VLC…");
+  // Fire the vlc:// scheme (one-click if the handler is installed → VLC launches,
+  // window blurs). No blur within 1.2s → fall back to downloading the .m3u.
   let blurred=false; const onblur=()=>{blurred=true;};
   window.addEventListener("blur",onblur,{once:true});
   window.location.href=url.replace(/^https?:\/\//,"vlc://");
@@ -722,7 +730,8 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
   const actions=el("div",{className:"actions"});
   if(airsNote){ actions.appendChild(el("span",{className:"airs",textContent:airsNote})); }
   if(onPlay){
-    const b=el("button",{className:"play",textContent:cta||"Play"});
+    const b=el("button",{className:"play playicon"});
+    b.innerHTML=ic("play"); b.setAttribute("aria-label",cta||"Play"); b.title=cta||"Play";
     b.onclick=()=>onPlay(); actions.appendChild(b);
   }
   if(onMarkWatched){
@@ -852,6 +861,11 @@ function followingItem(s, onMarked){
       tap.style.backgroundSize="cover"; tap.style.backgroundPosition="center 20%"; };
     img.src=ps; }
   item.appendChild(tap);
+  // Fast-play ▶ — play the next unwatched episode's best source directly.
+  { const pb=el("button",{className:"foplay"}); pb.innerHTML=ic("play");
+    pb.title="Play "+(nu||s.title); pb.setAttribute("aria-label","Play "+(nu||s.title));
+    pb.onclick=(ev)=>{ ev.stopPropagation(); fastPlay((s.title+(nu?" "+nu:"")).trim(), true, s.poster_url); };
+    item.appendChild(pb); }
   if(s.next_unwatched_season!=null){
     const mk=el("button",{className:"fomark",textContent:"✓",title:"Mark "+nu+" watched"});
     mk.setAttribute("aria-label","Mark "+nu+" watched");
@@ -988,7 +1002,13 @@ function continueItem(it){
     const q=(name+(se?" "+se:"")).trim(); $("#q").value=q; S.search.q=q;
     location.hash="#/search"; runSearch(q); };
   paintPoster(tap,it.poster_url);
-  item.appendChild(tap); return item;
+  item.appendChild(tap);
+  // Fast-play ▶ — resume the best source directly (skips the search step).
+  const pb=el("button",{className:"foplay"}); pb.innerHTML=ic("play");
+  pb.title="Play "+name; pb.setAttribute("aria-label","Play "+name);
+  pb.onclick=(ev)=>{ ev.stopPropagation(); fastPlay((name+(se?" "+se:"")).trim(), isTV, it.poster_url); };
+  item.appendChild(pb);
+  return item;
 }
 
 // Recommended — harness-curated picks. The "why" line is the value. Tap → search.
@@ -1235,7 +1255,8 @@ const LU={
   phone:'<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>',
   refresh:'<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
   film:'<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18"/><path d="M3 7.5h4"/><path d="M3 12h18"/><path d="M3 16.5h4"/><path d="M17 3v18"/><path d="M17 7.5h4"/><path d="M17 16.5h4"/>',
-  home:'<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'
+  home:'<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  play:'<polygon points="6 3 20 12 6 21 6 3" fill="currentColor" stroke="none"/>'
 };
 function ic(n){ return '<svg class="lu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+(LU[n]||"")+'</svg>'; }
 /* one-time pass: prepend the icon to every static [data-ic] button/link */
@@ -1282,7 +1303,7 @@ async function doPlay(opts,cardForSources){
   if(!S.target){ S.pending=()=>doPlay(opts,cardForSources); toast("Pick where to play — it starts right after"); openSheet(); return; }
   if(S.target.kind==="phone"){ return doPhoneDirect(opts,cardForSources,(S.search.data&&S.search.data.show&&S.search.data.show.title)||""); }
   if(S.target.kind==="shannon"){ return doShannonPlay(opts,cardForSources); }
-  if(S.target.kind==="vlc"){ if(opts.result_id!=null) return openInVlc(opts.result_id); toast("Tap a source (or Play best) to open it in VLC"); return; }
+  if(S.target.kind==="vlc"){ if(opts.result_id!=null){ const vlbl=(S.search.data&&S.search.data.show&&S.search.data.show.title)||opts.title||"Opening in VLC"; return openInVlc(opts.result_id,vlbl,opts.poster_url); } toast("Tap a source (or Play best) to open it in VLC"); return; }
   const label=(S.search.data&&S.search.data.show&&S.search.data.show.title)||opts.title||"Playing";
   beginWarming(label,opts.poster_url);
   const body={...opts,target:"chromecast",cast_name:S.target.name};
@@ -1294,6 +1315,21 @@ async function doPlay(opts,cardForSources){
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   S.now.data={title:label,poster_url:opts.poster_url||"",quality:"",target:":"+(S.target&&S.target.name||"")};
   renderNowFull(); pollNow(true);
+}
+
+/* Fast-play: search a title + play its best source directly (the ▶ on Continue /
+   New-Episodes rows). Skips the manual search→tap-play step. Shows the loading
+   surface instantly, then hands off to the normal doPlay (target-aware). */
+async function fastPlay(query, isTV, poster){
+  if(!S.target){ S.pending=()=>fastPlay(query,isTV,poster); toast("Pick where to play — it starts right after"); openSheet(); return; }
+  setMode(isTV?"tv":"movie"); $("#q").value=query; S.search.q=query;
+  beginWarming(query, poster);
+  let d; try{ d=await api("/search?q="+encodeURIComponent(query)+(isTV?"":"&movie=1")); }
+  catch{ showPlayError(query,poster,"spela unreachable",()=>fastPlay(query,isTV,poster)); return; }
+  S.search.data=d;
+  const first=(d&&d.results&&d.results[0]);
+  if(!first){ showPlayError(query,poster,"No playable sources for “"+esc(query)+"”.",()=>fastPlay(query,isTV,poster)); return; }
+  doPlay({result_id:first.id, title:(d.show&&d.show.title)||query, poster_url:poster||(d.show&&d.show.poster_url)||""}, null);
 }
 
 /* ---------- Shannon-TV playback (Phase-7 / target=shannon, 2026-05-23) ----------
@@ -1630,7 +1666,9 @@ function renderWarmupInto(root){
   const title=w.title||wd.title||"Loading…", poster=wd.poster||"";
   const phase=w.phase||"connecting", t=w.torrent;
   let label, barPct=null, sub="";
-  if(phase==="downloading" && t){
+  if(w.vlc){
+    label="Buffering for VLC…"; barPct=(w.pct!=null)?w.pct:null; sub="opens automatically when ready";
+  }else if(phase==="downloading" && t){
     label="Downloading…";
     barPct=Math.max(0,Math.min(100,t.percent||0));
     sub=`${fmtSpeed(t.speed_bps)} · ${t.peers||0} peer${t.peers===1?"":"s"}`;
