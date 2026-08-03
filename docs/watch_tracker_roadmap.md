@@ -227,11 +227,17 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
      Range read 92 curated vs 85 live; Home now matches the search card everywhere). Verified in
      Chrome: 10 rec posters 200, Outer Range→85. Also: inline SVG favicon (quiets the
      `/favicon.ico` probe). Continue verified live too (HotD S03E07 @ 73% + progress bar).
-   - **NEXT (refinements, not blockers)**: (a) two display nuances Fredrik flagged 2026-08-03 —
-     an episode you're mid-way through shows in BOTH Continue and New Episodes (dedup could hide
-     the New-Eps row); and the New-Episodes count treats a barely-started show's whole backlog as
-     "new" (Fargo = 47 → the "50 new" badge is mostly backlog; "new since caught up" would read
-     truer); (b) an optional
+   - **Continue/New-Eps dedup + mark-seen + non-linear counting — ✅ SHIPPED (2026-08-03).**
+     (i) A Continue episode that IS a followed show's next-unwatched folds into its New-Eps row as
+     "▸ NN% into SxxExx" (parses SE from the title, since a VLC-tracked play leaves the struct
+     fields None) instead of a duplicate. (ii) A ✓ "already seen" button on each Recommended row
+     (→ `/watched-add`, dropped from recs next load, optimistic remove). (iii) **Per-season seen
+     overlay** (`FollowedShow.seen_seasons` + `POST /following/seen-seasons` + `unseen_after` /
+     `next_unwatched_skipping`): a ☰ expander on each New-Eps row reveals S1..SN toggle chips;
+     marking whole seasons seen subtracts them from the count, so a middle-seen gap is
+     representable (the single caught-up HWM couldn't). Verified: Fargo 47→6 new (marked S2-5
+     seen, only unseen S01E05-10 remain), chips reflect state, count refreshes on panel close.
+   - **NEXT (refinements, not blockers)**: (b) an optional
      `/recommend`-style refresh affordance (button that re-triggers the harness), or a mood
      input ("how much do you have tonight?") the profile's meta-rules call for; (d) a Phase-2
      model-swappable autonomous harness (same POST surface).
