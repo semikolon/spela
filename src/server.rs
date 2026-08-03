@@ -7427,7 +7427,7 @@ async fn handle_vlc_playlist(
     // offset; a fresh start streams sequentially, so the 3s default is fine there.
     let netcache = if start_opt.is_empty() { 3000 } else { 8000 };
     let body = format!(
-        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:network-caching={}\n{}{}/vlc/{}/stream?al={}\n",
+        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:sub-language=en,eng\n#EXTVLCOPT:network-caching={}\n{}{}/vlc/{}/stream?al={}\n",
         name, audio_lang, netcache, start_opt, base, id, audio_lang
     );
     axum::response::Response::builder()
