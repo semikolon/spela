@@ -143,6 +143,15 @@
   .cprogfill{display:block;height:100%;background:var(--accent);border-radius:2px}
   .foitem .ep{margin-left:.4rem;font-size:.72rem;color:var(--dim2);font-weight:600}
   .foitem .partway{color:var(--accent);font-weight:600}
+  .fowrap{display:flex;flex-direction:column;gap:.3rem}
+  .foseasonbtn{flex:0 0 auto;background:var(--bg3);border:1px solid var(--line);border-radius:.55rem;color:var(--dim);min-width:44px;font-size:1rem}
+  .foseasonbtn:active{transform:scale(.96)}
+  .foseasons{display:none;padding:.35rem .2rem .1rem}
+  .foseasons.on{display:block}
+  .foseaslab{font-size:.72rem;color:var(--dim2);margin-bottom:.3rem}
+  .foseaschips{display:flex;flex-wrap:wrap;gap:.4rem}
+  .foseaschip{background:var(--bg3);border:1px solid var(--line);border-radius:1rem;color:var(--dim);padding:.3rem .7rem;font-size:.8rem;min-height:34px}
+  .foseaschip.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
   .fomark{flex:0 0 46px;border:1px solid var(--line);border-radius:11px;background:var(--bg3);
     color:var(--good);font-size:1.2rem;font-weight:800;touch-action:manipulation}
   .fomark:active{transform:scale(.95)}
@@ -861,7 +870,45 @@ function followingItem(s, onMarked){
     toast("Unfollowed");
     if(onMarked) onMarked(); };
   item.appendChild(uf);
+  // Per-season "seen" overlay: an expander (☰) revealing S1..SN toggle chips, so a
+  // non-linear history (saw S2-5 but not S1) can be recorded → the New-Episodes
+  // count drops to only genuinely-unseen episodes. Count refreshes on panel close.
+  if(Array.isArray(s.season_numbers) && s.season_numbers.length){
+    const wrap=el("div",{className:"fowrap"});
+    const exp=el("button",{className:"foseasonbtn",textContent:"☰",title:"Mark seasons already seen"});
+    exp.setAttribute("aria-label","Mark seasons of "+s.title+" already seen");
+    const panel=el("div",{className:"foseasons"});
+    exp.onclick=(ev)=>{ ev.stopPropagation();
+      const opening=!panel.classList.contains("on");
+      panel.classList.toggle("on");
+      if(opening && !panel.childElementCount) buildSeasonChips(panel,s);
+      if(!opening && onMarked) onMarked(); };
+    item.appendChild(exp);
+    wrap.appendChild(item); wrap.appendChild(panel);
+    return wrap;
+  }
   return item;
+}
+
+// Season toggle chips for the seen-seasons overlay. Each chip POSTs the full
+// checked set (replace semantics); the New-Episodes count refreshes when the panel
+// is closed (see the expander handler) so a burst of toggles is one recompute.
+function buildSeasonChips(panel, s){
+  const seen=new Set(s.seen_seasons||[]);
+  panel.appendChild(el("div",{className:"foseaslab",textContent:"I've already seen these seasons:"}));
+  const row=el("div",{className:"foseaschips"});
+  s.season_numbers.forEach(n=>{
+    const c=el("button",{className:"foseaschip"+(seen.has(n)?" on":""),textContent:"S"+n});
+    c.setAttribute("aria-pressed",seen.has(n)?"true":"false");
+    c.onclick=async(ev)=>{ ev.stopPropagation();
+      const now=!seen.has(n); if(now) seen.add(n); else seen.delete(n);
+      c.classList.toggle("on",now); c.setAttribute("aria-pressed",now?"true":"false");
+      try{ const r=await api("/following/seen-seasons",{method:"POST",body:{tmdb_id:s.tmdb_id,seasons:[...seen]}});
+        if(!r||!r.ok) toast("Couldn’t save"); }
+      catch{ toast("spela unreachable"); } };
+    row.appendChild(c);
+  });
+  panel.appendChild(row);
 }
 
 // Fill `container` with the "New episodes" label + rows for shows with new eps.

@@ -31,6 +31,14 @@ pub struct FollowedShow {
     /// from the ledger now, never stored here (so unfollow can't lose it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watched_through: Option<String>,
+    /// Whole seasons the user has marked seen OUTSIDE the linear `watched_through`
+    /// baseline (e.g. saw Fargo S2-5 but not S1). The single caught-up HWM assumes
+    /// start-to-finish viewing and can't represent a middle-seen gap; the
+    /// New-Episodes count subtracts these seasons so only genuinely-unseen episodes
+    /// are counted. Coarse (per-season) by design — a per-episode overlay would just
+    /// duplicate the ledger.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seen_seasons: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -101,9 +109,25 @@ pub fn add_show(title: &str, tmdb_id: u64, imdb_id: Option<String>) -> bool {
         tmdb_id,
         imdb_id: imdb_id.filter(|v| !v.is_empty()),
         watched_through: None,
+        seen_seasons: Vec::new(),
     });
     let _ = save(&f);
     true
+}
+
+/// Set the whole-seasons-seen overlay for a followed show (replace semantics —
+/// the UI sends the full checked set). Returns true if the show exists.
+pub fn set_seen_seasons(tmdb_id: u64, mut seasons: Vec<u32>) -> bool {
+    let mut f = load();
+    if let Some(s) = f.shows.iter_mut().find(|s| s.tmdb_id == tmdb_id) {
+        seasons.sort_unstable();
+        seasons.dedup();
+        s.seen_seasons = seasons;
+        let _ = save(&f);
+        true
+    } else {
+        false
+    }
 }
 
 /// Remove a show from the followed set. MEMBERSHIP only — the ledger (and thus all

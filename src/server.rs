@@ -315,6 +315,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/following/mark", post(handle_following_mark))
         .route("/following/add", post(handle_following_add))
         .route("/following/remove", post(handle_following_remove))
+        .route("/following/seen-seasons", post(handle_following_seen_seasons))
         .route("/position", post(handle_position))
         .route("/poster/{size}/{file}", get(handle_poster))
         // Web-remote My Library (US-3): aggregate curated collection
@@ -4384,54 +4385,54 @@ async fn handle_status(State(state): State<SharedState>) -> Json<Value> {
     }
 }
 
-/// Count episodes that aired strictly AFTER `watched` up to and including `last`,
-/// respecting per-season episode counts (specials excluded upstream). Same-season
-/// is the common ongoing case (`le - we`); the cross-season branch sums whole
-/// intermediate seasons.
-fn episodes_between(watched: (u32, u32), last: (u32, u32), seasons: &[(u32, u32)]) -> u32 {
-    if last <= watched {
-        return 0;
+/// Count aired episodes strictly after the caught-up HWM, EXCLUDING whole seasons
+/// the user marked seen (the `seen_seasons` overlay) + specials (S0). `seasons` =
+/// (season_no, ep_count) from TMDB; `last` = last-aired (season, ep). This is the
+/// non-linear-aware replacement for `episodes_between`: a middle-seen gap (Fargo:
+/// seen S2-5, not S1) is representable, which a single HWM can't.
+fn unseen_after(
+    watched: (u32, u32),
+    last: (u32, u32),
+    seasons: &[(u32, u32)],
+    seen_seasons: &[u32],
+) -> u32 {
+    let mut n = 0;
+    for &(s, cnt) in seasons {
+        if s == 0 || seen_seasons.contains(&s) {
+            continue;
+        }
+        for e in 1..=cnt {
+            let ep = (s, e);
+            if ep > watched && ep <= last {
+                n += 1;
+            }
+        }
     }
-    let (ws, we) = watched;
-    let (ls, le) = last;
-    if ws == ls {
-        return le.saturating_sub(we);
-    }
-    let ep_count = |s: u32| {
-        seasons
-            .iter()
-            .find(|(n, _)| *n == s)
-            .map(|(_, c)| *c)
-            .unwrap_or(0)
-    };
-    let mut n = ep_count(ws).saturating_sub(we);
-    for s in (ws + 1)..ls {
-        n += ep_count(s);
-    }
-    n + le
+    n
 }
 
-/// The episode immediately after `watched`, rolling over season boundaries via
-/// per-season episode counts. `watched == (0, _)` (nothing watched) → the first
-/// real season's E01.
-fn next_unwatched_ep(watched: (u32, u32), seasons: &[(u32, u32)]) -> (u32, u32) {
-    let (ws, we) = watched;
-    if ws == 0 {
-        let first = seasons.iter().map(|(n, _)| *n).min().unwrap_or(1);
-        return (first, 1);
+/// First aired episode after the HWM that isn't in a seen season — the next thing
+/// to actually watch (skips the middle-seen seasons).
+fn next_unwatched_skipping(
+    watched: (u32, u32),
+    last: (u32, u32),
+    seasons: &[(u32, u32)],
+    seen_seasons: &[u32],
+) -> Option<(u32, u32)> {
+    let mut secs: Vec<(u32, u32)> = seasons.iter().copied().filter(|(s, _)| *s != 0).collect();
+    secs.sort_unstable();
+    for (s, cnt) in secs {
+        if seen_seasons.contains(&s) {
+            continue;
+        }
+        for e in 1..=cnt {
+            let ep = (s, e);
+            if ep > watched && ep <= last {
+                return Some(ep);
+            }
+        }
     }
-    let ep_count = |s: u32| {
-        seasons
-            .iter()
-            .find(|(n, _)| *n == s)
-            .map(|(_, c)| *c)
-            .unwrap_or(0)
-    };
-    if we < ep_count(ws) {
-        (ws, we + 1)
-    } else {
-        (ws + 1, 1)
-    }
+    None
 }
 
 /// `GET /following` — followed-series tracker (slice 2b). For each show in
@@ -4461,9 +4462,9 @@ async fn compute_following_shows(state: &SharedState, app: &AppState) -> (Vec<Va
         let watched = watched_opt.unwrap_or((0, 0));
         let (new_count, next_se) = match st.last_aired {
             Some((ls, le, _, _)) => {
-                let nc = episodes_between(watched, (ls, le), &st.seasons);
+                let nc = unseen_after(watched, (ls, le), &st.seasons, &show.seen_seasons);
                 let ns = if nc > 0 {
-                    Some(next_unwatched_ep(watched, &st.seasons))
+                    next_unwatched_skipping(watched, (ls, le), &st.seasons, &show.seen_seasons)
                 } else {
                     None
                 };
@@ -4499,6 +4500,10 @@ async fn compute_following_shows(state: &SharedState, app: &AppState) -> (Vec<Va
             "next_unwatched_name": (!nu_name.is_empty()).then_some(nu_name),
             "next_unwatched_air": (!nu_air.is_empty()).then_some(nu_air),
             "next_air": next_air,
+            // For the per-season "seen" toggles UI: the show's real season numbers
+            // (specials/S0 dropped) + which ones are marked seen.
+            "season_numbers": st.seasons.iter().filter(|(s, _)| *s != 0).map(|(s, _)| *s).collect::<Vec<u32>>(),
+            "seen_seasons": show.seen_seasons.clone(),
         }));
     }
     // Most new first; ties keep TMDB/insertion order.
@@ -4662,6 +4667,22 @@ async fn handle_recommendations_set(
         Ok(n) => Json(json!({ "ok": true, "count": n })),
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
+}
+
+#[derive(Deserialize)]
+struct SeenSeasonsRequest {
+    tmdb_id: u64,
+    #[serde(default)]
+    seasons: Vec<u32>,
+}
+
+/// `POST /following/seen-seasons` {tmdb_id, seasons:[...]} — set the whole-seasons-
+/// seen overlay for a followed show (replace semantics; the UI sends the full
+/// checked set). Lets a non-linear history (seen S2-5, not S1) be represented so
+/// the New-Episodes count reflects only genuinely-unseen episodes.
+async fn handle_following_seen_seasons(Json(req): Json<SeenSeasonsRequest>) -> Json<Value> {
+    let ok = crate::following::set_seen_seasons(req.tmdb_id, req.seasons);
+    Json(json!({ "ok": ok }))
 }
 
 #[derive(Deserialize)]
