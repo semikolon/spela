@@ -4538,18 +4538,30 @@ async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
             Some(d) if d > 0.0 => Some(((e.position / d) * 100.0).clamp(0.0, 100.0).round() as u64),
             _ => None,
         };
-        let e_title =
-            crate::search::clean_title_for_tmdb(e.show.as_deref().unwrap_or(&e.title)).to_lowercase();
-        let folded = new_eps.iter_mut().find(|r| {
-            e.season.is_some()
-                && r["next_unwatched_season"].as_u64() == e.season.map(|v| v as u64)
-                && r["next_unwatched_episode"].as_u64() == e.episode.map(|v| v as u64)
-                && r["title"]
-                    .as_str()
-                    .map(|t| crate::search::clean_title_for_tmdb(t).to_lowercase())
-                    == Some(e_title.clone())
-        });
-        if let Some(row) = folded {
+        // SE + show may live only in the title (a VLC-tracked play doesn't populate
+        // the struct fields), so parse them out too before matching.
+        let (parsed_show, parsed_s, parsed_e) = crate::search::parse_episode_markers(&e.title);
+        let season = e.season.or(parsed_s);
+        let episode = e.episode.or(parsed_e);
+        let show_for_match = e
+            .show
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(parsed_show);
+        let e_title = crate::search::clean_title_for_tmdb(&show_for_match).to_lowercase();
+        let matched = if season.is_some() && episode.is_some() {
+            new_eps.iter_mut().find(|r| {
+                r["next_unwatched_season"].as_u64() == season.map(|v| v as u64)
+                    && r["next_unwatched_episode"].as_u64() == episode.map(|v| v as u64)
+                    && r["title"]
+                        .as_str()
+                        .map(|t| crate::search::clean_title_for_tmdb(t).to_lowercase())
+                        == Some(e_title.clone())
+            })
+        } else {
+            None
+        };
+        if let Some(row) = matched {
             if let Some(p) = pct {
                 row["partway"] = json!(p);
             }
