@@ -468,7 +468,6 @@
     <div id="pendingRow" class="pending"></div>
     <div id="continueRow" class="following"></div>
     <div id="homeFollowingRow" class="following"></div>
-    <div id="recommendedRow" class="following"></div>
     <div id="homeEmpty"></div>
   </section>
 
@@ -638,6 +637,11 @@ async function renderToWatch(){
   // New episodes of followed shows at the top — same section as the search landing.
   try{ const fd=await api("/following"); const fc=el("div",{className:"following"});
     if(fillFollowing(fc,(fd&&fd.shows)||[],refreshFollowing)>0){ fc.classList.add("on"); wrap.appendChild(fc); }
+  }catch{}
+  // Claude-curated recommendations — the smart, ranked top of your to-watch pool.
+  // Lives here (not the landing): it IS the to-watch list, just curated.
+  try{ const rd=await api("/recommendations"); const rc=el("div",{className:"following"});
+    fillRecommended(rc,(rd&&rd.picks)||[]); if(rc.classList.contains("on")) wrap.appendChild(rc);
   }catch{}
   if(series.length){ wrap.appendChild(el("div",{className:"twhead",textContent:`Series · ${series.length}`}));
     const box=el("div",{className:"sources open"}); series.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
@@ -952,9 +956,8 @@ async function loadHome(){
   fillContinue($("#continueRow"), (d&&d.continue)||[]);
   const fr=$("#homeFollowingRow");
   if(fr){ const n=fillFollowing(fr,(d&&d.new_episodes)||[],loadHome); fr.classList.toggle("on",n>0); }
-  fillRecommended($("#recommendedRow"), (d&&d.recommended)||[]);
   const em=$("#homeEmpty");
-  if(em){ const any=(d&&((d.continue||[]).length||(d.new_episodes||[]).length||(d.recommended||[]).length));
+  if(em){ const any=(d&&((d.continue||[]).length||(d.new_episodes||[]).length));
     em.innerHTML=any?"":`<div class="state"><div class="big">Nothing queued yet</div><div>Search for something, or follow a show.</div></div>`; }
 }
 
