@@ -7282,6 +7282,24 @@ async fn handle_vlc_stream(
             .torrent_engine
             .prefetch_ends(tid, file_index.unwrap_or(0) as usize);
     }
+    // On a mid-file SEEK (a resume homing past the head), prioritize a window from
+    // the requested offset so the download focuses there instead of starving VLC
+    // (2026-08-03 Fargo resume-to-41min froze with byte ~3.1 GB not downloaded).
+    if let Some(off) = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|r| {
+            r.strip_prefix("bytes=")
+                .and_then(|s| s.split('-').next())
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+    {
+        if off > 8 * 1024 * 1024 {
+            state
+                .torrent_engine
+                .prefetch_at(tid, file_index.unwrap_or(0) as usize, off);
+        }
+    }
     tracing::info!(
         "VLC: result #{} → torrent {} FileStream (progressive) (range={:?})",
         id,
@@ -7405,9 +7423,12 @@ async fn handle_vlc_playlist(
     // #8556) + stream drops we chased 2026-08-03. A 3s buffer is the research-backed
     // mitigation (partial — it can't cure auhal's internal race, but cuts its
     // frequency). Mirrored as `--network-caching=3000` in the vlc:// handler.
+    // A resumed play needs more buffer runway while the download ramps at the seek
+    // offset; a fresh start streams sequentially, so the 3s default is fine there.
+    let netcache = if start_opt.is_empty() { 3000 } else { 8000 };
     let body = format!(
-        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:network-caching=3000\n{}{}/vlc/{}/stream?al={}\n",
-        name, audio_lang, start_opt, base, id, audio_lang
+        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:network-caching={}\n{}{}/vlc/{}/stream?al={}\n",
+        name, audio_lang, netcache, start_opt, base, id, audio_lang
     );
     axum::response::Response::builder()
         .status(200)

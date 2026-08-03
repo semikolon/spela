@@ -329,6 +329,32 @@ impl TorrentEngine {
         });
     }
 
+    /// Prioritize a window starting at `byte_offset` (a mid-file seek target) so the
+    /// pieces VLC is about to read download FIRST — keeps a resumed play from
+    /// starving at the seek point on a fresh torrent, where the default piece order
+    /// hasn't reached that region. Fire-and-forget; overlaps with VLC's own read
+    /// harmlessly (librqbit dedupes pieces). Aug 3 2026: Fargo S01E05 resume-to-41min
+    /// froze because byte ~3.1 GB wasn't downloaded and nothing was prioritizing it.
+    pub fn prefetch_at(&self, id: u32, file_idx: usize, byte_offset: u64) {
+        let Some(handle) = self.handle(id) else {
+            return;
+        };
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            const WINDOW: usize = 8 * 1024 * 1024; // ~13s at 5 Mbps of runway
+            if let Ok(mut s) = handle.stream(file_idx) {
+                let len = s.len();
+                if byte_offset < len
+                    && s.seek(std::io::SeekFrom::Start(byte_offset)).await.is_ok()
+                {
+                    let want = WINDOW.min((len - byte_offset) as usize);
+                    let mut buf = vec![0u8; want];
+                    let _ = s.read_exact(&mut buf).await;
+                }
+            }
+        });
+    }
+
     /// True only if BOTH the file's head (container header / track info) AND its
     /// tail (the MKV Cues / MP4 moov seek-index) are actually downloaded — the two
     /// regions a player probes before playback. A `FileStream` read blocks until
