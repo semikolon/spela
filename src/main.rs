@@ -4,6 +4,7 @@ mod disk;
 mod following;
 mod hls_cache;
 mod library_origin;
+mod recommendations;
 mod search;
 mod server;
 mod state;

@@ -63,6 +63,12 @@ pub struct AppState {
     /// still surfaces. Capped.
     #[serde(default)]
     pub dismissed_watched: std::collections::HashSet<String>,
+    /// 2026-08-03 (slice 7 unified queue): plays in progress (started, not yet
+    /// finished) → the queue's "Continue" section. Keyed like `resume_positions`;
+    /// upserted in `save_position_smart`'s HWM branch (metadata from the live
+    /// `CurrentStream`), cleared on completion / `reset_position`.
+    #[serde(default)]
+    pub in_progress: HashMap<String, InProgressEntry>,
 }
 
 /// A Chromecast-detected completion awaiting Fredrik's confirmation (slice 5).
@@ -216,6 +222,29 @@ pub struct WatchedEntry {
     pub seed: bool,
 }
 
+/// A play in progress (started, not finished) — the "Continue" surface of the
+/// unified queue (roadmap slice 7). Keyed like `resume_positions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InProgressEntry {
+    pub key: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imdb_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub season: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode: Option<u32>,
+    /// Furthest-watched position (seconds) — the resume HWM.
+    pub position: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poster_url: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preferences {
     #[serde(default = "default_target")]
@@ -255,6 +284,7 @@ impl Default for AppState {
             corrupt_files: std::collections::HashSet::new(),
             pending_watched: Vec::new(),
             dismissed_watched: std::collections::HashSet::new(),
+            in_progress: HashMap::new(),
         }
     }
 }
@@ -324,6 +354,12 @@ impl AppState {
             None => return ("unknown".into(), false),
         };
 
+        // Metadata for the "Continue" queue row, pulled from the live stream.
+        let (cur_show, cur_season, cur_episode, cur_poster) = match &self.current {
+            Some(c) => (c.show.clone(), c.season, c.episode, c.poster_url.clone()),
+            None => (None, None, None, None),
+        };
+
         // --- Completion Logic ---
         // Clear the HWM when the user has effectively watched to the end.
         if let Some(dur) = duration {
@@ -350,6 +386,21 @@ impl AppState {
         // Only update if we've moved further than before.
         if t > current {
             self.resume_positions.insert(key.clone(), t);
+            self.in_progress.insert(
+                key.clone(),
+                InProgressEntry {
+                    key: key.clone(),
+                    title: title.clone().unwrap_or_default(),
+                    show: cur_show,
+                    imdb_id: imdb_id.clone(),
+                    season: cur_season,
+                    episode: cur_episode,
+                    position: t,
+                    duration,
+                    poster_url: cur_poster,
+                    updated_at: Utc::now(),
+                },
+            );
             (key, true)
         } else {
             (key, false)
@@ -371,6 +422,7 @@ impl AppState {
             None => return "unknown".into(),
         };
         self.resume_positions.remove(&key);
+        self.in_progress.remove(&key);
         key
     }
 
@@ -409,6 +461,27 @@ impl AppState {
         };
         self.mark_watched(&key, imdb_id, Some(title));
         true
+    }
+
+    /// True if this title/imdb already appears in the watch-ledger (any episode or
+    /// the movie). Excludes already-seen titles from recommendations.
+    pub fn has_seen(&self, imdb_id: Option<&str>, title: &str) -> bool {
+        // clean_title_for_tmdb preserves case, so lowercase both sides — a harness
+        // pick ("poor things") must still match a watched title ("Poor Things").
+        let clean = crate::search::clean_title_for_tmdb(title).to_lowercase();
+        self.watched.iter().any(|w| {
+            (imdb_id.is_some() && w.imdb_id.as_deref() == imdb_id)
+                || w.show.as_deref().map(str::to_lowercase) == Some(clean.clone())
+                || crate::search::clean_title_for_tmdb(&w.title).to_lowercase() == clean
+        })
+    }
+
+    /// In-progress plays, most-recently-advanced first — the queue's Continue
+    /// section.
+    pub fn in_progress_list(&self) -> Vec<InProgressEntry> {
+        let mut v: Vec<InProgressEntry> = self.in_progress.values().cloned().collect();
+        v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        v
     }
 
     /// Write a baseline (seed) ledger entry from the following.json→ledger
@@ -928,5 +1001,55 @@ mod tests {
         // At 3700s absolute (~96.8%), we should be past the threshold.
         let near_end = 3700.0_f64;
         assert!(near_end >= duration * HWM_CLEAR_FRACTION);
+    }
+
+    #[test]
+    fn test_has_seen_excludes_watched() {
+        let mut app = AppState::default();
+        app.mark_watched_auto(Some("tt1234567".into()), "Silo S03E04".into());
+        app.mark_watched_auto(None, "Poor Things".into());
+
+        // imdb match (any episode of the show → seen).
+        assert!(app.has_seen(Some("tt1234567"), "Silo"));
+        // cleaned-title match, no imdb (case-insensitive via clean_title_for_tmdb).
+        assert!(app.has_seen(None, "Poor Things"));
+        assert!(app.has_seen(None, "poor things"));
+        // Not in the ledger → not seen (a fresh recommendation stays).
+        assert!(!app.has_seen(Some("tt9999999"), "Andor"));
+        assert!(!app.has_seen(None, "Dune Part Two"));
+    }
+
+    #[test]
+    fn test_in_progress_written_and_cleared() {
+        let mut app = AppState::default();
+        app.current = Some(CurrentStream {
+            magnet: "m".into(),
+            title: "Dune Part Two".into(),
+            show: None,
+            season: None,
+            episode: None,
+            imdb_id: Some("tt15239678".into()),
+            target: "vlc".into(),
+            url: "u".into(),
+            started_at: Utc::now(),
+            pid: 0,
+            has_subtitles: false,
+            subtitle_lang: None,
+            duration: Some(9000.0),
+            quality: None,
+            size: None,
+            poster_url: Some("p".into()),
+            ss_offset: 0.0,
+            smooth: false,
+            prepared_hls: false,
+            cache_key: None,
+        });
+        // Mid-play HWM advance → an in-progress entry appears.
+        app.save_position_smart(Some("tt15239678".into()), Some("Dune Part Two".into()), 1200.0, Some(9000.0));
+        assert_eq!(app.in_progress_list().len(), 1);
+        assert_eq!(app.in_progress_list()[0].position, 1200.0);
+        // Reaching the end clears it (completion branch → reset_position).
+        app.save_position_smart(Some("tt15239678".into()), Some("Dune Part Two".into()), 8900.0, Some(9000.0));
+        assert!(app.in_progress_list().is_empty());
     }
 }

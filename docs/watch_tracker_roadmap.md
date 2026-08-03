@@ -189,6 +189,36 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    `extract_metadata_title(&Metadata)` (cast.rs:560) pulls the title;
    `Metadata::TvShow{series_title, episode_title, season, episode}` carries S/E.
 
+7. **Unified home queue + recommender harness — backend ✅ SHIPPED (2026-08-03);
+   home UI + first curated pass NEXT.** Fredrik: *"I want both Claude to be able to
+   wisely recommend, and a unified queue in the UI... Weave it in naturally with what
+   already exists."* Two pieces, arsenal-and-harness:
+   - **Recommender arsenal** (`recommendations.rs` + `~/.config/spela/recommendations.json`,
+     user-local): `GET /recommendations` (serve, excludes already-seen via
+     `AppState::has_seen`, case-insensitive) + `POST /recommendations` (the harness writes
+     the full ranked list; replace semantics; capped 100). Each `RecEntry` carries a one-line
+     **`why`** — the rationale IS the value. The HARNESS = Claude/CC (Phase 1): reads
+     `taste_profile.md` + `/watched` + `/watchlist` + air-dates, ranks, POSTs. Model-swappable
+     later (a Phase-2 autonomous harness writes the same file).
+   - **Continue store** (`AppState.in_progress`, keyed like `resume_positions`): upserted in
+     `save_position_smart`'s HWM branch (title/show/S·E/poster from the live `CurrentStream`;
+     duration + position for the %), cleared on completion / `reset_position`. Needed because
+     `resume_positions` holds only seconds — no duration/title/poster to render a Continue row.
+   - **Unified home** `GET /home` (NOT `/queue` — that route is the play-FIFO auto-fire list):
+     three priority-ordered sections — **Continue** (in-progress, % + poster) → **New Episodes**
+     (reuses `compute_following_shows`, the shared `/following` derivation, refactored out) →
+     **Recommended** (harness picks, de-duped against Continue + New-Episodes + already-seen so
+     the queue never repeats a title).
+   - **UI decision** (Fredrik, 2026-08-03, via mockup pick): priority-sectioned **home screen**
+     (Continue → New Episodes → Recommended); the queue BECOMES the landing view, absorbing the
+     Recently-watched chip row + the New-Episodes row; Search moves one tap away.
+   - **NEXT**: (a) rebuild `static/remote.html` landing → the home queue (three poster-bg
+     sections like To-Watch; Continue tap → resume, rec tap → search, the `why` line shown);
+     (b) a first real curated pass — Claude reads `taste_profile.md` (Darwin) + `/watched` +
+     `/watchlist`, POSTs genuine picks, proving the harness end-to-end; (c) deploy + verify on
+     Darwin (`GET /home` returns three sections; `POST`→`GET /recommendations` round-trips).
+   Tests: `has_seen` case-insensitive exclusion + in-progress write/clear (`state.rs`).
+
 ## Notes
 - **⚠ Arsenal data lives on the SPELA HOST (Darwin `~/.config/spela/`), not the Mac.**
   spela serves `watchlist.json` from the host it runs on (Darwin). Authoring these

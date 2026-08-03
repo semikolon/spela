@@ -304,6 +304,13 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
             get(handle_watchlist).post(handle_watchlist_add),
         )
         .route("/title-meta", get(handle_title_meta))
+        // Unified "what do I watch now" home surface (Continue + New Episodes +
+        // Recommended). NOT `/queue` — that's the play-FIFO auto-fire list.
+        .route("/home", get(handle_home))
+        .route(
+            "/recommendations",
+            get(handle_recommendations).post(handle_recommendations_set),
+        )
         .route("/following", get(handle_following))
         .route("/following/mark", post(handle_following_mark))
         .route("/following/add", post(handle_following_add))
@@ -4432,8 +4439,16 @@ fn next_unwatched_ep(watched: (u32, u32), seasons: &[(u32, u32)]) -> (u32, u32) 
 /// report new-episode count + the next unwatched episode + next air date. Sorted
 /// most-new-first. Personal data (the follow-list) lives only on the spela host.
 async fn handle_following(State(state): State<SharedState>) -> Json<Value> {
-    let following = crate::following::load();
     let app = AppState::load(&state.state_dir);
+    let (shows, total_new) = compute_following_shows(&state, &app).await;
+    Json(json!({ "shows": shows, "total_new": total_new }))
+}
+
+/// Shared New-Episodes derivation for `/following` and the unified `/queue`.
+/// Returns (per-show JSON, most-new-first, total new-episode count). Progress
+/// DERIVES from the ledger (`app`), never a stored field.
+async fn compute_following_shows(state: &SharedState, app: &AppState) -> (Vec<Value>, u32) {
+    let following = crate::following::load();
     let mut shows = Vec::new();
     let mut total_new: u32 = 0;
     for show in &following.shows {
@@ -4493,7 +4508,132 @@ async fn handle_following(State(state): State<SharedState>) -> Json<Value> {
             .unwrap_or(0)
             .cmp(&a["new_count"].as_u64().unwrap_or(0))
     });
-    Json(json!({ "shows": shows, "total_new": total_new }))
+    (shows, total_new)
+}
+
+/// `GET /home` — the unified "what do I watch now" home surface (roadmap slice 7).
+/// Three priority-ordered sections (the UI stacks them Continue → New Episodes →
+/// Recommended): Continue (in-progress plays), New Episodes (followed shows with
+/// aired-but-unwatched episodes), Recommended (harness-curated picks). Recommended
+/// is de-duped against the two sections above + already-seen, so the queue never
+/// repeats a title. (Distinct from `/queue`, which is the play-FIFO auto-fire list.)
+async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
+    let app = AppState::load(&state.state_dir);
+
+    // Continue — in-progress plays, most-recently-advanced first, with a percent.
+    let cont: Vec<Value> = app
+        .in_progress_list()
+        .into_iter()
+        .map(|e| {
+            let pct = match e.duration {
+                Some(d) if d > 0.0 => {
+                    Some(((e.position / d) * 100.0).clamp(0.0, 100.0).round() as u32)
+                }
+                _ => None,
+            };
+            json!({
+                "title": e.title,
+                "show": e.show,
+                "imdb_id": e.imdb_id,
+                "season": e.season,
+                "episode": e.episode,
+                "position": e.position,
+                "duration": e.duration,
+                "pct": pct,
+                "poster_url": e.poster_url,
+            })
+        })
+        .collect();
+
+    // New Episodes — reuse the followed-shows derivation; keep only shows with news.
+    let (all_following, total_new) = compute_following_shows(&state, &app).await;
+    let new_eps: Vec<Value> = all_following
+        .into_iter()
+        .filter(|s| s["new_count"].as_u64().unwrap_or(0) > 0)
+        .collect();
+
+    // Recommended — harness picks minus already-seen and minus anything already
+    // surfaced above (so the queue never repeats a title across sections).
+    let recs = crate::recommendations::load();
+    let gen_at = recs.generated_at;
+    let cont_titles: std::collections::HashSet<String> = app
+        .in_progress
+        .values()
+        .map(|e| crate::search::clean_title_for_tmdb(e.show.as_deref().unwrap_or(&e.title)))
+        .collect();
+    let ne_titles: std::collections::HashSet<String> = new_eps
+        .iter()
+        .filter_map(|s| s["title"].as_str().map(crate::search::clean_title_for_tmdb))
+        .collect();
+    let recommended: Vec<Value> = recs
+        .picks
+        .into_iter()
+        .filter(|p| {
+            let ct = crate::search::clean_title_for_tmdb(&p.title);
+            !app.has_seen(p.imdb_id.as_deref(), &p.title)
+                && !cont_titles.contains(&ct)
+                && !ne_titles.contains(&ct)
+        })
+        .map(|p| {
+            json!({
+                "title": p.title,
+                "media_type": p.media_type,
+                "tmdb_id": p.tmdb_id,
+                "imdb_id": p.imdb_id,
+                "year": p.year,
+                "rt_score": p.rt_score,
+                "why": p.why,
+                "poster_url": p.poster_url,
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "continue": cont,
+        "new_episodes": new_eps,
+        "total_new": total_new,
+        "recommended": recommended,
+        "recommended_generated_at": gen_at,
+    }))
+}
+
+/// `GET /recommendations` — the harness-curated picks, minus already-seen titles
+/// (a pick written before Fredrik watched it drops off on its own).
+async fn handle_recommendations(State(state): State<SharedState>) -> Json<Value> {
+    let app = AppState::load(&state.state_dir);
+    let recs = crate::recommendations::load();
+    let picks: Vec<&crate::recommendations::RecEntry> = recs
+        .picks
+        .iter()
+        .filter(|p| !app.has_seen(p.imdb_id.as_deref(), &p.title))
+        .collect();
+    Json(json!({
+        "picks": picks,
+        "generated_at": recs.generated_at,
+        "generated_by": recs.generated_by,
+    }))
+}
+
+#[derive(Deserialize)]
+struct SetRecommendationsRequest {
+    picks: Vec<crate::recommendations::RecEntry>,
+    #[serde(default)]
+    generated_by: Option<String>,
+}
+
+/// `POST /recommendations` — the LLM harness (Claude/CC in Phase 1; a swappable
+/// autonomous harness later) writes the full ranked pick list. Replace semantics:
+/// curation is a whole-list judgement. Capped so a runaway harness can't bloat the
+/// store.
+async fn handle_recommendations_set(
+    Json(req): Json<SetRecommendationsRequest>,
+) -> Json<Value> {
+    let mut picks = req.picks;
+    picks.truncate(100);
+    match crate::recommendations::set_picks(picks, req.generated_by) {
+        Ok(n) => Json(json!({ "ok": true, "count": n })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
 }
 
 #[derive(Deserialize)]
