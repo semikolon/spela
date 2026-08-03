@@ -189,10 +189,12 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    `extract_metadata_title(&Metadata)` (cast.rs:560) pulls the title;
    `Metadata::TvShow{series_title, episode_title, season, episode}` carries S/E.
 
-7. **Unified home queue + recommender harness — backend ✅ SHIPPED (2026-08-03);
-   home UI + first curated pass NEXT.** Fredrik: *"I want both Claude to be able to
-   wisely recommend, and a unified queue in the UI... Weave it in naturally with what
-   already exists."* Two pieces, arsenal-and-harness:
+7. **Unified home queue + recommender harness — ✅ SHIPPED + LIVE (2026-08-03):
+   backend + home UI + first curated pass all deployed on Darwin.** Fredrik: *"I want
+   both Claude to be able to wisely recommend, and a unified queue in the UI... Weave
+   it in naturally with what already exists."* Verified end-to-end: `/home` returns the
+   three sections; a 13-pick harness POST surfaced as 12 (Fargo auto-excluded — already
+   in the ledger, proving `has_seen`). Two pieces, arsenal-and-harness:
    - **Recommender arsenal** (`recommendations.rs` + `~/.config/spela/recommendations.json`,
      user-local): `GET /recommendations` (serve, excludes already-seen via
      `AppState::has_seen`, case-insensitive) + `POST /recommendations` (the harness writes
@@ -212,11 +214,20 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    - **UI decision** (Fredrik, 2026-08-03, via mockup pick): priority-sectioned **home screen**
      (Continue → New Episodes → Recommended); the queue BECOMES the landing view, absorbing the
      Recently-watched chip row + the New-Episodes row; Search moves one tap away.
-   - **NEXT**: (a) rebuild `static/remote.html` landing → the home queue (three poster-bg
-     sections like To-Watch; Continue tap → resume, rec tap → search, the `why` line shown);
-     (b) a first real curated pass — Claude reads `taste_profile.md` (Darwin) + `/watched` +
-     `/watchlist`, POSTs genuine picks, proving the harness end-to-end; (c) deploy + verify on
-     Darwin (`GET /home` returns three sections; `POST`→`GET /recommendations` round-trips).
+   - **Home UI** (`static/remote.html`, `#v-home`, LIVE): three poster-bg sections
+     (`fillContinue`/`fillFollowing`/`fillRecommended`); Home is the default landing (Search one
+     tap away); Continue tap re-searches → auto-resumes from HWM, rec tap → search, the `why`
+     line shown; pending-watched + New-Episodes moved off Search onto Home; new Home nav tab.
+   - **First curated pass** (LIVE): 13 picks POSTed from `taste_profile.md` + `watchlist.json`,
+     RT≥89, tone-first `why` lines, the watched-loved excluded. Re-run any time by POSTing a new
+     list to `/recommendations` (replace semantics).
+   - **NEXT (refinements, not blockers)**: (a) poster + year enrichment on rec rows (a TMDB
+     lookup per pick → `poster_url`/`year`/`tmdb_id`, so rec rows get the poster-bg treatment
+     the Continue/New-Eps rows already have); (b) Continue populates naturally as episodes are
+     watched partway (no action needed — verify on first real mid-play); (c) an optional
+     `/recommend`-style refresh affordance (button that re-triggers the harness), or a mood
+     input ("how much do you have tonight?") the profile's meta-rules call for; (d) a Phase-2
+     model-swappable autonomous harness (same POST surface).
    Tests: `has_seen` case-insensitive exclusion + in-progress write/clear (`state.rs`).
 
 ## Notes
