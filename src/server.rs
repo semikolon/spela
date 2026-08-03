@@ -339,6 +339,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         // 2026-07-13: "Open in VLC" — serve any resolved on-disk source raw
         // (Range) for direct VLC playback (native HEVC/DV, full seek, no HLS).
         .route("/vlc/{id}/stream", get(handle_vlc_stream))
+        .route("/vlc/{id}/ready", get(handle_vlc_ready))
         .route("/vlc/{id}/open.m3u", get(handle_vlc_playlist))
         .route("/hls/master.m3u8", get(handle_hls_master))
         .route("/hls/playlist.m3u8", get(handle_hls_playlist))
@@ -7091,6 +7092,60 @@ async fn handle_vlc_stream(
 /// OS hands it to VLC → VLC plays the raw source. Emitted for ANY valid result
 /// (the /stream endpoint handles all download states), so VLC works for
 /// fresh/partial/complete sources alike.
+/// `GET /vlc/{id}/ready` — is this source ready to open in VLC without hanging?
+/// The web remote polls this after a VLC play, shows download progress, and only
+/// fires the `vlc://` launch once ready — so the user never quits+re-clicks after a
+/// fresh 4K torrent buffers (2026-08-03). Ready when: (a) a complete on-disk file
+/// exists (static serve, instant), or (b) the torrent is fully downloaded, or (c) a
+/// healthy head-start buffer is present — the prefetch (fired here) primes the
+/// head+tail Cues, so ≥15% + ≥64MB means the container is probeable + there's a
+/// playback cushion. Heuristic; a head/tail-present verify + rate-vs-bitrate gate for
+/// slow 4K swarms are TODO refinements.
+async fn handle_vlc_ready(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<usize>,
+) -> Json<Value> {
+    // Complete file on disk → instantly ready (served static + fully seekable).
+    if resolve_local_file_for_result(&state, id).is_some()
+        || resolve_local_file_lenient(&state, id).is_some()
+    {
+        return Json(json!({ "ready": true, "pct": 100, "phase": "on disk" }));
+    }
+    let Some((magnet, file_index, _, _)) = resolve_result_for_vlc(&state, id) else {
+        return Json(json!({ "ready": false, "error": "Result not found — search again." }));
+    };
+    if magnet.is_empty() {
+        return Json(json!({ "ready": false, "error": "No magnet for this source." }));
+    }
+    // Ensure the torrent is running + its head/tail (Cues) are being prioritized.
+    let tid = match start_torrent_for_play(&state, &magnet, file_index).await {
+        Ok((tid, _)) => tid,
+        Err(_) => return Json(json!({ "ready": false, "pct": 0, "phase": "starting" })),
+    };
+    state
+        .torrent_engine
+        .prefetch_ends(tid, file_index.unwrap_or(0) as usize);
+    let (bytes, total, finished) = state
+        .torrent_engine
+        .progress(tid)
+        .map(|p| (p.bytes_downloaded, p.bytes_total, p.finished))
+        .unwrap_or((0, 0, false));
+    let frac = if total > 0 {
+        bytes as f64 / total as f64
+    } else {
+        0.0
+    };
+    const MIN_BUFFER: u64 = 64 * 1024 * 1024;
+    let ready = finished || (frac >= 0.15 && bytes >= MIN_BUFFER);
+    Json(json!({
+        "ready": ready,
+        "pct": (frac * 100.0) as u32,
+        "bytes": bytes,
+        "total": total,
+        "phase": if finished { "complete" } else if ready { "buffered" } else { "buffering" },
+    }))
+}
+
 async fn handle_vlc_playlist(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,

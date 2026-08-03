@@ -541,7 +541,26 @@ let toastT;
 // HLS/browser transcode). Baseline: download a one-line .m3u that the OS hands
 // to VLC. If a vlc:// protocol handler is installed (smoothest, true one-click),
 // S.vlcScheme is set and we fire that instead. 2026-07-13.
+// Poll /vlc/{id}/ready until the source can open in VLC without hanging (complete
+// file → instant; partial torrent → when the head/tail Cues are primed + a buffer
+// cushion exists). Returns true when ready, false if the user gave up / it errored.
+// Progress via a re-fired toast (stays visible); a complete file returns on poll 0.
+async function vlcWaitReady(id){
+  for(let i=0;i<600;i++){   // ~15 min cap at 1.5s/poll
+    let d; try{ d=await api("/vlc/"+id+"/ready"); }catch(e){ toast("spela unreachable"); return false; }
+    if(d && d.error){ toast(d.error); return false; }
+    if(d && d.ready) return true;
+    toast(i===0 ? "Buffering… VLC opens automatically when ready"
+                : "Buffering "+((d&&d.pct!=null)?d.pct+"% ":"")+"— VLC opens automatically");
+    await new Promise(r=>setTimeout(r,1500));
+  }
+  toast("Still buffering — give it a moment, then tap again"); return false;
+}
 async function openInVlc(id){
+  // Wait until spela says the source is ready (complete file, or enough buffered +
+  // head/tail Cues primed via prefetch) BEFORE firing VLC — so a fresh 4K torrent
+  // never opens to a hung player. Auto-launches when ready; no manual re-click.
+  if((await vlcWaitReady(id))!==true) return;
   let m3u;
   try{ const r=await fetch("/vlc/"+id+"/open.m3u"); if(!r.ok){ toast("Couldn't resolve that source"); return; } m3u=await r.text(); }
   catch(e){ toast("spela unreachable"); return; }
