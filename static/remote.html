@@ -348,6 +348,28 @@
     border-radius:50%;animation:rot .8s linear infinite}
   @keyframes rot{to{transform:rotate(360deg)}}
 
+  /* ---- lower-third loading panel (2026-08-04): the warmup + VLC-buffer + play-error
+     surfaces as a bottom-third overlay over the current view (search/home stay
+     visible), NOT a fullscreen #/now takeover. Slides up when active. ---- */
+  #warmpanel{position:fixed;left:0;right:0;bottom:0;z-index:35;background:var(--bg2);
+    border-top:1px solid var(--line);border-radius:18px 18px 0 0;
+    box-shadow:0 -14px 44px rgba(0,0,0,.55);padding:1rem 1rem calc(1rem + var(--safe-b));
+    transform:translateY(115%);transition:transform .28s cubic-bezier(.2,.8,.2,1);
+    max-height:42vh;overflow:hidden}
+  #warmpanel.on{transform:none}
+  .wp{display:flex;gap:.9rem;align-items:stretch}
+  .wpthumb{flex:0 0 auto;width:78px;aspect-ratio:2/3;border-radius:11px;object-fit:cover;
+    background:var(--bg3);box-shadow:0 8px 22px rgba(0,0,0,.45)}
+  .wpbody{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:.5rem;justify-content:center}
+  .wptitle{font-weight:800;font-size:1.02rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .wpphase{display:flex;align-items:center;gap:.55rem;color:var(--warn);font-weight:700;font-size:.92rem}
+  .wpphase .spin{width:18px;height:18px;border-width:2px}
+  .wp .wbar{width:100%;margin:.05rem 0}
+  .wpsub{color:var(--dim);font-size:.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .wpact{display:flex;gap:.6rem;margin-top:.15rem;flex-wrap:wrap}
+  .wperr .wpphase{color:var(--bad)}
+  .srcbtn.primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
+
   /* ---- target sheet ---- */
   .scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:50;display:none}
   .scrim.on{display:block}
@@ -506,6 +528,8 @@
   <button class="tbtn" id="nbExpand" title="Open player" aria-label="Open player" data-ic="expand"></button>
 </div>
 
+<div id="warmpanel"></div>
+
 <div class="toast" id="toast"></div>
 <div class="scrim" id="scrim"></div>
 <div class="sheet" id="sheet">
@@ -535,8 +559,9 @@ const S={
   now:{data:null,posAbs:0,dur:0,frontier:0,endlist:false,playing:false,lastSync:0,
        everRan:false,cold:false,seekDrag:false,phone:false,
        warming:false,warmup:null,warmupData:null,   // 2026-07-04 live warmup progress
+       vlc:false,vlcTitle:"",   // 2026-08-04 VLC-on-this-Mac remote-control now-view
        error:null},   // 2026-07-08 persistent play-start failure {title,poster,msg,retry}
-  pollTimer:null, frontierTimer:null, warmTimer:null,
+  pollTimer:null, frontierTimer:null, warmTimer:null, vlcTimer:null,
   pending:null,   // deferred play: tapped before a target was set → picker → resume
   followedIds:null   // Set<tmdb_id> of followed shows; lazily loaded (ensureFollowedIds)
 };
@@ -577,7 +602,7 @@ async function vlcWaitReady(id){
     if(d && d.ready) return true;
     // Drive the loading surface (not a transient toast) — matches the Chromecast warmup.
     S.now.warmup={active:true, vlc:true, pct:(d&&d.pct!=null)?d.pct:0};
-    if(S.now.warming) renderNowFull();
+    if(S.now.warming) renderWarmPanel();
     await new Promise(r=>setTimeout(r,1500));
   }
   S.now.vlcErr="Still buffering — the swarm may be slow."; return false;
@@ -596,7 +621,17 @@ async function openInVlc(id,title,poster){
   catch(e){ showPlayError(title||"VLC",poster,"spela unreachable",()=>openInVlc(id,title,poster)); return; }
   const url=(m3u.split("\n").find(l=>l.startsWith("http"))||"").trim();
   if(!url){ showPlayError(title||"VLC",poster,"No stream URL.",()=>openInVlc(id,title,poster)); return; }
-  endWarming(); toast("Opening in VLC…");
+  endWarming();
+  // 2026-08-04: VLC-on-this-Mac becomes a controllable now-view (parity with
+  // Chromecast). The Mac-side spela-vlc-watcher relays pause/resume/seek from the
+  // web remote to VLC's HTTP interface; its /position POST feeds the scrubber.
+  S.now.vlc=true; S.now.phone=false; S.now.cold=false; S.now.playing=true; S.now.error=null;
+  S.now.endlist=true; S.now.frontier=0; S.now.posAbs=0; S.now.dur=0;
+  S.now.lastSync=Date.now(); S.now.vlcTitle="";
+  S.now.data={title:title||"VLC",poster_url:poster||"",quality:"",target:":VLC",imdb_id:"",ss_offset:0};
+  stopPolling();   // the Chromecast /status poll must NOT run for a VLC stream
+  location.hash="#/now"; renderNowFull(); startVlcPoll();
+  toast("Opening in VLC…");
   // Fire the vlc:// scheme (one-click if the handler is installed → VLC launches,
   // window blurs). No blur within 1.2s → fall back to downloading the .m3u.
   let blurred=false; const onblur=()=>{blurred=true;};
@@ -1270,31 +1305,38 @@ function iconizeStatic(){ document.querySelectorAll("[data-ic]").forEach(e=>{
    window (30-60s+). Instead of leaving the user staring at the search view,
    we navigate to a live progress screen IMMEDIATELY and poll GET /progress
    every 1s while /play is awaited in the background. */
+/* 2026-08-04: the loading surface is a LOWER-THIRD overlay (#warmpanel) layered
+   over the current view (search/home stay visible), NOT a fullscreen #/now
+   takeover. beginWarming shows the panel + stays put; success paths navigate to
+   #/now themselves (now-playing is a full view, loading is not). */
+function showWarmPanel(){ const p=$("#warmpanel"); if(p) p.classList.add("on"); }
+function hideWarmPanel(){ const p=$("#warmpanel"); if(p){ p.classList.remove("on"); p.classList.remove("wperr"); } }
 function beginWarming(title,poster){
   S.now.error=null;   // a fresh attempt clears any prior failure surface
   S.now.warming=true; S.now.warmup=null; S.now.warmupData={title:title||"Playing",poster:poster||""};
   S.now.data=null; S.now.phone=false;
-  location.hash="#/now"; renderNowFull(); startWarmupPoll();
+  S.now.vlc=false; stopVlcPoll();   // a fresh play supersedes any prior VLC now-view
+  showWarmPanel(); renderWarmPanel(); startWarmupPoll();
 }
 /* Persistent play-START failure surface (2026-07-08, UX doc §6/§9): a failed
    start is NOT a transient toast that bounces to Search (toast-only-critical is
-   an anti-pattern — the recovery path vanishes). Instead keep the failed item +
-   a "Tap to retry" ATTACHED to the now-playing surface until the user retries,
-   goes back, or a fresh attempt clears it. */
+   an anti-pattern — the recovery path vanishes). It stays in the SAME bottom
+   panel with "Tap to retry" until the user retries, goes back, or a fresh
+   attempt clears it — the loading surface's failure state, in place. */
 function showPlayError(title,poster,msg,retry){
-  endWarming();
+  S.now.warming=false; stopWarmupPoll();   // stop the loading poll but KEEP the panel up for the error
   S.now.error={title:title||"Couldn’t start",poster:poster||"",msg:msg||"unknown error",retry:retry||null};
   S.now.data=null; S.now.phone=false; S.now.cold=false; S.now.playing=false;
-  location.hash="#/now"; renderNowFull();
+  showWarmPanel(); renderErrPanel();
 }
-function endWarming(){ S.now.warming=false; stopWarmupPoll(); }
+function endWarming(){ S.now.warming=false; stopWarmupPoll(); hideWarmPanel(); }
 function startWarmupPoll(){ if(S.warmTimer)return; pollWarmup(); S.warmTimer=setInterval(pollWarmup,1000); }
 function stopWarmupPoll(){ clearInterval(S.warmTimer); S.warmTimer=null; }
 async function pollWarmup(){
   let p; try{ p=await api("/progress"); }catch{ return; }
   if(!p||!p.active) return;                 // do_play hasn't published yet (race) — keep last frame
   S.now.warmup=p;
-  if(currentView()==="now" && S.now.warming) renderNowFull();
+  if(S.now.warming) renderWarmPanel();
 }
 function fmtSpeed(bps){ if(!bps) return "0 KB/s"; const mb=bps/1e6;
   return mb>=1 ? mb.toFixed(1)+" MB/s" : Math.round(bps/1e3)+" KB/s"; }
@@ -1314,7 +1356,7 @@ async function doPlay(opts,cardForSources){
   if(r&&r.error){ showPlayError(label,opts.poster_url,r.error,()=>doPlay(opts,cardForSources)); return; }
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   S.now.data={title:label,poster_url:opts.poster_url||"",quality:"",target:":"+(S.target&&S.target.name||"")};
-  renderNowFull(); pollNow(true);
+  location.hash="#/now"; renderNowFull(); pollNow(true);   // playing → the full now-view (loading stayed in the panel)
 }
 
 /* Fast-play: search a title + play its best source directly (the ▶ on Continue /
@@ -1370,7 +1412,7 @@ async function doPhoneDirect(opts,cardForSources,label){
   if(r&&r.error){ showPlayError(label||opts.title,opts.poster_url,r.error,()=>doPhoneDirect(opts,cardForSources,label)); return; }
   S.now.phone=true; S.now.phoneLoading=false; S.now.everRan=true; S.now.playing=true;
   S.now.data={title:label||"Playing",quality:"",poster_url:opts.poster_url||""};
-  renderNowFull();                                               // build the <video> + buffering overlay
+  location.hash="#/now"; renderNowFull();                       // playing → now-view builds the <video> + buffering overlay
   pollNow(true);
 }
 let _hlsLoading;
@@ -1419,7 +1461,7 @@ async function doPlayLibrary(entry){
   if(r&&r.error){ showPlayError(entry.title,entry.poster_url,r.error,()=>doPlayLibrary(entry)); return; }
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   S.now.data={title:entry.title,poster_url:entry.poster_url||"",quality:"",target:":"+(S.target&&S.target.name||"")};
-  renderNowFull(); pollNow(true);
+  location.hash="#/now"; renderNowFull(); pollNow(true);   // playing → the full now-view (loading stayed in the panel)
 }
 async function renderLibrary(force){
   const out=$("#libraryOut"); if(!out) return;
@@ -1555,12 +1597,34 @@ function openSheet(){
 /* ---------- now-playing: status poll (visibility+active gated) ---------- */
 function startPolling(){ if(S.pollTimer)return; S.pollTimer=setInterval(()=>pollNow(false),3000); }
 function stopPolling(){ clearInterval(S.pollTimer); S.pollTimer=null; }
+/* VLC-on-this-Mac poll (2026-08-04): distinct from pollNow (which reads /status
+   for a CurrentStream — VLC has none). Tracks the scrubber position from
+   /api/position (fed by the Mac watcher's /position POST) + refreshes the title
+   from /status while vlc_active is fresh. Does NOT auto-clear on !vlc_active —
+   that flag is only true ~30s after VLC's last byte fetch, so a buffered-ahead
+   quiet VLC would look "ended". The user stops via the Stop button. */
+function startVlcPoll(){ if(S.vlcTimer)return; pollVlc(); S.vlcTimer=setInterval(pollVlc,3000); }
+function stopVlcPoll(){ clearInterval(S.vlcTimer); S.vlcTimer=null; }
+async function pollVlc(){
+  if(!S.now.vlc){ stopVlcPoll(); return; }
+  let s={}; try{ s=await api("/status"); }catch{}
+  if(s.vlc_active && s.title){ S.now.vlcTitle=s.title; if(s.imdb_id&&S.now.data) S.now.data.imdb_id=s.imdb_id; }
+  const title=S.now.vlcTitle;
+  if(title){
+    try{ const p=await api(`/api/position?title=${encodeURIComponent(title)}`);
+      if(p){ if(typeof p.t==="number"&&p.t>=0){ S.now.posAbs=p.t; S.now.lastSync=Date.now(); }
+             if(p.dur>0) S.now.dur=p.dur; } }catch{}
+  }
+  $("#nowbar").classList.add("on"); updateNowBar();
+  if(currentView()==="now" && !S.now.seekDrag) renderNowFull();
+}
 document.addEventListener("visibilitychange",()=>{
   if(document.visibilityState==="visible"){ pollNow(true); }
   else stopPolling();
 });
 
 async function pollNow(force){
+  if(S.now.vlc) return;       // 2026-08-04: VLC-on-this-Mac has its own poll (pollVlc); /status has no `current` for it
   if(S.now.warming) return;   // 2026-07-04: the warmup poll owns the screen until /play resolves
   if(document.visibilityState!=="visible"&&!force) return;
   let s; try{ s=await api("/status"); }catch{ return; }
@@ -1659,9 +1723,13 @@ function updateNowBar(){
 }
 
 /* ---------- now-playing: full view + scrubber ---------- */
-/* 2026-07-04: live warmup screen — phase label + progress bar + second-by-second
-   stats (download %/speed/peers OR transcode segments), fed by GET /progress. */
-function renderWarmupInto(root){
+/* 2026-08-04: live warmup rendered into the LOWER-THIRD panel (#warmpanel) —
+   phase label + progress bar + second-by-second stats (download %/speed/peers
+   OR transcode segments OR VLC buffer), fed by GET /progress (and vlcWaitReady
+   for the VLC path). Compact horizontal layout: poster thumb + body. */
+function renderWarmPanel(){
+  const root=$("#warmpanel"); if(!root) return;
+  root.classList.remove("wperr");
   const w=S.now.warmup||{}, wd=S.now.warmupData||{};
   const title=w.title||wd.title||"Loading…", poster=wd.poster||"";
   const phase=w.phase||"connecting", t=w.torrent;
@@ -1682,38 +1750,47 @@ function renderWarmupInto(root){
     sub=t?`${t.peers||0} peer${t.peers===1?"":"s"}`:"finding sources";
   }
   const el=(w.elapsed_secs!=null)?` · ${w.elapsed_secs}s`:"";
-  root.innerHTML=`<div class="nowfull" id="warmup">
-    ${poster?`<img class="bigposter" src="${esc(posterSrc(poster))}" alt="">`:""}
-    <h2>${esc(title)}</h2>
-    <div class="starting"><div class="spin"></div>${esc(label)}</div>
-    ${barPct!=null?`<div class="wbar"><div class="wfill" style="width:${barPct}%"></div></div>`:""}
-    <div class="sub">${esc(sub)}${el}</div>
-    <div class="transport"><button class="srcbtn" id="wCancel">${ic("stop")}Cancel</button></div>
+  root.innerHTML=`<div class="wp">
+    ${poster?`<img class="wpthumb" src="${esc(posterSrc(poster))}" alt="">`:""}
+    <div class="wpbody">
+      <div class="wptitle">${esc(title)}</div>
+      <div class="wpphase"><div class="spin"></div>${esc(label)}</div>
+      ${barPct!=null?`<div class="wbar"><div class="wfill" style="width:${barPct}%"></div></div>`:""}
+      <div class="wpsub">${esc(sub)}${el}</div>
+      <div class="wpact"><button class="srcbtn" id="wCancel">${ic("stop")}Cancel</button></div>
+    </div>
   </div>`;
   const cb=$("#wCancel");
   if(cb) cb.onclick=async()=>{ endWarming(); S.now.data=null;
-    await api("/stop",{method:"POST"}).catch(()=>{}); location.hash="#/search"; };
+    await api("/stop",{method:"POST"}).catch(()=>{}); };
+}
+/* Play-start failure, rendered into the same bottom panel (persistent, in place). */
+function renderErrPanel(){
+  const root=$("#warmpanel"); if(!root) return;
+  root.classList.add("wperr");
+  const e=S.now.error||{};
+  root.innerHTML=`<div class="wp">
+    ${e.poster?`<img class="wpthumb" src="${esc(posterSrc(e.poster))}" alt="">`:""}
+    <div class="wpbody">
+      <div class="wptitle">${esc(e.title||"Couldn’t start")}</div>
+      <div class="wpphase">Couldn’t start</div>
+      <div class="wpsub">${esc(e.msg||"unknown error")}</div>
+      <div class="wpact">
+        ${e.retry?`<button class="srcbtn primary" id="errRetry">${ic("refresh")}Tap to retry</button>`:""}
+        <button class="srcbtn" id="errBack">Dismiss</button>
+      </div>
+    </div>
+  </div>`;
+  const rb=$("#errRetry"); if(rb) rb.onclick=()=>{ const fn=e.retry; S.now.error=null; hideWarmPanel(); if(fn) fn(); };
+  $("#errBack").onclick=()=>{ S.now.error=null; hideWarmPanel(); };
 }
 function renderNowFull(){
   const root=$("#nowFull");
-  if(S.now.warming){ renderWarmupInto(root); return; }   // 2026-07-04 live warmup screen
-  if(S.now.error){                                       // 2026-07-08 persistent play-start failure
-    const e=S.now.error;
-    root.innerHTML=`<div class="nowfull">
-      ${e.poster?`<img class="bigposter" src="${esc(posterSrc(e.poster))}" alt="">`:""}
-      <h2>${esc(e.title)}</h2>
-      <div class="errbox">
-        <div class="errmsg">Couldn’t start — ${esc(e.msg)}</div>
-        <div class="transport">
-          ${e.retry?`<button class="srcbtn primary" id="errRetry">${ic("refresh")}Tap to retry</button>`:""}
-          <button class="srcbtn" id="errBack">${ic("search")}Back to search</button>
-        </div>
-      </div>
-    </div>`;
-    const rb=$("#errRetry"); if(rb) rb.onclick=()=>{ const fn=e.retry; S.now.error=null; if(fn) fn(); };
-    $("#errBack").onclick=()=>{ S.now.error=null; location.hash="#/search"; };
-    return;
-  }
+  // 2026-08-04: loading + play-error now live in the lower-third #warmpanel, not
+  // here. If the user opens the Now tab mid-load, show a slim pointer (the panel
+  // below carries the live progress).
+  if(S.now.warming){ root.innerHTML=`<div class="state"><div class="big">Starting…</div>Progress is shown in the panel below.</div>`; return; }
+  if(S.now.error){ root.innerHTML=`<div class="state"><div class="big">Couldn’t start</div>${esc(S.now.error.msg||"")} — see the panel below.</div>`; return; }
   const c=S.now.data;
   if(!c){ root.innerHTML=`<div class="state"><div class="big">Nothing playing</div>Start something from Search.</div>`; return; }
   if(S.now.phone){
@@ -1773,6 +1850,10 @@ function renderNowFull(){
   sl.addEventListener("change",async()=>{
     const v=+sl.value;
     S.now.seekDrag=false; S.now.posAbs=v; S.now.lastSync=Date.now();
+    if(S.now.vlc){   // VLC: absolute-seconds seek via the Mac-watcher relay
+      const rv=await api("/vlc/control",{method:"POST",body:{cmd:"seek",val:String(Math.round(v))}}).catch(()=>({error:"unreachable"}));
+      if(rv&&rv.error) toast("Seek failed"); return;
+    }
     // Past the transcoded frontier while still transcoding → RE-TRANSCODE
     // from there (user's "play from that time", NOT clamp-to-edge).
     // BEFORE the transcode's start point (ss_offset — e.g. an auto-resume
@@ -1809,6 +1890,13 @@ async function transport(path){ await api(path,{method:"POST"}).catch(()=>toast(
    brief "Stopped" toast, and the backend stops the cast itself. */
 async function stopPlayback(){
   if(S.now.stopping) return;
+  if(S.now.vlc){   // VLC: tell the Mac watcher to stop VLC, clear the now-view
+    S.now.stopping=true; stopVlcPoll();
+    await api("/vlc/control",{method:"POST",body:{cmd:"stop"}}).catch(()=>{});
+    toast("Stopped VLC");
+    S.now.vlc=false; S.now.data=null; S.now.playing=false; S.now.stopping=false;
+    $("#nowbar").classList.remove("on"); renderNowFull(); return;
+  }
   S.now.stopping=true; stopPolling();
   const nf=$("#nowFull");
   if(nf){ nf.style.transition="opacity .28s ease"; nf.style.opacity=".28"; }
@@ -1826,12 +1914,21 @@ async function togglePlay(){
   S.now.playing=!toPause;
   if(!toPause){ S.now.lastSync=Date.now(); }   // resuming: restart interpolation clock
   updateNowBar(); if(currentView()==="now") renderNowFull();
+  if(S.now.vlc){   // VLC: relay via the Mac watcher (pl_forcepause / pl_forceresume)
+    await api("/vlc/control",{method:"POST",body:{cmd:toPause?"pause":"resume"}}).catch(()=>toast("spela unreachable"));
+    return;
+  }
   await api(toPause?"/pause":"/resume",{method:"POST"}).catch(()=>toast("spela unreachable"));
   setTimeout(()=>pollNow(true),900);           // re-sync position only; never play-state
 }
 async function restart(){
   S.now.posAbs=0; S.now.lastSync=Date.now(); S.now.playing=true;
   updateNowBar(); if(currentView()==="now") renderNowFull();
+  if(S.now.vlc){   // VLC: seek to 0 via the relay
+    const rv=await api("/vlc/control",{method:"POST",body:{cmd:"seek",val:"0"}}).catch(()=>({error:"unreachable"}));
+    if(rv&&rv.error) toast("Restart failed"); else toast("Rewound to the start");
+    return;
+  }
   const r=await api("/seek",{method:"POST",body:{seconds:0}}).catch(()=>({error:"unreachable"}));
   if(r&&r.error) toast("Restart failed: "+r.error); else toast("Rewound to the start");
 }

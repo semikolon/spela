@@ -70,6 +70,13 @@ pub struct ServerState {
     /// request stamps this; `/status` reports `vlc_active` when recent (<30s),
     /// so consumers (Ruby, the desk-dim daemon) can see VLC-on-this-Mac.
     pub vlc_activity: Mutex<Option<(Instant, String, Option<String>)>>,
+    /// 2026-08-04: pending VLC control commands (pause/resume/seek/stop) for the
+    /// Mac-side `spela-vlc-watcher` to drain + apply to the local VLC HTTP
+    /// interface. spela runs on Darwin and CANNOT reach the Mac's loopback VLC,
+    /// so the already-running watcher (which polls spela) is the relay: the web
+    /// remote POSTs `/vlc/control` here, the watcher GETs `/vlc/pending` (drains)
+    /// and issues the matching `?command=` to VLC. Each item = `{"cmd":..,"val":..}`.
+    pub vlc_commands: Mutex<Vec<Value>>,
 }
 
 /// Live playback position for the web-remote scrubber (see `live_position`).
@@ -77,6 +84,10 @@ pub struct ServerState {
 pub struct LivePosition {
     pub title: String,
     pub abs_secs: f64,
+    /// 2026-08-04: media duration (0 if unknown). Only the VLC scrubber reads
+    /// this (via `/api/position`) — the Chromecast scrubber takes duration from
+    /// `/status`'s `current.duration`. The VLC watcher's `/position` POST feeds it.
+    pub dur: f64,
 }
 
 type SharedState = Arc<ServerState>;
@@ -239,6 +250,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         warmup: Mutex::new(None),
         live_position: Mutex::new(None),
         vlc_activity: Mutex::new(None),
+        vlc_commands: Mutex::new(Vec::new()),
     });
 
     // 2026-07-13 (slice 5): background watch tracker — polls house Chromecasts,
@@ -315,7 +327,10 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/following/mark", post(handle_following_mark))
         .route("/following/add", post(handle_following_add))
         .route("/following/remove", post(handle_following_remove))
-        .route("/following/seen-seasons", post(handle_following_seen_seasons))
+        .route(
+            "/following/seen-seasons",
+            post(handle_following_seen_seasons),
+        )
         .route("/position", post(handle_position))
         .route("/poster/{size}/{file}", get(handle_poster))
         // Web-remote My Library (US-3): aggregate curated collection
@@ -349,6 +364,8 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/vlc/{id}/stream", get(handle_vlc_stream))
         .route("/vlc/{id}/ready", get(handle_vlc_ready))
         .route("/vlc/{id}/open.m3u", get(handle_vlc_playlist))
+        .route("/vlc/control", post(handle_vlc_control))
+        .route("/vlc/pending", get(handle_vlc_pending))
         .route("/hls/master.m3u8", get(handle_hls_master))
         .route("/hls/playlist.m3u8", get(handle_hls_playlist))
         .route("/hls/init.mp4", get(handle_hls_init))
@@ -2294,7 +2311,11 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                             } else {
                                 FAIL_FAST_STREAM_START_SECS
                             };
-                            if should_fail_fast_with_deadline(elapsed_secs, seg_count, fail_fast_secs) {
+                            if should_fail_fast_with_deadline(
+                                elapsed_secs,
+                                seg_count,
+                                fail_fast_secs,
+                            ) {
                                 tracing::error!(
                                     "HLS stream-start fail-fast: {}s elapsed with 0 segments. \
                                  Likely starved swarm or bad source — returning error so \
@@ -3999,6 +4020,7 @@ async fn cast_health_monitor(
                             *lock_recover(&state.live_position) = Some(LivePosition {
                                 title: t.clone(),
                                 abs_secs: absolute,
+                                dur: 0.0,
                             });
                         }
                     }
@@ -4580,8 +4602,8 @@ async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
         };
         // season/episode/show are populated at the source (save_position_smart parses
         // them from the title for VLC plays), so the fold reads the struct fields.
-        let e_title =
-            crate::search::clean_title_for_tmdb(e.show.as_deref().unwrap_or(&e.title)).to_lowercase();
+        let e_title = crate::search::clean_title_for_tmdb(e.show.as_deref().unwrap_or(&e.title))
+            .to_lowercase();
         let matched = if e.season.is_some() && e.episode.is_some() {
             new_eps.iter_mut().find(|r| {
                 r["next_unwatched_season"].as_u64() == e.season.map(|v| v as u64)
@@ -4686,9 +4708,7 @@ struct SetRecommendationsRequest {
 /// autonomous harness later) writes the full ranked pick list. Replace semantics:
 /// curation is a whole-list judgement. Capped so a runaway harness can't bloat the
 /// store.
-async fn handle_recommendations_set(
-    Json(req): Json<SetRecommendationsRequest>,
-) -> Json<Value> {
+async fn handle_recommendations_set(Json(req): Json<SetRecommendationsRequest>) -> Json<Value> {
     let mut picks = req.picks;
     picks.truncate(100);
     match crate::recommendations::set_picks(picks, req.generated_by) {
@@ -4819,9 +4839,26 @@ async fn handle_position(
     Json(req): Json<SetResumeRequest>,
 ) -> Json<Value> {
     let mut app = AppState::load(&state.state_dir);
-    let (key, changed) = app.save_position_smart(req.imdb_id, req.title, req.seconds, req.duration);
+    let (key, changed) = app.save_position_smart(
+        req.imdb_id.clone(),
+        req.title.clone(),
+        req.seconds,
+        req.duration,
+    );
     if changed {
         let _ = app.save(&state.state_dir);
+    }
+    // 2026-08-04: the Mac-side VLC watcher POSTs VLC's true playhead here every
+    // poll. Mirror it into the live cell (non-max, unlike the HWM) so the
+    // web-remote VLC scrubber shows the ACTUAL position + can reflect a rewind —
+    // and carry duration for the scrubber's max. Title-keyed to the watcher's
+    // /status-derived title, which `/api/position` queries with (same source).
+    if let Some(t) = req.title.clone() {
+        *lock_recover(&state.live_position) = Some(LivePosition {
+            title: t,
+            abs_secs: req.seconds,
+            dur: req.duration.unwrap_or(0.0),
+        });
     }
     Json(json!({ "ok": changed, "key": key }))
 }
@@ -4991,6 +5028,7 @@ async fn handle_seek(
             *lock_recover(&state.live_position) = Some(LivePosition {
                 title: current.title.clone(),
                 abs_secs: absolute_pos,
+                dur: 0.0,
             });
             tracing::info!(
                 "Seek: '{}' on '{}' to absolute {:.0}s (stream {:.0}s, ss_offset={:.0}s)",
@@ -7196,6 +7234,31 @@ fn vlc_audio_lang_pref(orig: &str) -> String {
 /// VLC decodes HEVC/Dolby-Vision natively. LAN-scoped (Host-allowlist applies);
 /// serving an already-managed torrent's FileStream is bytes-only (no SSRF — the
 /// magnet was validated at start), so it needs no loopback gate.
+/// `POST /vlc/control` — enqueue a VLC control command for the Mac-side
+/// `spela-vlc-watcher` to apply (spela can't reach the Mac's loopback VLC).
+/// Body `{"cmd":"pause"|"resume"|"seek"|"stop", "val":"<secs>"?}`. The watcher
+/// drains via `/vlc/pending` on its next tick (~1s) and issues the VLC
+/// `?command=pl_forcepause|pl_forceresume|seek&val=..|pl_stop`.
+async fn handle_vlc_control(
+    State(state): State<SharedState>,
+    Json(cmd): Json<Value>,
+) -> Json<Value> {
+    let mut q = lock_recover(&state.vlc_commands);
+    // Cap the queue so a watcher that isn't running (VLC closed) can't let
+    // commands accumulate unbounded.
+    if q.len() < 32 {
+        q.push(cmd);
+    }
+    Json(json!({ "ok": true }))
+}
+
+/// `GET /vlc/pending` — the watcher drains all queued VLC commands (returns +
+/// clears). Returns `{"cmds":[{"cmd":..,"val":..}, ...]}`.
+async fn handle_vlc_pending(State(state): State<SharedState>) -> Json<Value> {
+    let cmds: Vec<Value> = std::mem::take(&mut *lock_recover(&state.vlc_commands));
+    Json(json!({ "cmds": cmds }))
+}
+
 async fn handle_vlc_stream(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
@@ -7853,11 +7916,20 @@ async fn handle_get_position(
         lock_recover(&state.live_position).as_ref(),
         query.title.as_deref(),
     );
+    // 2026-08-04: duration from the live cell (VLC watcher feeds it) so the VLC
+    // scrubber has a max; 0 when unknown (Chromecast reads dur from /status).
+    let dur = {
+        let g = lock_recover(&state.live_position);
+        g.as_ref()
+            .filter(|lp| Some(lp.title.as_str()) == query.title.as_deref())
+            .map(|lp| lp.dur)
+            .unwrap_or(0.0)
+    };
     let pos = match live {
         Some(p) => p,
         None => AppState::load(&state.state_dir).get_position(query.imdb_id.clone(), query.title),
     };
-    Json(json!({"imdb_id": query.imdb_id, "t": pos}))
+    Json(json!({"imdb_id": query.imdb_id, "t": pos, "dur": dur}))
 }
 
 /// Pure decision for the scrubber's live position: return the live cell's
@@ -8285,6 +8357,7 @@ mod tests {
         let live = LivePosition {
             title: "Spider-Noir S01E02".into(),
             abs_secs: 1375.0,
+            dur: 0.0,
         };
         // Backward seek to 1375 on the SAME stream → live wins (would snap to
         // the 1575 HWM without this).
