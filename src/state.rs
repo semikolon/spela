@@ -359,6 +359,20 @@ impl AppState {
             Some(c) => (c.show.clone(), c.season, c.episode, c.poster_url.clone()),
             None => (None, None, None, None),
         };
+        // Open-in-VLC plays are tracked via the watcher's POST /position and never
+        // set `current`, so recover show + SxxExx from the title spela itself
+        // encoded into it — making season/episode correct AT THE SOURCE for every
+        // consumer (the Continue/New-Episodes fold, the row display, …).
+        let (cur_show, cur_season, cur_episode) = if cur_season.is_none() {
+            let (ps, s, e) = title
+                .as_deref()
+                .map(crate::search::parse_episode_markers)
+                .unwrap_or_default();
+            let show = cur_show.or_else(|| (s.is_some() && !ps.is_empty()).then_some(ps));
+            (show, s, e)
+        } else {
+            (cur_show, cur_season, cur_episode)
+        };
 
         // --- Completion Logic ---
         // Clear the HWM when the user has effectively watched to the end.
@@ -1051,5 +1065,23 @@ mod tests {
         // Reaching the end clears it (completion branch → reset_position).
         app.save_position_smart(Some("tt15239678".into()), Some("Dune Part Two".into()), 8900.0, Some(9000.0));
         assert!(app.in_progress_list().is_empty());
+    }
+
+    #[test]
+    fn test_in_progress_recovers_se_from_title_when_no_stream() {
+        // An Open-in-VLC play never sets `current`, so season/episode must be
+        // recovered from the title spela encoded (the source-fix).
+        let mut app = AppState::default();
+        app.current = None;
+        app.save_position_smart(
+            Some("tt0944947".into()),
+            Some("House of the Dragon S03E07".into()),
+            3000.0,
+            Some(4000.0),
+        );
+        let e = app.in_progress_list();
+        assert_eq!(e[0].season, Some(3));
+        assert_eq!(e[0].episode, Some(7));
+        assert_eq!(e[0].show.as_deref(), Some("House of the Dragon"));
     }
 }
