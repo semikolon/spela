@@ -7050,6 +7050,19 @@ async fn handle_vlc_stream(
             return serve_static_with_range(path, "video/x-matroska", &headers).await;
         }
     }
+    // Prime the first + last pieces (MKV Cues / header) so VLC's container probe
+    // succeeds on a partial torrent instead of hanging on the not-yet-downloaded tail
+    // (2026-08-03 "4K waits forever"). Only on the initial open (no Range / bytes=0-),
+    // so per-seek re-requests don't pile up prefetch tasks.
+    let is_initial_open = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .map_or(true, |r| r == "bytes=0-");
+    if is_initial_open {
+        state
+            .torrent_engine
+            .prefetch_ends(tid, file_index.unwrap_or(0) as usize);
+    }
     tracing::info!(
         "VLC: result #{} → torrent {} FileStream (progressive) (range={:?})",
         id,

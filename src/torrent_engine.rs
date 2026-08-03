@@ -293,6 +293,42 @@ impl TorrentEngine {
     /// Number of torrents started across this engine's lifetime. Diagnostic
     /// only — doesn't reflect currently-active count (use the session API for
     /// that).
+    /// Best-effort "download first AND last pieces first" primer (2026-08-03).
+    /// A player probes the container before playback — track headers (front) + the
+    /// seek index (MKV **Cues** / MP4 **moov**), and MKV keeps its Cues at the END.
+    /// Torrents fetch rarest-first, so the tail (Cues) often isn't present and VLC's
+    /// end-probe BLOCKS on it → "waits forever" on a fresh/partial torrent. Reading a
+    /// byte range through a `FileStream` makes librqbit PRIORITIZE those pieces, so
+    /// this opens a stream and reads the last + first couple MB, priming exactly the
+    /// pieces VLC needs to start. Fire-and-forget: spawned, all errors swallowed,
+    /// NEVER blocks the caller or the serve path (safe to stage unverified — it's
+    /// additive and isolated). The read of a not-yet-downloaded tail simply waits
+    /// while librqbit fetches it with priority; that's the point.
+    pub fn prefetch_ends(&self, id: u32, file_idx: usize) {
+        let Some(handle) = self.handle(id) else {
+            return;
+        };
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            const CHUNK: u64 = 2 * 1024 * 1024; // 2 MB per end
+            // Tail first — the MKV Cues live at the end; that's the piece VLC blocks on.
+            if let Ok(mut s) = handle.clone().stream(file_idx) {
+                let len = s.len();
+                if len > CHUNK
+                    && s.seek(std::io::SeekFrom::Start(len - CHUNK)).await.is_ok()
+                {
+                    let mut buf = vec![0u8; CHUNK as usize];
+                    let _ = s.read_exact(&mut buf).await;
+                }
+            }
+            // Head — container header / track info (also served first for playback).
+            if let Ok(mut s) = handle.stream(file_idx) {
+                let mut buf = vec![0u8; CHUNK as usize];
+                let _ = s.read_exact(&mut buf).await;
+            }
+        });
+    }
+
     pub fn started_count(&self) -> u32 {
         self.started_count.load(Ordering::Relaxed)
     }

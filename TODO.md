@@ -1,5 +1,14 @@
 # Spela TODOs 🎬🍿
 
+### 4K / partial-torrent VLC "buffer then AUTO-play" (2026-08-03 — the real fix for "waits forever + manual re-click")
+**Why VLC hangs on a fresh 4K torrent** (research-confirmed): a player must PROBE the container before playback — track headers (front) + the seek index (MKV **Cues** / MP4 **moov**), and MKV Cues sit at the **END** of the file. Torrents download rarest-first, so the tail (Cues) + sometimes the head aren't present yet; VLC's end-probe (a Range request for the index) blocks on the not-yet-downloaded tail → hangs. "Enough data" isn't quantity, it's the RIGHT pieces (head + tail-index + a sequential lead buffer). webtorrent/peerflix/Popcorn/qBittorrent all solve it identically: **sequential download + "download first AND last pieces first" + buffer-a-threshold-then-launch-the-player** (peerflix's `--vlc` auto-opens VLC when ready).
+**Fix (reuse spela's existing `/progress` warmup + SPA loading screen, already built for Chromecast):**
+1. VLC path on a PARTIAL torrent: sequential download + **PREFETCH first + last pieces** — seek the librqbit FileStream to `end-1MB` and read (forces librqbit to fetch the Cues pieces), same for the head → VLC's probe succeeds.
+2. **Buffer-gate**: don't fire the `vlc://` launch until head+tail present + a lead buffer sized by download-rate-vs-bitrate.
+3. **AUTO-launch**: SPA shows the `/progress` screen on a VLC play, polls, and auto-fires `vlc://` when spela signals "ready" — no manual quit + re-click.
+4. **4K on a slow swarm** (rate < bitrate → can't stream live regardless): gate to FULL (or rate-safe) download, THEN auto-launch the static serve (smooth + seekable). User never re-clicks; it "starts when ready."
+Check librqbit for a sequential / first-last-piece priority API; else the FileStream head+tail read is the primer. Ranker note: DV profile-5 4K renders poorly in VLC anyway — consider de-prioritising DV for the VLC target.
+
 ### VLC audio/seek reliability (2026-08-03 — open)
 - **Pin the auhal audio-drop trigger.** Mitigation (`network-caching=3000`) shipped; if drops persist, relaunch VLC once with `--verbose 2` during a watch — the `audio device configuration changed, resetting cache` line (VideoLAN #8556) lands at the drop and shows whether it's spurious or triggered by something touching the DAC config mid-play. Then kill the trigger or pin the DAC rate in Audio MIDI Setup. Full diagnosis: CLAUDE.md Hard-Won-Lesson "VLC audio drops + seek-kills". Monitor: `~/.local/bin/spela-audio-drop-monitor` (4h bounded, VLC HTTP stats).
 - **Seek-kill recovery can land on a partial source.** 2026-08-03: a backward seek dropped a HotD S03E06 stream (complete 588MB MeGusta), and the re-open played result #4 — a *different*, still-downloading 3.8GB release — via FileStream, so it couldn't resume. Consider: for the VLC path, prefer a COMPLETE non-sparse on-disk copy of the episode over a sparse/partial one regardless of which result id was tapped.
