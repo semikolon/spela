@@ -77,6 +77,11 @@ pub struct ServerState {
     /// remote POSTs `/vlc/control` here, the watcher GETs `/vlc/pending` (drains)
     /// and issues the matching `?command=` to VLC. Each item = `{"cmd":..,"val":..}`.
     pub vlc_commands: Mutex<Vec<Value>>,
+    /// 2026-08-04: torrent ids started for Open-in-VLC streams, so a NEW VLC play
+    /// can stop the PREVIOUS one. Without this the per-play torrents accumulated
+    /// (never torn down when VLC quits) until they exhausted the FD ceiling and new
+    /// streams failed with EMFILE. Bounded to the current VLC stream.
+    pub vlc_torrents: Mutex<Vec<u32>>,
 }
 
 /// Live playback position for the web-remote scrubber (see `live_position`).
@@ -251,6 +256,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         live_position: Mutex::new(None),
         vlc_activity: Mutex::new(None),
         vlc_commands: Mutex::new(Vec::new()),
+        vlc_torrents: Mutex::new(Vec::new()),
     });
 
     // 2026-07-13 (slice 5): background watch tracker — polls house Chromecasts,
@@ -7463,6 +7469,30 @@ async fn handle_vlc_pending(State(state): State<SharedState>) -> Json<Value> {
     Json(json!({ "cmds": cmds }))
 }
 
+/// 2026-08-04: reap idle VLC torrents. When a NEW Open-in-VLC stream starts a
+/// torrent, stop every PREVIOUSLY-started VLC torrent (you watch one thing at a
+/// time) — freeing their peer connections + file descriptors so per-play torrents
+/// can't accumulate into an EMFILE (the FD-exhaustion leak the 524288 limit only
+/// papered over). Keeps the downloaded data on disk (`delete_files=false`) for
+/// Local-Bypass reuse; stops are spawned fire-and-forget so serving isn't blocked.
+fn reap_previous_vlc_torrents(state: &SharedState, keep: u32) {
+    let to_stop: Vec<u32> = {
+        let mut g = lock_recover(&state.vlc_torrents);
+        let old: Vec<u32> = g.iter().copied().filter(|&t| t != keep).collect();
+        *g = vec![keep];
+        old
+    };
+    for tid in to_stop {
+        let st = state.clone();
+        tokio::spawn(async move {
+            match st.torrent_engine.stop(tid, false).await {
+                Ok(()) => tracing::info!("vlc-torrent reap: stopped superseded torrent {}", tid),
+                Err(e) => tracing::warn!("vlc-torrent reap: stop {} failed: {}", tid, e),
+            }
+        });
+    }
+}
+
 async fn handle_vlc_stream(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
@@ -7512,6 +7542,7 @@ async fn handle_vlc_stream(
                 .into_response();
         }
     };
+    reap_previous_vlc_torrents(&state, tid);
     // 2026-08-03: if the selected file is FULLY downloaded, serve it STATICALLY
     // (fully seekable) rather than via the progressive FileStream. The strict
     // complete-file resolver above misses a season-pack episode (its on-disk size
@@ -7625,6 +7656,7 @@ async fn handle_vlc_ready(
         Ok((tid, _)) => tid,
         Err(_) => return Json(json!({ "ready": false, "pct": 0, "phase": "starting" })),
     };
+    reap_previous_vlc_torrents(&state, tid);
     state
         .torrent_engine
         .prefetch_ends(tid, file_index.unwrap_or(0) as usize);
