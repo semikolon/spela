@@ -49,7 +49,7 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    /following/mark {tmdb_id,season,episode}`, next ep → `mark_watched_auto`); **spela
    completion** (`save_position_smart` → `mark_watched`, the Chromecast/HLS path spela
    position-tracks); and **VLC completion** — the Mac-side
-   `spela-vlc-watcher` launchd agent, since Open-in-VLC serves raw byte-ranges
+   `spela-vlc-bridge` launchd agent, since Open-in-VLC serves raw byte-ranges
    (spela is blind to VLC's playhead). VLC's HTTP control interface exposes the
    playhead (`vlcrc extraintf=http` + password on the Mac → `127.0.0.1:8080/requests/
    status.json`); the agent gets the show identity from spela `/status` and POSTs
@@ -63,7 +63,7 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    to the end, else completion never fires (Silo S03E03 froze at 70% before this fix).
    VLC is NOT opaque — the byte-progress proxy was rejected (MKV tail-reads/seeks) in
    favour of the true playhead. Setup step to reproduce on a fresh Mac: enable VLC's
-   web interface in vlcrc + install the agent plist (`com.fredrikbranstrom.spela-vlc-watcher`).
+   web interface in vlcrc + install the agent plist (`com.fredrikbranstrom.spela-vlc-bridge`).
 
 3. **To-watch list + recommender — arsenal ✅ SHIPPED (2026-07-13, `b4fed13`); harness (curation) = Claude, ongoing.**
    `GET /watchlist` serves `~/.config/spela/watchlist.json` (seeded from the RT

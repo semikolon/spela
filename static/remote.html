@@ -623,7 +623,7 @@ async function openInVlc(id,title,poster){
   if(!url){ showPlayError(title||"VLC",poster,"No stream URL.",()=>openInVlc(id,title,poster)); return; }
   endWarming();
   // 2026-08-04: VLC-on-this-Mac becomes a controllable now-view (parity with
-  // Chromecast). The Mac-side spela-vlc-watcher relays pause/resume/seek from the
+  // Chromecast). The Mac-side spela-vlc-bridge relays pause/resume/seek from the
   // web remote to VLC's HTTP interface; its /position POST feeds the scrubber.
   S.now.vlc=true; S.now.phone=false; S.now.cold=false; S.now.playing=true; S.now.error=null;
   S.now.endlist=true; S.now.frontier=0; S.now.posAbs=0; S.now.dur=0;

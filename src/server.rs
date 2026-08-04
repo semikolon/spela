@@ -71,7 +71,7 @@ pub struct ServerState {
     /// so consumers (Ruby, the desk-dim daemon) can see VLC-on-this-Mac.
     pub vlc_activity: Mutex<Option<(Instant, String, Option<String>)>>,
     /// 2026-08-04: pending VLC control commands (pause/resume/seek/stop) for the
-    /// Mac-side `spela-vlc-watcher` to drain + apply to the local VLC HTTP
+    /// Mac-side `spela-vlc-bridge` to drain + apply to the local VLC HTTP
     /// interface. spela runs on Darwin and CANNOT reach the Mac's loopback VLC,
     /// so the already-running watcher (which polls spela) is the relay: the web
     /// remote POSTs `/vlc/control` here, the watcher GETs `/vlc/pending` (drains)
@@ -7235,7 +7235,7 @@ fn vlc_audio_lang_pref(orig: &str) -> String {
 /// serving an already-managed torrent's FileStream is bytes-only (no SSRF — the
 /// magnet was validated at start), so it needs no loopback gate.
 /// `POST /vlc/control` — enqueue a VLC control command for the Mac-side
-/// `spela-vlc-watcher` to apply (spela can't reach the Mac's loopback VLC).
+/// `spela-vlc-bridge` to apply (spela can't reach the Mac's loopback VLC).
 /// Body `{"cmd":"pause"|"resume"|"seek"|"stop", "val":"<secs>"?}`. The watcher
 /// drains via `/vlc/pending` on its next tick (~1s) and issues the VLC
 /// `?command=pl_forcepause|pl_forceresume|seek&val=..|pl_stop`.
