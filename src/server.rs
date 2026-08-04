@@ -19,7 +19,7 @@ use crate::cast::{self, CastController};
 use crate::config::Config;
 use crate::disk;
 use crate::search::{SearchEngine, SearchResult};
-use crate::state::{AppState, CurrentStream, HWM_CLEAR_FRACTION};
+use crate::state::{AppState, CurrentStream, InProgressEntry, HWM_CLEAR_FRACTION};
 use crate::subtitles;
 use crate::torrent;
 use crate::torrent_engine::{self, TorrentEngine};
@@ -217,7 +217,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         config.port
     );
 
-    reconcile_session_state_on_startup(&state_dir);
+    let stale_stream = reconcile_session_state_on_startup(&state_dir);
 
     // One-time: move legacy following.json `watched_through` baselines into the
     // watch-ledger (the single source of truth for progress). Idempotent — no-op
@@ -426,7 +426,14 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
             require_host_header,
         ))
         .layer(cors)
-        .with_state(state);
+        .with_state(state.clone());
+
+    // Aug 4 2026 (Tier B graceful-restart): if a recent Chromecast stream was
+    // interrupted by this restart, auto-resume it in the background once we're
+    // serving. Fail-safe + Chromecast-scoped (see `maybe_resume_stream_on_boot`).
+    if let Some(prev) = stale_stream {
+        maybe_resume_stream_on_boot(state.clone(), prev);
+    }
 
     let bind_addresses = compute_bind_addresses(&host, port);
     tracing::info!(
@@ -447,19 +454,52 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     // swap the middleware would 500 on every request to /torrent/*.
     let make_service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
-    let mut listeners = Vec::with_capacity(bind_addresses.len());
-    for addr in &bind_addresses {
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("failed to bind {}", addr))?;
-        tracing::info!("spela server listening on http://{}", addr);
-        listeners.push(listener);
+    // Aug 4, 2026 — graceful restart: if systemd handed us listening sockets via
+    // socket activation (the `spela.socket` unit + `listenfd`), SERVE ON THOSE so
+    // the port never drops across a restart. The new process inherits the same
+    // socket; in-flight HLS/byte-range clients just retry and reconnect (no
+    // "connection refused"). Falls back to binding the addresses directly when NOT
+    // under socket activation (CLI `spela server`, the test instance, non-systemd).
+    let mut listeners: Vec<tokio::net::TcpListener> = Vec::new();
+    let mut lf = listenfd::ListenFd::from_env();
+    let mut idx = 0;
+    while let Ok(Some(std_listener)) = lf.take_tcp_listener(idx) {
+        std_listener
+            .set_nonblocking(true)
+            .context("set_nonblocking on inherited socket")?;
+        let l =
+            tokio::net::TcpListener::from_std(std_listener).context("adopt inherited socket")?;
+        if let Ok(a) = l.local_addr() {
+            tracing::info!(
+                "spela server serving on inherited (socket-activated) socket http://{}",
+                a
+            );
+        }
+        listeners.push(l);
+        idx += 1;
+    }
+    if listeners.is_empty() {
+        for addr in &bind_addresses {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("failed to bind {}", addr))?;
+            tracing::info!("spela server listening on http://{}", addr);
+            listeners.push(listener);
+        }
     }
 
     let mut tasks = tokio::task::JoinSet::new();
     for listener in listeners {
         let svc = make_service.clone();
-        tasks.spawn(async move { axum::serve(listener, svc).await });
+        // Graceful shutdown on SIGTERM (systemd sends it on stop/restart): stop
+        // accepting new connections + let in-flight requests finish, then exit.
+        // Paired with socket activation this makes a redeploy near-seamless for
+        // HLS clients. systemd `TimeoutStopSec` bounds the drain (then SIGKILL).
+        tasks.spawn(async move {
+            axum::serve(listener, svc)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+        });
     }
     // If any listener task exits (error or shutdown), surface the result.
     // Movie-night-affecting failures should be visible, not silent.
@@ -471,6 +511,30 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Aug 4, 2026 — resolves when the process receives SIGTERM (systemd stop/
+/// restart) or Ctrl-C, driving axum's `with_graceful_shutdown`.
+async fn shutdown_signal() {
+    use tokio::signal;
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("could not install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    let ctrl_c = async {
+        let _ = signal::ctrl_c().await;
+    };
+    tokio::select! {
+        _ = terminate => tracing::info!("SIGTERM received — graceful shutdown"),
+        _ = ctrl_c => tracing::info!("Ctrl-C received — graceful shutdown"),
+    }
 }
 
 /// Apr 30, 2026 (security audit H3): acquire a Mutex guard, recovering
@@ -645,11 +709,16 @@ async fn require_host_header(
 /// ffmpeg/HLS state is still meaningful, so we conservatively clear that
 /// too. Belt-and-suspenders: kill any lingering Node webtorrent processes
 /// from pre-v3.3.0 deployments that may still be running after an upgrade.
-fn reconcile_session_state_on_startup(state_dir: &PathBuf) {
+fn reconcile_session_state_on_startup(state_dir: &PathBuf) -> Option<CurrentStream> {
     let mut app_state = AppState::load(state_dir);
-    if app_state.current.is_some() {
+    // Aug 4 2026 — take (not just clear) the stale stream so run_server can decide
+    // to AUTO-RESUME a recent interrupted cast (Tier B graceful-restart). The
+    // librqbit Session + ffmpeg are gone after a restart, so `current` is stale as
+    // a LIVE record regardless — but it carries everything needed to re-establish
+    // the play (magnet, target:device, imdb, ss_offset).
+    let stale = app_state.current.take();
+    if stale.is_some() {
         tracing::warn!("Clearing stale current stream on startup (fresh librqbit session)");
-        app_state.current = None;
         let _ = app_state.save(state_dir);
     }
     let killed = torrent::kill_lingering_webtorrent_workers();
@@ -661,6 +730,71 @@ fn reconcile_session_state_on_startup(state_dir: &PathBuf) {
     }
     // webtorrent.pid is obsolete since v3.3.0; remove if present.
     let _ = std::fs::remove_file(state_dir.join("webtorrent.pid"));
+    stale
+}
+
+/// Aug 4 2026 (Tier B graceful-restart): auto-resume a recent CHROMECAST stream
+/// that a restart interrupted. Reconstructs the play from the persisted
+/// `CurrentStream` (magnet + `target` = `"chromecast:<device>"` + resume position)
+/// and re-invokes `do_play` in the background once the server is serving.
+///
+/// Scoped + fail-safe by design: only Chromecast (Open-in-VLC sets no
+/// `CurrentStream`; browser-direct hls.js self-recovers), only recent streams
+/// (≤ 3 h, so a boot hours later doesn't blast an old cast onto the TV), only when
+/// `SPELA_NO_RESUME` is unset. Any failure just leaves "nothing playing" — never
+/// worse than the pre-Tier-B behavior of clearing + forgetting.
+fn maybe_resume_stream_on_boot(state: SharedState, prev: CurrentStream) {
+    let no_resume = std::env::var("SPELA_NO_RESUME").is_ok();
+    let Some(device) = boot_resume_device(&prev, Utc::now(), no_resume) else {
+        tracing::info!(
+            "boot-resume: not resuming '{}' (target={}; needs a recent chromecast + magnet, and SPELA_NO_RESUME unset)",
+            prev.title, prev.target
+        );
+        return;
+    };
+    tokio::spawn(async move {
+        // Let the listeners start accepting before we re-establish (ffmpeg fetches
+        // torrent pieces over the loopback listener).
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // Resume from the furthest-watched HWM if we have one, else the prior -ss.
+        let hwm = AppState::load(&state.state_dir)
+            .get_position(prev.imdb_id.clone(), Some(prev.title.clone()));
+        let seek_to = if hwm > 1.0 { hwm } else { prev.ss_offset };
+        tracing::info!(
+            "boot-resume: re-establishing cast '{}' → {} from {:.0}s",
+            prev.title,
+            device,
+            seek_to
+        );
+        let mut req = PlayRequest {
+            magnet: Some(prev.magnet.clone()),
+            result_id: None,
+            target: Some("chromecast".into()),
+            cast_name: Some(device),
+            title: Some(prev.title.clone()),
+            file_index: None,
+            no_subs: Some(!prev.has_subtitles),
+            no_intro: Some(true), // resuming mid-episode — never replay the intro bumper
+            smooth: Some(prev.smooth),
+            subtitle_lang: prev.subtitle_lang.clone(),
+            imdb_id: prev.imdb_id.clone(),
+            show: prev.show.clone(),
+            season: prev.season,
+            episode: prev.episode,
+            seek_to: Some(seek_to),
+            duration: prev.duration,
+            quality: prev.quality.clone(),
+            size: prev.size.clone(),
+            poster_url: prev.poster_url.clone(),
+        };
+        let r = do_play(&state, &mut req).await;
+        if let Some(err) = r.0.get("error").and_then(|e| e.as_str()) {
+            tracing::warn!(
+                "boot-resume: do_play returned error (leaving idle): {}",
+                err
+            );
+        }
+    });
 }
 
 /// Start a torrent and return `(torrent_id, http_url)` for `do_play` to wire
@@ -4579,6 +4713,65 @@ async fn compute_following_shows(state: &SharedState, app: &AppState) -> (Vec<Va
 /// aired-but-unwatched episodes), Recommended (harness-curated picks). Recommended
 /// is de-duped against the two sections above + already-seen, so the queue never
 /// repeats a title. (Distinct from `/queue`, which is the play-FIFO auto-fire list.)
+/// Per-show, keep only the FURTHEST (season, episode) in-progress entry for the
+/// Continue rail. A single stray `/status.title` (a transient wrong-SxxExx resolve)
+/// can write a duplicate entry for a LOWER, already-watched episode of a show you're
+/// deep into — the "Silo S01E01 vs S03E04" bug (2026-08-04) where the stale lower
+/// one shadowed the real one (it was newer). A watched-through episode isn't
+/// "Continue". Movies (no season/episode) are distinct per title and all retained.
+/// Order is preserved.
+fn dedup_continue_furthest(entries: Vec<InProgressEntry>) -> Vec<InProgressEntry> {
+    fn show_key(e: &InProgressEntry) -> String {
+        e.imdb_id.clone().unwrap_or_else(|| {
+            crate::search::clean_title_for_tmdb(e.show.as_deref().unwrap_or(&e.title))
+        })
+    }
+    let mut furthest: std::collections::HashMap<String, (u32, u32)> =
+        std::collections::HashMap::new();
+    for e in &entries {
+        if let (Some(s), Some(ep)) = (e.season, e.episode) {
+            let slot = furthest.entry(show_key(e)).or_insert((0, 0));
+            if (s, ep) > *slot {
+                *slot = (s, ep);
+            }
+        }
+    }
+    entries
+        .into_iter()
+        .filter(|e| match (e.season, e.episode) {
+            (Some(s), Some(ep)) => !furthest.get(&show_key(e)).is_some_and(|f| (s, ep) < *f),
+            _ => true,
+        })
+        .collect()
+}
+
+/// Pure decision for Tier B boot auto-resume (graceful restart): given the
+/// persisted interrupted stream + the current time + the `SPELA_NO_RESUME` flag,
+/// return `Some(device)` to re-cast to, or `None` to skip. Scoped to Chromecast
+/// (Open-in-VLC sets no `CurrentStream`; browser-direct hls.js self-recovers), a
+/// non-empty device+magnet, and recent streams (≤ 3 h — so a boot hours later
+/// doesn't blast a stale cast onto the TV). `target` is `"chromecast:<device>"`.
+fn boot_resume_device(
+    prev: &CurrentStream,
+    now: chrono::DateTime<chrono::Utc>,
+    no_resume: bool,
+) -> Option<String> {
+    if no_resume {
+        return None;
+    }
+    let mut parts = prev.target.splitn(2, ':');
+    let kind = parts.next().unwrap_or("");
+    let device = parts.next().unwrap_or("").to_string();
+    if kind != "chromecast" || device.is_empty() || prev.magnet.is_empty() {
+        return None;
+    }
+    let age = now.signed_duration_since(prev.started_at);
+    if age.num_minutes() > 180 || age.num_seconds() < 0 {
+        return None;
+    }
+    Some(device)
+}
+
 async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
     let app = AppState::load(&state.state_dir);
 
@@ -4595,7 +4788,7 @@ async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
     // A match against a New-Episodes next-unwatched folds in (annotate + skip);
     // everything else (movies, non-followed, older episodes) stays a Continue row.
     let mut cont: Vec<Value> = Vec::new();
-    for e in app.in_progress_list() {
+    for e in dedup_continue_furthest(app.in_progress_list()) {
         let pct = match e.duration {
             Some(d) if d > 0.0 => Some(((e.position / d) * 100.0).clamp(0.0, 100.0).round() as u64),
             _ => None,
@@ -6589,11 +6782,22 @@ async fn handle_cast_receiver_html() -> impl IntoResponse {
 /// served same-origin from `/remote` so there is zero CORS/Host friction.
 /// T-1 ships a dark stub; the full hash-routed SPA shell is Phase 3+.
 async fn handle_remote_html() -> impl IntoResponse {
-    const REMOTE_HTML: &str = include_str!("../static/remote.html");
+    // 2026-08-04: PREFER the on-disk SPA so a frontend change goes live on the
+    // next page-load with NO rebuild+restart (a restart would drop live streams).
+    // Falls back to the compile-time embedded copy if the file is missing, so the
+    // binary stays standalone-capable. `CARGO_MANIFEST_DIR` is the repo root on
+    // the build host (spela is built + run on the same host), giving an absolute
+    // path independent of the systemd WorkingDirectory. A per-request read of a
+    // ~120 KB file is trivial (OS page cache) for a single-user LAN app.
+    const REMOTE_HTML_EMBEDDED: &str = include_str!("../static/remote.html");
+    const REMOTE_HTML_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/static/remote.html");
+    let body = tokio::fs::read_to_string(REMOTE_HTML_PATH)
+        .await
+        .unwrap_or_else(|_| REMOTE_HTML_EMBEDDED.to_string());
     axum::response::Response::builder()
         .header("Content-Type", "text/html; charset=utf-8")
         .header("Cache-Control", "no-cache")
-        .body(axum::body::Body::from(REMOTE_HTML))
+        .body(axum::body::Body::from(body))
         .unwrap()
 }
 
@@ -8310,6 +8514,224 @@ async fn handle_hls_cache_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- v3.22 (2026-08-04): Continue-dedup + Tier B boot-resume + seen-seasons ----
+
+    fn ip(imdb: &str, show: &str, s: Option<u32>, e: Option<u32>, pos: f64) -> InProgressEntry {
+        InProgressEntry {
+            key: format!("{imdb}_s{:02}e{:02}", s.unwrap_or(0), e.unwrap_or(0)),
+            title: match (s, e) {
+                (Some(s), Some(e)) => format!("{show} S{s:02}E{e:02}"),
+                _ => show.to_string(),
+            },
+            show: Some(show.to_string()),
+            imdb_id: Some(imdb.to_string()),
+            season: s,
+            episode: e,
+            position: pos,
+            duration: Some(2866.0),
+            poster_url: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn dedup_continue_keeps_furthest_episode_silo_regression() {
+        // The 2026-08-04 bug: a stray in-progress entry for the already-watched Silo
+        // S01E01 (written from a transient wrong /status.title) shadowed the real
+        // S03E04 on Continue because it was newer. Dedup must keep only S03E04.
+        let out = dedup_continue_furthest(vec![
+            ip("tt14688458", "Silo", Some(3), Some(4), 1549.0),
+            ip("tt14688458", "Silo", Some(1), Some(1), 1542.0),
+        ]);
+        assert_eq!(
+            out.len(),
+            1,
+            "the lower already-watched episode must be dropped"
+        );
+        assert_eq!((out[0].season, out[0].episode), (Some(3), Some(4)));
+    }
+
+    #[test]
+    fn dedup_continue_retains_distinct_shows_and_movies() {
+        let movie = |t: &str, id: &str| InProgressEntry {
+            key: id.into(),
+            title: t.into(),
+            show: Some(t.into()),
+            imdb_id: Some(id.into()),
+            season: None,
+            episode: None,
+            position: 10.0,
+            duration: Some(9000.0),
+            poster_url: None,
+            updated_at: Utc::now(),
+        };
+        let out = dedup_continue_furthest(vec![
+            ip("tt14688458", "Silo", Some(3), Some(4), 100.0),
+            ip("tt_fargo", "Fargo", Some(1), Some(7), 100.0),
+            movie("Dune", "ttdune"),
+            movie("Sinners", "ttsinners"),
+        ]);
+        assert_eq!(
+            out.len(),
+            4,
+            "distinct shows + distinct movies all retained"
+        );
+    }
+
+    #[test]
+    fn dedup_continue_dedups_by_cleaned_title_when_no_imdb() {
+        let mk = |s: u32, e: u32| InProgressEntry {
+            key: format!("k{s}{e}"),
+            title: format!("The Bear S{s:02}E{e:02}"),
+            show: Some("The Bear".into()),
+            imdb_id: None,
+            season: Some(s),
+            episode: Some(e),
+            position: 1.0,
+            duration: Some(1500.0),
+            poster_url: None,
+            updated_at: Utc::now(),
+        };
+        let out = dedup_continue_furthest(vec![mk(2, 3), mk(4, 1), mk(1, 8)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].season, out[0].episode), (Some(4), Some(1)));
+    }
+
+    fn cs_cast(target: &str, magnet: &str, started: chrono::DateTime<Utc>) -> CurrentStream {
+        CurrentStream {
+            magnet: magnet.into(),
+            title: "Silo S03E04".into(),
+            show: Some("Silo".into()),
+            season: Some(3),
+            episode: Some(4),
+            imdb_id: Some("tt14688458".into()),
+            target: target.into(),
+            url: "http://x/hls/master.m3u8".into(),
+            started_at: started,
+            pid: 5,
+            has_subtitles: true,
+            subtitle_lang: Some("eng".into()),
+            duration: Some(2866.0),
+            quality: Some("1080p".into()),
+            size: Some("2 GB".into()),
+            poster_url: Some("http://p/x.jpg".into()),
+            ss_offset: 0.0,
+            smooth: false,
+            prepared_hls: false,
+            cache_key: None,
+        }
+    }
+
+    #[test]
+    fn boot_resume_recent_chromecast_returns_device() {
+        let now = Utc::now();
+        let prev = cs_cast(
+            "chromecast:Fredriks TV",
+            "magnet:?xt=1",
+            now - chrono::Duration::minutes(5),
+        );
+        assert_eq!(
+            boot_resume_device(&prev, now, false),
+            Some("Fredriks TV".to_string())
+        );
+    }
+
+    #[test]
+    fn boot_resume_skips_non_chromecast_targets() {
+        let now = Utc::now();
+        for target in [
+            "vlc:this Mac",
+            "vlc",
+            "chromecast:",
+            "phone:x",
+            "shannon:tv",
+            "",
+        ] {
+            let prev = cs_cast(target, "magnet:?xt=1", now - chrono::Duration::minutes(1));
+            assert_eq!(
+                boot_resume_device(&prev, now, false),
+                None,
+                "target {target:?} must not resume"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_resume_skips_stale_flagged_nomagnet_and_future() {
+        let now = Utc::now();
+        let stale = cs_cast(
+            "chromecast:TV",
+            "magnet:?xt=1",
+            now - chrono::Duration::minutes(200),
+        );
+        assert_eq!(
+            boot_resume_device(&stale, now, false),
+            None,
+            "stale (>3h) skipped"
+        );
+        let recent = cs_cast(
+            "chromecast:TV",
+            "magnet:?xt=1",
+            now - chrono::Duration::minutes(2),
+        );
+        assert_eq!(
+            boot_resume_device(&recent, now, true),
+            None,
+            "SPELA_NO_RESUME skips"
+        );
+        let nomagnet = cs_cast("chromecast:TV", "", now - chrono::Duration::minutes(2));
+        assert_eq!(
+            boot_resume_device(&nomagnet, now, false),
+            None,
+            "empty magnet skipped"
+        );
+        let future = cs_cast(
+            "chromecast:TV",
+            "magnet:?xt=1",
+            now + chrono::Duration::minutes(5),
+        );
+        assert_eq!(
+            boot_resume_device(&future, now, false),
+            None,
+            "future timestamp (clock skew) skipped"
+        );
+    }
+
+    #[test]
+    fn unseen_after_skips_seen_seasons_fargo() {
+        // Fargo S1..S5; seen S2-S5 but NOT S1 → only S1's 10 episodes are "new".
+        let seasons = [(1, 10), (2, 10), (3, 10), (4, 11), (5, 10)];
+        assert_eq!(unseen_after((0, 0), (5, 10), &seasons, &[2, 3, 4, 5]), 10);
+    }
+
+    #[test]
+    fn unseen_after_excludes_specials_and_respects_hwm() {
+        let seasons = [(0, 3), (1, 8), (2, 8)]; // S0 = specials, always excluded
+        assert_eq!(unseen_after((1, 8), (2, 8), &seasons, &[]), 8);
+        assert_eq!(
+            unseen_after((2, 8), (2, 8), &seasons, &[]),
+            0,
+            "caught up → 0 new"
+        );
+    }
+
+    #[test]
+    fn next_unwatched_skipping_returns_first_unseen_episode() {
+        let seasons = [(1, 10), (2, 10), (3, 10)];
+        assert_eq!(
+            next_unwatched_skipping((0, 0), (3, 10), &seasons, &[2]),
+            Some((1, 1))
+        );
+        assert_eq!(
+            next_unwatched_skipping((0, 0), (3, 10), &seasons, &[1, 2]),
+            Some((3, 1))
+        );
+        assert_eq!(
+            next_unwatched_skipping((0, 0), (3, 10), &seasons, &[1, 2, 3]),
+            None
+        );
+    }
 
     // --- 2026-07-13: HEVC master CODECS normalization (Chrome rejects .B01 tail) ---
 

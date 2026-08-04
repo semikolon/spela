@@ -608,6 +608,10 @@ async function vlcWaitReady(id){
   S.now.vlcErr="Still buffering — the swarm may be slow."; return false;
 }
 async function openInVlc(id,title,poster){
+  // 2026-08-04: fall back to the search show's poster when the caller didn't thread
+  // one (a VLC play always follows a search, so show.poster_url is available) — /status
+  // for a VLC stream carries no poster, so an empty arg → a broken now-view <img>.
+  poster = poster || (S.search.data && S.search.data.show && S.search.data.show.poster_url) || "";
   // Immediate loading surface (like the Chromecast warmup), THEN wait until spela
   // says the source is ready (head/tail Cues primed) before firing VLC — so a fresh
   // torrent never opens to a hung player, and the user always sees progress.

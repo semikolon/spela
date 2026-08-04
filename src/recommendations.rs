@@ -102,3 +102,49 @@ pub fn set_picks(mut picks: Vec<RecEntry>, generated_by: Option<String>) -> std:
     })?;
     Ok(count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recommendations_json_roundtrip_preserves_all_fields() {
+        let recs = Recommendations {
+            picks: vec![RecEntry {
+                title: "Poor Things".into(),
+                media_type: "movie".into(),
+                tmdb_id: Some(792307),
+                imdb_id: Some("tt14230458".into()),
+                year: Some(2023),
+                rt_score: Some(92),
+                why: "surreal + your taste for the strange".into(),
+                poster_url: Some("http://p/x.jpg".into()),
+                rank: 1,
+            }],
+            generated_at: None,
+            generated_by: Some("claude".into()),
+        };
+        let back: Recommendations =
+            serde_json::from_str(&serde_json::to_string(&recs).unwrap()).unwrap();
+        assert_eq!(back.picks.len(), 1);
+        assert_eq!(back.picks[0].title, "Poor Things");
+        assert_eq!(back.picks[0].rt_score, Some(92));
+        assert_eq!(back.picks[0].rank, 1);
+        assert_eq!(back.generated_by.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn minimal_harness_json_deserializes_with_defaults() {
+        // The harness contract: a pick POSTed with only title + why must parse, with
+        // media_type→"movie", rank→0, and all optionals absent — so a lean write
+        // never fails to load.
+        let back: Recommendations =
+            serde_json::from_str(r#"{"picks":[{"title":"Sinners","why":"loved the vibe"}]}"#)
+                .unwrap();
+        assert_eq!(back.picks.len(), 1);
+        assert_eq!(back.picks[0].media_type, "movie");
+        assert_eq!(back.picks[0].rank, 0);
+        assert_eq!(back.picks[0].tmdb_id, None);
+        assert_eq!(back.picks[0].why, "loved the vibe");
+    }
+}

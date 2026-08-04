@@ -1,6 +1,6 @@
 [package]
 name = "spela"
-version = "3.8.0"
+version = "3.22.0"
 edition = "2021"
 description = "AI-agent-ready media controller — search, stream, cast"
 
@@ -23,6 +23,9 @@ dirs = "6"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
+# Aug 4, 2026: systemd socket-activation support — inherit the listening socket
+# across restarts so a redeploy doesn't drop live streams (graceful restart).
+listenfd = "1"
 
 # Apr 29, 2026: pure-Rust BitTorrent client to replace webtorrent-cli (Node).
 # Migration plan: see `~/Projects/spela/CLAUDE.md` § "webtorrent-cli weak peer
