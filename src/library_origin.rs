@@ -56,10 +56,15 @@ use crate::config::Config;
 use crate::server::first_local_bypass_match;
 use crate::torrent_stream::parse_range_header;
 
-/// How long a minted `/library/match` handle stays valid. Covers the
-/// server's `detect_codecs` ffprobe + `transcode_hls` start latency with
-/// generous headroom; a re-resolved play simply mints a fresh handle.
-const HANDLE_TTL: Duration = Duration::from_secs(120);
+/// How long a minted `/library/match` handle stays valid AFTER ITS LAST ACCESS
+/// (sliding — `handle_stream` refreshes the timestamp on every request). An
+/// actively-watched or -seeked file therefore never expires; the TTL is really an
+/// IDLE timeout that only prunes an abandoned handle (VLC closed). It must still
+/// span the worst case of a single uninterrupted connection — a full movie played
+/// straight through with no new request, then a seek — so it's watch-length, not the
+/// old 2 min (which returned 410 GONE to VLC's seek after ~2 min → "input can't be
+/// opened", the direct-VLC seek bug, 2026-08-05). 6 h covers any movie + a long pause.
+const HANDLE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// v3.8.0 drive-aware state machine. Replaces the v3.6.0-pre-3.8 model
 /// where serve-library exited 1 the moment no roots canonicalized (which
@@ -818,8 +823,13 @@ async fn handle_stream(
     let path = {
         let mut map = state.handles.lock().unwrap_or_else(|e| e.into_inner());
         prune_expired(&mut map);
-        match map.get(&p.h) {
-            Some((path, _)) => path.clone(),
+        match map.get_mut(&p.h) {
+            Some((path, issued)) => {
+                // Sliding TTL: an actively-streamed / seeked handle refreshes here, so
+                // it never expires mid-watch (VLC re-opens the connection on each seek).
+                *issued = Instant::now();
+                path.clone()
+            }
             None => return (StatusCode::GONE, "unknown or expired handle").into_response(),
         }
     };
