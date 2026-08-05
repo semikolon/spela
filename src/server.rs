@@ -7656,7 +7656,12 @@ async fn handle_vlc_ready(
         Ok((tid, _)) => tid,
         Err(_) => return Json(json!({ "ready": false, "pct": 0, "phase": "starting" })),
     };
-    reap_previous_vlc_torrents(&state, tid);
+    // Do NOT reap here. /vlc/ready is POLLED (~1s) and can run CONCURRENTLY for
+    // several tapped sources; a reap keyed to THIS poll's tid stops the OTHER sources'
+    // in-flight torrents, whose own polls then restart them — a mutual start↔stop
+    // death spiral where nothing ever buffers (2026-08-05 regression from the FD-leak
+    // reap). Supersession is committed at the /stream serve (the source VLC actually
+    // opens, handle_vlc_stream); the SPA also polls only one source at a time.
     state
         .torrent_engine
         .prefetch_ends(tid, file_index.unwrap_or(0) as usize);

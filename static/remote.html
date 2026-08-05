@@ -595,9 +595,11 @@ let toastT;
 // file → instant; partial torrent → when the head/tail Cues are primed + a buffer
 // cushion exists). Returns true when ready, false if the user gave up / it errored.
 // Progress via a re-fired toast (stays visible); a complete file returns on poll 0.
-async function vlcWaitReady(id){
+async function vlcWaitReady(id, gen){
   for(let i=0;i<600;i++){   // ~15 min cap at 1.5s/poll
+    if(gen!=null && S.vlcGen!==gen) return "superseded";  // a newer VLC source took over — stop this loop silently
     let d; try{ d=await api("/vlc/"+id+"/ready"); }catch(e){ S.now.vlcErr="spela unreachable"; return false; }
+    if(gen!=null && S.vlcGen!==gen) return "superseded";  // re-check after the await
     if(d && d.error){ S.now.vlcErr=d.error; return false; }
     if(d && d.ready) return true;
     // Drive the loading surface (not a transient toast) — matches the Chromecast warmup.
@@ -608,6 +610,11 @@ async function vlcWaitReady(id){
   S.now.vlcErr="Still buffering — the swarm may be slow."; return false;
 }
 async function openInVlc(id,title,poster){
+  // Single active VLC buffer: bump a generation token so any PRIOR openInVlc's
+  // readiness-poll loop supersedes itself (2026-08-05). Without this, tapping several
+  // sources ran concurrent /vlc/ready poll loops, each buffering its own torrent —
+  // wasteful, and (pre server-fix) it fed a mutual start↔stop reap death spiral.
+  const gen = S.vlcGen = (S.vlcGen||0)+1;
   // 2026-08-04: fall back to the search show's poster when the caller didn't thread
   // one (a VLC play always follows a search, so show.poster_url is available) — /status
   // for a VLC stream carries no poster, so an empty arg → a broken now-view <img>.
@@ -617,7 +624,9 @@ async function openInVlc(id,title,poster){
   // torrent never opens to a hung player, and the user always sees progress.
   beginWarming(title||"Opening in VLC…", poster); stopWarmupPoll();  // /progress isn't the VLC source; vlcWaitReady drives the screen
   S.now.vlcErr=null;
-  if((await vlcWaitReady(id))!==true){
+  const rdy = await vlcWaitReady(id, gen);
+  if(rdy==="superseded") return;   // a newer VLC source took over this screen — don't clobber it with an error
+  if(rdy!==true){
     showPlayError(title||"VLC", poster, S.now.vlcErr||"Couldn’t buffer this source.", ()=>openInVlc(id,title,poster)); return;
   }
   let m3u;
