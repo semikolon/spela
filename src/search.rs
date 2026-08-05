@@ -812,15 +812,20 @@ impl SearchEngine {
         // returns 522/523 (origin down) or an HTML rate-limit page instead of JSON.
         // A hard `.json()?` here propagated reqwest's opaque "error decoding response
         // body" that blanked the WHOLE search (2026-08-05: "oxygen" → Torrentio 522).
-        // Retry the transient failure a few times, then surface a CLEAR message so the
-        // remote shows "temporarily unavailable, try again" rather than a cryptic error.
+        // Retry the transient failure ONCE, then surface a CLEAR message so the remote
+        // shows "temporarily unavailable, try again" rather than a cryptic error. A hung
+        // Cloudflare 522 can hold the connection 20-50s, so a per-attempt 8s timeout is
+        // MANDATORY — without it the retries stack into a minute-plus hang (observed
+        // 2026-08-05: http=000 at 45s). Fail fast, tell the user, let them retry.
+        const TORRENTIO_ATTEMPTS: u32 = 2;
         let mut parsed: Option<Value> = None;
         let mut last_status = String::from("no response");
-        for attempt in 0..3u32 {
+        for attempt in 0..TORRENTIO_ATTEMPTS {
             match self
                 .client
                 .get(&url)
                 .header("User-Agent", "spela/2.0")
+                .timeout(std::time::Duration::from_secs(8))
                 .send()
                 .await
             {
@@ -835,8 +840,9 @@ impl SearchEngine {
                         Err(_) => {
                             last_status = format!("HTTP {}", status.as_u16());
                             tracing::warn!(
-                                "torrentio non-JSON (attempt {}/3, {}): {:.80}",
+                                "torrentio non-JSON (attempt {}/{}, {}): {:.80}",
                                 attempt + 1,
+                                TORRENTIO_ATTEMPTS,
                                 status,
                                 body.replace('\n', " ")
                             );
@@ -844,11 +850,20 @@ impl SearchEngine {
                     }
                 }
                 Err(e) => {
-                    last_status = e.to_string();
-                    tracing::warn!("torrentio request failed (attempt {}/3): {}", attempt + 1, e);
+                    last_status = if e.is_timeout() {
+                        "timed out".to_string()
+                    } else {
+                        e.to_string()
+                    };
+                    tracing::warn!(
+                        "torrentio request failed (attempt {}/{}): {}",
+                        attempt + 1,
+                        TORRENTIO_ATTEMPTS,
+                        e
+                    );
                 }
             }
-            if attempt < 2 {
+            if attempt + 1 < TORRENTIO_ATTEMPTS {
                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             }
         }
