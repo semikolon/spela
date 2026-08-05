@@ -552,7 +552,7 @@ const fmt=s=>{ s=Math.max(0,Math.round(s||0)); const h=s/3600|0,m=(s%3600)/60|0,
 /* ---------- state ---------- */
 const TKEY="spela_target", MKEY="spela_mode";
 const S={
-  target:JSON.parse(sessionStorage.getItem(TKEY)||"null"),   // {kind:'chromecast'|'phone', name}
+  target:JSON.parse(sessionStorage.getItem(TKEY)||"null")||{kind:"vlc",name:"VLC"},   // {kind:'chromecast'|'phone'|'vlc'|'shannon', name}; default VLC — the Mac monitor is the main watch surface. Switch via the target chip; the pick lasts the session.
   mode:sessionStorage.getItem(MKEY)||"movie",                 // 'movie' | 'tv'
   search:{q:"",abort:null,data:null},
   library:{data:null,loading:false},
