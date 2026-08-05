@@ -808,14 +808,56 @@ impl SearchEngine {
         };
         let url = format!("{}/{}", TORRENTIO_BASE, path);
 
-        let resp: Value = self
-            .client
-            .get(&url)
-            .header("User-Agent", "spela/2.0")
-            .send()
-            .await?
-            .json()
-            .await?;
+        // Torrentio is a Cloudflare-fronted community service that intermittently
+        // returns 522/523 (origin down) or an HTML rate-limit page instead of JSON.
+        // A hard `.json()?` here propagated reqwest's opaque "error decoding response
+        // body" that blanked the WHOLE search (2026-08-05: "oxygen" → Torrentio 522).
+        // Retry the transient failure a few times, then surface a CLEAR message so the
+        // remote shows "temporarily unavailable, try again" rather than a cryptic error.
+        let mut parsed: Option<Value> = None;
+        let mut last_status = String::from("no response");
+        for attempt in 0..3u32 {
+            match self
+                .client
+                .get(&url)
+                .header("User-Agent", "spela/2.0")
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    let status = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    match serde_json::from_str::<Value>(&body) {
+                        Ok(v) => {
+                            parsed = Some(v);
+                            break;
+                        }
+                        Err(_) => {
+                            last_status = format!("HTTP {}", status.as_u16());
+                            tracing::warn!(
+                                "torrentio non-JSON (attempt {}/3, {}): {:.80}",
+                                attempt + 1,
+                                status,
+                                body.replace('\n', " ")
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_status = e.to_string();
+                    tracing::warn!("torrentio request failed (attempt {}/3): {}", attempt + 1, e);
+                }
+            }
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
+        }
+        let resp = parsed.ok_or_else(|| {
+            anyhow!(
+                "Torrentio is temporarily unavailable ({}) — the torrent index is rate-limiting or down. Try again in a moment.",
+                last_status
+            )
+        })?;
 
         let streams = resp["streams"].as_array().cloned().unwrap_or_default();
         let results: Vec<TorrentResult> = streams
