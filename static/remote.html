@@ -495,6 +495,7 @@
     <div id="pendingRow" class="pending"></div>
     <div id="continueRow" class="following"></div>
     <div id="homeFollowingRow" class="following"></div>
+    <div id="homeUpcomingRow" class="following"></div>
     <div id="homeEmpty"></div>
   </section>
 
@@ -1017,6 +1018,44 @@ function fillFollowing(container, shows, onMarked){
   return withNew.length;
 }
 
+// Coming soon — caught-up followed shows whose next episode airs in the FUTURE
+// (new_count==0, so New Episodes can't show them; e.g. Silo waiting on tomorrow's ep).
+// No play/mark (the episode isn't out yet); tap searches the show.
+function fmtRelDate(d){
+  if(!d) return "";
+  const t=new Date(d+"T00:00:00"); const now=new Date(); now.setHours(0,0,0,0);
+  const days=Math.round((t-now)/86400000);
+  if(days<=0) return fmtDate(d);
+  if(days===1) return "tomorrow";
+  if(days<7) return "in "+days+" days";
+  return fmtDate(d);
+}
+function upcomingItem(s){
+  const item=el("div",{className:"foitem"});
+  const tap=el("button",{className:"fotap"});
+  const se=s.next_air?esc(s.next_air.se):"";
+  const when=s.next_air?fmtRelDate(s.next_air.air_date):"";
+  tap.innerHTML=`<span class="fotitle">${esc(s.title)}</span>`
+    +`<span class="fometa">${se?se+" · ":""}airs <b>${when}</b></span>`;
+  tap.onclick=()=>{ setMode("tv"); $("#q").value=s.title; S.search.q=s.title; location.hash="#/search"; runSearch(s.title); };
+  if(s.poster_url){ const ps=posterSrc(s.poster_url); const img=new Image();
+    img.onload=()=>{ tap.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.9),rgba(15,15,20,.66)),url('${ps}')`;
+      tap.style.backgroundSize="cover"; tap.style.backgroundPosition="center 20%"; };
+    img.src=ps; }
+  item.appendChild(tap); return item;
+}
+function fillUpcoming(container, shows){
+  if(!container) return 0;
+  container.innerHTML="";
+  const up=(shows||[]);
+  if(!up.length){ container.classList.remove("on"); return 0; }
+  container.appendChild(el("div",{className:"rlab",textContent:"Coming soon"}));
+  const list=el("div",{className:"folist"});
+  up.forEach(s=>list.appendChild(upcomingItem(s)));
+  container.appendChild(list); container.classList.add("on");
+  return up.length;
+}
+
 // Refresh the section wherever it's shown (search landing row + header badge, and
 // the To-Watch view if that's current).
 function refreshFollowing(){ loadFollowing(); if(currentView()==="towatch") renderToWatch(); }
@@ -1045,8 +1084,9 @@ async function loadHome(){
   fillContinue($("#continueRow"), (d&&d.continue)||[]);
   const fr=$("#homeFollowingRow");
   if(fr){ const n=fillFollowing(fr,(d&&d.new_episodes)||[],loadHome); fr.classList.toggle("on",n>0); }
+  fillUpcoming($("#homeUpcomingRow"), (d&&d.upcoming)||[]);
   const em=$("#homeEmpty");
-  if(em){ const any=(d&&((d.continue||[]).length||(d.new_episodes||[]).length));
+  if(em){ const any=(d&&((d.continue||[]).length||(d.new_episodes||[]).length||(d.upcoming||[]).length));
     em.innerHTML=any?"":`<div class="state"><div class="big">Nothing queued yet</div><div>Search for something, or follow a show.</div></div>`; }
 }
 

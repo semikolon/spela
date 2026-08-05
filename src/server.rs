@@ -4786,6 +4786,29 @@ async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
     // next-unwatched folds into its New-Episodes row (a subtle partway indicator)
     // instead of appearing as a duplicate Continue entry.
     let (all_following, total_new) = compute_following_shows(&state, &app).await;
+    // Coming Soon — caught-up followed shows whose NEXT episode airs in the future
+    // (TMDB `next_episode_to_air`, carried as `next_air`). These have new_count==0, so
+    // they're filtered out of New Episodes below; without this a show you're caught up
+    // on (e.g. Silo waiting on tomorrow's episode) appears NOWHERE on the landing page.
+    // Soonest air first.
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let mut upcoming: Vec<Value> = all_following
+        .iter()
+        .filter(|s| s["new_count"].as_u64().unwrap_or(0) == 0)
+        .filter(|s| {
+            s.get("next_air")
+                .and_then(|na| na.get("air_date"))
+                .and_then(|a| a.as_str())
+                .is_some_and(|air| air >= today.as_str())
+        })
+        .cloned()
+        .collect();
+    upcoming.sort_by(|a, b| {
+        a["next_air"]["air_date"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["next_air"]["air_date"].as_str().unwrap_or(""))
+    });
     let mut new_eps: Vec<Value> = all_following
         .into_iter()
         .filter(|s| s["new_count"].as_u64().unwrap_or(0) > 0)
@@ -4874,6 +4897,7 @@ async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
     Json(json!({
         "continue": cont,
         "new_episodes": new_eps,
+        "upcoming": upcoming,
         "total_new": total_new,
         "recommended": recommended,
         "recommended_generated_at": gen_at,
