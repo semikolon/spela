@@ -645,13 +645,12 @@ async function openInVlc(id,title,poster){
   stopPolling();   // the Chromecast /status poll must NOT run for a VLC stream
   location.hash="#/now"; renderNowFull(); startVlcPoll();
   toast("Opening in VLC…");
-  // Fire the vlc:// scheme (one-click if the handler is installed → VLC launches,
-  // window blurs). No blur within 1.2s → fall back to downloading the .m3u.
-  let blurred=false; const onblur=()=>{blurred=true;};
-  window.addEventListener("blur",onblur,{once:true});
+  // Fire the vlc:// scheme — the handler is installed on the Mac (install-vlc-url-handler.sh
+  // + Chrome AutoLaunch), so it launches VLC directly. NO page-navigation fallback: the old
+  // blur-timeout fallback navigated Chrome to the .m3u whenever blur wasn't detected, and on
+  // a multi-monitor setup VLC opens on the OTHER screen without blurring Chrome → the movie
+  // opened in BOTH the browser AND VLC (2026-08-05). vlc:// alone is reliable here.
   window.location.href=url.replace(/^https?:\/\//,"vlc://");
-  setTimeout(()=>{ window.removeEventListener("blur",onblur);
-    if(!blurred) window.location.href="/vlc/"+id+"/open.m3u"; }, 1200);
 }
 // Library file → VLC. The file is COMPLETE on the origin, so there's no torrent
 // buffering to poll: resolve its serve-library URL (/library/vlc.m3u) and fire vlc://
@@ -677,11 +676,9 @@ async function openLibraryInVlc(spec){
   stopPolling();
   location.hash="#/now"; renderNowFull(); startVlcPoll();
   toast("Opening in VLC…");
-  let blurred=false; const onblur=()=>{blurred=true;};
-  window.addEventListener("blur",onblur,{once:true});
+  // vlc:// only — no page-navigation fallback (see openInVlc: the blur-timeout fallback
+  // double-opened in browser + VLC on a multi-monitor setup where VLC doesn't blur Chrome).
   window.location.href=url.replace(/^https?:\/\//,"vlc://");
-  setTimeout(()=>{ window.removeEventListener("blur",onblur);
-    if(!blurred) window.location.href="/library/vlc.m3u?title="+q; }, 1200);
 }
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("on");
   clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("on"),4200); }
