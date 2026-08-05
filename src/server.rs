@@ -342,6 +342,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         // Web-remote My Library (US-3): aggregate curated collection
         // (local library_dirs + remote serve-library origins).
         .route("/library", get(handle_library))
+        .route("/library/vlc.m3u", get(handle_vlc_library_playlist))
         .route(
             "/queue",
             get(handle_queue_list)
@@ -5600,6 +5601,54 @@ pub(crate) fn build_remote_stream_url(origin_base: &str, handle: &str) -> String
     )
 }
 
+/// Resolve a library title to a VLC-openable RAW stream URL (no transcode) — the
+/// library counterpart of `resolve_result_for_vlc`. Mirrors do_play's remote-origin
+/// Local Bypass (liveness ping → `/library/match` → `build_remote_stream_url`) so a
+/// library title opened in VLC streams the EXACT serve-library file the Chromecast
+/// path would, just decoded natively by VLC (no Darwin NVENC). Remote origins only
+/// for now — Fredrik's library lives on a remote serve-library origin; a Darwin-local
+/// curated dir would need a local raw-serve endpoint (TODO if one is ever added).
+async fn resolve_library_vlc_url(state: &SharedState, title: &str) -> Option<String> {
+    const PING_TIMEOUT_SECS: u64 = 2;
+    const MATCH_TIMEOUT_SECS: u64 = 25;
+    for origin in &state.config.remote_origins {
+        let base = origin.trim_end_matches('/');
+        let client = reqwest::Client::new();
+        let alive = matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(PING_TIMEOUT_SECS),
+                client
+                    .get(format!("{}/library/stream", base))
+                    .query(&[("h", "__spela_liveness__")])
+                    .send(),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if !alive {
+            continue;
+        }
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(MATCH_TIMEOUT_SECS),
+            client
+                .get(format!("{}/library/match", base))
+                .query(&[("title", title)])
+                .send(),
+        )
+        .await;
+        if let Ok(Ok(r)) = resp {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    if let Some(handle) = v.get("handle").and_then(|h| h.as_str()) {
+                        return Some(build_remote_stream_url(base, handle));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn local_bypass_file_is_healthy(
     path: &std::path::Path,
     has_done_marker: bool,
@@ -7694,6 +7743,36 @@ async fn handle_vlc_ready(
         "total": total,
         "phase": if finished { "complete" } else if ready { "buffered" } else { "buffering" },
     }))
+}
+
+/// `GET /library/vlc.m3u?title=<raw_name>` — the library counterpart of
+/// `/vlc/{id}/open.m3u`. Resolves the library file to its serve-library URL and
+/// returns a one-entry .m3u VLC opens directly (native decode on the Mac, no Darwin
+/// GPU). The SPA's library play routes here for the `vlc` target, sharing the same
+/// device-targeting dispatch as a torrent play.
+async fn handle_vlc_library_playlist(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let title = params.get("title").map(|s| s.as_str()).unwrap_or("");
+    if title.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "title required"})),
+        )
+            .into_response();
+    }
+    match resolve_library_vlc_url(&state, title).await {
+        Some(url) => {
+            let body = format!("#EXTM3U\n#EXTINF:-1,{}\n{}\n", title, url);
+            ([(axum::http::header::CONTENT_TYPE, "audio/x-mpegurl")], body).into_response()
+        }
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": "Library file not found, or its origin is offline."})),
+        )
+            .into_response(),
+    }
 }
 
 async fn handle_vlc_playlist(

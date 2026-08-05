@@ -653,6 +653,36 @@ async function openInVlc(id,title,poster){
   setTimeout(()=>{ window.removeEventListener("blur",onblur);
     if(!blurred) window.location.href="/vlc/"+id+"/open.m3u"; }, 1200);
 }
+// Library file → VLC. The file is COMPLETE on the origin, so there's no torrent
+// buffering to poll: resolve its serve-library URL (/library/vlc.m3u) and fire vlc://
+// straight away. Shares the VLC now-view + bridge-relay control with openInVlc; the
+// generation token supersedes any prior VLC buffer the same way.
+async function openLibraryInVlc(spec){
+  const gen=S.vlcGen=(S.vlcGen||0)+1;
+  const title=spec.label||"VLC", poster=spec.poster||"", q=encodeURIComponent(spec.body.title);
+  beginWarming(title,poster); stopWarmupPoll();
+  let m3u;
+  try{ const r=await fetch("/library/vlc.m3u?title="+q);
+    if(!r.ok){ const j=await r.json().catch(()=>({})); showPlayError(title,poster,j.error||"Couldn’t resolve that library file.",()=>openLibraryInVlc(spec)); return; }
+    m3u=await r.text();
+  }catch(e){ showPlayError(title,poster,"spela unreachable",()=>openLibraryInVlc(spec)); return; }
+  if(gen!==S.vlcGen) return;                 // a newer VLC source took over
+  const url=(m3u.split("\n").find(l=>l.startsWith("http"))||"").trim();
+  if(!url){ showPlayError(title,poster,"No stream URL.",()=>openLibraryInVlc(spec)); return; }
+  endWarming();
+  S.now.vlc=true; S.now.phone=false; S.now.cold=false; S.now.playing=true; S.now.error=null;
+  S.now.endlist=true; S.now.frontier=0; S.now.posAbs=0; S.now.dur=0;
+  S.now.lastSync=Date.now(); S.now.vlcTitle="";
+  S.now.data={title:title,poster_url:poster,quality:"",target:":VLC",imdb_id:"",ss_offset:0};
+  stopPolling();
+  location.hash="#/now"; renderNowFull(); startVlcPoll();
+  toast("Opening in VLC…");
+  let blurred=false; const onblur=()=>{blurred=true;};
+  window.addEventListener("blur",onblur,{once:true});
+  window.location.href=url.replace(/^https?:\/\//,"vlc://");
+  setTimeout(()=>{ window.removeEventListener("blur",onblur);
+    if(!blurred) window.location.href="/library/vlc.m3u?title="+q; }, 1200);
+}
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("on");
   clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("on"),4200); }
 
@@ -1354,21 +1384,46 @@ async function pollWarmup(){
 function fmtSpeed(bps){ if(!bps) return "0 KB/s"; const mb=bps/1e6;
   return mb>=1 ? mb.toFixed(1)+" MB/s" : Math.round(bps/1e3)+" KB/s"; }
 
+// Search / torrent play → the shared target dispatcher.
 async function doPlay(opts,cardForSources){
-  if(!S.target){ S.pending=()=>doPlay(opts,cardForSources); toast("Pick where to play — it starts right after"); openSheet(); return; }
-  if(S.target.kind==="phone"){ return doPhoneDirect(opts,cardForSources,(S.search.data&&S.search.data.show&&S.search.data.show.title)||""); }
-  if(S.target.kind==="shannon"){ return doShannonPlay(opts,cardForSources); }
-  if(S.target.kind==="vlc"){ if(opts.result_id!=null){ const vlbl=(S.search.data&&S.search.data.show&&S.search.data.show.title)||opts.title||"Opening in VLC"; return openInVlc(opts.result_id,vlbl,opts.poster_url); } toast("Tap a source (or Play best) to open it in VLC"); return; }
   const label=(S.search.data&&S.search.data.show&&S.search.data.show.title)||opts.title||"Playing";
-  beginWarming(label,opts.poster_url);
-  const body={...opts,target:"chromecast",cast_name:S.target.name};
+  return playToTarget({
+    body:{...opts}, label, poster:opts.poster_url, card:cardForSources,
+    resultId:(opts.result_id!=null?opts.result_id:null), vlcTitle:label
+  }, ()=>doPlay(opts,cardForSources));
+}
+
+// ONE device-targeting dispatcher — search/torrent plays AND library plays both route
+// here, so target selection + memory (S.target) can never drift between them (the
+// library path used to hardcode chromecast and skip VLC entirely — 2026-08-05). spec:
+//   body     — /play POST body + phone/shannon opts (search opts, or {title,poster_url})
+//   label,poster — now-view + loading labels
+//   card     — sources-card for the phone/shannon "more sources" disclosure (null for library)
+//   resultId — search result id (torrent VLC needs it; absent for a library entry)
+//   library  — true → resolve the library file for VLC by title (no result id)
+//   vlcTitle — human title for VLC / phone-direct
+async function playToTarget(spec, retry){
+  if(!S.target){ S.pending=retry; toast("Pick where to play — it starts right after"); openSheet(); return; }
+  const k=S.target.kind;
+  if(k==="phone")   return doPhoneDirect(spec.body, spec.card||null, spec.vlcTitle||spec.label);
+  if(k==="shannon") return doShannonPlay(spec.body, spec.card||null);
+  if(k==="vlc"){
+    if(spec.library)        return openLibraryInVlc(spec);
+    if(spec.resultId!=null) return openInVlc(spec.resultId, spec.vlcTitle||spec.label, spec.poster);
+    toast("Tap a source (or Play best) to open it in VLC"); return;
+  }
+  return castViaPlay(spec, retry);   // chromecast
+}
+async function castViaPlay(spec, retry){
+  beginWarming(spec.label, spec.poster);
+  const body={...spec.body, target:"chromecast", cast_name:S.target.name};
   let r;
   try{ r=await api("/play",{method:"POST",body}); }
-  catch{ showPlayError(label,opts.poster_url,"spela unreachable",()=>doPlay(opts,cardForSources)); return; }
+  catch{ showPlayError(spec.label,spec.poster,"spela unreachable",retry); return; }
   endWarming();
-  if(r&&r.error){ showPlayError(label,opts.poster_url,r.error,()=>doPlay(opts,cardForSources)); return; }
+  if(r&&r.error){ showPlayError(spec.label,spec.poster,r.error,retry); return; }
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
-  S.now.data={title:label,poster_url:opts.poster_url||"",quality:"",target:":"+(S.target&&S.target.name||"")};
+  S.now.data={title:spec.label,poster_url:spec.poster||"",quality:"",target:":"+(S.target&&S.target.name||"")};
   location.hash="#/now"; renderNowFull(); pollNow(true);   // playing → the full now-view (loading stayed in the panel)
 }
 
@@ -1462,19 +1517,12 @@ function attachPhoneVideo(v,src){
 }
 
 /* ---------- My Library (Phase 5 / US-3) ---------- */
+// Library play → the SAME shared dispatcher as doPlay (device-targeting parity).
 async function doPlayLibrary(entry){
-  if(!S.target){ S.pending=()=>doPlayLibrary(entry); toast("Pick where to play — it starts right after"); openSheet(); return; }
-  if(S.target.kind==="phone"){ return doPhoneDirect({title:entry.raw_name,poster_url:entry.poster_url},null,entry.title); }
-  if(S.target.kind==="shannon"){ return doShannonPlay({title:entry.raw_name,poster_url:entry.poster_url},null); }
-  beginWarming(entry.title,entry.poster_url);
-  let r;
-  try{ r=await api("/play",{method:"POST",body:{title:entry.raw_name,poster_url:entry.poster_url,target:"chromecast",cast_name:S.target.name}}); }
-  catch{ showPlayError(entry.title,entry.poster_url,"spela unreachable",()=>doPlayLibrary(entry)); return; }
-  endWarming();
-  if(r&&r.error){ showPlayError(entry.title,entry.poster_url,r.error,()=>doPlayLibrary(entry)); return; }
-  S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
-  S.now.data={title:entry.title,poster_url:entry.poster_url||"",quality:"",target:":"+(S.target&&S.target.name||"")};
-  location.hash="#/now"; renderNowFull(); pollNow(true);   // playing → the full now-view (loading stayed in the panel)
+  return playToTarget({
+    body:{title:entry.raw_name,poster_url:entry.poster_url}, label:entry.title,
+    poster:entry.poster_url, library:true, vlcTitle:entry.title
+  }, ()=>doPlayLibrary(entry));
 }
 async function renderLibrary(force){
   const out=$("#libraryOut"); if(!out) return;
