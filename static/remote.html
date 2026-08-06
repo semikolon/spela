@@ -1146,6 +1146,15 @@ function continueItem(it){
   pb.title="Play "+name; pb.setAttribute("aria-label","Play "+name);
   pb.onclick=(ev)=>{ ev.stopPropagation(); fastPlay((name+(se?" "+se:"")).trim(), isTV, it.poster_url); };
   item.appendChild(pb);
+  // Dismiss ✕ — drop a stray / mislabelled watch from Continue (→ /continue/remove).
+  if(it.key){
+    const dm=el("button",{className:"fomark",textContent:"✕",title:"Remove from Continue"});
+    dm.setAttribute("aria-label","Remove "+name+" from Continue");
+    dm.onclick=async(ev)=>{ ev.stopPropagation(); dm.disabled=true;
+      const r=await api("/continue/remove",{method:"POST",body:{key:it.key}}).catch(()=>null);
+      if(r&&r.ok) item.remove(); else dm.disabled=false; };
+    item.appendChild(dm);
+  }
   return item;
 }
 

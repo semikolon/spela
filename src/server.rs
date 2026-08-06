@@ -333,6 +333,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/following/mark", post(handle_following_mark))
         .route("/following/add", post(handle_following_add))
         .route("/following/remove", post(handle_following_remove))
+        .route("/continue/remove", post(handle_continue_remove))
         .route(
             "/following/seen-seasons",
             post(handle_following_seen_seasons),
@@ -4847,6 +4848,7 @@ async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
             continue;
         }
         cont.push(json!({
+            "key": e.key,
             "title": e.title,
             "show": e.show,
             "imdb_id": e.imdb_id,
@@ -5040,6 +5042,24 @@ struct FollowingRemoveRequest {
 /// off (the whole point of the single-source-of-truth refactor).
 async fn handle_following_remove(Json(req): Json<FollowingRemoveRequest>) -> Json<Value> {
     let ok = crate::following::remove_show(req.tmdb_id);
+    Json(json!({ "ok": ok }))
+}
+
+#[derive(Deserialize)]
+struct ContinueRemoveRequest {
+    key: String,
+}
+
+/// `POST /continue/remove` {key} — dismiss a Continue-rail entry (a stray or
+/// mislabelled watch, e.g. a VLC source whose result name carried the wrong
+/// SxxExx). Removes the in-progress row + its resume HWM, then persists.
+async fn handle_continue_remove(
+    State(state): State<SharedState>,
+    Json(req): Json<ContinueRemoveRequest>,
+) -> Json<Value> {
+    let mut app_state = AppState::load(&state.state_dir);
+    let ok = app_state.remove_in_progress(&req.key);
+    let _ = app_state.save(&state.state_dir);
     Json(json!({ "ok": ok }))
 }
 

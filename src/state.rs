@@ -440,6 +440,16 @@ impl AppState {
         key
     }
 
+    /// Dismiss a Continue-rail entry by its exact key (the SPA has it) — removes
+    /// the in-progress row AND its resume high-water-mark. Returns whether it
+    /// existed. Used by `POST /continue/remove` so a stray/mislabelled watch can
+    /// be cleared from the UI (no manual state-file edit).
+    pub fn remove_in_progress(&mut self, key: &str) -> bool {
+        let had = self.in_progress.remove(key).is_some();
+        self.resume_positions.remove(key);
+        had
+    }
+
     /// Record a completed play in the watch-ledger (dedup by key, newest-first,
     /// capped at 500). Called from `save_position_smart`'s completion branch, so
     /// it rides spela's existing "watched to the end" detection.
