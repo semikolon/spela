@@ -6281,7 +6281,12 @@ async fn handle_title_meta(
             .get("_ts")
             .and_then(|v| v.as_u64())
             .is_some_and(|ts| now.saturating_sub(ts) < TTL_SECS);
-        if fresh {
+        // Entries cached before backdrop support lack the `backdrop_url` key →
+        // treat as stale so the wide-row backdrop appears now, not in 30 days.
+        let has_backdrop = hit
+            .get("data")
+            .is_some_and(|d| d.get("backdrop_url").is_some());
+        if fresh && has_backdrop {
             if let Some(data) = hit.get("data") {
                 return Json(data.clone());
             }

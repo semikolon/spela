@@ -766,9 +766,10 @@ async function enrichToWatchRow(row,title,isTV){
     if(st){ const sx=el("span",{className:"stx"+(st==="Returning"||st==="Upcoming"?" on":""),textContent:st});
       (row.querySelector(".mx")||row.querySelector(".gx")||row.querySelector(".ty")||q).after(sx); }
   }
-  if(m.poster_url){ const ps=posterSrc(m.poster_url); const img=new Image();
+  const bgsrc=m.backdrop_url||m.poster_url;
+  if(bgsrc){ const ps=posterSrc(bgsrc); const img=new Image();
     img.onload=()=>{ row.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.88),rgba(15,15,20,.62)),url('${ps}')`;
-      row.style.backgroundSize="cover"; row.style.backgroundPosition="center 20%"; };
+      row.style.backgroundSize="cover"; row.style.backgroundPosition=m.backdrop_url?"center 30%":"center 20%"; };
     img.src=ps; }
 }
 addEventListener("hashchange",route);
@@ -1138,7 +1139,7 @@ function continueItem(it){
   tap.onclick=()=>{ setMode(isTV?"tv":"movie");
     const q=(name+(se?" "+se:"")).trim(); $("#q").value=q; S.search.q=q;
     location.hash="#/search"; runSearch(q); };
-  paintPoster(tap,it.poster_url);
+  paintPoster(tap,it.poster_url); lazyBackdrop(tap, name, isTV);
   item.appendChild(tap);
   // Fast-play ▶ — resume the best source directly (skips the search step).
   const pb=el("button",{className:"foplay"}); pb.innerHTML=ic("play");
@@ -1188,17 +1189,26 @@ function recItem(it){
 async function enrichRec(tap, title, isTV){
   let m; try{ m=await api("/title-meta?title="+encodeURIComponent(title)+(isTV?"&tv=1":"")); }catch{ return; }
   if(!m) return;
-  if(m.poster_url) paintPoster(tap, m.poster_url);
+  if(m.poster_url||m.backdrop_url) paintPoster(tap, m.poster_url, m.backdrop_url);
   if(m.year){ const t=tap.querySelector(".fotitle"); if(t && !t.querySelector(".ep")) t.appendChild(el("span",{className:"ep",textContent:String(m.year)})); }
   if(m.rt!=null){ const r=tap.querySelector(".rrt"); if(r) r.textContent=" · 🍅 "+m.rt; }
 }
 
-// Shared poster-as-faded-background (same treatment as followingItem / To-Watch).
-function paintPoster(tap, poster){
-  if(!poster) return; const ps=posterSrc(poster); const img=new Image();
+// Shared faded-background for wide rows. Prefers the landscape backdrop (crisp);
+// falls back to the portrait poster (which `cover` upscales ~3-4x → fuzzy).
+function paintPoster(tap, poster, backdrop){
+  const src=backdrop||poster; if(!src) return; const ps=posterSrc(src); const img=new Image();
   img.onload=()=>{ tap.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.9),rgba(15,15,20,.66)),url('${ps}')`;
-    tap.style.backgroundSize="cover"; tap.style.backgroundPosition="center 20%"; };
+    tap.style.backgroundSize="cover"; tap.style.backgroundPosition=backdrop?"center 30%":"center 20%"; };
   img.src=ps;
+}
+// Lazy landscape backdrop for a title-only row (Continue rail) — the same
+// server-cached /title-meta lookup To-Watch + Recommended use. Poster paints
+// instantly; this upgrades it to the sharp backdrop when it resolves. 2026-08-06.
+async function lazyBackdrop(tap, title, isTV){
+  if(!title) return;
+  try{ const m=await api("/title-meta?title="+encodeURIComponent(title)+(isTV?"&tv=1":""));
+    if(m&&m.backdrop_url) paintPoster(tap, m.poster_url, m.backdrop_url); }catch{}
 }
 
 // Chromecast auto-track confirm prompt (slice 5). The tracker detects

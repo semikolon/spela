@@ -451,6 +451,7 @@ impl SearchEngine {
             return json!({});
         };
         let poster = tmdb_poster_url(d["poster_path"].as_str());
+        let backdrop = tmdb_backdrop_url(d["backdrop_path"].as_str());
         let genres: Vec<String> = d["genres"]
             .as_array()
             .map(|a| {
@@ -496,6 +497,7 @@ impl SearchEngine {
         let (rt, rt_audience, rt_url) = self.mdblist_rt(id, is_tv).await;
         json!({
             "poster_url": poster,
+            "backdrop_url": backdrop,
             "rt": rt,
             "rt_audience": rt_audience,
             "rt_url": rt_url,
