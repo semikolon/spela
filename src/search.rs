@@ -160,6 +160,9 @@ pub struct SearchEngine {
 pub struct TvStatus {
     pub name: String,
     pub poster_url: Option<String>,
+    /// 16:9 landscape backdrop (w1280) for the wide home rows — sharper than a
+    /// blown-up portrait poster. None → the row falls back to the poster.
+    pub backdrop_url: Option<String>,
     pub status: String,
     /// (season, episode, name, air_date) of the latest AIRED episode.
     pub last_aired: Option<(u32, u32, String, String)>,
@@ -1045,6 +1048,7 @@ impl SearchEngine {
         Some(TvStatus {
             name: d["name"].as_str().unwrap_or("").to_string(),
             poster_url: tmdb_poster_url(d["poster_path"].as_str()),
+            backdrop_url: tmdb_backdrop_url(d["backdrop_path"].as_str()),
             status: d["status"].as_str().unwrap_or("").to_string(),
             last_aired,
             next_episode,
@@ -2023,6 +2027,26 @@ fn tmdb_poster_url(poster_path: Option<&str>) -> Option<String> {
         format!("/{path}")
     };
     Some(format!("https://image.tmdb.org/t/p/w500{normalized}"))
+}
+
+/// TMDB backdrop (16:9 landscape still) at w1280 — for the WIDE home rows (New
+/// Episodes / Coming soon), which upscaled a portrait w500 poster ~3-4x under
+/// `cover` (fuzzy). A landscape backdrop fills a wide banner near-natively (crisp).
+/// Portrait posters stay on the Search grid + Now-view.
+fn tmdb_backdrop_url(backdrop_path: Option<&str>) -> Option<String> {
+    let path = backdrop_path?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return Some(path.to_string());
+    }
+    let normalized = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    Some(format!("https://image.tmdb.org/t/p/w1280{normalized}"))
 }
 
 fn parse_torrentio_title(title: &str) -> (u32, String, String) {

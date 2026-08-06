@@ -4689,6 +4689,7 @@ async fn compute_following_shows(state: &SharedState, app: &AppState) -> (Vec<Va
             "title": if st.name.is_empty() { show.title.clone() } else { st.name },
             "tmdb_id": show.tmdb_id,
             "poster_url": st.poster_url,
+            "backdrop_url": st.backdrop_url,
             "status": st.status,
             "watched_through": watched_opt.map(|(s, e)| crate::following::fmt_se(s, e)),
             "new_count": new_count,

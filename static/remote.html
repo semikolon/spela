@@ -944,9 +944,12 @@ function followingItem(s, onMarked){
     +(s.partway!=null?`<span class="fosub partway">▸ ${s.partway}% into ${esc(nu||"this episode")}</span><span class="cprog"><span class="cprogfill" style="width:${s.partway}%"></span></span>`:"");
   tap.onclick=()=>{ setMode("tv"); const q=s.title+(nu?" "+nu:""); $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
   // Poster as a half-faded background — same treatment as the To-Watch rows.
-  if(s.poster_url){ const ps=posterSrc(s.poster_url); const img=new Image();
+  // Prefer the landscape backdrop (crisp in the wide row); fall back to the
+  // portrait poster (which `cover` upscales ~3-4x → fuzzy). 2026-08-06.
+  const bg=s.backdrop_url||s.poster_url;
+  if(bg){ const ps=posterSrc(bg); const img=new Image();
     img.onload=()=>{ tap.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.9),rgba(15,15,20,.66)),url('${ps}')`;
-      tap.style.backgroundSize="cover"; tap.style.backgroundPosition="center 20%"; };
+      tap.style.backgroundSize="cover"; tap.style.backgroundPosition="center 30%"; };
     img.src=ps; }
   item.appendChild(tap);
   // Fast-play ▶ — play the next unwatched episode's best source directly.
@@ -1054,9 +1057,12 @@ function upcomingItem(s){
   // spela parses the SxxExx and lands on that episode (0 sources until it releases).
   tap.onclick=()=>{ setMode("tv"); const q=s.title+(s.next_air&&s.next_air.se?" "+s.next_air.se:"");
     $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
-  if(s.poster_url){ const ps=posterSrc(s.poster_url); const img=new Image();
+  // Prefer the landscape backdrop (crisp in the wide row); fall back to the
+  // portrait poster (which `cover` upscales ~3-4x → fuzzy). 2026-08-06.
+  const bg=s.backdrop_url||s.poster_url;
+  if(bg){ const ps=posterSrc(bg); const img=new Image();
     img.onload=()=>{ tap.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.9),rgba(15,15,20,.66)),url('${ps}')`;
-      tap.style.backgroundSize="cover"; tap.style.backgroundPosition="center 20%"; };
+      tap.style.backgroundSize="cover"; tap.style.backgroundPosition="center 30%"; };
     img.src=ps; }
   item.appendChild(tap); return item;
 }
