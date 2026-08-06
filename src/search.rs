@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Torrentio API — aggregates 24 torrent sites (TPB, 1337x, YTS, RARBG, TorrentGalaxy, etc.)
 /// Default providers already return 76+ results per movie. All-providers URL doesn't add more.
@@ -98,6 +101,18 @@ pub struct EpisodeRef {
     pub air_date: Option<String>,
 }
 
+/// One TVmaze episode with its air date resolved to Fredrik's local (Europe/
+/// Stockholm) date. TVmaze corrects TMDB's date-only `air_date`, which lags the
+/// real platform release by ~a day (Silo S03E06: TMDB=Aug 6, real Apple TV+=Aug 7).
+#[derive(Debug, Clone)]
+struct TvEp {
+    season: u32,
+    episode: u32,
+    name: Option<String>,
+    /// YYYY-MM-DD in Europe/Stockholm (from `airstamp`, else raw `airdate`).
+    date: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TvEpisodeIntent {
     None,
@@ -132,6 +147,10 @@ pub struct SearchEngine {
     client: reqwest::Client,
     tmdb_key: String,
     mdblist_key: String,
+    /// TVmaze episode lists, keyed by imdb_id (or lowercased title). 6h TTL.
+    /// `None` value = TVmaze has no verified match (cached so we don't re-hit it
+    /// every request — the caller keeps TMDB dates).
+    tvmaze_cache: Mutex<HashMap<String, (Instant, Option<Vec<TvEp>>)>>,
 }
 
 /// TMDB air-date snapshot for a followed series (slice 2b, the followed-shows
@@ -155,6 +174,7 @@ impl SearchEngine {
             client: reqwest::Client::new(),
             tmdb_key,
             mdblist_key,
+            tvmaze_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -620,7 +640,7 @@ impl SearchEngine {
         let detail = self.tmdb_tv_details(tmdb_id).await?;
         let imdb_id = detail["external_ids"]["imdb_id"].as_str().map(String::from);
 
-        let show_info = ShowInfo {
+        let mut show_info = ShowInfo {
             tmdb_id,
             imdb_id: imdb_id.clone(),
             title: detail["name"].as_str().unwrap_or("Unknown").into(),
@@ -648,6 +668,21 @@ impl SearchEngine {
             }
         };
 
+        // TVmaze accurate air dates (corrects TMDB's date-only lag + a just-aired
+        // episode TMDB hasn't caught up to). Fetched ONCE, reused for latest/next +
+        // the searched episode's date below. None → keep TMDB's values.
+        let today = sthlm_today();
+        let tvmaze = self.tvmaze_episodes(&show_info.title, Some(imdb_id.as_str())).await;
+        if let Some(eps) = &tvmaze {
+            let (last, next) = tvmaze_pick(eps, &today);
+            if last.is_some() {
+                show_info.latest_episode = last; // e.g. Star Trek S04E03 while TMDB still says E02
+            }
+            if next.is_some() {
+                show_info.next_episode = next;
+            }
+        }
+
         let (s, e) = episode_to_search(season, episode, intent, show_info.latest_episode.as_ref());
 
         // Episode name + air date (for the card, and the unaired guard). A future
@@ -655,7 +690,21 @@ impl SearchEngine {
         // only "results" for an unaired episode are mislabeled junk the title-filter
         // would reject anyway (the S04E03 "no worky" incident, 2026-08-02) — and let
         // the UI show "Airs <date>" instead of a dead Play button.
-        let (ep_name, ep_air) = self.episode_detail(tmdb_id, s, e).await.unwrap_or_default();
+        let (mut ep_name, mut ep_air) = self.episode_detail(tmdb_id, s, e).await.unwrap_or_default();
+        // Correct the searched episode's air date from TVmaze (Silo E06: TMDB=Aug 6 →
+        // real Aug 7), so the unaired guard + "Airs <date>" line reflect reality.
+        if let Some(eps) = &tvmaze {
+            if let Some((tv_name, tv_date)) = tvmaze_date_for(eps, s, e) {
+                if let Some(d) = tv_date {
+                    ep_air = d;
+                }
+                if ep_name.is_empty() {
+                    if let Some(n) = tv_name {
+                        ep_name = n;
+                    }
+                }
+            }
+        }
         let unaired = is_future_date(&ep_air);
 
         // Step 3: Torrentio lookup (filtered by show title to drop spurious
@@ -935,7 +984,7 @@ impl SearchEngine {
             return None;
         }
         let url = format!(
-            "https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={}",
+            "https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={}&append_to_response=external_ids",
             self.tmdb_key
         );
         let resp = self.client.get(&url).send().await.ok()?;
@@ -968,14 +1017,124 @@ impl SearchEngine {
                     .collect()
             })
             .unwrap_or_default();
+        let mut last_aired = ep(&d["last_episode_to_air"]);
+        let mut next_episode = ep(&d["next_episode_to_air"]);
+        // TVmaze correction (accurate dates + a just-aired episode TMDB lags on) —
+        // powers the /home "Coming soon" + New-Episodes tracker with the REAL
+        // platform date. None → keep TMDB. Only overrides when TVmaze has a value.
+        let name = d["name"].as_str().unwrap_or("");
+        let imdb = d["external_ids"]["imdb_id"].as_str();
+        if let Some(eps) = self.tvmaze_episodes(name, imdb).await {
+            let today = sthlm_today();
+            let (last, next) = tvmaze_pick(&eps, &today);
+            let to_tuple = |r: EpisodeRef| {
+                (
+                    r.season,
+                    r.episode,
+                    r.name.unwrap_or_default(),
+                    r.air_date.unwrap_or_default(),
+                )
+            };
+            if let Some(r) = last {
+                last_aired = Some(to_tuple(r));
+            }
+            if let Some(r) = next {
+                next_episode = Some(to_tuple(r));
+            }
+        }
         Some(TvStatus {
             name: d["name"].as_str().unwrap_or("").to_string(),
             poster_url: tmdb_poster_url(d["poster_path"].as_str()),
             status: d["status"].as_str().unwrap_or("").to_string(),
-            last_aired: ep(&d["last_episode_to_air"]),
-            next_episode: ep(&d["next_episode_to_air"]),
+            last_aired,
+            next_episode,
             seasons,
         })
+    }
+
+    /// Accurate episode air dates for a series from TVmaze (free, no key), which
+    /// corrects TMDB's date-only `air_date` lag (Silo S03E06: TMDB=Aug 6, real
+    /// Apple TV+=Aug 7) AND surfaces a just-aired episode TMDB hasn't caught up to
+    /// yet (Star Trek S04E03 out while TMDB still said latest=E02). Returns the full
+    /// episode list (dates in Europe/Stockholm), or None when TVmaze has no VERIFIED
+    /// match — the caller then keeps TMDB's dates. 6h in-memory cache (per imdb/title).
+    ///
+    /// Robust show-id join: `/singlesearch/shows?q=<title>` (name match) THEN
+    /// cross-check `externals.imdb == our imdb_id`. TVmaze's `/lookup/shows?imdb=`/
+    /// `?thetvdb=` are UNRELIABLE (returned null for Silo despite the crosslink),
+    /// so name-search + imdb equality is the dependable path.
+    async fn tvmaze_episodes(&self, title: &str, imdb_id: Option<&str>) -> Option<Vec<TvEp>> {
+        let key = imdb_id
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| title.to_ascii_lowercase());
+        if let Some((at, v)) = self.tvmaze_cache.lock().unwrap().get(&key) {
+            if at.elapsed() < Duration::from_secs(6 * 3600) {
+                return v.clone();
+            }
+        }
+        let fetched = self.tvmaze_fetch(title, imdb_id).await;
+        self.tvmaze_cache
+            .lock()
+            .unwrap()
+            .insert(key, (Instant::now(), fetched.clone()));
+        fetched
+    }
+
+    async fn tvmaze_fetch(&self, title: &str, imdb_id: Option<&str>) -> Option<Vec<TvEp>> {
+        // 1. Resolve the show by name; verify it's the right one via imdb.
+        let show: Value = self
+            .client
+            .get("https://api.tvmaze.com/singlesearch/shows")
+            .query(&[("q", title)])
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let id = show.get("id")?.as_u64()?;
+        if let Some(want) = imdb_id.filter(|s| !s.is_empty()) {
+            let got = show["externals"]["imdb"].as_str().unwrap_or("");
+            if !got.eq_ignore_ascii_case(want) {
+                return None; // wrong show — do NOT feed a mismatched schedule; keep TMDB
+            }
+        }
+        // 2. Full episode list with tz-aware airstamps.
+        let eps: Value = self
+            .client
+            .get(format!("https://api.tvmaze.com/shows/{id}/episodes"))
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let out: Vec<TvEp> = eps
+            .as_array()?
+            .iter()
+            .filter_map(|e| {
+                let season = e.get("season")?.as_u64()? as u32;
+                let episode = e.get("number")?.as_u64()? as u32;
+                if season == 0 {
+                    return None; // specials
+                }
+                let name = e
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+                Some(TvEp {
+                    season,
+                    episode,
+                    name,
+                    date: tvmaze_local_date(e),
+                })
+            })
+            .collect();
+        (!out.is_empty()).then_some(out)
     }
 
     /// A single episode's (name, air_date) via TMDB — used for the followed-shows
@@ -1250,8 +1409,73 @@ fn is_future_date(air_date: &str) -> bool {
     if air_date.len() < 10 {
         return false;
     }
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    air_date > today.as_str()
+    air_date > sthlm_today().as_str()
+}
+
+/// Today's date in Fredrik's timezone (Europe/Stockholm) — the correct basis for
+/// "has this episode aired?" against TVmaze/TMDB dates (a UTC "today" is up to a
+/// day off near midnight).
+fn sthlm_today() -> String {
+    chrono::Utc::now()
+        .with_timezone(&chrono_tz::Europe::Stockholm)
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// TVmaze episode -> local air DATE. Prefer `airstamp` (offset-aware instant →
+/// Europe/Stockholm date, correct for a global streaming drop in Fredrik's tz),
+/// fall back to the raw `airdate` field.
+fn tvmaze_local_date(e: &Value) -> Option<String> {
+    if let Some(ts) = e
+        .get("airstamp")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+            return Some(
+                dt.with_timezone(&chrono_tz::Europe::Stockholm)
+                    .format("%Y-%m-%d")
+                    .to_string(),
+            );
+        }
+    }
+    e.get("airdate")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// From a TVmaze episode list, the latest-AIRED (date ≤ today, highest S/E) and
+/// the next-UPCOMING (date > today, lowest S/E) episodes — the accurate answers
+/// TMDB's stale `last/next_episode_to_air` miss. Episodes with no date are ignored.
+fn tvmaze_pick(eps: &[TvEp], today: &str) -> (Option<EpisodeRef>, Option<EpisodeRef>) {
+    let to_ref = |e: &TvEp| EpisodeRef {
+        season: e.season,
+        episode: e.episode,
+        name: e.name.clone(),
+        air_date: e.date.clone(),
+    };
+    let mut last: Option<&TvEp> = None;
+    let mut next: Option<&TvEp> = None;
+    for e in eps {
+        let Some(d) = e.date.as_deref() else { continue };
+        if d <= today {
+            if last.is_none_or(|l| (e.season, e.episode) > (l.season, l.episode)) {
+                last = Some(e);
+            }
+        } else if next.is_none_or(|n| (e.season, e.episode) < (n.season, n.episode)) {
+            next = Some(e);
+        }
+    }
+    (last.map(&to_ref), next.map(&to_ref))
+}
+
+/// (name, date) for a specific episode in the TVmaze list — used to correct the
+/// searched episode's air date (the unaired guard + the "Airs <date>" card line).
+fn tvmaze_date_for(eps: &[TvEp], season: u32, episode: u32) -> Option<(Option<String>, Option<String>)> {
+    eps.iter()
+        .find(|e| e.season == season && e.episode == episode)
+        .map(|e| (e.name.clone(), e.date.clone()))
 }
 
 fn filter_results_by_show_title(
