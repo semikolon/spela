@@ -330,6 +330,7 @@
   .wfill{height:100%;background:var(--warn);border-radius:6px;transition:width .45s ease}
   .nowfull h2{margin:.2rem 0 0;font-size:1.3rem;text-align:center}
   .nowfull .sub{color:var(--dim);font-size:.85rem;margin-top:-.4rem}
+  .nowfull .epline{color:var(--fg);font-size:1rem;font-weight:600;margin-top:.15rem;opacity:.92}
   .lu{width:1.05em;height:1.05em;display:inline-block;vertical-align:-.16em;flex:none;stroke:currentColor}
   nav a .lu,.seg button .lu{margin-right:.34em}
   .tgt .lu{margin-right:.4em}
@@ -561,6 +562,7 @@ const S={
        everRan:false,cold:false,seekDrag:false,phone:false,
        warming:false,warmup:null,warmupData:null,   // 2026-07-04 live warmup progress
        vlc:false,vlcTitle:"",   // 2026-08-04 VLC-on-this-Mac remote-control now-view
+       epLabel:"",epShort:"",   // 2026-08-06 which episode is playing ("S04E03 · Human Best Friend" / "S04E03")
        error:null},   // 2026-07-08 persistent play-start failure {title,poster,msg,retry}
   pollTimer:null, frontierTimer:null, warmTimer:null, vlcTimer:null,
   pending:null,   // deferred play: tapped before a target was set → picker → resume
@@ -900,13 +902,23 @@ function fmtDate(iso){ if(!iso) return ""; const p=String(iso).split("-").map(Nu
 // "Latest S03E06 · aired Jul 26 · next S03E07 Aug 2" from show.latest_episode +
 // next_episode — shown on the search card so you see how current the show is,
 // regardless of which episode the query resolved to. TV only (movies → undefined).
-function latestAirLine(show){
+// `searched` = d.searching (the episode the query resolved to). TMDB's latest_episode
+// LAGS the real platform release (Star Trek S04E03 was out while TMDB still said the
+// latest was E02 — the "which ep is actually latest?" confusion, 2026-08-06). So when
+// the searched episode is >= TMDB's latest, TMDB's "Latest" is stale + contradicts the
+// card header → drop the "Latest" clause (the header already shows the newer episode);
+// keep only a genuinely-future "next" hint.
+function latestAirLine(show, searched){
   if(!show || show.seasons==null) return undefined;
   const le=show.latest_episode; if(!le) return undefined;
   const se=(s,e)=>"S"+String(s).padStart(2,"0")+"E"+String(e).padStart(2,"0");
-  let s="Latest "+se(le.season,le.episode)+(le.air_date?" · aired "+fmtDate(le.air_date):"");
   const ne=show.next_episode, t=new Date().toISOString().slice(0,10);
-  if(ne && ne.air_date && ne.air_date>t) s+=" · next "+se(ne.season,ne.episode)+" "+fmtDate(ne.air_date);
+  const nextClause=(ne && ne.air_date && ne.air_date>t)?"next "+se(ne.season,ne.episode)+" "+fmtDate(ne.air_date):"";
+  const searchedNewer = searched && searched.season!=null && searched.episode!=null &&
+    (searched.season>le.season || (searched.season===le.season && searched.episode>=le.episode));
+  if(searchedNewer) return nextClause||undefined;   // TMDB "latest" is stale — don't contradict the header
+  let s="Latest "+se(le.season,le.episode)+(le.air_date?" · aired "+fmtDate(le.air_date):"");
+  if(nextClause) s+=" · "+nextClause;
   return s;
 }
 
@@ -1283,7 +1295,7 @@ async function runSearch(q){
   const se=d.searching;
   const seLabel=se?`Season ${se.season} Episode ${se.episode}`:seFromQuery(q);
   const fb=await followBtnFor(show);
-  const airInfo=latestAirLine(show);
+  const airInfo=latestAirLine(show, se);
   // Unaired-episode guard: the server skips Torrentio for a future air_date (so
   // `res` is empty by design). Show "Airs <date>" instead of a dead Play + junk
   // sources (the S04E03 "no worky" incident, 2026-08-02).
@@ -1425,12 +1437,25 @@ async function pollWarmup(){
 function fmtSpeed(bps){ if(!bps) return "0 KB/s"; const mb=bps/1e6;
   return mb>=1 ? mb.toFixed(1)+" MB/s" : Math.round(bps/1e3)+" KB/s"; }
 
+// Which episode is about to play, from the search context THIS play came from
+// (server-parsed d.searching {season,episode,name}). Movies (no SxxExx) → empty,
+// so the now-view shows only the title. "S04E03 · Human Best Friend" + short "S04E03".
+// The user could not tell E02 from E03 in the now-view before this (2026-08-06).
+function nowEpFromSearch(){
+  const se=S.search.data&&S.search.data.searching;
+  if(!se||se.season==null||se.episode==null) return {epLabel:"",epShort:""};
+  const sx="S"+String(se.season).padStart(2,"0")+"E"+String(se.episode).padStart(2,"0");
+  return {epLabel: se.name? sx+" · "+se.name : sx, epShort:sx};
+}
+
 // Search / torrent play → the shared target dispatcher.
 async function doPlay(opts,cardForSources){
   const label=(S.search.data&&S.search.data.show&&S.search.data.show.title)||opts.title||"Playing";
+  const ep=nowEpFromSearch();
   return playToTarget({
     body:{...opts}, label, poster:opts.poster_url, card:cardForSources,
-    resultId:(opts.result_id!=null?opts.result_id:null), vlcTitle:label
+    resultId:(opts.result_id!=null?opts.result_id:null), vlcTitle:label,
+    epLabel:ep.epLabel, epShort:ep.epShort
   }, ()=>doPlay(opts,cardForSources));
 }
 
@@ -1445,6 +1470,9 @@ async function doPlay(opts,cardForSources){
 //   vlcTitle — human title for VLC / phone-direct
 async function playToTarget(spec, retry){
   if(!S.target){ S.pending=retry; toast("Pick where to play — it starts right after"); openSheet(); return; }
+  // Which episode is playing — set before dispatch so every target (VLC/cast/phone/
+  // shannon) shows it in the now-view + now-bar. Library/movie plays leave it empty.
+  S.now.epLabel=spec.epLabel||""; S.now.epShort=spec.epShort||"";
   const k=S.target.kind;
   if(k==="phone")   return doPhoneDirect(spec.body, spec.card||null, spec.vlcTitle||spec.label);
   if(k==="shannon") return doShannonPlay(spec.body, spec.card||null);
@@ -1818,11 +1846,15 @@ function seekMax(){ return S.now.endlist? (S.now.dur||0)
 
 function updateNowBar(){
   const c=S.now.data; if(!c)return;
-  $("#nbPoster").src=posterSrc(c.poster_url||""); $("#nbTitle").textContent=c.title||"—";
+  $("#nbPoster").src=posterSrc(c.poster_url||"");
+  $("#nbTitle").textContent=(c.title||"—")+(S.now.epShort?" · "+S.now.epShort:"");
   $("#nbState").textContent = S.now.cold ? "Starting…"
     : `${fmt(livePos())} / ${fmt(S.now.dur)}`;
   $("#nbPlay").innerHTML = S.now.cold ? "…" : ic(S.now.playing?"pause":"play");
 }
+
+// Episode line under the now-view title ("S04E03 · Human Best Friend") — empty for movies.
+function epLine(){ return S.now.epLabel? `<div class="sub epline">${esc(S.now.epLabel)}</div>` : ""; }
 
 /* ---------- now-playing: full view + scrubber ---------- */
 /* 2026-08-04: live warmup rendered into the LOWER-THIRD panel (#warmpanel) —
@@ -1899,6 +1931,7 @@ function renderNowFull(){
     if($("#phvid")) return;   // built once — poll re-renders must NOT rebuild the playing <video>
     root.innerHTML=`<div class="nowfull">
       <h2>${esc(c.title||"")}</h2>
+      ${epLine()}
       <div class="sub">${esc(c.quality||"")} · on this device</div>
       <div class="phwrap">
         <video id="phvid" class="phvid" controls playsinline autoplay></video>
@@ -1922,6 +1955,7 @@ function renderNowFull(){
     root.innerHTML=`<div class="nowfull">
       <img class="bigposter" src="${esc(posterSrc(c.poster_url||""))}" alt="">
       <h2>${esc(c.title||"")}</h2>
+      ${epLine()}
       <div class="starting"><div class="spin"></div>Starting on ${esc((c.target||"").split(":")[1]||S.target?.name||"TV")}…</div>
       <div class="sub">Cold-start can take up to a minute — this is normal, not an error.</div>
     </div>`;
@@ -1932,6 +1966,7 @@ function renderNowFull(){
   root.innerHTML=`<div class="nowfull">
     <img class="bigposter" src="${esc(posterSrc(c.poster_url||""))}" alt="">
     <h2>${esc(c.title||"")}</h2>
+    ${epLine()}
     <div class="sub">${esc(c.quality||"")} · ${esc((c.target||"").split(":")[1]||"")}</div>
     <div class="scrub">
       <div class="rail"><div class="frontier" style="width:${fpct}%"></div><div class="fill" id="fFill" style="width:${pct}%"></div></div>
