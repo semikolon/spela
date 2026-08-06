@@ -1037,7 +1037,11 @@ function upcomingItem(s){
   const when=s.next_air?fmtRelDate(s.next_air.air_date):"";
   tap.innerHTML=`<span class="fotitle">${esc(s.title)}</span>`
     +`<span class="fometa">${se?se+" · ":""}airs <b>${when}</b></span>`;
-  tap.onclick=()=>{ setMode("tv"); $("#q").value=s.title; S.search.q=s.title; location.hash="#/search"; runSearch(s.title); };
+  // Tap → search the SPECIFIC upcoming episode (e.g. "Silo S03E06"), NOT just the show
+  // (which defaults to S01E01). TV mode sends no movie param, so the show resolves right;
+  // spela parses the SxxExx and lands on that episode (0 sources until it releases).
+  tap.onclick=()=>{ setMode("tv"); const q=s.title+(s.next_air&&s.next_air.se?" "+s.next_air.se:"");
+    $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
   if(s.poster_url){ const ps=posterSrc(s.poster_url); const img=new Image();
     img.onload=()=>{ tap.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.9),rgba(15,15,20,.66)),url('${ps}')`;
       tap.style.backgroundSize="cover"; tap.style.backgroundPosition="center 20%"; };
