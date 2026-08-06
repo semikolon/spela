@@ -1,5 +1,8 @@
 # Spela TODOs 🎬🍿
 
+### Accurate platform-release dates via TVmaze — SHIPPED + live-verified 2026-08-06 ✅
+Corrects TMDB's day-early air-date lag for ALL networks (Silo S03E06 now Aug 7 not Aug 6; Star Trek latest now S04E03 not the stale E02). `search.rs::tvmaze_episodes` (singlesearch + imdb cross-check; `/lookup` is unreliable), airstamp→Stockholm, 6h cache, falls back to TMDB on any miss. Wired into `search_tv` + `tv_status`. Full detail: CLAUDE.md Hard-Won "Air dates come from TVmaze". Companion SPA fix (same day): now-view/now-bar show the playing episode + search-card drops stale "Latest". **Residual (minor):** TVmaze is TV-only (movies use TMDB `release_date`, no lag problem); `is_future_date`/`compute_following_shows` "today" is now Stockholm — consistent.
+
 ### 4K / partial-torrent VLC "buffer then AUTO-play" (2026-08-03)
 **✅ MOSTLY SHIPPED (v3.21):** `TorrentEngine::prefetch_ends` (first+last-piece prefetch) + `GET /vlc/{id}/ready` + SPA `vlcWaitReady` (poll readiness, auto-fire `vlc://` when buffered, no re-click) are live. **Remaining refinements:** (a) ✅ SHIPPED (v3.22 `ends_present` — a short-timeout head+tail present-check, ANDed with the `≥15% + ≥64MB` proxy in `/vlc/ready`); (b) rate-vs-bitrate gate — for a slow 4K swarm (download < playback bitrate), wait for full/rate-safe download before auto-launch (needs the file's bitrate, ~size/duration once probed); (c) dedup `prefetch_ends` (currently fires per /ready poll — harmless pile-up of fire-and-forget tasks, but wasteful); (d) de-prioritise DV profile-5 4K for the VLC target (renders poorly). Design + why below:
 
