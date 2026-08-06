@@ -7849,8 +7849,15 @@ async fn handle_vlc_playlist(
     // the exact resume point is unreliable here — the recorded duration can mismatch
     // the current source, so seconds→byte is wrong; whole-file-present is the robust
     // gate. A partial-torrent resume-to-downloaded-point refinement is a TODO.)
-    let complete_on_disk = resolve_local_file_for_result(&state, id).is_some()
-        || resolve_local_file_lenient(&state, id).is_some();
+    // "Complete" must mean PHYSICALLY FULL (non-sparse), not merely resolvable: the
+    // lenient resolver matches any ≥100MB non-sparse file, so a half-downloaded
+    // sparse torrent (e.g. 1GB of a 20GB 4K) would otherwise count as complete and
+    // re-introduce the resume-into-a-hole hang. is_physically_full(_, 0) = blocks
+    // cover the whole logical size.
+    let complete_on_disk = resolve_local_file_for_result(&state, id)
+        .or_else(|| resolve_local_file_lenient(&state, id))
+        .map(|(path, _)| is_physically_full(&path, 0))
+        .unwrap_or(false);
     let resume = if complete_on_disk {
         AppState::load(&state.state_dir).get_position(resume_imdb, Some(name.clone()))
     } else {
