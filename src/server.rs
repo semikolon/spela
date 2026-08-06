@@ -5962,7 +5962,8 @@ async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
 async fn handle_poster(
     AxumPath((size, file)): AxumPath<(String, String)>,
 ) -> axum::response::Response {
-    const SIZES: &[&str] = &["w92", "w154", "w185", "w342", "w500", "w780", "original"];
+    // w1280 = the landscape backdrop size for the wide home rows (2026-08-06).
+    const SIZES: &[&str] = &["w92", "w154", "w185", "w342", "w500", "w780", "w1280", "original"];
     let file_ok = !file.is_empty()
         && file
             .chars()
