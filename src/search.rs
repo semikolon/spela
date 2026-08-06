@@ -2276,6 +2276,57 @@ fn episode_to_search(
 mod tests {
     use super::*;
 
+    fn ep(season: u32, episode: u32, date: &str) -> TvEp {
+        TvEp {
+            season,
+            episode,
+            name: None,
+            date: (!date.is_empty()).then(|| date.to_string()),
+        }
+    }
+
+    #[test]
+    fn tvmaze_pick_finds_latest_aired_and_next_upcoming() {
+        // Star Trek scenario: E03 aired (Aug 5) but TMDB still says latest=E02.
+        // tvmaze_pick must return E03 as latest-aired, E04 as next-upcoming.
+        let eps = vec![
+            ep(4, 1, "2026-07-16"),
+            ep(4, 2, "2026-07-30"),
+            ep(4, 3, "2026-08-05"),
+            ep(4, 4, "2026-08-13"),
+        ];
+        let (last, next) = tvmaze_pick(&eps, "2026-08-06");
+        assert_eq!(last.map(|r| (r.season, r.episode)), Some((4, 3)));
+        assert_eq!(next.map(|r| (r.season, r.episode)), Some((4, 4)));
+    }
+
+    #[test]
+    fn tvmaze_pick_ignores_undated_and_spans_the_boundary() {
+        // Silo scenario: E06 airs Aug 7 (future on Aug 6), E05 aired; an undated
+        // episode is skipped, not mistaken for aired.
+        let eps = vec![
+            ep(3, 5, "2026-07-31"),
+            ep(3, 6, "2026-08-07"),
+            ep(3, 7, ""), // undated → ignored
+        ];
+        let (last, next) = tvmaze_pick(&eps, "2026-08-06");
+        assert_eq!(last.map(|r| (r.season, r.episode)), Some((3, 5)));
+        assert_eq!(next.map(|r| (r.season, r.episode)), Some((3, 6)));
+    }
+
+    #[test]
+    fn tvmaze_local_date_prefers_airstamp_in_stockholm() {
+        // A UTC-noon airstamp → same date in Stockholm (CEST = UTC+2).
+        let v = serde_json::json!({"airstamp":"2026-08-07T12:00:00+00:00","airdate":"2026-08-07"});
+        assert_eq!(tvmaze_local_date(&v).as_deref(), Some("2026-08-07"));
+        // A late-UTC instant rolls into the next Stockholm day.
+        let v2 = serde_json::json!({"airstamp":"2026-08-06T23:30:00+00:00","airdate":"2026-08-06"});
+        assert_eq!(tvmaze_local_date(&v2).as_deref(), Some("2026-08-07"));
+        // No airstamp → fall back to airdate.
+        let v3 = serde_json::json!({"airdate":"2026-08-06"});
+        assert_eq!(tvmaze_local_date(&v3).as_deref(), Some("2026-08-06"));
+    }
+
     #[test]
     fn is_future_date_guards_unaired_episodes() {
         assert!(
