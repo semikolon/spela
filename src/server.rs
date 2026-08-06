@@ -7838,12 +7838,24 @@ async fn handle_vlc_playlist(
             .into_response();
     };
     let base = format!("http://{}:{}", state.config.stream_host, state.config.port);
-    // Auto-resume: seek VLC to the saved position (like Chromecast does). /vlc/ready
-    // already gates head+tail present, so VLC can read the Cues to map the seek; it
-    // then buffers the seek-offset pieces (librqbit prioritizes them on the range
-    // request) and plays. A completed watch has its HWM cleared, so any >30s value is
-    // a genuine mid-episode; skip a near-start position.
-    let resume = AppState::load(&state.state_dir).get_position(resume_imdb, Some(name.clone()));
+    // Auto-resume: seek VLC to the saved position (like Chromecast does) — but ONLY
+    // when the whole file is on disk (complete local/library file, or a finished
+    // download). A still-downloading torrent has only head+tail primed (prefetch_ends),
+    // so a resume-seek into the undownloaded MIDDLE makes VLC open the item and buffer
+    // forever — every source failing identically because the resume is keyed to the
+    // movie, not the source (The Nice Guys, 2026-08-06). A partial torrent therefore
+    // starts at 0: the head is present, so it plays immediately + downloads
+    // sequentially (the user can seek forward as it fills). (byte-offset prefetch of
+    // the exact resume point is unreliable here — the recorded duration can mismatch
+    // the current source, so seconds→byte is wrong; whole-file-present is the robust
+    // gate. A partial-torrent resume-to-downloaded-point refinement is a TODO.)
+    let complete_on_disk = resolve_local_file_for_result(&state, id).is_some()
+        || resolve_local_file_lenient(&state, id).is_some();
+    let resume = if complete_on_disk {
+        AppState::load(&state.state_dir).get_position(resume_imdb, Some(name.clone()))
+    } else {
+        0.0
+    };
     let start_opt = if resume > 30.0 {
         format!("#EXTVLCOPT:start-time={}\n", resume as u64)
     } else {
