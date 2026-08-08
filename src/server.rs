@@ -5895,23 +5895,37 @@ fn result_partial_pct(
     // (±12% absorbs GiB-vs-GB reporting). No parseable size → no on-disk claim
     // (a false-negative badge beats ten false-positive ones).
     let want_bytes = parse_size_to_bytes(&result.size)?;
+    // Candidate FILES: top-level entries + one level inside directories. A library
+    // folder ("Predestination (2014) [1080p]") holds the real release file INSIDE
+    // it, so its generic folder name must NOT be the match key — match the inner
+    // file's name + size instead (2026-08-08: the folder name was a substring of
+    // every 1080p result → all flagged on disk).
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     for entry in std::fs::read_dir(media_dir).ok()?.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("transcoded") {
+        let p = entry.path();
+        if p.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&p) {
+                candidates.extend(rd.flatten().map(|e| e.path()));
+            }
+        } else {
+            candidates.push(p);
+        }
+    }
+    for path in candidates {
+        let Some(fname) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if fname.starts_with("transcoded") {
             continue;
         }
-        let got = normalize_release_name(&name);
-        // Forward containment ONLY: the on-disk name must contain the FULL result
-        // release name (an exact librqbit download, possibly with a tracker suffix).
-        // The reverse (`want.contains(got)`) let a SHORT generic on-disk name — the
-        // library folder "Predestination (2014) [1080p]" → "predestination20141080p"
-        // — be a substring of every 1080p result, flagging unrelated releases as on
-        // disk (2026-08-08). A library copy isn't a specific torrent release; it's
-        // handled by the Local-Bypass path, not the per-result on-disk badge.
+        let got = normalize_release_name(&fname);
+        // Forward containment: the on-disk file name must contain the FULL result
+        // release name (an exact download, possibly with a tracker suffix). NOT the
+        // reverse — a short generic name being a substring of every result is the bug.
         if got.len() < 8 || !got.contains(&want) {
             continue;
         }
-        let (phys, logi) = phys_logical_bytes(&entry.path());
+        let (phys, logi) = phys_logical_bytes(&path);
         if logi == 0 {
             continue; // empty/placeholder entry — keep scanning for the real file
         }
@@ -9956,6 +9970,30 @@ mod tests {
             &mk("Pantheon.S01E01.REPACK.1080p.WEBRip.x264-CATS.mkv", "100 MB")
         )
         .is_none());
+
+        // A release file INSIDE a generic library folder is matched by the FILE's
+        // name, not the folder's (the 2026-08-08 Predestination bug: the folder
+        // "X (2014) [1080p]" normalized to a substring of every 1080p result).
+        let libdir = dir.path().join("Movie (2014) [1080p]");
+        std::fs::create_dir(&libdir).unwrap();
+        let inner = libdir.join("Movie.2014.1080p.BluRay.x264-GRP.mkv");
+        let mut ih = std::fs::File::create(&inner).unwrap();
+        ih.write_all(&vec![2u8; 50 * 1024 * 1024]).unwrap();
+        ih.sync_all().unwrap();
+        drop(ih);
+        // The matching release (inner file name + size) is detected...
+        assert!(
+            result_partial_pct(dir.path(), &mk("Movie.2014.1080p.BluRay.x264-GRP.mkv", "50 MB"))
+                .is_some(),
+            "a release file inside a library folder must be detected"
+        );
+        // ...but a DIFFERENT release of the same title is NOT (the old reverse match
+        // on the folder name would have wrongly flagged it).
+        assert!(
+            result_partial_pct(dir.path(), &mk("Movie.2014.1080p.WEB.x265-OTHER.mkv", "8 GB"))
+                .is_none(),
+            "a different release must not match via the generic folder name"
+        );
     }
 
     #[test]
