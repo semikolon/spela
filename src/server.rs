@@ -5901,7 +5901,14 @@ fn result_partial_pct(
             continue;
         }
         let got = normalize_release_name(&name);
-        if got.len() < 8 || !(got.contains(&want) || want.contains(&got)) {
+        // Forward containment ONLY: the on-disk name must contain the FULL result
+        // release name (an exact librqbit download, possibly with a tracker suffix).
+        // The reverse (`want.contains(got)`) let a SHORT generic on-disk name — the
+        // library folder "Predestination (2014) [1080p]" → "predestination20141080p"
+        // — be a substring of every 1080p result, flagging unrelated releases as on
+        // disk (2026-08-08). A library copy isn't a specific torrent release; it's
+        // handled by the Local-Bypass path, not the per-result on-disk badge.
+        if got.len() < 8 || !got.contains(&want) {
             continue;
         }
         let (phys, logi) = phys_logical_bytes(&entry.path());
