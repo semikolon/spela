@@ -5886,6 +5886,15 @@ fn result_partial_pct(
     if want.len() < 8 {
         return None; // too short to match a release reliably
     }
+    // Name containment alone is too loose: `normalize_release_name` reduces every
+    // "Predestination 2014 1080p ..." to a common prefix, and a short on-disk name
+    // (e.g. the folder "Predestination (2014) [1080p]" → "predestination20141080p")
+    // is a SUBSTRING of every 1080p result → all 10 releases falsely showed "on
+    // disk" (2026-08-08). SIZE is the release discriminator: an 18GB remux ≠ the
+    // 1.44GB YIFY file. Require the on-disk logical size to match the result's size
+    // (±12% absorbs GiB-vs-GB reporting). No parseable size → no on-disk claim
+    // (a false-negative badge beats ten false-positive ones).
+    let want_bytes = parse_size_to_bytes(&result.size)?;
     for entry in std::fs::read_dir(media_dir).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with("transcoded") {
@@ -5897,7 +5906,11 @@ fn result_partial_pct(
         }
         let (phys, logi) = phys_logical_bytes(&entry.path());
         if logi == 0 {
-            return None;
+            continue; // empty/placeholder entry — keep scanning for the real file
+        }
+        let ratio = logi as f64 / want_bytes as f64;
+        if !(0.88..=1.12).contains(&ratio) {
+            continue; // a different-sized release of the same title — not this one
         }
         let pct = ((phys as f64 / logi as f64) * 100.0)
             .round()
@@ -5905,6 +5918,23 @@ fn result_partial_pct(
         return (pct >= 1).then_some(pct);
     }
     None
+}
+
+/// Parse a human size string ("1.44 GB", "366.45 MB", "18.92 GB") to bytes.
+/// Tracker sizes are GiB/GB-ambiguous; callers use a tolerance band. None if
+/// unparseable.
+fn parse_size_to_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, unit) = s.split_once(char::is_whitespace)?;
+    let n: f64 = num.replace(',', ".").parse().ok()?;
+    let mult = match unit.trim().to_ascii_uppercase().as_str() {
+        "GB" | "GIB" => 1024.0 * 1024.0 * 1024.0,
+        "MB" | "MIB" => 1024.0 * 1024.0,
+        "KB" | "KIB" => 1024.0,
+        "B" => 1.0,
+        _ => return None,
+    };
+    Some((n * mult) as u64)
 }
 
 async fn handle_targets(State(state): State<SharedState>) -> Json<Value> {
@@ -9892,12 +9922,12 @@ mod tests {
     #[test]
     fn test_result_partial_pct_reports_sparse_partial_and_skips_nonmatch() {
         use std::io::Write;
-        let mk = |title: &str| crate::search::TorrentResult {
+        let mk = |title: &str, size: &str| crate::search::TorrentResult {
             id: 1,
             quality: "1080p".into(),
             title: title.into(),
             seeds: 10,
-            size: "1 GB".into(),
+            size: size.into(),
             source: "Test".into(),
             magnet: "magnet:test".into(),
             info_hash: "x".into(),
@@ -9915,18 +9945,35 @@ mod tests {
         fh.set_len(100 * 1024 * 1024).unwrap();
         fh.sync_all().unwrap();
         drop(fh);
+        let fname = f.file_name().unwrap().to_string_lossy().to_string();
 
-        // Same release → ~32% detected (allow filesystem block rounding).
-        let pct = result_partial_pct(dir.path(), &mk(&f.file_name().unwrap().to_string_lossy()))
+        // Same release + matching size → ~32% detected (allow block rounding).
+        let pct = result_partial_pct(dir.path(), &mk(&fname, "100 MB"))
             .expect("partial should be detected for the matching release");
         assert!((28..=36).contains(&pct), "expected ~32%, got {}", pct);
+
+        // Same NAME but a very different SIZE (a different encode of the same title)
+        // → NOT on disk. This is the 2026-08-08 fix: size discriminates releases so
+        // ten differently-sized results don't all match one file.
+        assert!(
+            result_partial_pct(dir.path(), &mk(&fname, "18 GB")).is_none(),
+            "a differently-sized release must NOT match this file"
+        );
 
         // Different release (CATS) → no cross-match, no partial.
         assert!(result_partial_pct(
             dir.path(),
-            &mk("Pantheon.S01E01.REPACK.1080p.WEBRip.x264-CATS.mkv")
+            &mk("Pantheon.S01E01.REPACK.1080p.WEBRip.x264-CATS.mkv", "100 MB")
         )
         .is_none());
+    }
+
+    #[test]
+    fn parse_size_to_bytes_handles_common_units() {
+        assert_eq!(parse_size_to_bytes("1 GB"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size_to_bytes("366.45 MB"), Some((366.45 * 1048576.0) as u64));
+        assert_eq!(parse_size_to_bytes("18.92 GB"), Some((18.92 * 1073741824.0) as u64));
+        assert_eq!(parse_size_to_bytes("nonsense"), None);
     }
 
     #[test]
