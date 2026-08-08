@@ -372,6 +372,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/vlc/{id}/stream", get(handle_vlc_stream))
         .route("/vlc/{id}/ready", get(handle_vlc_ready))
         .route("/vlc/{id}/open.m3u", get(handle_vlc_playlist))
+        .route("/vlc/{id}/sub.srt", get(handle_vlc_sub))
         .route("/vlc/control", post(handle_vlc_control))
         .route("/vlc/pending", get(handle_vlc_pending))
         .route("/hls/master.m3u8", get(handle_hls_master))
@@ -7860,6 +7861,54 @@ async fn handle_vlc_library_playlist(
     }
 }
 
+/// `GET /vlc/{id}/sub.srt` — external English subtitle for the VLC path (native
+/// decode = no burn-in). Fetches OpenSubtitles for the current title on demand
+/// (download-only, no alass — fast enough for VLC's input-slave load; alass-sync
+/// for the VLC path is a follow-up) and serves the .srt. The .m3u attaches this
+/// via input-slave so VLC auto-loads it; 404 → VLC plays without subs. 2026-08-08.
+async fn handle_vlc_sub(
+    State(state): State<SharedState>,
+    axum::extract::Path(_id): axum::extract::Path<usize>,
+) -> axum::response::Response {
+    let search = AppState::load_last_search(&state.state_dir);
+    let imdb = search
+        .as_ref()
+        .and_then(|s| s.show.as_ref())
+        .and_then(|sh| sh.imdb_id.clone());
+    let (season, episode) = match search.as_ref().and_then(|s| s.searching.as_ref()) {
+        Some(e) => (Some(e.season), Some(e.episode)),
+        None => (None, None),
+    };
+    let Some(imdb) = imdb.filter(|i| !i.is_empty()) else {
+        return (axum::http::StatusCode::NOT_FOUND, "no imdb for subtitles").into_response();
+    };
+    let client = reqwest::Client::new();
+    match crate::subtitles::fetch_subtitles(
+        &client,
+        &imdb,
+        season,
+        episode,
+        "en",
+        &state.media_dir,
+        None, // download-only: no embedded/alass pass (fast for the slave load)
+    )
+    .await
+    {
+        Ok(Some(_)) => {
+            let srt = state.media_dir.join("subtitle_en.srt");
+            match tokio::fs::read(&srt).await {
+                Ok(bytes) => axum::response::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "application/x-subrip")
+                    .body(axum::body::Body::from(bytes))
+                    .unwrap(),
+                Err(_) => (axum::http::StatusCode::NOT_FOUND, "no sub file").into_response(),
+            }
+        }
+        _ => (axum::http::StatusCode::NOT_FOUND, "no subtitles found").into_response(),
+    }
+}
+
 async fn handle_vlc_playlist(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
@@ -7913,9 +7962,16 @@ async fn handle_vlc_playlist(
     // A resumed play needs more buffer runway while the download ramps at the seek
     // offset; a fresh start streams sequentially, so the 3s default is fine there.
     let netcache = if start_opt.is_empty() { 3000 } else { 8000 };
+    // Attach an external English subtitle as an input-slave. The VLC path decodes
+    // natively (no burn-in like Chromecast), and most releases (e.g. YIFY) ship NO
+    // embedded subs, so `sub-language` alone finds nothing to select (2026-08-08:
+    // Predestination played with no subs). /vlc/{id}/sub.srt fetches OpenSubtitles
+    // on demand; VLC loads the slave URL when it opens the item, and a 404 (no sub
+    // found) is graceful — VLC just plays without subs.
+    let sub_opt = format!("#EXTVLCOPT:input-slave={}/vlc/{}/sub.srt\n", base, id);
     let body = format!(
-        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:sub-language=en,eng\n#EXTVLCOPT:network-caching={}\n{}{}/vlc/{}/stream?al={}\n",
-        name, audio_lang, netcache, start_opt, base, id, audio_lang
+        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:sub-language=en,eng\n#EXTVLCOPT:network-caching={}\n{}{}{}/vlc/{}/stream?al={}\n",
+        name, audio_lang, netcache, sub_opt, start_opt, base, id, audio_lang
     );
     axum::response::Response::builder()
         .status(200)
