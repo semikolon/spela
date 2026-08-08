@@ -7888,14 +7888,14 @@ async fn handle_vlc_sub(
         &imdb,
         season,
         episode,
-        "en",
+        "eng", // OpenSubtitles uses ISO 639-2 ("eng"), not "en" — same as the cast path
         &state.media_dir,
         None, // download-only: no embedded/alass pass (fast for the slave load)
     )
     .await
     {
         Ok(Some(_)) => {
-            let srt = state.media_dir.join("subtitle_en.srt");
+            let srt = state.media_dir.join("subtitle_eng.srt");
             match tokio::fs::read(&srt).await {
                 Ok(bytes) => axum::response::Response::builder()
                     .status(200)
