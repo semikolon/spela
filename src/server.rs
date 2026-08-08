@@ -5920,23 +5920,6 @@ fn result_partial_pct(
     None
 }
 
-/// Parse a human size string ("1.44 GB", "366.45 MB", "18.92 GB") to bytes.
-/// Tracker sizes are GiB/GB-ambiguous; callers use a tolerance band. None if
-/// unparseable.
-fn parse_size_to_bytes(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let (num, unit) = s.split_once(char::is_whitespace)?;
-    let n: f64 = num.replace(',', ".").parse().ok()?;
-    let mult = match unit.trim().to_ascii_uppercase().as_str() {
-        "GB" | "GIB" => 1024.0 * 1024.0 * 1024.0,
-        "MB" | "MIB" => 1024.0 * 1024.0,
-        "KB" | "KIB" => 1024.0,
-        "B" => 1.0,
-        _ => return None,
-    };
-    Some((n * mult) as u64)
-}
-
 async fn handle_targets(State(state): State<SharedState>) -> Json<Value> {
     let state_clone = state.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -9966,14 +9949,6 @@ mod tests {
             &mk("Pantheon.S01E01.REPACK.1080p.WEBRip.x264-CATS.mkv", "100 MB")
         )
         .is_none());
-    }
-
-    #[test]
-    fn parse_size_to_bytes_handles_common_units() {
-        assert_eq!(parse_size_to_bytes("1 GB"), Some(1024 * 1024 * 1024));
-        assert_eq!(parse_size_to_bytes("366.45 MB"), Some((366.45 * 1048576.0) as u64));
-        assert_eq!(parse_size_to_bytes("18.92 GB"), Some((18.92 * 1073741824.0) as u64));
-        assert_eq!(parse_size_to_bytes("nonsense"), None);
     }
 
     #[test]
