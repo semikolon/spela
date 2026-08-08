@@ -648,12 +648,15 @@ async function openInVlc(id,title,poster){
   stopPolling();   // the Chromecast /status poll must NOT run for a VLC stream
   location.hash="#/now"; renderNowFull(); startVlcPoll();
   toast("Opening in VLC…");
-  // Fire the vlc:// scheme — the handler is installed on the Mac (install-vlc-url-handler.sh
-  // + Chrome AutoLaunch), so it launches VLC directly. NO page-navigation fallback: the old
-  // blur-timeout fallback navigated Chrome to the .m3u whenever blur wasn't detected, and on
-  // a multi-monitor setup VLC opens on the OTHER screen without blurring Chrome → the movie
-  // opened in BOTH the browser AND VLC (2026-08-05). vlc:// alone is reliable here.
-  window.location.href=url.replace(/^https?:\/\//,"vlc://");
+  // Fire the PLAYLIST url (…/open.m3u), NOT the bare stream url. VLC opening the .m3u
+  // is what makes its #EXTVLCOPT lines apply — the subtitle input-slave, resume
+  // start-time, buffer. Firing the extracted stream url (the old behavior) meant VLC
+  // opened the bare stream and DISCARDED every EXTVLCOPT → no subs, no resume
+  // (2026-08-08). Keep ?al= on it for the vlc:// handler's --audio-language. Handler
+  // is installed on the Mac (install-vlc-url-handler.sh + Chrome AutoLaunch); no
+  // page-navigation fallback (it double-opened in browser+VLC on multi-monitor, 2026-08-05).
+  const m3uUrl=url.replace(/\/stream\?/,"/open.m3u?");
+  window.location.href=m3uUrl.replace(/^https?:\/\//,"vlc://");
 }
 // Library file → VLC. The file is COMPLETE on the origin, so there's no torrent
 // buffering to poll: resolve its serve-library URL (/library/vlc.m3u) and fire vlc://
