@@ -106,6 +106,7 @@
      won't start). Mirrors the green "on disk" style so slow sources are visible. */
   .src .s.low{color:var(--warn)}
   .src .s.dead{color:var(--bad)}
+  .src .s.fresh{color:var(--accent)}  /* just-aired: swarm forming, count unreliable */
   .src.dead{border-color:var(--bad);background:linear-gradient(90deg,rgba(224,86,74,.13),var(--bg3))}
   /* 2026-06-30: a source already (part-)downloaded on disk — tapping it resumes
      (librqbit overwrite:true) instead of re-fetching that fraction. */
@@ -778,7 +779,7 @@ async function enrichToWatchRow(row,title,isTV){
 addEventListener("hashchange",route);
 
 /* ---------- poster card (skeleton -> img | titled fallback) ---------- */
-function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,detailLine,seLabel,epName,airsNote,followBtn,airInfo}){
+function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,detailLine,seLabel,epName,airsNote,followBtn,airInfo,justAired}){
   const c=el("div",{className:"card"});
   const p=el("div",{className:"poster"});
   const sh=el("div",{className:"shimmer"});
@@ -844,15 +845,20 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
       const part=typeof r.partial_pct==="number";
       const sc=r.seeds??0;
       // seed health — mirrors the green "on disk" pattern. On-disk sources are
-      // never "dead" (they play from the local file regardless of swarm).
-      const health=part?"ok":(sc<5?"dead":sc<20?"low":"ok");
+      // never "dead" (they play from the local file regardless of swarm). A
+      // just-aired episode's swarm is still forming, so a low/0 count is unreliable
+      // → mark "🌱 new" (neutral), not red-dead, so a fresh episode isn't scared off.
+      const fresh=justAired&&!part&&sc<20;
+      const health=part?"ok":fresh?"fresh":(sc<5?"dead":sc<20?"low":"ok");
       const row=el("button",{className:"src"+(part?" partial":health==="dead"?" dead":"")});
       row.appendChild(el("span",{className:"q",textContent:r.quality||"?"}));
       if(part) row.appendChild(el("span",{className:"dl",textContent:r.partial_pct>=100?"✓ on disk":`↓ ${r.partial_pct}%`}));
       row.appendChild(el("span",{className:"x",textContent:codec(r.title)}));
       row.appendChild(el("span",{className:"x",textContent:r.size||""}));
       row.appendChild(el("span",{className:"x",textContent:r.source||""}));
-      row.appendChild(el("span",{className:"s "+health,textContent:(health==="dead"?"⚠ ":"")+sc+"🌱"}));
+      row.appendChild(el("span",{className:"s "+health,
+        title:fresh?"just aired — seed counts unreliable for a day or so; tap to try (spela verifies real delivery)":"",
+        textContent:fresh?"🌱 new":(health==="dead"?"⚠ ":"")+sc+"🌱"}));
       row.onclick=()=>doPlay({result_id:r.id});
       box.appendChild(row);
     });
@@ -1344,7 +1350,11 @@ async function runSearch(q){
     cta:"Play best source", sources:res,
     onPlay:()=>doPlay({result_id:res[0].id}, card),
     onMarkWatched:()=>markWatched(show.title||res[0].title, show.imdb_id),
-    rtTitle:show.title||res[0].title, followBtn:fb, airInfo
+    rtTitle:show.title||res[0].title, followBtn:fb, airInfo,
+    // Just-aired episode → its swarm is still forming, so low/0 seed counts are
+    // unreliable (2026-08-13: a "0 seeds" S04E04 streamed fine). Mark sources "🌱 new"
+    // instead of red-dead so a fresh episode doesn't look falsely dead.
+    justAired: !!(se && se.air_date && (()=>{const a=new Date(se.air_date).getTime(); return a<=Date.now() && Date.now()-a < 2.2*864e5;})())
   });
   grid.appendChild(card); out.innerHTML=""; out.appendChild(grid);
   fillDetailLine(card, show.title||res[0].title, S.mode==="tv");
