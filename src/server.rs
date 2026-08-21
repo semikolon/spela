@@ -6018,7 +6018,9 @@ async fn handle_poster(
     AxumPath((size, file)): AxumPath<(String, String)>,
 ) -> axum::response::Response {
     // w1280 = the landscape backdrop size for the wide home rows (2026-08-06).
-    const SIZES: &[&str] = &["w92", "w154", "w185", "w342", "w500", "w780", "w1280", "original"];
+    const SIZES: &[&str] = &[
+        "w92", "w154", "w185", "w342", "w500", "w780", "w1280", "original",
+    ];
     let file_ok = !file.is_empty()
         && file
             .chars()
@@ -6308,15 +6310,38 @@ async fn handle_title_meta(
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
     let title = q.get("title").cloned().unwrap_or_default();
-    let is_tv = q.get("tv").map(|v| v == "1").unwrap_or(false);
-    if title.trim().is_empty() {
+    let media = q.get("media_type").map(|s| s.as_str()).unwrap_or("");
+    let is_tv =
+        q.get("tv").map(|v| v == "1").unwrap_or(false) || matches!(media, "tv" | "series" | "show");
+    // ID-first inputs the caller (rec / search result) may already know — resolving by
+    // these is mismatch-proof.
+    let tmdb_id = q
+        .get("tmdb_id")
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| *v > 0);
+    let imdb_id = q
+        .get("imdb_id")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let year = q
+        .get("year")
+        .and_then(|s| s.get(..4).unwrap_or(s.as_str()).parse::<u32>().ok());
+    if title.trim().is_empty() && tmdb_id.is_none() && imdb_id.is_none() {
         return Json(json!({}));
     }
-    let cache_key = format!(
-        "{}:{}",
-        if is_tv { "tv" } else { "movie" },
-        title.to_lowercase()
-    );
+    // Collision-free cache key: two same-title different-year titles (The Curse 2023 vs
+    // 1999) must NOT share a slot. Key on an id when known, else title + year.
+    let id_key = tmdb_id
+        .map(|t| format!("t{t}"))
+        .or_else(|| imdb_id.clone().map(|i| format!("i{i}")))
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                title.to_lowercase(),
+                year.map(|y| y.to_string()).unwrap_or_default()
+            )
+        });
+    let cache_key = format!("{}:{}", if is_tv { "tv" } else { "movie" }, id_key);
     let path = dirs::home_dir().map(|h| h.join(".config/spela/watchlist_meta.json"));
     let mut cache: serde_json::Map<String, Value> = path
         .as_ref()
@@ -6347,7 +6372,10 @@ async fn handle_title_meta(
             }
         }
     }
-    let data = state.search_engine.title_meta(&title, is_tv).await;
+    let data = state
+        .search_engine
+        .title_meta(&title, is_tv, tmdb_id, imdb_id.as_deref(), year)
+        .await;
     cache.insert(cache_key, json!({"_ts": now, "data": data.clone()}));
     if let Some(p) = path {
         let _ = std::fs::write(&p, serde_json::to_string(&cache).unwrap_or_default());
@@ -7851,7 +7879,11 @@ async fn handle_vlc_library_playlist(
     match resolve_library_vlc_url(&state, title).await {
         Some(url) => {
             let body = format!("#EXTM3U\n#EXTINF:-1,{}\n{}\n", title, url);
-            ([(axum::http::header::CONTENT_TYPE, "audio/x-mpegurl")], body).into_response()
+            (
+                [(axum::http::header::CONTENT_TYPE, "audio/x-mpegurl")],
+                body,
+            )
+                .into_response()
         }
         None => (
             axum::http::StatusCode::NOT_FOUND,
@@ -10023,7 +10055,10 @@ mod tests {
         // Different release (CATS) → no cross-match, no partial.
         assert!(result_partial_pct(
             dir.path(),
-            &mk("Pantheon.S01E01.REPACK.1080p.WEBRip.x264-CATS.mkv", "100 MB")
+            &mk(
+                "Pantheon.S01E01.REPACK.1080p.WEBRip.x264-CATS.mkv",
+                "100 MB"
+            )
         )
         .is_none());
 
@@ -10039,15 +10074,21 @@ mod tests {
         drop(ih);
         // The matching release (inner file name + size) is detected...
         assert!(
-            result_partial_pct(dir.path(), &mk("Movie.2014.1080p.BluRay.x264-GRP.mkv", "50 MB"))
-                .is_some(),
+            result_partial_pct(
+                dir.path(),
+                &mk("Movie.2014.1080p.BluRay.x264-GRP.mkv", "50 MB")
+            )
+            .is_some(),
             "a release file inside a library folder must be detected"
         );
         // ...but a DIFFERENT release of the same title is NOT (the old reverse match
         // on the folder name would have wrongly flagged it).
         assert!(
-            result_partial_pct(dir.path(), &mk("Movie.2014.1080p.WEB.x265-OTHER.mkv", "8 GB"))
-                .is_none(),
+            result_partial_pct(
+                dir.path(),
+                &mk("Movie.2014.1080p.WEB.x265-OTHER.mkv", "8 GB")
+            )
+            .is_none(),
             "a different release must not match via the generic folder name"
         );
     }

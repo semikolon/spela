@@ -366,79 +366,136 @@ impl SearchEngine {
     /// `poster_url`, `year` (a RANGE for series: "2014–2022" / "2014–present"),
     /// `genres` (real TMDB names), `tmdb` (vote_average 0–10), `status`,
     /// `seasons`, `episodes`, `runtime`, `overview`. Two TMDB calls, then cached.
-    pub async fn title_meta(&self, title: &str, is_tv: bool) -> Value {
-        if self.tmdb_key.is_empty() || title.trim().is_empty() {
+    /// Resolve an IMDb id → (tmdb_id, is_tv) via TMDB's `/find` endpoint. Bulletproof:
+    /// an IMDb id maps to exactly one title, so there is no fuzzy matching to get wrong.
+    /// Returns the first tv result, else the first movie result. `None` on error / miss.
+    async fn tmdb_find_by_imdb(&self, imdb: &str) -> Option<(u64, bool)> {
+        if self.tmdb_key.is_empty() {
+            return None;
+        }
+        let url = format!(
+            "https://api.themoviedb.org/3/find/{}?external_source=imdb_id&api_key={}",
+            urlencoded(imdb),
+            self.tmdb_key
+        );
+        let v = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()?;
+        if let Some(id) = v["tv_results"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|r| r["id"].as_u64())
+        {
+            return Some((id, true));
+        }
+        if let Some(id) = v["movie_results"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|r| r["id"].as_u64())
+        {
+            return Some((id, false));
+        }
+        None
+    }
+
+    pub async fn title_meta(
+        &self,
+        title: &str,
+        is_tv: bool,
+        tmdb_id: Option<u64>,
+        imdb_id: Option<&str>,
+        year: Option<u32>,
+    ) -> Value {
+        if self.tmdb_key.is_empty() {
             return json!({});
         }
-        let cleaned = clean_title_for_tmdb(title);
-        let title = if cleaned.is_empty() {
-            title
+        // Resolve to a concrete (kind, id). ID-FIRST: when the caller already knows the
+        // exact TMDB or IMDb id (recs + search results carry them), resolve by id and
+        // SKIP the ambiguous title search entirely — no same-title / wrong-year / wrong-
+        // media mismatch is possible. Only when NO id is known do we title-search,
+        // disambiguated by the shared year+votes+extra-word scorer
+        // (`pick_best_tmdb_candidate`) with the caller's `year` — the same comparator the
+        // search path uses, so "The Curse" + 2023 + tv resolves the Fielder series, not
+        // the 1999 movie or the 2022 comedy.
+        let mut kind = if is_tv { "tv" } else { "movie" };
+        let id: u64 = if let Some(tid) = tmdb_id.filter(|t| *t > 0) {
+            tid
+        } else if let Some((fid, ftv)) = match imdb_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(imdb) => self.tmdb_find_by_imdb(imdb).await,
+            None => None,
+        } {
+            kind = if ftv { "tv" } else { "movie" };
+            fid
         } else {
-            cleaned.as_str()
-        };
-        let q = urlencoded(title);
-        let kind = if is_tv { "tv" } else { "movie" };
-        // Find the best-overlap candidate's id (search endpoint), then fetch its
-        // detail. Two attempts: typed search, then a shortened multi query.
-        let words: Vec<&str> = title.split_whitespace().collect();
-        let mut urls = vec![format!(
-            "https://api.themoviedb.org/3/search/{}?query={}&api_key={}",
-            kind, q, self.tmdb_key
-        )];
-        if words.len() >= 2 {
-            let head = urlencoded(&words[..words.len() - 1].join(" "));
-            urls.push(format!(
+            let cleaned = clean_title_for_tmdb(title);
+            let title = if cleaned.is_empty() {
+                title
+            } else {
+                cleaned.as_str()
+            };
+            if title.trim().is_empty() {
+                return json!({});
+            }
+            let q = urlencoded(title);
+            // Typed search, then a shortened multi query as a fallback.
+            let words: Vec<&str> = title.split_whitespace().collect();
+            let mut urls = vec![format!(
                 "https://api.themoviedb.org/3/search/{}?query={}&api_key={}",
-                kind, head, self.tmdb_key
-            ));
-        }
-        let want = title_norm(title);
-        let want_words = want.split_whitespace().count().max(1) as f32;
-        let mut best: Option<(f32, u64)> = None;
-        for url in &urls {
-            let Ok(resp) = self.client.get(url).send().await else {
-                continue;
-            };
-            let Ok(v) = resp.json::<Value>().await else {
-                continue;
-            };
-            let Some(arr) = v["results"].as_array() else {
-                continue;
-            };
-            for item in arr {
-                let id = item["id"].as_u64().unwrap_or(0);
-                if id == 0 {
+                kind, q, self.tmdb_key
+            )];
+            if words.len() >= 2 {
+                let head = urlencoded(&words[..words.len() - 1].join(" "));
+                urls.push(format!(
+                    "https://api.themoviedb.org/3/search/{}?query={}&api_key={}",
+                    kind, head, self.tmdb_key
+                ));
+            }
+            let want = title_norm(title);
+            let mut candidates: Vec<Value> = Vec::new();
+            for url in &urls {
+                let Ok(resp) = self.client.get(url).send().await else {
                     continue;
-                }
-                let cand = item["title"]
-                    .as_str()
-                    .or_else(|| item["name"].as_str())
-                    .or_else(|| item["original_title"].as_str())
-                    .unwrap_or("");
-                let cand_norm = title_norm(cand);
-                // Prefer an EXACT title over a partial-containment match. Without
-                // this, "The Beasts" scores 1.0 against the popular
-                // "Transformers: Rise of the Beasts" (both contain the words) and
-                // wins on popularity order. Exact = 2.0; otherwise penalize a
-                // candidate that carries far more words than the query.
-                let score = if cand_norm == want {
-                    2.0
-                } else {
-                    let cand_words = cand_norm.split_whitespace().count().max(1) as f32;
-                    title_token_score(&want, &cand_norm) * (want_words / cand_words.max(want_words))
                 };
-                if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
-                    best = Some((score, id));
+                let Ok(v) = resp.json::<Value>().await else {
+                    continue;
+                };
+                if let Some(arr) = v["results"].as_array() {
+                    candidates.extend(
+                        arr.iter()
+                            .filter(|it| it["id"].as_u64().unwrap_or(0) > 0)
+                            .cloned(),
+                    );
+                }
+                // An exact-title hit is present → the fallback query can't do better.
+                if candidates.iter().any(|it| {
+                    let n = it["title"]
+                        .as_str()
+                        .or_else(|| it["name"].as_str())
+                        .unwrap_or("");
+                    title_norm(n) == want
+                }) {
+                    break;
                 }
             }
-            if best.as_ref().is_some_and(|(s, _)| *s >= 2.0) {
-                break; // exact match — no need for the fallback query
+            let refs: Vec<&Value> = candidates.iter().collect();
+            // Confident pick via the shared scorer; else fall back to the first result
+            // (old behavior) so a genuinely-ambiguous no-year query still returns SOMETHING.
+            let picked = pick_best_tmdb_candidate(&refs, title, year)
+                .or_else(|| refs.first().map(|v| (**v).clone()));
+            match picked {
+                Some(best) => best["id"].as_u64().unwrap_or(0),
+                None => return json!({}),
             }
-        }
-        let Some((score, id)) = best.filter(|(s, _)| *s >= 0.01) else {
-            return json!({});
         };
-        let _ = score;
+        if id == 0 {
+            return json!({});
+        }
         // Detail endpoint — the full field set.
         let durl = format!(
             "https://api.themoviedb.org/3/{}/{}?api_key={}",
@@ -677,7 +734,9 @@ impl SearchEngine {
         // episode TMDB hasn't caught up to). Fetched ONCE, reused for latest/next +
         // the searched episode's date below. None → keep TMDB's values.
         let today = sthlm_today();
-        let tvmaze = self.tvmaze_episodes(&show_info.title, Some(imdb_id.as_str())).await;
+        let tvmaze = self
+            .tvmaze_episodes(&show_info.title, Some(imdb_id.as_str()))
+            .await;
         if let Some(eps) = &tvmaze {
             let (last, next) = tvmaze_pick(eps, &today);
             if last.is_some() {
@@ -695,7 +754,8 @@ impl SearchEngine {
         // only "results" for an unaired episode are mislabeled junk the title-filter
         // would reject anyway (the S04E03 "no worky" incident, 2026-08-02) — and let
         // the UI show "Airs <date>" instead of a dead Play button.
-        let (mut ep_name, mut ep_air) = self.episode_detail(tmdb_id, s, e).await.unwrap_or_default();
+        let (mut ep_name, mut ep_air) =
+            self.episode_detail(tmdb_id, s, e).await.unwrap_or_default();
         // Correct the searched episode's air date from TVmaze (Silo E06: TMDB=Aug 6 →
         // real Aug 7), so the unaired guard + "Airs <date>" line reflect reality.
         if let Some(eps) = &tvmaze {
@@ -1478,7 +1538,11 @@ fn tvmaze_pick(eps: &[TvEp], today: &str) -> (Option<EpisodeRef>, Option<Episode
 
 /// (name, date) for a specific episode in the TVmaze list — used to correct the
 /// searched episode's air date (the unaired guard + the "Airs <date>" card line).
-fn tvmaze_date_for(eps: &[TvEp], season: u32, episode: u32) -> Option<(Option<String>, Option<String>)> {
+fn tvmaze_date_for(
+    eps: &[TvEp],
+    season: u32,
+    episode: u32,
+) -> Option<(Option<String>, Option<String>)> {
     eps.iter()
         .find(|e| e.season == season && e.episode == episode)
         .map(|e| (e.name.clone(), e.date.clone()))
@@ -1953,15 +2017,34 @@ fn score_tmdb_candidate(item: &Value, query_norm: &str, query_year: Option<u32>)
         .unwrap_or("");
     let title_n = title_norm(title);
     let token = title_token_score(query_norm, &title_n);
+    // Extra-word penalty. `title_token_score` is query-token COVERAGE, so a superset
+    // title fully covers a short query and scores 1.0 ("The Curse" ⊂ "The Curse of Oak
+    // Island"; "The Beasts" ⊂ "Transformers: Rise of the Beasts"). Without a length
+    // penalty those false-friends win on popularity. Exact-normalized title = no
+    // penalty; otherwise scale coverage by query-words / candidate-words. (Folds the
+    // guard that used to live only in the /title-meta inline scorer, so ALL title
+    // resolution — search + title-meta — shares one strong comparator.)
+    let base = if title_n == query_norm {
+        1.0
+    } else {
+        let qw = query_norm.split_whitespace().count().max(1) as f32;
+        let cw = title_n.split_whitespace().count().max(1) as f32;
+        token * (qw / cw.max(qw))
+    };
 
     let item_year = item["release_date"]
         .as_str()
         .or_else(|| item["first_air_date"].as_str())
         .and_then(|d| d.get(..4))
         .and_then(|y| y.parse::<u32>().ok());
+    // Year is DECISIVE, not a nudge: for same-title different-year collisions (The
+    // Curse 2023 series vs 2022 series vs 1999 movie) an exact-year match must beat a
+    // near-year alternate even when the wrong year has far more votes — so exact-year
+    // (0.40) > near-year (0.15) + max vote_bonus (0.15). Only applies when the query
+    // carries a year (user/rec intent); year-less queries are unaffected.
     let year_bonus = match (query_year, item_year) {
-        (Some(q), Some(i)) if q == i => 0.20,
-        (Some(q), Some(i)) if (q as i32 - i as i32).abs() <= 1 => 0.10,
+        (Some(q), Some(i)) if q == i => 0.40,
+        (Some(q), Some(i)) if (q as i32 - i as i32).abs() <= 1 => 0.15,
         _ => 0.0,
     };
 
@@ -1974,7 +2057,7 @@ fn score_tmdb_candidate(item: &Value, query_norm: &str, query_year: Option<u32>)
         0.0
     };
 
-    token + year_bonus + vote_bonus
+    base + year_bonus + vote_bonus
 }
 
 /// 2026-06-09: Pick the best TMDB candidate from a slice. Returns `None`
@@ -4023,5 +4106,119 @@ mod tests {
         let best = pick_best_tmdb_candidate(&candidates, "The Boys", None).unwrap();
         assert_eq!(best["media_type"], "tv");
         assert_eq!(best["name"], "The Boys");
+    }
+
+    // ---- Real-TMDB-response fixtures (copied verbatim from the live API 2026-08-21,
+    // trimmed to the fields the scorer reads — see tests/fixtures/tmdb/). These are the
+    // ACTUAL collision shapes that mis-resolved: a same-named wrong-year / wrong-media /
+    // superset title outranking the intended one on popularity. ----
+    fn fixture_results(json_str: &str) -> Vec<Value> {
+        serde_json::from_str::<Value>(json_str).expect("fixture parses")["results"]
+            .as_array()
+            .expect("results array")
+            .clone()
+    }
+    fn resolve_fixture(fixture: &str, query: &str, year: Option<u32>) -> Value {
+        let arr = fixture_results(fixture);
+        let refs: Vec<&Value> = arr.iter().collect();
+        pick_best_tmdb_candidate(&refs, query, year)
+            .or_else(|| refs.first().map(|v| (**v).clone()))
+            .expect("a pick")
+    }
+    fn picked_year(item: &Value) -> Option<String> {
+        item["first_air_date"]
+            .as_str()
+            .or_else(|| item["release_date"].as_str())
+            .and_then(|d| d.get(..4))
+            .map(String::from)
+    }
+    fn picked_name(item: &Value) -> String {
+        item["title"]
+            .as_str()
+            .or_else(|| item["name"].as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    const F_CURSE_TV: &str = include_str!("../tests/fixtures/tmdb/the_curse_tv.json");
+    const F_CURSE_MOVIE: &str = include_str!("../tests/fixtures/tmdb/the_curse_movie.json");
+    const F_SPRING: &str = include_str!("../tests/fixtures/tmdb/spring_movie.json");
+    const F_BEASTS: &str = include_str!("../tests/fixtures/tmdb/the_beasts_movie.json");
+
+    #[test]
+    fn real_the_curse_2023_series_beats_2022_and_oak_island() {
+        // /search/tv?query=The Curse returns "The Curse of Oak Island" (2014, huge votes)
+        // FIRST, then "The Curse" (2023) and "The Curse" (2022). Year 2023 must resolve
+        // the Nathan Fielder series — the actual /title-meta bug that started this.
+        let best = resolve_fixture(F_CURSE_TV, "The Curse", Some(2023));
+        assert_eq!(picked_name(&best), "The Curse");
+        assert_eq!(picked_year(&best).as_deref(), Some("2023"));
+    }
+
+    #[test]
+    fn real_the_curse_1999_movie_when_year_is_1999() {
+        // Same title on the MOVIE side (buried among Pirates / Halloween / Noroi supersets)
+        // → year 1999 resolves the 1999 movie.
+        let best = resolve_fixture(F_CURSE_MOVIE, "The Curse", Some(1999));
+        assert_eq!(picked_name(&best), "The Curse");
+        assert_eq!(picked_year(&best).as_deref(), Some("1999"));
+    }
+
+    #[test]
+    fn real_spring_2014_beats_spring_breakers() {
+        // "Spring Breakers" (2013, huge pop) is result #1 — year 2014 must pick "Spring".
+        let best = resolve_fixture(F_SPRING, "Spring", Some(2014));
+        assert_eq!(picked_name(&best), "Spring");
+        assert_eq!(picked_year(&best).as_deref(), Some("2014"));
+    }
+
+    #[test]
+    fn real_the_beasts_2022_beats_transformers_and_fantastic_beasts() {
+        // The canonical extra-word false-friend: "Transformers: Rise of the Beasts" and
+        // multiple "Fantastic Beasts" fully CONTAIN the query "The Beasts" and dwarf it in
+        // votes. The extra-word penalty must demote them; year 2022 seals "The Beasts".
+        let best = resolve_fixture(F_BEASTS, "The Beasts", Some(2022));
+        assert_eq!(picked_name(&best), "The Beasts");
+        assert_eq!(picked_year(&best).as_deref(), Some("2022"));
+    }
+
+    #[test]
+    fn real_the_beasts_extra_word_penalty_holds_without_year() {
+        // Even with NO year hint, the extra-word penalty must keep a superset blockbuster
+        // from stealing an exact-title query on popularity alone.
+        let best = resolve_fixture(F_BEASTS, "The Beasts", None);
+        assert_eq!(
+            picked_name(&best),
+            "The Beasts",
+            "extra-word penalty must beat raw popularity"
+        );
+    }
+
+    #[test]
+    fn real_corpus_every_collision_resolves_to_the_intended_title() {
+        // Corpus assertion over all real fixtures: each (query, year) resolves to a title
+        // whose NORMALIZED name equals the query — no superset false-friend ever wins.
+        let cases: &[(&str, &str, Option<u32>)] = &[
+            (F_CURSE_TV, "The Curse", Some(2023)),
+            (F_CURSE_MOVIE, "The Curse", Some(1999)),
+            (F_SPRING, "Spring", Some(2014)),
+            (F_BEASTS, "The Beasts", Some(2022)),
+        ];
+        let mut checked = 0;
+        for (fx, q, yr) in cases {
+            let best = resolve_fixture(fx, q, *yr);
+            assert_eq!(
+                title_norm(&picked_name(&best)),
+                title_norm(q),
+                "query {:?} mis-resolved to {:?}",
+                q,
+                picked_name(&best)
+            );
+            if let Some(y) = yr {
+                assert_eq!(picked_year(&best).as_deref(), Some(y.to_string().as_str()));
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "all real collision cases must be exercised");
     }
 }

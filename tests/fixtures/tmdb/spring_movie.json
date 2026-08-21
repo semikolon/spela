@@ -1,0 +1,137 @@
+{
+ "query_note": "spring_movie",
+ "results": [
+  {
+   "id": 122081,
+   "name": null,
+   "title": "Spring Breakers",
+   "original_name": null,
+   "original_title": "Spring Breakers",
+   "first_air_date": null,
+   "release_date": "2013-03-06",
+   "vote_count": 4072,
+   "popularity": 6.0268
+  },
+  {
+   "id": 241855,
+   "name": null,
+   "title": "Spring",
+   "original_name": null,
+   "original_title": "Spring",
+   "first_air_date": null,
+   "release_date": "2014-10-08",
+   "vote_count": 809,
+   "popularity": 2.4401
+  },
+  {
+   "id": 58231,
+   "name": null,
+   "title": "Mardi Gras: Spring Break",
+   "original_name": null,
+   "original_title": "Mardi Gras: Spring Break",
+   "first_air_date": null,
+   "release_date": "2011-09-23",
+   "vote_count": 182,
+   "popularity": 4.8255
+  },
+  {
+   "id": 865733,
+   "name": null,
+   "title": "Spring",
+   "original_name": null,
+   "original_title": "Spring",
+   "first_air_date": null,
+   "release_date": "2021-08-24",
+   "vote_count": 12,
+   "popularity": 1.0228
+  },
+  {
+   "id": 18826,
+   "name": null,
+   "title": "Spring Breakdown",
+   "original_name": null,
+   "original_title": "Spring Breakdown",
+   "first_air_date": null,
+   "release_date": "2009-05-22",
+   "vote_count": 105,
+   "popularity": 1.9895
+  },
+  {
+   "id": 593048,
+   "name": null,
+   "title": "Spring",
+   "original_name": null,
+   "original_title": "Spring",
+   "first_air_date": null,
+   "release_date": "2019-04-04",
+   "vote_count": 16,
+   "popularity": 0.6418
+  },
+  {
+   "id": 174987,
+   "name": null,
+   "title": "Spring Reunion",
+   "original_name": null,
+   "original_title": "Spring Reunion",
+   "first_air_date": null,
+   "release_date": "1957-03-01",
+   "vote_count": 5,
+   "popularity": 1.0131
+  },
+  {
+   "id": 257315,
+   "name": null,
+   "title": "Scorpion Spring",
+   "original_name": null,
+   "original_title": "Scorpion Spring",
+   "first_air_date": null,
+   "release_date": "1996-10-10",
+   "vote_count": 5,
+   "popularity": 1.3953
+  },
+  {
+   "id": 151996,
+   "name": null,
+   "title": "Spring",
+   "original_name": null,
+   "original_title": "Spring",
+   "first_air_date": null,
+   "release_date": "2002-09-25",
+   "vote_count": 2,
+   "popularity": 0.8162
+  },
+  {
+   "id": 660592,
+   "name": null,
+   "title": "Second Spring",
+   "original_name": null,
+   "original_title": "Second Spring",
+   "first_air_date": null,
+   "release_date": "2020-02-21",
+   "vote_count": 1,
+   "popularity": 1.199
+  },
+  {
+   "id": 487320,
+   "name": null,
+   "title": "Red Spring",
+   "original_name": null,
+   "original_title": "Red Spring",
+   "first_air_date": null,
+   "release_date": "2017-11-23",
+   "vote_count": 6,
+   "popularity": 0.55
+  },
+  {
+   "id": 426218,
+   "name": null,
+   "title": "The Spring",
+   "original_name": null,
+   "original_title": "The Spring",
+   "first_air_date": null,
+   "release_date": "1989-01-01",
+   "vote_count": 1,
+   "popularity": 1.1186
+  }
+ ]
+}

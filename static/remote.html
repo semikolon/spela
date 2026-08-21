@@ -718,7 +718,7 @@ async function renderToWatch(){
     // written `note` was inconsistent + jargon-y, replaced by real genres).
     if(x.rt!=null) r.appendChild(el("span",{className:"s "+(x.rt>=88?"":"low"),textContent:"🍅 "+x.rt}));
     r.onclick=()=>{ setMode(isTV?"tv":"movie"); $("#q").value=x.title; S.search.q=x.title; location.hash="#/search"; runSearch(x.title); };
-    enrichToWatchRow(r,x.title,isTV);
+    enrichToWatchRow(r,x,isTV);
     return r;
   });
   const series=mk(d.series,true), movies=mk(d.movies,false);
@@ -744,8 +744,19 @@ async function renderToWatch(){
 // release year (after the title) — TMDB via /title-meta, cached server-side so
 // it's one lookup per title then instant. Progressive: rows show immediately,
 // posters/years fill in as they resolve. 2026-07-13.
-async function enrichToWatchRow(row,title,isTV){
-  let m; try{ m=await api("/title-meta?title="+encodeURIComponent(title)+(isTV?"&tv=1":"")); }catch{ return; }
+// Build a /title-meta query that passes the ids/year the item already carries, so
+// resolution is ID-FIRST (mismatch-proof) instead of fuzzy-title. Without this the
+// server can only guess by title and picks a same-named wrong-year/wrong-media title
+// (e.g. "The Curse" → the 1999 movie instead of the 2023 series). 2026-08-21.
+function titleMetaQS(it,isTV){
+  let qs="/title-meta?title="+encodeURIComponent(it.title||"")+(isTV?"&tv=1":"");
+  if(it.tmdb_id) qs+="&tmdb_id="+encodeURIComponent(it.tmdb_id);
+  if(it.imdb_id) qs+="&imdb_id="+encodeURIComponent(it.imdb_id);
+  if(it.year)    qs+="&year="+encodeURIComponent(it.year);
+  return qs;
+}
+async function enrichToWatchRow(row,x,isTV){
+  let m; try{ m=await api(titleMetaQS(x,isTV)); }catch{ return; }
   if(!m) return;
   const q=row.querySelector(".q");
   // live RT (MDBList) overrides the static curated score when present; also
@@ -1188,7 +1199,7 @@ function recItem(it){
   tap.onclick=()=>{ setMode(isTV?"tv":"movie");
     $("#q").value=it.title; S.search.q=it.title; location.hash="#/search"; runSearch(it.title); };
   if(it.poster_url) paintPoster(tap,it.poster_url);
-  enrichRec(tap,it.title,isTV);
+  enrichRec(tap,it);
   item.appendChild(tap);
   // Quick "I've already seen this" ✓ — marks watched (→ ledger, dropped from recs
   // next load) WITHOUT clicking into the title. Optimistically removes the row.
@@ -1204,8 +1215,9 @@ function recItem(it){
 // lookup To-Watch uses: paints the poster-bg, appends the year, and OVERRIDES the
 // curated 🍅 with the LIVE MDBList score so Home matches the search card + To-Watch
 // (a curated score can be months stale; live is the truth spela shows elsewhere).
-async function enrichRec(tap, title, isTV){
-  let m; try{ m=await api("/title-meta?title="+encodeURIComponent(title)+(isTV?"&tv=1":"")); }catch{ return; }
+async function enrichRec(tap, it){
+  const isTV=it.media_type==="tv";
+  let m; try{ m=await api(titleMetaQS(it,isTV)); }catch{ return; }
   if(!m) return;
   if(m.poster_url||m.backdrop_url) paintPoster(tap, m.poster_url, m.backdrop_url);
   if(m.year){ const t=tap.querySelector(".fotitle"); if(t && !t.querySelector(".ep")) t.appendChild(el("span",{className:"ep",textContent:String(m.year)})); }
