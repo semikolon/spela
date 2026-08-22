@@ -496,6 +496,13 @@ impl SearchEngine {
         if id == 0 {
             return json!({});
         }
+        // Media type may have been CORRECTED during resolution (an IMDb id that
+        // resolves to a TV series when the caller passed no `tv=1`). Everything below —
+        // the detail fetch, the year computation, and the RT lookup — must use the
+        // RESOLVED media type, not the caller's original `is_tv`. Shadow it so no
+        // downstream use can read the stale flag (the bug that returned null rt/year for
+        // TV titles resolved by imdb_id).
+        let is_tv = kind == "tv";
         // Detail endpoint — the full field set.
         let durl = format!(
             "https://api.themoviedb.org/3/{}/{}?api_key={}",
