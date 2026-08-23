@@ -3,7 +3,15 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-pub const MAX_MEDIA_MB: u64 = 10_000;
+// 2026-08-23: raised 10_000 → 100_000 when the media cache moved OFF the
+// encrypted root (shared-fate with Postgres/FalkorDB/Docker/router/journald)
+// onto the dedicated /mnt/hdd backup drive (233 GB free). The cap stays
+// load-bearing there — /mnt/hdd also holds restic (383 GB) + backups — but a
+// 100 GB ceiling on a 233-GB-free dedicated drive is a convenience buffer for
+// resume/rewatch, not a shared-fate risk to live services. Enforced on EVERY
+// torrent-start path (do_play AND Open-in-VLC) via start_torrent_for_play +
+// a background periodic sweep, so it can't silently stop being enforced again.
+pub const MAX_MEDIA_MB: u64 = 100_000;
 
 /// Match a filesystem entry name against an active-play title, tolerant to
 /// separator variation (dots vs spaces vs underscores vs dashes). Used by
@@ -52,7 +60,7 @@ pub fn check_space(media_dir: &Path) -> Result<Option<String>> {
     let size_mb = size_bytes / (1024 * 1024);
     if size_mb > MAX_MEDIA_MB {
         return Ok(Some(format!(
-            "~/media/ is {}MB (>{}MB cap). Clean up first.",
+            "media cache is {}MB (>{}MB cap). Clean up first.",
             size_mb, MAX_MEDIA_MB
         )));
     }

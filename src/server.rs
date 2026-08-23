@@ -82,6 +82,12 @@ pub struct ServerState {
     /// (never torn down when VLC quits) until they exhausted the FD ceiling and new
     /// streams failed with EMFILE. Bounded to the current VLC stream.
     pub vlc_torrents: Mutex<Vec<u32>>,
+    /// 2026-08-23: debounce timestamp for the per-torrent-start cap prune in
+    /// `start_torrent_for_play`. The Open-in-VLC `/vlc/{id}/ready` endpoint is
+    /// POLLED (~1 s) and calls `start_torrent_for_play` every tick, so without
+    /// a debounce the prune (read_dir + du) would run every second. At most
+    /// one prune per `PRUNE_DEBOUNCE_SECS` across all callers.
+    pub last_prune: Mutex<Option<Instant>>,
 }
 
 /// Live playback position for the web-remote scrubber (see `live_position`).
@@ -257,7 +263,37 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         vlc_activity: Mutex::new(None),
         vlc_commands: Mutex::new(Vec::new()),
         vlc_torrents: Mutex::new(Vec::new()),
+        last_prune: Mutex::new(None),
     });
+
+    // 2026-08-23: background cap-enforcement sweep. The per-play prune inside
+    // `start_torrent_for_play` covers every download path, but a periodic
+    // sweep is the path-agnostic safety net: it enforces MAX_MEDIA_MB even if
+    // a future download path forgets to prune (the durable cure for the
+    // "Open-in-VLC downloaded uncapped to 48 GB" incident — that path never
+    // pruned because only do_play did). Protects the currently-cast title
+    // (CurrentStream); an in-flight VLC download is protected by recency
+    // (newest mtime → never LRU-evicted). Runs in spawn_blocking so the
+    // read_dir + du never stall the axum runtime.
+    {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            tick.tick().await; // consume the immediate first tick; startup already prunes on first play
+            loop {
+                tick.tick().await;
+                let media_dir = resolve_media_dir(&sweep_state);
+                let active = AppState::load(&sweep_state.state_dir)
+                    .current
+                    .map(|c| c.title)
+                    .unwrap_or_default();
+                let _ = tokio::task::spawn_blocking(move || {
+                    disk::prune_to_fit(&media_dir, &active, disk::MAX_MEDIA_MB);
+                })
+                .await;
+            }
+        });
+    }
 
     // 2026-07-13 (slice 5): background watch tracker — polls house Chromecasts,
     // stages near-complete non-spela sessions for Fredrik to confirm on load.
@@ -808,11 +844,44 @@ fn maybe_resume_stream_on_boot(state: SharedState, prev: CurrentStream) {
 
 /// Start a torrent and return `(torrent_id, http_url)` for `do_play` to wire
 /// into `CurrentStream.pid` + ffmpeg's input URL.
+/// At most one cap-enforcement prune per this window across ALL torrent-start
+/// callers. The Open-in-VLC readiness poll hits `start_torrent_for_play` ~1×/s;
+/// this stops the prune's read_dir+du from running every tick.
+const PRUNE_DEBOUNCE_SECS: u64 = 60;
+
 async fn start_torrent_for_play(
     state: &SharedState,
     magnet: &str,
     file_index: Option<u32>,
 ) -> anyhow::Result<(u32, String)> {
+    // 2026-08-23: enforce the media-cache cap on EVERY download path here, the
+    // single choke point every torrent-start flows through (do_play AND both
+    // Open-in-VLC endpoints). Before this, only do_play pruned/checked — so the
+    // Open-in-VLC path (the default target) downloaded uncapped and grew the
+    // cache to 48 GB (~5× cap) unchecked. Debounced against the ~1 s VLC
+    // readiness poll. Runs BEFORE engine.start, so the in-flight file doesn't
+    // exist yet and can't be evicted; a later re-prune (>60 s, still
+    // downloading) sees it as newest-mtime and recency-protects it. Empty
+    // active-title is safe for the same recency reason. See disk::prune_to_fit.
+    let should_prune = {
+        let mut lp = lock_recover(&state.last_prune);
+        let now = Instant::now();
+        let due = lp.map_or(true, |t| {
+            now.duration_since(t) >= std::time::Duration::from_secs(PRUNE_DEBOUNCE_SECS)
+        });
+        if due {
+            *lp = Some(now);
+        }
+        due
+    };
+    if should_prune {
+        let media_dir = resolve_media_dir(state);
+        disk::prune_to_fit(&media_dir, "", disk::MAX_MEDIA_MB);
+        if let Ok(Some(err)) = disk::check_space(&media_dir) {
+            anyhow::bail!(err);
+        }
+    }
+
     let info = state.torrent_engine.start(magnet, file_index).await?;
     tracing::info!(
         "librqbit: torrent {} started, file_idx={}, url={}",
