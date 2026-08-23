@@ -1561,14 +1561,11 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                         req.file_index = req.file_index.or(r.file_index);
                         // Auto-fill metadata from the search context
                         if req.title.is_none() {
-                            let ep = search.searching.as_ref();
-                            req.title = Some(match (&search.show, ep) {
-                                (Some(show), Some(ep)) => {
-                                    format!("{} S{:02}E{:02}", show.title, ep.season, ep.episode)
-                                }
-                                (Some(show), None) => show.title.clone(),
-                                _ => r.title.clone(),
-                            });
+                            req.title = Some(bypass_match_title(
+                                search.show.as_ref().map(|s| s.title.as_str()),
+                                search.searching.as_ref().map(|e| (e.season, e.episode)),
+                                &r.title,
+                            ));
                         }
                         if req.imdb_id.is_none() {
                             req.imdb_id = search.show.as_ref().and_then(|s| s.imdb_id.clone());
@@ -5580,6 +5577,40 @@ pub(crate) fn is_valid_poster_url(url: &str) -> bool {
 ///      regression case.
 ///
 /// Pure (filesystem-only) — testable via tempfile fixtures.
+/// Parse a filename's SxxExx and test it against a required (season, episode).
+/// Uses the shared `parse_episode_markers` so `S01E06` / `s01e06` / `1x06` all
+/// normalize the same way. False if the name carries no episode marker.
+fn name_matches_episode(name: &str, required: (u32, u32)) -> bool {
+    let (_, s, e) = crate::search::parse_episode_markers(name);
+    matches!((s, e), (Some(s2), Some(e2)) if s2 == required.0 && e2 == required.1)
+}
+
+/// Build the title used for Local Bypass matching / CurrentStream. When the
+/// structured episode (`searching`) is set, use it. When it's absent — a
+/// free-text episode query (e.g. a /home "Coming soon" tap searches
+/// "Show S01E06" as text, so `searching` is None though the results ARE that
+/// episode) — recover SxxExx from the RESULT title so the bypass stays
+/// episode-strict instead of matching any on-disk episode of the show
+/// (2026-08-23). Movies / no-episode results fall back to the show title, or
+/// the raw result title when there's no show context.
+pub(crate) fn bypass_match_title(
+    show_title: Option<&str>,
+    searching: Option<(u32, u32)>,
+    result_title: &str,
+) -> String {
+    match (show_title, searching) {
+        (Some(t), Some((s, e))) => format!("{t} S{s:02}E{e:02}"),
+        (Some(t), None) => {
+            let (_, s, e) = crate::search::parse_episode_markers(result_title);
+            match (s, e) {
+                (Some(s), Some(e)) => format!("{t} S{s:02}E{e:02}"),
+                _ => t.to_string(),
+            }
+        }
+        (None, _) => result_title.to_string(),
+    }
+}
+
 pub(crate) fn find_local_bypass_match(
     media_dir: &std::path::Path,
     title: &str,
@@ -5587,6 +5618,30 @@ pub(crate) fn find_local_bypass_match(
     expected_bytes: u64,
     corrupt_files: &std::collections::HashSet<String>,
 ) -> Option<std::path::PathBuf> {
+    // Episode-strictness (2026-08-23): if the request names a specific episode,
+    // the on-disk match MUST be that episode — a top-level file's own SxxExx, or
+    // a season-pack dir's INNER file's SxxExx — never a sibling episode of the
+    // same show. Closes two bugs: (1) a bare show title (searching=None, e.g. a
+    // /home Coming-soon tap that reached the caller before `bypass_match_title`)
+    // matching any episode folder; (2) a season-pack dir ("Show.S01.WEBRip...")
+    // being invisible because its NAME lacks "S01E06", so packed episodes were
+    // needlessly re-downloaded. Movies (no SxxExx in the title) keep pure
+    // title+year+quality matching, unchanged.
+    let (show_only, req_season, req_episode) = crate::search::parse_episode_markers(title);
+    let required_se = match (req_season, req_episode) {
+        (Some(s), Some(e)) => Some((s, e)),
+        _ => None,
+    };
+    // For the show/dir-name token match, use the episode-STRIPPED title when an
+    // episode is required, so a season-pack dir still matches (the episode is
+    // verified on the inner file, not the dir name). The year survives in
+    // show_only (only the SxxExx is stripped), so the year filter is unaffected.
+    let name_match_title: &str = if required_se.is_some() {
+        &show_only
+    } else {
+        title
+    };
+
     let entries = std::fs::read_dir(media_dir).ok()?;
     for entry in entries.flatten() {
         let file_type = match entry.file_type() {
@@ -5595,7 +5650,7 @@ pub(crate) fn find_local_bypass_match(
         };
         let folder_name = entry.file_name().to_string_lossy().to_string();
 
-        if !title_tokens_match(&folder_name, title) {
+        if !title_tokens_match(&folder_name, name_match_title) {
             continue;
         }
         let matches_year = if title.contains("2026") {
@@ -5629,6 +5684,13 @@ pub(crate) fn find_local_bypass_match(
 
         let path = entry.path();
         let has_done_marker = path.join(".spela_done").exists();
+        // If the DIR name itself already names the requested episode, it's a
+        // single-episode folder whose inner file may be generically named
+        // ("a.mkv", "video.mkv") — accept any healthy video inside. Only when
+        // the dir name does NOT name the episode (a season pack, "Show.S01...")
+        // do we require the INNER file to carry the exact SxxExx.
+        let dir_name_has_episode =
+            required_se.is_some_and(|se| name_matches_episode(&folder_name, se));
 
         if file_type.is_dir() {
             if let Ok(sub_entries) = std::fs::read_dir(&path) {
@@ -5637,6 +5699,14 @@ pub(crate) fn find_local_bypass_match(
                     let fname = sub_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                     let ext = sub_path.extension().and_then(|s| s.to_str()).unwrap_or("");
                     if (ext == "mp4" || ext == "mkv") && !fname.starts_with("transcoded") {
+                        // Episode gate: satisfied if the dir name already names
+                        // the episode (single-episode folder) OR the inner file
+                        // does (season pack). Skips a sibling episode's file.
+                        if let Some(se) = required_se {
+                            if !dir_name_has_episode && !name_matches_episode(fname, se) {
+                                continue;
+                            }
+                        }
                         if local_bypass_file_is_healthy(&sub_path, has_done_marker, expected_bytes)
                         {
                             // Apr 30, 2026: skip paths flagged corrupt by a
@@ -5656,7 +5726,12 @@ pub(crate) fn find_local_bypass_match(
         } else if file_type.is_file() {
             let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if (ext == "mp4" || ext == "mkv")
+            // Episode gate for a top-level file: with the episode-stripped
+            // show-name match above, re-assert the exact episode here (was
+            // previously enforced incidentally via the full-title substring).
+            let episode_ok = required_se.is_none_or(|se| name_matches_episode(fname, se));
+            if episode_ok
+                && (ext == "mp4" || ext == "mkv")
                 && !fname.starts_with("transcoded")
                 && top_level_file_is_healthy(&path, expected_bytes)
             {
@@ -6739,13 +6814,11 @@ async fn handle_queue_add(
                         }))
                     }
                 };
-                let title = match (search.show.as_ref(), search.searching.as_ref()) {
-                    (Some(show), Some(ep)) => {
-                        format!("{} S{:02}E{:02}", show.title, ep.season, ep.episode)
-                    }
-                    (Some(show), None) => show.title.clone(),
-                    _ => result.title.clone(),
-                };
+                let title = bypass_match_title(
+                    search.show.as_ref().map(|s| s.title.as_str()),
+                    search.searching.as_ref().map(|e| (e.season, e.episode)),
+                    &result.title,
+                );
                 crate::state::QueuedItem {
                     magnet: result.magnet.clone(),
                     title,
@@ -7589,11 +7662,11 @@ fn resolve_local_file_impl(
 ) -> Option<(std::path::PathBuf, String)> {
     let search = AppState::load_last_search(&state.state_dir)?;
     let r = search.results.iter().find(|r| r.id == rid)?;
-    let title = match (&search.show, search.searching.as_ref()) {
-        (Some(show), Some(ep)) => format!("{} S{:02}E{:02}", show.title, ep.season, ep.episode),
-        (Some(show), None) => show.title.clone(),
-        _ => r.title.clone(),
-    };
+    let title = bypass_match_title(
+        search.show.as_ref().map(|s| s.title.as_str()),
+        search.searching.as_ref().map(|e| (e.season, e.episode)),
+        &r.title,
+    );
     let expected_bytes = if ignore_size {
         0
     } else {
@@ -7622,11 +7695,11 @@ fn resolve_result_for_vlc(
 ) -> Option<(String, Option<u32>, String, String, Option<String>)> {
     let search = AppState::load_last_search(&state.state_dir)?;
     let r = search.results.iter().find(|r| r.id == rid)?;
-    let title = match (&search.show, search.searching.as_ref()) {
-        (Some(show), Some(ep)) => format!("{} S{:02}E{:02}", show.title, ep.season, ep.episode),
-        (Some(show), None) => show.title.clone(),
-        _ => r.title.clone(),
-    };
+    let title = bypass_match_title(
+        search.show.as_ref().map(|s| s.title.as_str()),
+        search.searching.as_ref().map(|e| (e.season, e.episode)),
+        &r.title,
+    );
     // spela's audio rule: play the title's ORIGINAL language, never a dub. VLC
     // picks by track language tag, so pass original_language as a 2+3-letter
     // preference list (`--audio-language` / #EXTVLCOPT). Default English.
@@ -9950,6 +10023,137 @@ mod tests {
             &std::collections::HashSet::new(),
         );
         assert!(result.is_none(), "2025 entry must not match 2026 request");
+    }
+
+    // ---- 2026-08-23: episode-strict Local Bypass (season-pack aware). Real
+    // release names copied verbatim from the on-disk Widow's Bay cache. ----
+
+    #[test]
+    fn bypass_match_title_recovers_episode_from_result_when_searching_none() {
+        // A /home "Coming soon" tap searches "Show S01E06" as free text, so the
+        // structured `searching` is None even though the results ARE E06. The
+        // bypass title must recover SxxExx from the result title — else a bare
+        // show title matches any on-disk episode of the show.
+        let got = bypass_match_title(
+            Some("Widow's Bay"),
+            None,
+            "Widows.Bay.S01E06.1080p.WEB.h264-GRACE[EZTVx.to].mkv",
+        );
+        assert_eq!(got, "Widow's Bay S01E06");
+    }
+
+    #[test]
+    fn bypass_match_title_structured_episode_wins() {
+        assert_eq!(
+            bypass_match_title(Some("Widow's Bay"), Some((1, 6)), "irrelevant.mkv"),
+            "Widow's Bay S01E06"
+        );
+    }
+
+    #[test]
+    fn bypass_match_title_movie_falls_back_to_show() {
+        assert_eq!(
+            bypass_match_title(
+                Some("Predestination"),
+                None,
+                "Predestination.2014.1080p.mkv"
+            ),
+            "Predestination"
+        );
+    }
+
+    #[test]
+    fn find_local_bypass_episode_strict_does_not_serve_sibling_episode() {
+        // Only E05 on disk; an E06 request must NOT be served the E05 file
+        // (the bare-title-matches-any-episode bug).
+        let root = tempfile::tempdir().unwrap();
+        let e05 = root
+            .path()
+            .join("Widow's Bay (2026) s01e05 [Mkv - 1080p H264 - MultiLang Aac 2.0 - MultiSubs]");
+        std::fs::create_dir_all(&e05).unwrap();
+        make_dense_mkv(
+            &e05,
+            "Widow's Bay (2026) s01e05 What to Expect on your Trip.mkv",
+        );
+        std::fs::write(e05.join(".spela_done"), b"").unwrap();
+        let result = find_local_bypass_match(
+            root.path(),
+            "Widow's Bay S01E06",
+            Some("1080p"),
+            0,
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            result.is_none(),
+            "E06 request must not match the E05 folder"
+        );
+    }
+
+    #[test]
+    fn find_local_bypass_matches_episode_inside_season_pack() {
+        // RED before 2026-08-23: a season-pack dir's NAME lacks "S01E06", so the
+        // old matcher skipped the whole dir and the packed E06 was invisible →
+        // needless re-download. Now the dir matches on show tokens + the inner
+        // file is episode-gated, so ONLY the E06 file (never the E05 sibling) is
+        // returned regardless of read_dir order.
+        let root = tempfile::tempdir().unwrap();
+        let pack = root
+            .path()
+            .join("Widows.Bay.S01.1080p.WEBRip.10Bit.DDP5.1.x265-NeoNoir");
+        std::fs::create_dir_all(&pack).unwrap();
+        make_dense_mkv(&pack, "Widows.Bay.S01E05.1080p.WEBRip.x265.mkv");
+        let want = make_dense_mkv(&pack, "Widows.Bay.S01E06.1080p.WEBRip.x265.mkv");
+        std::fs::write(pack.join(".spela_done"), b"").unwrap();
+        let result = find_local_bypass_match(
+            root.path(),
+            "Widows Bay S01E06",
+            Some("1080p"),
+            0,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            result,
+            Some(want),
+            "packed E06 must be found + episode-exact"
+        );
+    }
+
+    #[test]
+    fn find_local_bypass_season_pack_missing_episode_is_none() {
+        // A season pack that does NOT contain the requested episode must not
+        // serve a sibling episode's file.
+        let root = tempfile::tempdir().unwrap();
+        let pack = root.path().join("Widows.Bay.S01.1080p.WEBRip.x265-NeoNoir");
+        std::fs::create_dir_all(&pack).unwrap();
+        make_dense_mkv(&pack, "Widows.Bay.S01E05.1080p.WEBRip.x265.mkv");
+        std::fs::write(pack.join(".spela_done"), b"").unwrap();
+        let result = find_local_bypass_match(
+            root.path(),
+            "Widows Bay S01E07",
+            Some("1080p"),
+            0,
+            &std::collections::HashSet::new(),
+        );
+        assert!(result.is_none(), "no E07 in the pack → no match");
+    }
+
+    #[test]
+    fn find_local_bypass_movie_unaffected_by_episode_gate() {
+        // Regression: a movie (no SxxExx in the title) still matches by
+        // title+year+quality — the episode gate must not fire.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("Predestination.2014.1080p.BluRay.x264");
+        std::fs::create_dir_all(&dir).unwrap();
+        let want = make_dense_mkv(&dir, "Predestination.2014.1080p.BluRay.x264.mkv");
+        std::fs::write(dir.join(".spela_done"), b"").unwrap();
+        let result = find_local_bypass_match(
+            root.path(),
+            "Predestination",
+            Some("1080p"),
+            0,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(result, Some(want));
     }
 
     #[test]
