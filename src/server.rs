@@ -348,6 +348,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/recent", get(handle_recent))
         .route("/watched", get(handle_watched))
         .route("/watched-add", post(handle_watched_add))
+        .route("/watched-remove", post(handle_watched_remove))
         .route("/pending-watched", get(handle_pending_watched))
         .route(
             "/pending-watched/resolve",
@@ -6257,6 +6258,32 @@ async fn handle_watched_add(
     Json(json!({"ok": ok}))
 }
 
+/// `POST /watched-remove` {title} — drop every ledger entry for a title, undoing a
+/// mis-mark. The ledger was append-only until now, so a title marked watched by a
+/// stray tap (or by a completion check firing against a bad duration on a
+/// still-downloading file) could never be un-marked from the remote. Returns how
+/// many entries went. 2026-08-25.
+async fn handle_watched_remove(
+    State(state): State<SharedState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        return Json(json!({"ok": false, "error": "missing title"}));
+    }
+    let mut app = AppState::load(&state.state_dir);
+    let removed = app.unmark_watched(&title);
+    if removed > 0 {
+        let _ = app.save(&state.state_dir);
+    }
+    Json(json!({"ok": removed > 0, "removed": removed}))
+}
+
 /// `GET /pending-watched` — sessions the Chromecast tracker (slice 5) detected
 /// as completed on a house TV but that AREN'T yet confirmed as Fredrik's
 /// (housemates use these TVs too). The web remote surfaces these on load with a
@@ -6408,18 +6435,17 @@ async fn handle_watchlist(State(state): State<SharedState>) -> Json<Value> {
         .and_then(|p| std::fs::read_to_string(&p).ok())
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .unwrap_or_else(|| json!({"movies": [], "series": []}));
-    // Exclude what's been watched: flag any entry whose cleaned title is in the
-    // watched-ledger — the "Mark watched" button, Chromecast-confirms, and
+    // Exclude what's been watched: flag any entry whose cleaned title the ledger
+    // counts as watched — the "Mark watched" button, Chromecast-confirms, and
     // auto-track ALL land there, so this is the one place that makes them all
     // drop out of To-Watch. The To-Watch view's existing `!watched` filter then
     // hides them; the list's own hardcoded `watched:true` flags are preserved.
+    //
+    // A film hides on one entry, a SERIES only past an episode threshold — see
+    // `AppState::hidden_watched_shows`. Before that (2026-08-25) one sampled
+    // episode hid an entire series from the list.
     let app = AppState::load(&state.state_dir);
-    let seen: std::collections::HashSet<String> = app
-        .watched
-        .iter()
-        .filter_map(|w| w.show.clone())
-        .map(|s| s.to_lowercase())
-        .collect();
+    let seen = app.hidden_watched_shows();
     if !seen.is_empty() {
         for key in ["movies", "series"] {
             if let Some(arr) = root.get_mut(key).and_then(|v| v.as_array_mut()) {

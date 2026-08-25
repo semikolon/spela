@@ -487,6 +487,70 @@ impl AppState {
         true
     }
 
+    /// Distinct episodes of a SERIES that must sit in the ledger before the
+    /// To-Watch list treats the whole series as watched and hides it.
+    ///
+    /// Why a threshold at all (2026-08-25): the hide-check used to key on the show
+    /// NAME alone, so a single sampled episode erased a 50-episode series from the
+    /// to-watch list — four minutes of `Search Party S01E01` hid a 96% show he had
+    /// never really started. Three is deliberately forgiving: a to-watch list is a
+    /// list of CANDIDATES, so leaving a half-abandoned show visible costs one row,
+    /// while hiding a barely-sampled one costs the whole recommendation.
+    pub const SERIES_WATCHED_EPISODE_THRESHOLD: usize = 3;
+
+    /// Lowercased show/film names the To-Watch list should hide as already-watched.
+    ///
+    /// Two ledger shapes, two rules:
+    /// * an entry with NO `SxxExx` marker is a film, or an explicit whole-show
+    ///   "mark watched" — one is enough, it states intent;
+    /// * a `seed` entry is a migrated "watched through here" high-water mark, so it
+    ///   also stands for the whole show even though it names one episode;
+    /// * everything else is a per-episode completion, and a series hides only once
+    ///   `SERIES_WATCHED_EPISODE_THRESHOLD` DISTINCT episodes have accumulated.
+    pub fn hidden_watched_shows(&self) -> std::collections::HashSet<String> {
+        let mut hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut episodes: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for w in &self.watched {
+            let Some(show) = w.show.as_ref().map(|s| s.to_lowercase()) else {
+                continue;
+            };
+            match extract_se_suffix(&w.title) {
+                // A seeded baseline names one episode but means "everything up to
+                // here" — treat it like a whole-show mark, not a single sample.
+                Some(_) if w.seed => {
+                    hidden.insert(show);
+                }
+                Some(se) => {
+                    episodes.entry(show).or_default().insert(se);
+                }
+                None => {
+                    hidden.insert(show);
+                }
+            }
+        }
+        for (show, seen) in episodes {
+            if seen.len() >= Self::SERIES_WATCHED_EPISODE_THRESHOLD {
+                hidden.insert(show);
+            }
+        }
+        hidden
+    }
+
+    /// Drop every ledger entry for a show/film, by cleaned title (case-insensitive).
+    /// Returns how many were removed. The counterpart to `mark_watched` — without it
+    /// a mis-marked title is unfixable from the remote, which is how a four-minute
+    /// sample of `Search Party` stayed "watched" for weeks.
+    pub fn unmark_watched(&mut self, title: &str) -> usize {
+        let target = crate::search::clean_title_for_tmdb(title).to_lowercase();
+        let before = self.watched.len();
+        self.watched.retain(|w| {
+            let show = w.show.as_deref().map(|s| s.to_lowercase());
+            let cleaned = crate::search::clean_title_for_tmdb(&w.title).to_lowercase();
+            show.as_deref() != Some(target.as_str()) && cleaned != target
+        });
+        before - self.watched.len()
+    }
+
     /// True if this title/imdb already appears in the watch-ledger (any episode or
     /// the movie). Excludes already-seen titles from recommendations.
     pub fn has_seen(&self, imdb_id: Option<&str>, title: &str) -> bool {
@@ -1103,5 +1167,108 @@ mod tests {
         assert_eq!(e[0].season, Some(3));
         assert_eq!(e[0].episode, Some(7));
         assert_eq!(e[0].show.as_deref(), Some("House of the Dragon"));
+    }
+}
+
+#[cfg(test)]
+mod watched_threshold_tests {
+    use super::*;
+
+    /// Ledger rows copied verbatim from the live Darwin ledger on 2026-08-25 —
+    /// title strings exactly as spela wrote them, so the test exercises the real
+    /// shapes (`Show SxxExx` for a completion, a bare title for a whole-show mark).
+    fn ledger(rows: &[(&str, bool)]) -> AppState {
+        let mut app = AppState::default();
+        for (title, seed) in rows {
+            let show = Some(crate::search::clean_title_for_tmdb(title));
+            app.watched.push(WatchedEntry {
+                key: title.to_lowercase().replace(' ', "_"),
+                title: (*title).to_string(),
+                show,
+                imdb_id: None,
+                watched_at: Utc::now(),
+                seed: *seed,
+            });
+        }
+        app
+    }
+
+    #[test]
+    fn one_sampled_episode_does_not_hide_a_series() {
+        // The anchoring case: four minutes of S01E01 hid a 96% show for weeks.
+        let app = ledger(&[("Search Party S01E01", false)]);
+        assert!(!app.hidden_watched_shows().contains("search party"));
+    }
+
+    #[test]
+    fn two_episodes_still_below_the_bar() {
+        let app = ledger(&[
+            ("Search Party S01E01", false),
+            ("Search Party S01E02", false),
+        ]);
+        assert!(!app.hidden_watched_shows().contains("search party"));
+    }
+
+    #[test]
+    fn three_distinct_episodes_hide_the_series() {
+        let app = ledger(&[
+            ("House of the Dragon S03E06", false),
+            ("House of the Dragon S03E07", false),
+            ("House of the Dragon S03E08", false),
+        ]);
+        assert!(app.hidden_watched_shows().contains("house of the dragon"));
+    }
+
+    #[test]
+    fn replays_of_one_episode_do_not_stack_toward_the_threshold() {
+        // Distinct episodes, not row count — three plays of the pilot is still one.
+        let app = ledger(&[
+            ("Search Party S01E01", false),
+            ("Search Party S01E01", false),
+            ("Search Party S01E01", false),
+        ]);
+        assert!(!app.hidden_watched_shows().contains("search party"));
+    }
+
+    #[test]
+    fn a_film_hides_on_a_single_entry() {
+        let app = ledger(&[("Poor Things", false)]);
+        assert!(app.hidden_watched_shows().contains("poor things"));
+    }
+
+    #[test]
+    fn an_explicit_whole_show_mark_hides_immediately() {
+        // The rec-row ✓ writes a bare show title with no SxxExx — that states intent.
+        let app = ledger(&[("Halo", false)]);
+        assert!(app.hidden_watched_shows().contains("halo"));
+    }
+
+    #[test]
+    fn a_migrated_seed_baseline_stands_for_the_whole_show() {
+        // A seed names one episode but means "watched through here".
+        let app = ledger(&[("Foundation S03E10", true)]);
+        assert!(app.hidden_watched_shows().contains("foundation"));
+    }
+
+    #[test]
+    fn unmark_removes_every_entry_for_a_title_and_unhides_it() {
+        let mut app = ledger(&[
+            ("Fargo S01E08", false),
+            ("Fargo S01E09", false),
+            ("Fargo S01E10", false),
+            ("Silo S03E08", false),
+        ]);
+        assert!(app.hidden_watched_shows().contains("fargo"));
+        assert_eq!(app.unmark_watched("Fargo"), 3);
+        assert!(!app.hidden_watched_shows().contains("fargo"));
+        // Untouched neighbours survive.
+        assert_eq!(app.watched.len(), 1);
+    }
+
+    #[test]
+    fn unmark_is_case_insensitive_and_reports_zero_for_a_miss() {
+        let mut app = ledger(&[("Poor Things", false)]);
+        assert_eq!(app.unmark_watched("poor things"), 1);
+        assert_eq!(app.unmark_watched("Poor Things"), 0);
     }
 }
