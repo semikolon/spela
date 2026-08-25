@@ -473,6 +473,21 @@
   .banner{min-height:52px;font-size:.95rem}
   .banner button{min-height:40px;padding:.45rem 1rem}
   main{padding-bottom:9rem}
+  /* Toast with an inline action (the ✓ Undo). The action must be a real
+     touch target, so the toast grows a flex row rather than staying text-only. */
+  .toast{display:flex;align-items:center;gap:.85rem}
+  .toast button{background:rgba(255,255,255,.16);color:#fff;border:0;border-radius:.55rem;
+    font:inherit;font-weight:600;padding:.4rem .9rem;min-height:38px;cursor:pointer}
+  .toast button:active{background:rgba(255,255,255,.3)}
+  /* "Watched" section on To-Watch — the hidden set, made visible so a mis-mark is
+     fixable. Dimmer than a live row: it is an archive, not a candidate. */
+  .twwatched{opacity:.62}
+  .twwatched .src{padding-right:3.4rem}
+  .wrow{position:relative}
+  .wrow .unmark{position:absolute;right:.5rem;top:50%;transform:translateY(-50%);
+    background:rgba(255,255,255,.1);color:#fff;border:0;border-radius:.5rem;
+    font-size:1rem;line-height:1;min-width:40px;min-height:40px;cursor:pointer}
+  .wrow .unmark:active{background:rgba(255,255,255,.26)}
   @media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 </style>
 </head>
@@ -689,6 +704,13 @@ async function openLibraryInVlc(spec){
 }
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("on");
   clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("on"),4200); }
+// Toast carrying one action button — used for Undo after a ✓ mark-watched. Held
+// longer than a plain toast (an undo you can't reach in time isn't an undo).
+function toastAction(msg,label,fn){ const t=$("#toast"); t.textContent=msg;
+  const b=el("button",{textContent:label});
+  b.onclick=()=>{ clearTimeout(toastT); t.classList.remove("on"); fn(); };
+  t.appendChild(b); t.classList.add("on");
+  clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("on"),9000); }
 
 /* ---------- router ---------- */
 function route(){
@@ -738,7 +760,42 @@ async function renderToWatch(){
   if(movies.length){ wrap.appendChild(el("div",{className:"twhead",textContent:`Movies · ${movies.length}`}));
     const box=el("div",{className:"sources open"}); movies.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
   if(!series.length&&!movies.length) wrap.appendChild(el("div",{className:"state",textContent:"To-watch list is empty."}));
+  appendWatchedSection(wrap,d);
   out.appendChild(wrap);
+}
+
+// The hidden set, shown. Everything the ledger counts as watched drops out of the
+// lists above, which is right until it is wrong — and a title hidden by mistake was
+// previously invisible AND unfixable, so there was no way to even notice. Collapsed
+// by default (it is an archive, not a candidate list); each row carries a ✕ that
+// un-marks it and returns it to To-Watch. 2026-08-25.
+function appendWatchedSection(wrap,d){
+  const done=[]
+    .concat((d.series||[]).filter(x=>x.watched).map(x=>({...x,isTV:true})))
+    .concat((d.movies||[]).filter(x=>x.watched).map(x=>({...x,isTV:false})));
+  if(!done.length) return;
+  done.sort((a,b)=>(a.title||"").localeCompare(b.title||""));
+  const head=el("button",{className:"twhead",textContent:`▸ Watched · ${done.length}`});
+  head.setAttribute("aria-expanded","false");
+  const box=el("div",{className:"sources twwatched"});
+  head.onclick=()=>{ const open=box.classList.toggle("open");
+    head.textContent=`${open?"▾":"▸"} Watched · ${done.length}`;
+    head.setAttribute("aria-expanded",open?"true":"false"); };
+  done.forEach(x=>{
+    const holder=el("div",{className:"wrow"});
+    const r=el("button",{className:"src"});
+    r.appendChild(el("span",{className:"q",textContent:x.title}));
+    if(x.rt!=null) r.appendChild(el("span",{className:"s "+(x.rt>=88?"":"low"),textContent:"🍅 "+x.rt}));
+    r.onclick=()=>{ setMode(x.isTV?"tv":"movie"); $("#q").value=x.title; S.search.q=x.title;
+      location.hash="#/search"; runSearch(x.title); };
+    const un=el("button",{className:"unmark",textContent:"✕",title:"I haven't watched "+x.title});
+    un.setAttribute("aria-label","Un-mark "+x.title+" as watched");
+    un.onclick=async(ev)=>{ ev.stopPropagation(); un.disabled=true;
+      if(!await unmarkWatched(x.title)){ un.disabled=false; return; }
+      toast("Back on your to-watch list"); renderToWatch(); };
+    holder.append(r,un); box.appendChild(holder);
+  });
+  wrap.append(head,box);
 }
 // Lazily enrich a To-Watch row with its poster (as a half-faded background) and
 // release year (after the title) — TMDB via /title-meta, cached server-side so
@@ -1206,7 +1263,16 @@ function recItem(it){
   const mk=el("button",{className:"fomark",textContent:"✓",title:"I've already seen "+it.title});
   mk.setAttribute("aria-label","Mark "+it.title+" already watched");
   mk.onclick=async(ev)=>{ ev.stopPropagation(); mk.disabled=true;
-    if(await markWatched(it.title, it.imdb_id||"")) item.remove(); else mk.disabled=false; };
+    if(!await markWatched(it.title, it.imdb_id||"")){ mk.disabled=false; return; }
+    // Remember where the row sat so Undo puts it back in place, not at the end.
+    const parent=item.parentNode, next=item.nextSibling;
+    item.remove();
+    toastAction("Marked watched","Undo",async()=>{
+      if(!await unmarkWatched(it.title)) return;
+      if(parent) parent.insertBefore(item,next);
+      mk.disabled=false; toast("Undone");
+    });
+  };
   item.appendChild(mk);
   return item;
 }
@@ -1288,6 +1354,15 @@ $("#q").addEventListener("input",e=>{ const q=e.target.value.trim();
 async function markWatched(title,imdb){
   try{ const r=await api("/watched-add",{method:"POST",body:{title,imdb_id:imdb||""}});
     if(r&&r.ok){ toast("Marked watched"); return true; } toast("Couldn’t mark watched"); return false; }
+  catch{ toast("spela unreachable"); return false; }
+}
+
+// Undo a mark-watched — drops every ledger entry for the title (POST
+// /watched-remove). The ledger used to be append-only, so a stray ✓ was
+// permanent: four minutes of one episode hid a whole series for weeks.
+async function unmarkWatched(title){
+  try{ const r=await api("/watched-remove",{method:"POST",body:{title}});
+    if(r&&r.ok) return true; toast("Couldn’t undo"); return false; }
   catch{ toast("spela unreachable"); return false; }
 }
 
