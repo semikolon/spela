@@ -510,7 +510,13 @@
      fixable. Dimmer than a live row: it is an archive, not a candidate. */
   .twwatched{opacity:.62}
   .twwatched .src{padding-right:3.4rem}
-  .wrow{position:relative}
+  /* `.src` is authored as a DIRECT child of the `.sources` GRID, so wrapping it
+     in `.wrow` (needed to anchor the ✕) handed the grid column to the wrapper and
+     left the button shrink-to-fit at ~73px, collapsing the title span to zero
+     width — rows rendered as a bare tomato + ✕ with no text. The wrapper must
+     therefore pass its full column width through. 2026-08-27. */
+  .wrow{position:relative;display:block;width:100%}
+  .wrow>.src{width:100%}
   .wrow .unmark{position:absolute;right:.5rem;top:50%;transform:translateY(-50%);
     background:rgba(255,255,255,.1);color:#fff;border:0;border-radius:.5rem;
     font-size:1rem;line-height:1;min-width:40px;min-height:40px;cursor:pointer}
@@ -614,6 +620,7 @@
     <a href="#/library" data-v="library" data-ic="library" aria-label="Library"><span class="lbl">Library</span></a>
     <a href="#/now" data-v="now" data-ic="tv" aria-label="Now playing"><span class="lbl">Now</span></a>
     <a href="#/towatch" data-v="towatch" data-ic="film" aria-label="To Watch"><span class="lbl">To Watch</span></a>
+    <a href="#/rewatch" data-v="rewatch" data-ic="refresh" aria-label="Rewatch"><span class="lbl">Rewatch</span></a>
   </nav>
   <button class="tgt" id="tgtBtn" data-ic="cast" aria-label="Cast target"><b id="tgtLabel">Pick target</b></button>
 </header>
@@ -643,6 +650,7 @@
   <section class="view" id="v-library"><div id="libraryOut"></div></section>
 
   <section class="view" id="v-towatch"><div id="towatchOut"></div></section>
+  <section class="view" id="v-rewatch"><div id="rewatchOut"></div></section>
 
   <section class="view" id="v-now">
     <div id="nowFull"></div>
@@ -829,7 +837,7 @@ function toastAction(msg,label,fn){ const t=$("#toast"); t.textContent=msg;
 /* ---------- router ---------- */
 function route(){
   const v=(location.hash.replace(/^#\//,"")||"home").split("?")[0];
-  const known=["home","search","library","now","towatch"].includes(v)?v:"home";
+  const known=["home","search","library","now","towatch","rewatch"].includes(v)?v:"home";
   $$(".view").forEach(s=>s.classList.toggle("on",s.id==="v-"+known));
   $$("nav a").forEach(a=>a.classList.toggle("on",a.dataset.v===known));
   if(known==="home") loadHome();
@@ -837,6 +845,7 @@ function route(){
   if(known==="library") renderLibrary();
   if(known==="search" && !S.search.q){ loadRecent(); }
   if(known==="towatch") renderToWatch();
+  if(known==="rewatch") renderRewatch();
 }
 
 // "To Watch" view — the recommender's to-watch list (slice 3 arsenal), from
@@ -854,7 +863,7 @@ async function renderToWatch(){
     // written `note` was inconsistent + jargon-y, replaced by real genres).
     if(x.rt!=null) r.appendChild(el("span",{className:"s "+(x.rt>=88?"":"low"),textContent:"🍅 "+x.rt}));
     r.onclick=()=>{ setMode(isTV?"tv":"movie"); $("#q").value=x.title; S.search.q=x.title; location.hash="#/search"; runSearch(x.title); };
-    enrichToWatchRow(r,x,isTV);
+    enrichWhenVisible(r,()=>enrichToWatchRow(r,x,isTV));
     return r;
   });
   const series=mk(d.series,true), movies=mk(d.movies,false);
@@ -892,9 +901,17 @@ function appendWatchedSection(wrap,d){
   const head=el("button",{className:"twhead",textContent:`▸ Watched · ${done.length}`});
   head.setAttribute("aria-expanded","false");
   const box=el("div",{className:"sources twwatched"});
+  // Rows are BUILT on first expand, not on page load: this is an archive that is
+  // collapsed by default, so constructing 20 rows every time To-Watch opens is work
+  // nobody asked for. 2026-08-27.
+  let built=false;
   head.onclick=()=>{ const open=box.classList.toggle("open");
     head.textContent=`${open?"▾":"▸"} Watched · ${done.length}`;
-    head.setAttribute("aria-expanded",open?"true":"false"); };
+    head.setAttribute("aria-expanded",open?"true":"false");
+    if(open && !built){ built=true; buildWatchedRows(box,done); } };
+  wrap.append(head,box);
+}
+function buildWatchedRows(box,done){
   done.forEach(x=>{
     const holder=el("div",{className:"wrow"});
     const r=el("button",{className:"src"});
@@ -909,8 +926,61 @@ function appendWatchedSection(wrap,d){
       toast("Back on your to-watch list"); renderToWatch(); };
     holder.append(r,un); box.appendChild(holder);
   });
-  wrap.append(head,box);
 }
+// Rewatch — the watch-ledger as a browsable shelf. Seen is NOT ineligible: Fredrik is
+// openly rewatch-willing (both the Matrix and Terminator runs, "would gladly rewatch some
+// of the later ones"), and `has_seen` answers "is this a discovery?", never "would he
+// watch it tonight?". So the exclusion that is correct for RECOMMENDATIONS is wrong here,
+// and this view deliberately reads the same ledger from the other side. Newest-watched
+// first, since a recent finish is the likeliest rewatch prompt. 2026-08-27.
+async function renderRewatch(){
+  const out=$("#rewatchOut"); if(!out) return;
+  out.innerHTML=`<div class="state">Loading…</div>`;
+  let d; try{ d=await api("/watched"); }
+  catch{ out.innerHTML=`<div class="state"><div class="big">spela unreachable</div></div>`; return; }
+  // The ledger holds one row per EPISODE; collapse to the show/film so the shelf
+  // lists titles rather than 9 rows of Widow's Bay. Ledger order is newest-first.
+  const seen=new Set(), items=[];
+  ((d&&d.watched)||[]).forEach(w=>{
+    const name=w.show||w.title; if(!name||seen.has(name)) return;
+    seen.add(name); items.push({title:name, imdb_id:w.imdb_id||null, isTV:!!w.show&&/S\d\dE\d\d/i.test(w.title||"")});
+  });
+  if(!items.length){ out.innerHTML=`<div class="state"><div class="big">Nothing watched yet</div>Finish something and it shows up here.</div>`; return; }
+  out.innerHTML="";
+  const wrap=el("div",{className:"detail"});
+  wrap.appendChild(el("div",{className:"twhead",textContent:`Watched · ${items.length} · tap to play again`}));
+  const box=el("div",{className:"sources open"});
+  items.forEach(x=>{
+    const r=el("button",{className:"src"});
+    r.appendChild(el("span",{className:"q",textContent:x.title}));
+    r.onclick=()=>{ setMode(x.isTV?"tv":"movie"); $("#q").value=x.title; S.search.q=x.title;
+      location.hash="#/search"; runSearch(x.title); };
+    enrichWhenVisible(r,()=>enrichToWatchRow(r,x,x.isTV));
+    box.appendChild(r);
+  });
+  wrap.appendChild(box); out.appendChild(wrap);
+}
+
+// Lazy enrichment. Every list row used to fire its /title-meta immediately, so
+// opening To-Watch queued 143 requests (61 to-watch + 82 recommendations) through
+// the browser's ~6-connection limit — individually fast (median 260ms, server-cached)
+// but ~1.3s to settle, which is the delay Fredrik felt. Rows now enrich only as they
+// approach the viewport, so first paint costs the handful actually on screen.
+// 2026-08-27.
+const _enrichObserver = ("IntersectionObserver" in window)
+  ? new IntersectionObserver((entries,obs)=>{
+      entries.forEach(e=>{
+        if(!e.isIntersecting) return;
+        obs.unobserve(e.target);
+        const fn=e.target.__enrich; if(fn){ e.target.__enrich=null; fn(); }
+      });
+    }, {rootMargin:"300px 0px"})   // start slightly before it scrolls in
+  : null;
+function enrichWhenVisible(el, fn){
+  if(!_enrichObserver){ fn(); return; }   // no observer support → old behaviour
+  el.__enrich=fn; _enrichObserver.observe(el);
+}
+
 // Lazily enrich a To-Watch row with its poster (as a half-faded background) and
 // release year (after the title) — TMDB via /title-meta, cached server-side so
 // it's one lookup per title then instant. Progressive: rows show immediately,
@@ -1386,7 +1456,7 @@ function recItem(it){
   tap.onclick=()=>{ setMode(isTV?"tv":"movie");
     $("#q").value=it.title; S.search.q=it.title; location.hash="#/search"; runSearch(it.title); };
   if(it.poster_url) paintPoster(tap,it.poster_url);
-  enrichRec(tap,it);
+  enrichWhenVisible(tap,()=>enrichRec(tap,it));
   item.appendChild(tap);
   // Quick "I've already seen this" ✓ — marks watched (→ ledger, dropped from recs
   // next load) WITHOUT clicking into the title. Optimistically removes the row.
