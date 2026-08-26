@@ -524,6 +524,24 @@
   /* A Library card IS the play control (posterCard `clickPlays`) — give it the
      pointer and a visible keyboard focus ring, since a role=button div gets
      neither for free. 2026-08-26. */
+  /* Trailer: a click-to-load FACADE, never an eager iframe. A YouTube embed pulls
+     megabytes of third-party JS and sets cookies; doing that on every search result —
+     on a phone, in bed — would undo the viewport-gated enrichment work. The facade is
+     YouTube's own still (i.ytimg.com), so it costs one image until tapped, and the
+     player is only inserted on click. nocookie host + no autoplay-until-asked. */
+  .trbtn{display:flex;align-items:center;gap:.55rem;background:var(--bg2);
+    border:1px solid var(--line);border-radius:.7rem;padding:.5rem .9rem;
+    min-height:44px;font-weight:700;font-size:.9rem;cursor:pointer}
+  .trwrap{margin-top:.85rem;border-radius:.8rem;overflow:hidden;background:#000;
+    position:relative;aspect-ratio:16/9;max-width:640px}
+  .trwrap img{width:100%;height:100%;object-fit:cover;display:block;opacity:.72}
+  .trwrap .trplay{position:absolute;inset:0;display:flex;align-items:center;
+    justify-content:center;border:0;background:transparent;cursor:pointer}
+  .trwrap .trplay span{width:68px;height:48px;border-radius:.8rem;
+    background:rgba(0,0,0,.65);color:#fff;display:flex;align-items:center;
+    justify-content:center;font-size:1.6rem;line-height:1}
+  .trwrap .trplay:active span{background:rgba(0,0,0,.85)}
+  .trwrap iframe{width:100%;height:100%;border:0;display:block}
   .packn{color:var(--accent);font-size:.72rem;font-weight:800;letter-spacing:.06em;
     text-transform:uppercase;margin-top:.15rem}
   .cardplay{cursor:pointer}
@@ -987,6 +1005,29 @@ async function renderRewatch(){
   items.forEach(x=>pendBox.appendChild(mk(x)));
   wrap.append(filmHead,filmBox,seriesHead,seriesBox,pendHead,pendBox);
   out.appendChild(wrap); bump();
+}
+
+// Trailer facade. Renders YouTube's own still with a play glyph; the actual player
+// iframe is only created on click, so a search costs one image rather than a full
+// third-party player. Uses youtube-nocookie and asks for autoplay ONLY on the click
+// (which is a user gesture, so the browser permits it). 2026-08-27.
+function trailerBlock(key,title){
+  const wrap=el("div",{className:"trwrap"});
+  const img=el("img",{loading:"lazy",decoding:"async",alt:("Trailer for "+(title||"")).trim()});
+  img.src=`https://i.ytimg.com/vi/${encodeURIComponent(key)}/hqdefault.jpg`;
+  const btn=el("button",{className:"trplay"});
+  btn.setAttribute("aria-label","Play trailer"+(title?" for "+title:""));
+  btn.appendChild(el("span",{textContent:"▶"}));
+  btn.onclick=()=>{
+    const f=el("iframe");
+    f.src=`https://www.youtube-nocookie.com/embed/${encodeURIComponent(key)}?autoplay=1&rel=0`;
+    f.setAttribute("allow","accelerometer; autoplay; encrypted-media; picture-in-picture");
+    f.setAttribute("allowfullscreen","");
+    f.setAttribute("title",("Trailer for "+(title||"")).trim());
+    wrap.innerHTML=""; wrap.appendChild(f);
+  };
+  wrap.append(img,btn);
+  return wrap;
 }
 
 // Lazy enrichment. Every list row used to fire its /title-meta immediately, so
@@ -1624,6 +1665,14 @@ async function fillDetailLine(card, title, isTV){
   // link (unchanged).
   if(m.rt!=null){ const rl=card.querySelector(".rtlink");
     if(rl){ rl.textContent="🍅 "+m.rt+" →"; if(m.rt_url) rl.href=m.rt_url; } }
+  // Trailer sits under the actions, above "More sources" — it informs the decision
+  // the buttons act on, so it belongs between them, not at the bottom of the card.
+  if(m.trailer_key && !card.querySelector(".trwrap")){
+    const body=card.querySelector(".body")||card;
+    const acts=body.querySelector(".actions");
+    const blk=trailerBlock(m.trailer_key,title);
+    if(acts&&acts.nextSibling) body.insertBefore(blk,acts.nextSibling); else body.appendChild(blk);
+  }
 }
 
 async function runSearch(q){

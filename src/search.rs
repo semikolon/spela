@@ -574,7 +574,9 @@ impl SearchEngine {
                 .and_then(|v| v.as_u64())
         });
         let (rt, rt_audience, rt_url) = self.mdblist_rt(id, is_tv).await;
+        let trailer_key = self.tmdb_trailer_key(kind, id).await;
         json!({
+            "trailer_key": trailer_key,
             "poster_url": poster,
             "backdrop_url": backdrop,
             "rt": rt,
@@ -674,6 +676,50 @@ impl SearchEngine {
     /// the media_type of the BEST candidate. If no candidate clears the
     /// confidence floor, falls back to the first non-person result (old
     /// behavior) so we never regress on genuine zero-overlap cases.
+    /// Best YouTube trailer key for a resolved (kind, id), or None.
+    ///
+    /// Preference order is deliberate: an OFFICIAL Trailer beats an unofficial one,
+    /// and any Trailer beats a Teaser — a teaser tells you almost nothing about
+    /// whether you want to watch the thing, which is the entire point of showing it.
+    /// Non-YouTube sites are skipped because the player embed is YouTube-specific.
+    /// Best-effort: any failure yields None and the UI simply omits the affordance.
+    async fn tmdb_trailer_key(&self, kind: &str, id: u64) -> Option<String> {
+        let url = format!(
+            "https://api.themoviedb.org/3/{}/{}/videos?api_key={}",
+            kind, id, self.tmdb_key
+        );
+        let resp: Value = self.client.get(&url).send().await.ok()?.json().await.ok()?;
+        let vids = resp["results"].as_array()?;
+        let score = |v: &Value| -> i32 {
+            if v["site"].as_str() != Some("YouTube") {
+                return -1;
+            }
+            let official = v["official"].as_bool().unwrap_or(false);
+            match v["type"].as_str() {
+                Some("Trailer") => {
+                    if official {
+                        4
+                    } else {
+                        3
+                    }
+                }
+                Some("Teaser") => {
+                    if official {
+                        2
+                    } else {
+                        1
+                    }
+                }
+                _ => 0,
+            }
+        };
+        vids.iter()
+            .filter(|v| score(v) > 0)
+            .max_by_key(|v| score(v))
+            .and_then(|v| v["key"].as_str())
+            .map(str::to_string)
+    }
+
     async fn tmdb_auto_detect(&self, query: &str) -> Result<String> {
         let (q_clean, q_year) = extract_year_from_query(query);
         let api_q = if q_clean.is_empty() { query } else { &q_clean };
