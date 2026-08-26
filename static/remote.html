@@ -416,12 +416,12 @@
      delay + double-tap-zoom (snappier); inputs stay >=16px (no iOS
      focus-zoom); strong :active since touchless = no hover. */
   button,a,input,.card,.src,.topt,[role=button]{touch-action:manipulation}
-  /* Base 16px (Fredrik's pick, 2026-08-26). Was 17px from the 2026-05-18
+  /* Base 17px (Fredrik's pick, 2026-08-26 — 16px was tried and reverted). From the 2026-05-18
      touch-target overhaul; the primary hit areas (nav 46px, search input 56px,
      target pill 44px, row buttons 40px) are px-anchored, not rem, so they are
      unaffected — only rem-based padding scales by 16/17. Inputs stay >=16px, so
      iOS still won't focus-zoom. */
-  html,body{font-size:16px}
+  html,body{font-size:17px}
   nav{gap:.25rem;padding:.28rem}
   nav a{min-height:46px;display:flex;align-items:center;padding:.55rem 1.05rem;font-size:1rem}
   /* Nav tabs adopt the section-header voice (CONTINUE / NEW EPISODES / COMING
@@ -514,7 +514,69 @@
     background:rgba(255,255,255,.1);color:#fff;border:0;border-radius:.5rem;
     font-size:1rem;line-height:1;min-width:40px;min-height:40px;cursor:pointer}
   .wrow .unmark:active{background:rgba(255,255,255,.26)}
+  /* ---- Hover gleam -------------------------------------------------------
+     Ported from brf-auto's dashboard queue-card refresh swoosh
+     (`~/Projects/brf-auto/frontend/src/index.css` → `.queue-card-swoosh`):
+     a 120deg white gradient translating -120% → 120% over 1.1s ease-out.
+     Two deliberate changes for spela:
+       (1) INTENSITY. The source peaks at rgba(255,255,255,.7), calibrated for
+           a light CREAM card. Over this near-black chrome (#1f1f29 items) that
+           same value reads as a camera flash, so the peak is re-scaled — see
+           --gleam-peak. One knob, tune it there and every surface follows.
+       (2) TRIGGER. brf-auto fires it once on a data refresh; here it fires on
+           HOVER and then SETTLES into a persistent inset glow. The settle uses
+           a transition-delay set ONLY on the :hover state, so the glow arrives
+           after the sweep has passed but disappears immediately on pointer-out
+           (a delay on the base rule would make the glow linger after leaving).
+     The rim never brightens: an inset shadow paints INSIDE the border box, so
+     each element keeps its own border colour.
+     Pointer-only. iOS leaves :hover stuck after a tap, which would strand the
+     glow on the last-tapped row; touch already has the :active feedback from
+     the 2026-05-18 touch-target pass. */
+  :root{--gleam-peak:.18;--gleam-rest:.15}
+  @media (hover:hover){
+    .fotap,.src,.card,
+    .foplay,.fomark,.founfollow,.foseasonbtn,.unmark,.playicon,.srcbtn,
+    .tgt,.tbtn,.topt,.newbadge,nav a,.seg button,.toast button,.banner button{
+      position:relative;overflow:hidden;transition:box-shadow .25s ease}
+    .fotap::after,.src::after,.card::after,
+    .foplay::after,.fomark::after,.founfollow::after,.foseasonbtn::after,
+    .unmark::after,.playicon::after,.srcbtn::after,
+    .tgt::after,.tbtn::after,.topt::after,.newbadge::after,nav a::after,
+    .seg button::after,.toast button::after,.banner button::after{
+      content:"";position:absolute;inset:0;pointer-events:none;
+      border-radius:inherit;transform:translateX(-120%);
+      background:linear-gradient(120deg,
+        rgba(255,255,255,0) 0%,
+        rgba(255,255,255,var(--gleam-peak)) 45%,
+        rgba(255,255,255,0) 100%)}
+    .fotap:hover::after,.src:hover::after,.card:hover::after,
+    .foplay:hover::after,.fomark:hover::after,.founfollow:hover::after,
+    .foseasonbtn:hover::after,.unmark:hover::after,.playicon:hover::after,
+    .srcbtn:hover::after,.tgt:hover::after,.tbtn:hover::after,.topt:hover::after,
+    .newbadge:hover::after,nav a:hover::after,.seg button:hover::after,
+    .toast button:hover::after,.banner button:hover::after{
+      animation:spelaGleam 1.1s ease-out forwards}
+    .fotap:hover,.src:hover,.card:hover,
+    .foplay:hover,.fomark:hover,.founfollow:hover,.foseasonbtn:hover,
+    .unmark:hover,.playicon:hover,.srcbtn:hover,.tgt:hover,.tbtn:hover,
+    .topt:hover,.newbadge:hover,nav a:hover,.seg button:hover,
+    .toast button:hover,.banner button:hover{
+      box-shadow:inset 0 0 14px rgba(255,255,255,var(--gleam-rest));
+      transition:box-shadow .45s ease .5s}
+  }
+  @keyframes spelaGleam{0%{transform:translateX(-120%)}100%{transform:translateX(120%)}}
   @media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+  /* Reduced motion: the global rule above already collapses the sweep to .01ms
+     (invisible). Drop the settle DELAY too, so the glow is plain instant hover
+     feedback rather than appearing abruptly half a second late. */
+  @media (prefers-reduced-motion:reduce){
+    .fotap:hover,.src:hover,.card:hover,.foplay:hover,.fomark:hover,
+    .founfollow:hover,.foseasonbtn:hover,.unmark:hover,.playicon:hover,
+    .srcbtn:hover,.tgt:hover,.tbtn:hover,.topt:hover,.newbadge:hover,
+    nav a:hover,.seg button:hover,.toast button:hover,.banner button:hover{
+      transition-delay:0s!important}
+  }
 </style>
 </head>
 <body>
