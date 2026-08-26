@@ -542,6 +542,22 @@
     justify-content:center;font-size:1.6rem;line-height:1}
   .trwrap .trplay:active span{background:rgba(0,0,0,.85)}
   .trwrap iframe{width:100%;height:100%;border:0;display:block}
+  /* Rating on a Rewatch row: two toggles, not a cycle. Unrated is the honest
+     default and is simply "neither pressed" — a cycling control would force the
+     reader to remember which state a glyph currently means. */
+  .rate{position:absolute;right:.5rem;top:50%;transform:translateY(-50%);
+    display:flex;gap:.3rem}
+  .rate button{background:rgba(255,255,255,.08);border:0;border-radius:.5rem;
+    min-width:38px;min-height:38px;color:var(--dim);font-size:.95rem;cursor:pointer}
+  .rate button.on{background:rgba(255,255,255,.2);color:var(--fg)}
+  .rate button.love.on{background:rgba(255,90,120,.28);color:#ff9db0}
+  .rate button:active{background:rgba(255,255,255,.3)}
+  .rwrow{position:relative;display:block;width:100%}
+  .rwrow>.src{width:100%;padding-right:6rem}
+  .lovedonly{margin-left:auto;font-size:.72rem;font-weight:800;letter-spacing:.06em;
+    text-transform:uppercase;background:var(--bg2);border:1px solid var(--line);
+    border-radius:999px;padding:.4rem .8rem;min-height:36px;color:var(--dim);cursor:pointer}
+  .lovedonly.on{background:rgba(255,90,120,.22);color:#ff9db0;border-color:transparent}
   .packn{color:var(--accent);font-size:.72rem;font-weight:800;letter-spacing:.06em;
     text-transform:uppercase;margin-top:.15rem}
   .cardplay{cursor:pointer}
@@ -961,6 +977,30 @@ function buildWatchedRows(box,done){
     holder.append(r,un); box.appendChild(holder);
   });
 }
+// Write a rating to the ledger. null clears. Failure leaves the button unchanged
+// rather than showing a state the server does not hold.
+async function rateTitle(title,rating){
+  try{ const r=await api("/watched-rate",{method:"POST",body:{title,rating}});
+    if(r&&r.ok) return true; toast("Couldn't save that rating"); return false; }
+  catch{ toast("spela unreachable"); return false; }
+}
+// Loved-only is a VIEW filter, not a separate fetch — the shelf is already in the DOM,
+// so hiding is instant and toggling back costs nothing.
+let _lovedOnly=false;
+function applyLovedFilter(){
+  document.querySelectorAll("#v-rewatch .rwrow").forEach(h=>{
+    const it=h.__item;
+    h.style.display = (_lovedOnly && !(it&&it.rating===1)) ? "none" : "";
+  });
+  document.querySelectorAll("#v-rewatch .twhead").forEach(hd=>{
+    const box=hd.nextElementSibling;
+    if(!box||!box.classList.contains("sources")) return;
+    const vis=[...box.children].filter(c=>c.style.display!=="none").length;
+    hd.style.display = vis ? "" : "none";
+    box.style.display = vis ? "" : "none";
+  });
+}
+
 // Rewatch — the watch-ledger as a browsable shelf. Seen is NOT ineligible: Fredrik is
 // openly rewatch-willing (both the Matrix and Terminator runs, "would gladly rewatch some
 // of the later ones"), and `has_seen` answers "is this a discovery?", never "would he
@@ -988,27 +1028,59 @@ async function renderRewatch(){
     const cachedTV = w.media_type ? w.media_type==="tv" : null;
     const known = cachedTV!==null ? cachedTV : (provenTV ? true : null);
     seen.add(name); items.push({title:name, imdb_id:w.imdb_id||null,
+      rating: (w.rating===undefined?null:w.rating),
       knownTV: known, resolvedTV: known===true, settled: known!==null});
   });
   if(!items.length){ out.innerHTML=`<div class="state"><div class="big">Nothing watched yet</div>Finish something and it shows up here.</div>`; return; }
-  out.innerHTML="";
+  out.innerHTML=""; _lovedOnly=false;
   const wrap=el("div",{className:"detail"});
   // Rows are built once and MOVED into their section as the server resolves each
   // media type. Splitting Films from Series matters more here than on To-Watch: the
   // decision "what do I rewatch tonight" is mostly a runtime decision, and a 2h film
   // and a 5-season show are not comparable choices sitting in one list.
   const mk=(x)=>{
+    const holder=el("div",{className:"rwrow"});
     const r=el("button",{className:"src"});
     r.appendChild(el("span",{className:"q",textContent:x.title}));
     r.onclick=()=>{ setMode(x.resolvedTV?"tv":"movie"); $("#q").value=x.title; S.search.q=x.title;
       location.hash="#/search"; runSearch(x.title); };
+    // Two toggles: loved and not-for-me. Neither pressed = unrated, which is the
+    // honest default; pressing one clears the other, since they are exclusive.
+    const rate=el("div",{className:"rate"});
+    const mkBtn=(cls,glyph,val,label)=>{
+      const b=el("button",{className:cls,textContent:glyph,title:label});
+      b.setAttribute("aria-label",label+" "+x.title);
+      if(x.rating===val) b.classList.add("on");
+      b.onclick=async(ev)=>{ ev.stopPropagation();
+        const next = b.classList.contains("on") ? null : val;   // pressing again clears
+        b.disabled=true;
+        const ok=await rateTitle(x.title,next);
+        b.disabled=false;
+        if(!ok) return;
+        x.rating=next;
+        rate.querySelectorAll("button").forEach(o=>o.classList.remove("on"));
+        if(next!==null) b.classList.add("on");
+        applyLovedFilter();
+      };
+      return b;
+    };
+    rate.append(mkBtn("love","♥",1,"Loved"), mkBtn("nope","✕",-1,"Not for me"));
+    holder.append(r,rate);
     enrichWhenVisible(r,async()=>{
       await enrichToWatchRow(r,x,x.knownTV);
       const dest = x.resolvedTV ? seriesBox : filmBox;
-      if(r.parentElement!==dest){ dest.appendChild(r); bump(); }
+      if(holder.parentElement!==dest){ dest.appendChild(holder); bump(); }
     });
-    return r;
+    holder.__item=x;
+    return holder;
   };
+  const bar=el("div",{className:"libbar"});
+  bar.appendChild(el("span",{textContent:`${items.length} watched`}));
+  const loved=el("button",{className:"lovedonly",textContent:"♥ Loved only"});
+  loved.onclick=()=>{ _lovedOnly=!_lovedOnly; loved.classList.toggle("on",_lovedOnly);
+    applyLovedFilter(); };
+  bar.appendChild(loved);
+  wrap.appendChild(bar);
   const filmHead=el("div",{className:"twhead",textContent:"Films"});
   const filmBox=el("div",{className:"sources open"});
   const seriesHead=el("div",{className:"twhead",textContent:"Series"});
