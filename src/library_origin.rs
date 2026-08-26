@@ -1251,10 +1251,15 @@ mod pack_chooser_tests {
     /// Real release names copied from the BOHR library (the Game of Thrones
     /// directory that prompted this: named "S01 S02 S03 Complete" but holding a
     /// single S03E05 file) plus a genuine multi-episode pack shape.
+    /// Files large enough to clear `MIN_LIBRARY_FILE_BYTES`, written SPARSE — set the
+    /// length, do not materialise the bytes. Writing them for real cost ~700 MB of disk
+    /// per test run and filled a 100%-full volume, which is how these tests first
+    /// failed (`StorageFull`, not a logic error). `set_len` gives the same
+    /// `metadata().len()` the size filter reads, at zero blocks.
     fn pack(dir: &Path, names: &[&str]) {
         for n in names {
-            let p = dir.join(n);
-            std::fs::write(&p, vec![0u8; (MIN_LIBRARY_FILE_BYTES + 1) as usize]).unwrap();
+            let f = std::fs::File::create(dir.join(n)).unwrap();
+            f.set_len(MIN_LIBRARY_FILE_BYTES + 1).unwrap();
         }
     }
 

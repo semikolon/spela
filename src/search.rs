@@ -520,7 +520,7 @@ impl SearchEngine {
         let is_tv = kind == "tv";
         // Detail endpoint — the full field set.
         let durl = format!(
-            "https://api.themoviedb.org/3/{}/{}?api_key={}",
+            "https://api.themoviedb.org/3/{}/{}?api_key={}&append_to_response=external_ids",
             kind, id, self.tmdb_key
         );
         let Ok(resp) = self.client.get(&durl).send().await else {
@@ -576,6 +576,10 @@ impl SearchEngine {
         let (rt, rt_audience, rt_url) = self.mdblist_rt(id, is_tv).await;
         let trailer_key = self.tmdb_trailer_key(kind, id).await;
         json!({
+            // The IMDb id makes every LATER lookup for this title ID-first, which is the
+            // mismatch-proof path — a caller that stores it never re-runs the ambiguous
+            // title search that resolved Station Eleven to an unrelated 2013 film.
+            "imdb_id": d["external_ids"]["imdb_id"].as_str(),
             "trailer_key": trailer_key,
             "poster_url": poster,
             "backdrop_url": backdrop,

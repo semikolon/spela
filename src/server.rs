@@ -349,6 +349,8 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/watched", get(handle_watched))
         .route("/watched-add", post(handle_watched_add))
         .route("/watched-remove", post(handle_watched_remove))
+        .route("/watched-rate", post(handle_watched_rate))
+        .route("/watched-backfill-ids", post(handle_watched_backfill_ids))
         .route("/pending-watched", get(handle_pending_watched))
         .route(
             "/pending-watched/resolve",
@@ -6307,6 +6309,88 @@ async fn handle_watched_add(
     Json(json!({"ok": ok}))
 }
 
+/// `POST /watched-rate` {title, rating} — `1` loved · `0` fine · `-1` no · null clears.
+/// One tap per title; the shelf reads it to curate, the recommender reads it for signal.
+async fn handle_watched_rate(
+    State(state): State<SharedState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        return Json(json!({"ok": false, "error": "missing title"}));
+    }
+    let rating = body.get("rating").and_then(|v| v.as_i64()).map(|v| v as i8);
+    let mut app = AppState::load(&state.state_dir);
+    let n = app.rate_watched(&title, rating);
+    if n > 0 {
+        let _ = app.save(&state.state_dir);
+    }
+    Json(json!({"ok": n > 0, "updated": n, "rating": rating}))
+}
+
+/// `POST /watched-backfill-ids` — fill the missing `imdb_id` on ledger entries.
+///
+/// Entries written title-only (the 2026-08-26 backfill of 36 titles from the taste
+/// profile) carry no id, so every later lookup for them re-runs the ambiguous TITLE
+/// search — the exact path that resolved Station Eleven to an unrelated 2013 film.
+/// Storing the id once makes each of those lookups ID-FIRST and mismatch-proof.
+/// Resolution goes through `title_meta` with `auto_kind`, so the media type is settled
+/// by the shared scorer rather than guessed. Idempotent: entries that already have an
+/// id are skipped, so this is safe to re-run whenever the ledger grows.
+async fn handle_watched_backfill_ids(State(state): State<SharedState>) -> Json<Value> {
+    let mut app = AppState::load(&state.state_dir);
+    // Resolve ONE id per distinct title, then apply it to every row of that title
+    // (a show has one row per episode, and they all share the same imdb id).
+    let mut needed: Vec<String> = Vec::new();
+    for w in &app.watched {
+        if w.imdb_id.is_some() {
+            continue;
+        }
+        let name = w.show.clone().unwrap_or_else(|| w.title.clone());
+        if !needed.contains(&name) {
+            needed.push(name);
+        }
+    }
+    let mut resolved = 0usize;
+    let mut rows = 0usize;
+    let mut misses: Vec<String> = Vec::new();
+    for name in &needed {
+        let meta = state
+            .search_engine
+            .title_meta(name, false, true, None, None, None)
+            .await;
+        let Some(imdb) = meta.get("imdb_id").and_then(|v| v.as_str()) else {
+            misses.push(name.clone());
+            continue;
+        };
+        resolved += 1;
+        let target = crate::search::clean_title_for_tmdb(name).to_lowercase();
+        for w in app.watched.iter_mut() {
+            if w.imdb_id.is_some() {
+                continue;
+            }
+            let key = crate::search::clean_title_for_tmdb(w.show.as_deref().unwrap_or(&w.title))
+                .to_lowercase();
+            if key == target {
+                w.imdb_id = Some(imdb.to_string());
+                rows += 1;
+            }
+        }
+    }
+    if rows > 0 {
+        let _ = app.save(&state.state_dir);
+    }
+    Json(json!({
+        "ok": true, "titles_needing_id": needed.len(),
+        "resolved": resolved, "rows_updated": rows, "unresolved": misses
+    }))
+}
+
 /// `POST /watched-remove` {title} — drop every ledger entry for a title, undoing a
 /// mis-mark. The ledger was append-only until now, so a title marked watched by a
 /// stray tap (or by a completion check firing against a bad duration on a
@@ -6598,7 +6682,7 @@ async fn handle_title_meta(
     // with a bespoke `has_backdrop` check; versioning replaces it, so the NEXT field
     // added to `title_meta` costs one bumped integer instead of another one-off probe.
     // BUMP THIS whenever title_meta's response shape gains or changes a field.
-    const PAYLOAD_V: u64 = 2;
+    const PAYLOAD_V: u64 = 3;
     if let Some(hit) = cache.get(&cache_key) {
         let fresh = hit
             .get("_ts")

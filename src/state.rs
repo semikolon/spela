@@ -220,6 +220,14 @@ pub struct WatchedEntry {
     /// of "recently watched"-style displays; still counts for progress + seen-check.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub seed: bool,
+    /// How it landed: `1` loved · `0` fine · `-1` no. `None` = unrated, which is the
+    /// honest default and must stay distinguishable from "fine" — an unrated entry is
+    /// a title nobody has judged, not a lukewarm one. Deliberately three states rather
+    /// than stars: the question the shelf actually asks is "would I put this on again",
+    /// and one tap answers it. Positive ratings curate the Rewatch shelf; negative ones
+    /// are the more valuable recommender signal (a lane to stop suggesting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<i8>,
 }
 
 /// A play in progress (started, not finished) — the "Continue" surface of the
@@ -460,6 +468,13 @@ impl AppState {
         } else {
             Some(crate::search::clean_title_for_tmdb(&title))
         };
+        // Re-marking a title (a replay, a corrected mark) must PRESERVE its rating —
+        // the row is replaced wholesale below, so carry the judgement across.
+        let prior_rating = self
+            .watched
+            .iter()
+            .find(|w| w.key == key)
+            .and_then(|w| w.rating);
         self.watched.retain(|w| w.key != key);
         self.watched.insert(
             0,
@@ -470,6 +485,7 @@ impl AppState {
                 imdb_id,
                 watched_at: Utc::now(),
                 seed: false,
+                rating: prior_rating,
             },
         );
         self.watched.truncate(500);
@@ -536,6 +552,24 @@ impl AppState {
         hidden
     }
 
+    /// Rate a watched title: `1` loved · `0` fine · `-1` no · `None` clears.
+    /// Matches the same way the seen-check does (cleaned title or show), so a rating
+    /// given on a show row applies to the show, not to one episode. Returns how many
+    /// ledger rows were touched.
+    pub fn rate_watched(&mut self, title: &str, rating: Option<i8>) -> usize {
+        let target = crate::search::clean_title_for_tmdb(title).to_lowercase();
+        let mut n = 0;
+        for w in self.watched.iter_mut() {
+            let show = w.show.as_deref().map(|s| s.to_lowercase());
+            let cleaned = crate::search::clean_title_for_tmdb(&w.title).to_lowercase();
+            if show.as_deref() == Some(target.as_str()) || cleaned == target {
+                w.rating = rating.filter(|r| (-1..=1).contains(r));
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Drop every ledger entry for a show/film, by cleaned title (case-insensitive).
     /// Returns how many were removed. The counterpart to `mark_watched` — without it
     /// a mis-marked title is unfixable from the remote, which is how a four-minute
@@ -592,6 +626,7 @@ impl AppState {
                 imdb_id,
                 watched_at: Utc::now(),
                 seed: true,
+                rating: None,
             },
         );
         self.watched.truncate(500);
@@ -1188,6 +1223,7 @@ mod watched_threshold_tests {
                 imdb_id: None,
                 watched_at: Utc::now(),
                 seed: *seed,
+                rating: None,
             });
         }
         app
@@ -1270,5 +1306,80 @@ mod watched_threshold_tests {
         let mut app = ledger(&[("Poor Things", false)]);
         assert_eq!(app.unmark_watched("poor things"), 1);
         assert_eq!(app.unmark_watched("Poor Things"), 0);
+    }
+}
+
+#[cfg(test)]
+mod rating_tests {
+    use super::*;
+
+    fn app_with(rows: &[(&str, Option<&str>)]) -> AppState {
+        let mut a = AppState::default();
+        for (title, show) in rows {
+            a.watched.push(WatchedEntry {
+                key: title.to_lowercase().replace(' ', "_"),
+                title: (*title).to_string(),
+                show: show.map(|s| s.to_string()),
+                imdb_id: None,
+                watched_at: Utc::now(),
+                seed: false,
+                rating: None,
+            });
+        }
+        a
+    }
+
+    #[test]
+    fn rating_a_show_applies_to_every_episode_row() {
+        let mut a = app_with(&[
+            ("Widow's Bay S01E01", Some("Widow's Bay")),
+            ("Widow's Bay S01E02", Some("Widow's Bay")),
+            ("The Matrix", None),
+        ]);
+        assert_eq!(a.rate_watched("Widow's Bay", Some(1)), 2);
+        assert!(a
+            .watched
+            .iter()
+            .filter(|w| w.show.is_some())
+            .all(|w| w.rating == Some(1)));
+        // the unrelated film is untouched
+        assert_eq!(
+            a.watched
+                .iter()
+                .find(|w| w.title == "The Matrix")
+                .unwrap()
+                .rating,
+            None
+        );
+    }
+
+    #[test]
+    fn unrated_stays_distinguishable_from_fine() {
+        let mut a = app_with(&[("Moon", None)]);
+        assert_eq!(a.watched[0].rating, None); // unrated
+        a.rate_watched("Moon", Some(0)); // explicitly "fine"
+        assert_eq!(a.watched[0].rating, Some(0));
+        a.rate_watched("Moon", None); // cleared again
+        assert_eq!(a.watched[0].rating, None);
+    }
+
+    #[test]
+    fn out_of_range_ratings_are_refused_not_stored() {
+        let mut a = app_with(&[("Moon", None)]);
+        a.rate_watched("Moon", Some(7));
+        assert_eq!(
+            a.watched[0].rating, None,
+            "7 is not a rating this scale defines"
+        );
+    }
+
+    #[test]
+    fn re_marking_a_watched_title_preserves_its_rating() {
+        // A replay or a corrected mark must not silently erase the judgement.
+        let mut a = app_with(&[("Moon", None)]);
+        a.rate_watched("Moon", Some(1));
+        let key = a.watched[0].key.clone();
+        a.mark_watched(&key, None, Some("Moon".into()));
+        assert_eq!(a.watched[0].rating, Some(1));
     }
 }
