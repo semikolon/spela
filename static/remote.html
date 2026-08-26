@@ -428,7 +428,8 @@
      SOON) — same all-caps + weight + tracking as `.twhead`, one step larger so
      the nav still reads as the primary level. Must sit AFTER the base `nav a`
      rules to win the cascade. 2026-08-26. */
-  nav a{font-size:.82rem;font-weight:800;letter-spacing:.09em;text-transform:uppercase}
+  nav a{font-size:.82rem;font-weight:800;letter-spacing:.09em;text-transform:uppercase;
+    white-space:nowrap}  /* uppercase+tracking widened the labels — TO WATCH wrapped to two lines in a narrow window */
   .seg button{min-height:46px;display:flex;align-items:center;padding:.5rem 1.15rem;font-size:1rem}
   .searchbar input{min-height:56px;font-size:1.05rem;padding:1rem 1.1rem}
   .tgt{min-height:44px;font-size:.92rem;padding:.5rem .8rem}
@@ -537,13 +538,15 @@
   @media (hover:hover){
     .fotap,.src,.card,
     .foplay,.fomark,.founfollow,.foseasonbtn,.unmark,.playicon,.srcbtn,
-    .tgt,.tbtn,.topt,.newbadge,nav a,.seg button,.toast button,.banner button{
+    .tgt,.tbtn,.topt,.newbadge,nav a,.seg button,.toast button,.banner button,
+    .markw,.followbtn,.rtlink,.src-toggle{
       position:relative;overflow:hidden;transition:box-shadow .25s ease}
     .fotap::after,.src::after,.card::after,
     .foplay::after,.fomark::after,.founfollow::after,.foseasonbtn::after,
     .unmark::after,.playicon::after,.srcbtn::after,
     .tgt::after,.tbtn::after,.topt::after,.newbadge::after,nav a::after,
-    .seg button::after,.toast button::after,.banner button::after{
+    .seg button::after,.toast button::after,.banner button::after,
+    .markw::after,.followbtn::after,.rtlink::after,.src-toggle::after{
       content:"";position:absolute;inset:0;pointer-events:none;
       border-radius:inherit;transform:translateX(-120%);
       background:linear-gradient(120deg,
@@ -555,15 +558,28 @@
     .foseasonbtn:hover::after,.unmark:hover::after,.playicon:hover::after,
     .srcbtn:hover::after,.tgt:hover::after,.tbtn:hover::after,.topt:hover::after,
     .newbadge:hover::after,nav a:hover::after,.seg button:hover::after,
-    .toast button:hover::after,.banner button:hover::after{
+    .toast button:hover::after,.banner button:hover::after,
+    .markw:hover::after,.followbtn:hover::after,.rtlink:hover::after,
+    .src-toggle:hover::after{
       animation:spelaGleam 1.1s ease-out forwards}
     .fotap:hover,.src:hover,.card:hover,
     .foplay:hover,.fomark:hover,.founfollow:hover,.foseasonbtn:hover,
     .unmark:hover,.playicon:hover,.srcbtn:hover,.tgt:hover,.tbtn:hover,
     .topt:hover,.newbadge:hover,nav a:hover,.seg button:hover,
-    .toast button:hover,.banner button:hover{
+    .toast button:hover,.banner button:hover,
+    .markw:hover,.followbtn:hover,.rtlink:hover,.src-toggle:hover{
       box-shadow:inset 0 0 14px rgba(255,255,255,var(--gleam-rest));
-      transition:box-shadow .45s ease .5s}
+      /* Rises across the WHOLE sweep (1.1s, no delay) rather than arriving as
+         the gleam exits — Fredrik 2026-08-26. Release stays quick: the .25s
+         from the base rule applies on pointer-out. */
+      transition:box-shadow 1.1s ease}
+    /* The search view usually holds ONE result, so the card IS the page —
+       gleaming the whole thing on any pointer move is noise, not an affordance.
+       Its inner controls keep the effect. Scoped to #v-search so the LIBRARY
+       grid (same .card class, many cards) is unaffected. Fredrik 2026-08-26. */
+    #v-search .card{overflow:visible;transition:none}
+    #v-search .card::after{content:none}
+    #v-search .card:hover{box-shadow:none}
   }
   @keyframes spelaGleam{0%{transform:translateX(-120%)}100%{transform:translateX(120%)}}
   @media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
