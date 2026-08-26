@@ -6547,17 +6547,21 @@ async fn handle_title_meta(
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // PAYLOAD VERSION. The TTL alone cannot express "this entry predates a field we
+    // now return" — an entry cached before `backdrop_url` (and later `trailer_key`)
+    // stayed "fresh" for 30 days while silently missing the very key the UI reads, so
+    // the feature looked broken on every already-cached title. That was first patched
+    // with a bespoke `has_backdrop` check; versioning replaces it, so the NEXT field
+    // added to `title_meta` costs one bumped integer instead of another one-off probe.
+    // BUMP THIS whenever title_meta's response shape gains or changes a field.
+    const PAYLOAD_V: u64 = 2;
     if let Some(hit) = cache.get(&cache_key) {
         let fresh = hit
             .get("_ts")
             .and_then(|v| v.as_u64())
             .is_some_and(|ts| now.saturating_sub(ts) < TTL_SECS);
-        // Entries cached before backdrop support lack the `backdrop_url` key →
-        // treat as stale so the wide-row backdrop appears now, not in 30 days.
-        let has_backdrop = hit
-            .get("data")
-            .is_some_and(|d| d.get("backdrop_url").is_some());
-        if fresh && has_backdrop {
+        let current_shape = hit.get("_v").and_then(|v| v.as_u64()) == Some(PAYLOAD_V);
+        if fresh && current_shape {
             if let Some(data) = hit.get("data") {
                 return Json(data.clone());
             }
@@ -6567,7 +6571,10 @@ async fn handle_title_meta(
         .search_engine
         .title_meta(&title, is_tv, auto_kind, tmdb_id, imdb_id.as_deref(), year)
         .await;
-    cache.insert(cache_key, json!({"_ts": now, "data": data.clone()}));
+    cache.insert(
+        cache_key,
+        json!({"_ts": now, "_v": PAYLOAD_V, "data": data.clone()}),
+    );
     if let Some(p) = path {
         let _ = std::fs::write(&p, serde_json::to_string(&cache).unwrap_or_default());
     }
