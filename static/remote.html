@@ -416,7 +416,12 @@
      delay + double-tap-zoom (snappier); inputs stay >=16px (no iOS
      focus-zoom); strong :active since touchless = no hover. */
   button,a,input,.card,.src,.topt,[role=button]{touch-action:manipulation}
-  html,body{font-size:17px}
+  /* Base 16px (Fredrik's pick, 2026-08-26). Was 17px from the 2026-05-18
+     touch-target overhaul; the primary hit areas (nav 46px, search input 56px,
+     target pill 44px, row buttons 40px) are px-anchored, not rem, so they are
+     unaffected — only rem-based padding scales by 16/17. Inputs stay >=16px, so
+     iOS still won't focus-zoom. */
+  html,body{font-size:16px}
   nav{gap:.25rem;padding:.28rem}
   nav a{min-height:46px;display:flex;align-items:center;padding:.55rem 1.05rem;font-size:1rem}
   /* Nav tabs adopt the section-header voice (CONTINUE / NEW EPISODES / COMING
