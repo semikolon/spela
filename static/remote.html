@@ -1877,7 +1877,7 @@ async function openPackChooser(entry){
   files.forEach(f=>{
     const o=el("button",{className:"topt"});
     o.innerHTML=`<span class="ic">${ic("play")}</span><span><span class="nm">${esc(prettyEp(f.name))}</span><br><span class="md">${esc(fmtGB(f.size))} · ${esc(f.container||"")}</span></span>`;
-    o.onclick=()=>{ closeSheet(); $("#sheet h3").textContent="Where should it play?"; doPlayLibrary(entry,f.name); };
+    o.onclick=()=>{ closeSheet(); doPlayLibrary(entry,f.name); };
     list.appendChild(o);
   });
 }
@@ -1947,7 +1947,11 @@ function tgtLabel(){ const t=S.target; const b=$("#tgtBtn");
 tgtLabel();
 $("#tgtBtn").onclick=openSheet;
 $("#scrim").onclick=()=>{ S.pending=null; closeSheet(); };  // dismiss w/o picking → drop the deferred play
-function closeSheet(){ $("#sheet").classList.remove("on"); $("#scrim").classList.remove("on"); }
+function closeSheet(){ $("#sheet").classList.remove("on"); $("#scrim").classList.remove("on");
+  // The pack chooser borrows this sheet and retitles it; restore the target-picker
+  // heading HERE so every dismissal path is covered (scrim tap, Esc, a pick) rather
+  // than only the one that happened to be noticed. 2026-08-26.
+  const h=$("#sheet h3"); if(h) h.textContent="Where should it play?"; }
 function openSheet(){
   $("#sheet").classList.add("on"); $("#scrim").classList.add("on");
   const list=$("#tgtList"); list.innerHTML=`<div class="state">Discovering targets…</div>`;
