@@ -515,6 +515,11 @@
     background:rgba(255,255,255,.1);color:#fff;border:0;border-radius:.5rem;
     font-size:1rem;line-height:1;min-width:40px;min-height:40px;cursor:pointer}
   .wrow .unmark:active{background:rgba(255,255,255,.26)}
+  /* A Library card IS the play control (posterCard `clickPlays`) — give it the
+     pointer and a visible keyboard focus ring, since a role=button div gets
+     neither for free. 2026-08-26. */
+  .cardplay{cursor:pointer}
+  .cardplay:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /* ---- Hover gleam -------------------------------------------------------
      Ported from brf-auto's dashboard queue-card refresh swoosh
      (`~/Projects/brf-auto/frontend/src/index.css` → `.queue-card-swoosh`):
@@ -951,7 +956,7 @@ async function enrichToWatchRow(row,x,isTV){
 addEventListener("hashchange",route);
 
 /* ---------- poster card (skeleton -> img | titled fallback) ---------- */
-function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,detailLine,seLabel,epName,airsNote,followBtn,airInfo,justAired}){
+function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,detailLine,seLabel,epName,airsNote,followBtn,airInfo,justAired,clickPlays}){
   const c=el("div",{className:"card"});
   const p=el("div",{className:"poster"});
   const sh=el("div",{className:"shimmer"});
@@ -984,7 +989,22 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
   // to the right. "More sources" stays BELOW this row (appended after).
   const actions=el("div",{className:"actions"});
   if(airsNote){ actions.appendChild(el("span",{className:"airs",textContent:airsNote})); }
-  if(onPlay){
+  // `clickPlays` (Library): the CARD is the play control, so the redundant ▶ is
+  // dropped — a grid of posters where each poster is the target reads better than
+  // a grid of posters each wearing a small button. The hover gleam already marks
+  // the whole card as live, so the affordance is not lost. Opt-in, because the
+  // SEARCH card shares this builder and needs its ▶ alongside Mark-watched /
+  // Follow / RT. 2026-08-26.
+  if(onPlay && clickPlays){
+    c.classList.add("cardplay");
+    c.setAttribute("role","button");
+    c.tabIndex=0;
+    c.setAttribute("aria-label",(cta||"Play")+(title?" "+title:""));
+    c.title=(cta||"Play")+(title?" "+title:"");
+    c.onclick=()=>onPlay();
+    // Keyboard parity — a div with role=button is not natively operable.
+    c.onkeydown=(ev)=>{ if(ev.key==="Enter"||ev.key===" "){ ev.preventDefault(); onPlay(); } };
+  }else if(onPlay){
     const b=el("button",{className:"play playicon"});
     b.innerHTML=ic("play"); b.setAttribute("aria-label",cta||"Play"); b.title=cta||"Play";
     b.onclick=()=>onPlay(); actions.appendChild(b);
@@ -1865,7 +1885,7 @@ function paintLibrary(){
   const grid=el("div",{className:"grid"});
   lib.forEach(e=>grid.appendChild(posterCard({
     poster:e.poster_url, title:e.title, year:e.year, cta:"Play",
-    onPlay:()=>doPlayLibrary(e)
+    onPlay:()=>doPlayLibrary(e), clickPlays:true
   })));
   out.append(bar,grid);
 }
