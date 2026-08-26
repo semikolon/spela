@@ -6155,7 +6155,51 @@ async fn handle_recent(State(state): State<SharedState>) -> Json<Value> {
 /// the recommender's seen-check + a future watched/up-next view.
 async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
     let app = AppState::load(&state.state_dir);
-    Json(json!({"watched": app.watched.iter().take(200).collect::<Vec<_>>()}))
+    // Attach the media type from the title-meta DISK cache — no network, no TMDB call.
+    // A title's film-vs-series nature never changes, so once a title has been enriched
+    // once its type is known forever, and the Rewatch view can split Films from Series
+    // on first paint instead of shuffling rows between sections as they scroll into
+    // view. Entries not yet cached simply carry no type and resolve lazily client-side.
+    let meta: serde_json::Map<String, Value> = dirs::home_dir()
+        .map(|h| h.join(".config/spela/watchlist_meta.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    // Cache keys are "<kind>:<id-or-title:year>"; index by the title segment so a
+    // ledger title can be looked up without knowing which kind it was cached under.
+    let mut by_title: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (k, v) in meta.iter() {
+        let Some(mt) = v
+            .get("data")
+            .and_then(|d| d.get("media_type"))
+            .and_then(|m| m.as_str())
+        else {
+            continue;
+        };
+        if let Some(rest) = k.splitn(2, ':').nth(1) {
+            let title = rest.rsplitn(2, ':').nth(1).unwrap_or(rest);
+            if !title.is_empty() && !title.starts_with('t') && !title.starts_with('i') {
+                by_title.insert(title.to_string(), mt.to_string());
+            }
+        }
+    }
+    let rows: Vec<Value> = app
+        .watched
+        .iter()
+        .take(400)
+        .map(|w| {
+            let mut v = serde_json::to_value(w).unwrap_or_else(|_| json!({}));
+            let key = crate::search::clean_title_for_tmdb(w.show.as_deref().unwrap_or(&w.title))
+                .to_lowercase();
+            if let Some(mt) = by_title.get(&key) {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("media_type".into(), json!(mt));
+                }
+            }
+            v
+        })
+        .collect();
+    Json(json!({ "watched": rows }))
 }
 
 /// `GET /poster/{size}/{file}` — self-hosted TMDB poster proxy + disk cache.

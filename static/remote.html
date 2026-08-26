@@ -853,7 +853,23 @@ function toastAction(msg,label,fn){ const t=$("#toast"); t.textContent=msg;
   clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("on"),9000); }
 
 /* ---------- router ---------- */
+// Kill any playing trailer. A YouTube iframe keeps playing audio after its view is
+// hidden — hash routing only toggles `.view.on`, it does not unmount anything — so a
+// trailer started on the search card carried on playing over every other page until
+// the tab was closed. Removing the ELEMENT is the only reliable stop: postMessage to
+// the player needs the iframe API, and pause-on-hidden would not survive a re-render.
+// Called from route() so no view can leak one, and before a new search replaces the
+// card underneath it. 2026-08-27.
+function stopTrailers(){
+  document.querySelectorAll(".trwrap iframe").forEach(f=>{
+    f.src="about:blank";           // halt the stream even if removal is deferred
+    f.remove();
+  });
+  // Put the facade back so the card is not left with an empty black box.
+  document.querySelectorAll(".trwrap").forEach(w=>{ if(!w.children.length) w.remove(); });
+}
 function route(){
+  stopTrailers();
   const v=(location.hash.replace(/^#\//,"")||"home").split("?")[0];
   const known=["home","search","library","now","towatch","rewatch"].includes(v)?v:"home";
   $$(".view").forEach(s=>s.classList.toggle("on",s.id==="v-"+known));
@@ -964,9 +980,15 @@ async function renderRewatch(){
     // An `SxxExx` in the ledger title PROVES tv. Its absence proves nothing — a show
     // marked at show level looks identical to a film here — so that case asks the
     // server to resolve (knownTV=null => media_type=auto).
+    // Three tiers of evidence, best first: the server's CACHED media type (stable
+    // forever, so this is fact); an SxxExx in the ledger title (proves tv); nothing
+    // (ask the server to resolve — its ABSENCE proves nothing, since a show marked
+    // at show level looks exactly like a film here).
     const provenTV = /S\d\dE\d\d/i.test(w.title||"");
+    const cachedTV = w.media_type ? w.media_type==="tv" : null;
+    const known = cachedTV!==null ? cachedTV : (provenTV ? true : null);
     seen.add(name); items.push({title:name, imdb_id:w.imdb_id||null,
-      knownTV: provenTV ? true : null, resolvedTV: provenTV});
+      knownTV: known, resolvedTV: known===true, settled: known!==null});
   });
   if(!items.length){ out.innerHTML=`<div class="state"><div class="big">Nothing watched yet</div>Finish something and it shows up here.</div>`; return; }
   out.innerHTML="";
@@ -1000,9 +1022,15 @@ async function renderRewatch(){
     seriesHead.textContent=`Series · ${se}`; seriesHead.style.display=se?"":"none";
     seriesBox.style.display=se?"":"none";
     pendHead.style.display=p?"":"none";     pendBox.style.display=p?"":"none";
-    pendHead.textContent=`Resolving · ${p}`;
+    pendHead.textContent=`Not yet identified · ${p}`;
   }
-  items.forEach(x=>pendBox.appendChild(mk(x)));
+  items.forEach(x=>{
+    const row=mk(x);
+    // Known type => final section immediately. Only genuinely-unknown titles wait,
+    // and they are labelled honestly rather than as "resolving".
+    if(x.settled) (x.resolvedTV?seriesBox:filmBox).appendChild(row);
+    else pendBox.appendChild(row);
+  });
   wrap.append(filmHead,filmBox,seriesHead,seriesBox,pendHead,pendBox);
   out.appendChild(wrap); bump();
 }
@@ -1676,6 +1704,7 @@ async function fillDetailLine(card, title, isTV){
 }
 
 async function runSearch(q){
+  stopTrailers();                 // a new query replaces the card the trailer sits in
   if(S.search.abort) S.search.abort.abort();
   const ac=new AbortController(); S.search.abort=ac;
   // Viewing a specific title → hide the landing bars (recently-watched +
