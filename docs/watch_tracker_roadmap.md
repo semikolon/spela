@@ -29,6 +29,19 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    so any play watched to the end is auto-recorded — zero manual tracking. `GET
    /watched` exposes it (newest-first). Lives in `state.json` (user-local). This is
    the tracker's spine; the recommender's seen-check + slice 2b derive from it.
+   **Seen-detection is EPISODE-COUNTED, not name-matched (2026-08-26).** The
+   To-Watch hide-check keyed on the show NAME alone, so ONE watched episode erased
+   a whole series from the list — four minutes of a pilot hid a 96% show for weeks.
+   `AppState::hidden_watched_shows` now needs 3 DISTINCT episodes for a series;
+   films, explicit whole-show marks and migrated `seed` baselines still hide on
+   one. The threshold is deliberately forgiving: a to-watch list holds CANDIDATES,
+   so a half-abandoned show costs one row while a barely-sampled one costs the
+   whole recommendation. The ledger also stopped being append-only —
+   `POST /watched-remove {title}` plus a rec-row Undo toast and a collapsed
+   "Watched · N" section on To-Watch. That section is the load-bearing half: a
+   wrongly-hidden title was previously invisible AND unfixable, so there was no
+   way to even notice it had gone. Detail: CLAUDE.md Hard-Won "To-Watch hides a
+   SERIES only past 3 distinct watched episodes".
 
 2b. **Followed-shows "New Episodes" tracker — ✅ SHIPPED (2026-07-28→29, v3.19).**
    **Progress model reworked v3.20 (2026-08-02): unified into the watch-ledger as the
@@ -237,6 +250,13 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
      marking whole seasons seen subtracts them from the count, so a middle-seen gap is
      representable (the single caught-up HWM couldn't). Verified: Fargo 47→6 new (marked S2-5
      seen, only unseen S01E05-10 remain), chips reflect state, count refreshes on panel close.
+   - **Harness re-run 2026-08-26** (`generated_by: claude-taste-2026-08-26`, 90 picks):
+     eight new entries lead — Deadloch / Mr Inbetween / Bad Monkey for the
+     Poker-Face-shaped hole (Poker Face is cancelled at Peacock; Rian Johnson is
+     shopping it with Peter Dinklage, recasting Charlie every two seasons by design),
+     Scavengers Reign promoted from rank 71, plus Furious / Dept. Q / The Chestnut Man
+     / Rose of Nevada from a 2026 sweep. The prior 82 are preserved beneath, since the
+     pool is curated and bulk-pruning it is Fredrik's call, not the harness's.
    - **NEXT (refinements, not blockers)**: (b) an optional
      `/recommend`-style refresh affordance (button that re-triggers the harness), or a mood
      input ("how much do you have tonight?") the profile's meta-rules call for; (d) a Phase-2
@@ -263,7 +283,20 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
   watchlist + upcoming tabs (progress on tracked shows), NOT a completed-shows list,
   so finished-and-loved shows aren't fully captured — they're accumulated into the
   user-local `taste_profile.md` "watched & loved" list (title list stays user-local,
-  not this public repo). If TV Time has a watched/profile view, screenshot it before
-  the 2026-07-15 shutdown for a full pass; else keep accumulating manually.
+  not this public repo). TV Time shut down 2026-07-15, so that capture route is closed.
+  **The cost is measurable, not theoretical**: on 2026-08-26 the gap produced FIVE
+  recommendations of already-loved titles in a single session. **Newly-identified
+  import path**: Netflix's PER-PROFILE viewing activity (`netflix.com/viewingactivity`,
+  CSV) plus Amazon's data request — use the per-profile page, since the family account's
+  GDPR export pulls every profile. Blocked on a Bitwarden re-login for the credentials.
+  Tracked with the full flow in `TODO.md` § Watch tracker.
+- **The ledger is the SSoT for seen-status; `taste_profile.md` is NOT (2026-08-26).**
+  `has_seen` reads the ledger, and `GET /recommendations` filters every pick through it
+  at read time — so a title named "loved" in the profile but never written to the ledger
+  stays fully re-recommendable. The profile's lists are taste ANCHORS (each carries a
+  *reason* the ledger cannot hold), which is why the duplication is deliberate rather
+  than drift. Writing one without the other is the failure mode, and it is silent.
+  The rule + the one-line `POST /watched-add` that closes the chain are documented at
+  the foot of `taste_profile.md` (user-local, Darwin).
 - Future spela iOS app (if built) is for playing/remote, not re-tracking — the tracker
   lives in the shared backend + the existing web-remote PWA.
