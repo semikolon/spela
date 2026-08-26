@@ -408,6 +408,8 @@ impl SearchEngine {
         &self,
         title: &str,
         is_tv: bool,
+        // True when the caller cannot say film-vs-series and wants it resolved.
+        auto_kind: bool,
         tmdb_id: Option<u64>,
         imdb_id: Option<&str>,
         year: Option<u32>,
@@ -424,6 +426,19 @@ impl SearchEngine {
         // search path uses, so "The Curse" + 2023 + tv resolves the Fielder series, not
         // the 1999 movie or the 2022 comedy.
         let mut kind = if is_tv { "tv" } else { "movie" };
+        // MEDIA TYPE UNKNOWN (`media_type=auto`): the caller has no id AND cannot say
+        // whether this is a film or a series — the watch-ledger's case, where a show
+        // marked at SHOW level carries no `SxxExx` to infer from. Without this rung the
+        // typed search below locks to `movie` and confidently returns a DIFFERENT title
+        // (Station Eleven resolved to an unrelated 2013 film, 85 min). Multi-search
+        // settles the type first, via the same shared scorer, exactly as the imdb rung
+        // corrects it — and `kind` then flows into year + RT, per the 2026-08-22 lesson
+        // that a resolved media type must SHADOW the caller's assumption (`12e1ff0`).
+        if auto_kind && tmdb_id.is_none() && imdb_id.map(str::trim).unwrap_or("").is_empty() {
+            if let Ok(detected) = self.tmdb_auto_detect(title).await {
+                kind = if detected == "tv" { "tv" } else { "movie" };
+            }
+        }
         let id: u64 = if let Some(tid) = tmdb_id.filter(|t| *t > 0) {
             tid
         } else if let Some((fid, ftv)) = match imdb_id.map(str::trim).filter(|s| !s.is_empty()) {
@@ -567,6 +582,7 @@ impl SearchEngine {
             "rt_url": rt_url,
             "year": if year.is_empty() { Value::Null } else { Value::String(year) },
             "genres": genres,
+            "media_type": kind,
             "tmdb": tmdb,
             "status": status,
             "seasons": seasons,

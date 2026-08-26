@@ -6486,6 +6486,10 @@ async fn handle_title_meta(
 ) -> Json<Value> {
     let title = q.get("title").cloned().unwrap_or_default();
     let media = q.get("media_type").map(|s| s.as_str()).unwrap_or("");
+    // `media_type=auto` = the caller genuinely does not know (the watch-ledger: a show
+    // marked at SHOW level carries no `SxxExx` to infer from). Distinct from OMITTING the
+    // hint, which has always meant "movie" and must keep meaning that for existing callers.
+    let auto_kind = media == "auto";
     let is_tv =
         q.get("tv").map(|v| v == "1").unwrap_or(false) || matches!(media, "tv" | "series" | "show");
     // ID-first inputs the caller (rec / search result) may already know — resolving by
@@ -6516,7 +6520,19 @@ async fn handle_title_meta(
                 year.map(|y| y.to_string()).unwrap_or_default()
             )
         });
-    let cache_key = format!("{}:{}", if is_tv { "tv" } else { "movie" }, id_key);
+    // An auto request must not share a slot with a typed one — the resolved kind is
+    // not known until after the lookup, and a wrong-kind hit is the bug this fixes.
+    let cache_key = format!(
+        "{}:{}",
+        if auto_kind {
+            "auto"
+        } else if is_tv {
+            "tv"
+        } else {
+            "movie"
+        },
+        id_key
+    );
     let path = dirs::home_dir().map(|h| h.join(".config/spela/watchlist_meta.json"));
     let mut cache: serde_json::Map<String, Value> = path
         .as_ref()
@@ -6549,7 +6565,7 @@ async fn handle_title_meta(
     }
     let data = state
         .search_engine
-        .title_meta(&title, is_tv, tmdb_id, imdb_id.as_deref(), year)
+        .title_meta(&title, is_tv, auto_kind, tmdb_id, imdb_id.as_deref(), year)
         .await;
     cache.insert(cache_key, json!({"_ts": now, "data": data.clone()}));
     if let Some(p) = path {
