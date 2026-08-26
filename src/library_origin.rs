@@ -145,6 +145,13 @@ type Shared = Arc<LibraryOriginState>;
 struct MatchParams {
     title: String,
     quality: Option<String>,
+    /// Exact inner filename to serve, chosen by the pack chooser. When set the
+    /// title-matcher is BYPASSED: `title` names the top-level directory and this
+    /// names the file within it, so a multi-episode pack plays the episode the
+    /// user actually picked instead of whatever the matcher lands on. Still
+    /// funnelled through `resolve_under_roots`, so a traversal attempt in this
+    /// value is refused like any other. 2026-08-26.
+    file: Option<String>,
     /// Accepted for forward-compat / explicitness; year filtering is
     /// already encoded in `title` by the matcher, so this is advisory.
     #[allow(dead_code)]
@@ -193,6 +200,13 @@ pub struct LibraryEntry {
     pub raw_name: String,
     pub size_bytes: u64,
     pub container: String,
+    /// Playable media files inside a DIRECTORY release. Omitted for single-file
+    /// releases and for directories holding exactly one file, so `>1` is the
+    /// SPA's "this card is a pack, open a chooser" signal. Without it a pack
+    /// renders as one title with one poster and silently plays whichever file
+    /// the matcher happens to land on (2026-08-26).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_count: Option<u32>,
     /// Best-effort TMDB art, filled by spela's aggregator (web-remote
     /// T-4). `serve-library` always emits `None` — it is a dumb file
     /// server with no TMDB key; spela's `/library` enriches, and the
@@ -324,6 +338,39 @@ fn largest_inner_media(dir: &Path) -> Option<(u64, String)> {
     best
 }
 
+/// Every playable media file directly inside `dir`, name-sorted so an episode
+/// pack lists in episode order. Same extension + `transcoded` filters as
+/// `largest_inner_media`, which it complements: that one answers "how big is
+/// this release", this one answers "what is actually IN it". 2026-08-26.
+fn list_inner_media(dir: &Path) -> Vec<(String, u64, String)> {
+    let mut out: Vec<(String, u64, String)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for sub in rd.flatten() {
+        let p = sub.path();
+        if !p.is_file() {
+            continue;
+        }
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !LIBRARY_VIDEO_EXTS.contains(&ext.as_str()) || fname.starts_with("transcoded") {
+            continue;
+        }
+        let sz = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        if sz < MIN_LIBRARY_FILE_BYTES {
+            continue;
+        }
+        out.push((fname.to_string(), sz, ext));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Enumerate browsable media under each root (web-remote T-2). Mirrors
 /// the top-level-entry structure of `server::find_local_bypass_match`:
 /// a top-level `.mkv`/`.mp4` IS an entry; a directory is represented by
@@ -365,6 +412,12 @@ pub fn enumerate_library(roots: &[PathBuf]) -> Vec<LibraryEntry> {
             } else {
                 continue;
             };
+            let file_count = if ft.is_dir() {
+                let n = list_inner_media(&entry.path()).len();
+                (n > 1).then_some(n as u32)
+            } else {
+                None
+            };
 
             if size_bytes < MIN_LIBRARY_FILE_BYTES {
                 continue;
@@ -376,6 +429,7 @@ pub fn enumerate_library(roots: &[PathBuf]) -> Vec<LibraryEntry> {
                 raw_name,
                 size_bytes,
                 container,
+                file_count,
                 poster_url: None,
             });
         }
@@ -440,6 +494,7 @@ pub async fn run(config: Config, port_override: Option<u16>) -> Result<()> {
     let app = Router::new()
         .route("/library/match", get(handle_match))
         .route("/library/list", get(handle_library_list))
+        .route("/library/files", get(handle_library_files))
         .route("/library/stream", get(handle_stream))
         .route("/health", get(handle_health))
         .with_state(state);
@@ -724,7 +779,17 @@ async fn handle_match(State(state): State<Shared>, Query(p): Query<MatchParams>)
     // Reuse the EXACT server-side matcher + multi-root helper. expected
     // bytes = 0 (the origin host has no torrent-size expectation; the
     // title/year/quality + health matrix is the discriminator).
-    let hit = first_local_bypass_match(&roots, &p.title, p.quality.as_deref(), 0, &empty);
+    // An explicit `file` means the caller already chose from `/library/files`:
+    // join it under the named top-level directory instead of re-running the
+    // title matcher (which would pick its own file inside a pack).
+    let hit = if let Some(f) = p.file.as_deref().filter(|f| !f.trim().is_empty()) {
+        roots
+            .iter()
+            .map(|r| r.join(&p.title).join(f))
+            .find(|c| c.is_file())
+    } else {
+        first_local_bypass_match(&roots, &p.title, p.quality.as_deref(), 0, &empty)
+    };
     let Some(path) = hit else {
         return (StatusCode::NOT_FOUND, "no local match").into_response();
     };
@@ -759,6 +824,42 @@ async fn handle_match(State(state): State<Shared>, Query(p): Query<MatchParams>)
 /// USB HDD) runs on a blocking thread so the async runtime is never
 /// stalled; the caller (spela `/library`) gates it behind a liveness
 /// ping + generous timeout (web-remote T-3 / the v3.6.3 pattern).
+/// `GET /library/files?title=<raw_name>` — the media files inside one directory
+/// release, name-sorted. Feeds the SPA's pack chooser: a card whose `file_count`
+/// is >1 asks for this list, shows it, and plays the chosen entry by passing its
+/// name back as `/library/match?title=&file=`. Never leaks an absolute path (same
+/// posture as `/match`) — only the inner filename, which the caller already needs
+/// in order to choose. 2026-08-26.
+async fn handle_library_files(
+    State(state): State<Shared>,
+    Query(p): Query<MatchParams>,
+) -> Response {
+    if p.title.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "title required").into_response();
+    }
+    let roots = state
+        .healthy_roots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if roots.is_empty() {
+        return waiting_response(&state.configured_roots);
+    }
+    let Some(dir) = roots
+        .iter()
+        .map(|r| r.join(&p.title))
+        .find(|c| c.is_dir())
+        .and_then(|c| resolve_under_roots(&roots, &c))
+    else {
+        return (StatusCode::NOT_FOUND, "no such release").into_response();
+    };
+    let files: Vec<serde_json::Value> = list_inner_media(&dir)
+        .into_iter()
+        .map(|(name, size, container)| json!({"name": name, "size": size, "container": container}))
+        .collect();
+    Json(json!({ "title": p.title, "files": files })).into_response()
+}
+
 async fn handle_library_list(State(state): State<Shared>) -> Response {
     let roots = state
         .healthy_roots
@@ -1140,5 +1241,61 @@ mod tests {
             classify_state(got.len(), raw.len()),
             LibraryStateKind::Waiting
         );
+    }
+}
+
+#[cfg(test)]
+mod pack_chooser_tests {
+    use super::*;
+
+    /// Real release names copied from the BOHR library (the Game of Thrones
+    /// directory that prompted this: named "S01 S02 S03 Complete" but holding a
+    /// single S03E05 file) plus a genuine multi-episode pack shape.
+    fn pack(dir: &Path, names: &[&str]) {
+        for n in names {
+            let p = dir.join(n);
+            std::fs::write(&p, vec![0u8; (MIN_LIBRARY_FILE_BYTES + 1) as usize]).unwrap();
+        }
+    }
+
+    #[test]
+    fn list_inner_media_is_episode_sorted_and_filtered() {
+        let d = tempfile::tempdir().unwrap();
+        pack(
+            d.path(),
+            &[
+                "Girls.S01E03.mkv",
+                "Girls.S01E01.mkv",
+                "Girls.S01E02.mkv",
+                "transcoded_leftover.mkv",
+                "I.nfo",
+            ],
+        );
+        let got = list_inner_media(d.path());
+        let names: Vec<&str> = got.iter().map(|(n, _, _)| n.as_str()).collect();
+        // name-sorted => episode order; the `transcoded` file and the non-video
+        // .nfo are both excluded.
+        assert_eq!(
+            names,
+            vec!["Girls.S01E01.mkv", "Girls.S01E02.mkv", "Girls.S01E03.mkv"]
+        );
+    }
+
+    #[test]
+    fn a_directory_with_one_file_is_not_a_pack() {
+        // The anchoring case: a dir NAMED as a 3-season pack that actually holds
+        // one episode must NOT show a chooser — file_count stays None.
+        let d = tempfile::tempdir().unwrap();
+        pack(d.path(), &["S03E05.1080p.WEB-DL.x264.anoXmous_.mp4"]);
+        assert_eq!(list_inner_media(d.path()).len(), 1);
+    }
+
+    #[test]
+    fn list_inner_media_ignores_subdirectories() {
+        let d = tempfile::tempdir().unwrap();
+        pack(d.path(), &["Show.S01E01.mkv"]);
+        std::fs::create_dir(d.path().join("Subs")).unwrap();
+        pack(&d.path().join("Subs"), &["Show.S01E01.mkv"]);
+        assert_eq!(list_inner_media(d.path()).len(), 1);
     }
 }
