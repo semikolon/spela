@@ -263,11 +263,24 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
      model-swappable autonomous harness (same POST surface).
    Tests: `has_seen` case-insensitive exclusion + in-progress write/clear (`state.rs`).
 
+8. **Rewatch shelf — ✅ SHIPPED (2026-08-27).** `#/rewatch` lists the watch-ledger as a
+   browsable shelf: episodes collapse to their show, rows split **Films / Series**, films
+   read as `2h 16m` and series as episode/season counts (runtime is the number you scan
+   when choosing what fits tonight). Media type comes from `GET /watched`, which attaches
+   it from the title-meta DISK cache so the split happens on FIRST paint rather than
+   shuffling rows as they scroll in. **The type-evidence order matters**: cached type >
+   an `SxxExx` in the ledger title > ask the server (`media_type=auto`) — the ABSENCE of
+   `SxxExx` proves nothing, since a show marked at SHOW level looks exactly like a film,
+   which is how Station Eleven resolved to an unrelated 2013 movie. Detail: project
+   CLAUDE.md § Rewatch tab + § `GET /watched`.
+
 ## Notes
 - **`has_seen` answers "is this a discovery?", NOT "would he watch it tonight?" (2026-08-27).**
   The ledger backfill marked both the Matrix and Terminator franchises seen, and Fredrik is
   openly rewatch-willing on the later entries. Excluding them from RECOMMENDATIONS is right;
-  a future rewatch/themed-night surface must not inherit that exclusion. Rewatch-openness is
+  the **`#/rewatch` view SHIPPED 2026-08-27** reads the same ledger from the other side and
+  deliberately does not inherit that exclusion; any further themed-night surface should
+  follow it rather than the recommender. Rewatch-openness is
   a separate axis, recorded per-title in `taste_profile.md`.
 - **The recommender's quality gate is 82% (Fredrik, 2026-08-26), lowered from ~88%.**
   Devs (82%) was loved while sitting below the old bar, which showed the gate was
