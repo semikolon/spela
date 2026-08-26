@@ -264,6 +264,11 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    Tests: `has_seen` case-insensitive exclusion + in-progress write/clear (`state.rs`).
 
 ## Notes
+- **The recommender's quality gate is 82% (Fredrik, 2026-08-26), lowered from ~88%.**
+  Devs (82%) was loved while sitting below the old bar, which showed the gate was
+  filtering well-matched titles rather than unknown ones. Lane-fit outranks the number;
+  the score is still always stated. Full rule + bands: `taste_profile.md` (user-local).
+
 - **⚠ Arsenal data lives on the SPELA HOST (Darwin `~/.config/spela/`), not the Mac.**
   spela serves `watchlist.json` from the host it runs on (Darwin). Authoring these
   files on the Mac (this repo's dev box) does NOT reach spela — `/watchlist` reads
