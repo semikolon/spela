@@ -264,6 +264,11 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    Tests: `has_seen` case-insensitive exclusion + in-progress write/clear (`state.rs`).
 
 ## Notes
+- **`has_seen` answers "is this a discovery?", NOT "would he watch it tonight?" (2026-08-27).**
+  The ledger backfill marked both the Matrix and Terminator franchises seen, and Fredrik is
+  openly rewatch-willing on the later entries. Excluding them from RECOMMENDATIONS is right;
+  a future rewatch/themed-night surface must not inherit that exclusion. Rewatch-openness is
+  a separate axis, recorded per-title in `taste_profile.md`.
 - **The recommender's quality gate is 82% (Fredrik, 2026-08-26), lowered from ~88%.**
   Devs (82%) was loved while sitting below the old bar, which showed the gate was
   filtering well-matched titles rather than unknown ones. Lane-fit outranks the number;
