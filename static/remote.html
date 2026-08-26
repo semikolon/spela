@@ -403,6 +403,11 @@
   html,body{font-size:17px}
   nav{gap:.25rem;padding:.28rem}
   nav a{min-height:46px;display:flex;align-items:center;padding:.55rem 1.05rem;font-size:1rem}
+  /* Nav tabs adopt the section-header voice (CONTINUE / NEW EPISODES / COMING
+     SOON) — same all-caps + weight + tracking as `.twhead`, one step larger so
+     the nav still reads as the primary level. Must sit AFTER the base `nav a`
+     rules to win the cascade. 2026-08-26. */
+  nav a{font-size:.82rem;font-weight:800;letter-spacing:.09em;text-transform:uppercase}
   .seg button{min-height:46px;display:flex;align-items:center;padding:.5rem 1.15rem;font-size:1rem}
   .searchbar input{min-height:56px;font-size:1.05rem;padding:1rem 1.1rem}
   .tgt{min-height:44px;font-size:.92rem;padding:.5rem .8rem}
