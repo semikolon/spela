@@ -834,6 +834,9 @@ async function vlcWaitReady(id, gen){
     // equivalent, and since the play button always takes result #1, one dead top pick
     // was an unresolvable spinner (The Diplomat S03E01, 2026-08-27).
     if(d && d.dead) return {rotate:true};
+    // The server raced the top candidates and a different one is actually delivering.
+    // Switch to it rather than keep waiting on a source that is losing.
+    if(d && d.switch_to) return {switchTo:d.switch_to};
     // Drive the loading surface (not a transient toast) — matches the Chromecast warmup.
     S.now.warmup={active:true, vlc:true, pct:(d&&d.pct!=null)?d.pct:0};
     if(S.now.warming) renderWarmPanel();
@@ -862,13 +865,21 @@ async function openInVlc(id,title,poster){
   // pick. Matches the Chromecast retry budget of three.
   let skipped = 0;
   const total = (S.search.data && S.search.data.results && S.search.data.results.length) || 0;
-  while(rdy && rdy.rotate && skipped < 3 && id + 1 <= total){
-    id += 1; skipped += 1;
-    S.now.vlcNote = "Source " + (id-1) + " had no peers — trying source " + id + "…";
+  while(rdy && (rdy.rotate || rdy.switchTo) && skipped < 3){
+    if(rdy.switchTo){
+      // Not a failure — the race found a source that is actually delivering.
+      S.now.vlcNote = "Source " + rdy.switchTo + " is downloading faster — switching…";
+      id = rdy.switchTo;
+    }else{
+      if(id + 1 > total) break;
+      id += 1;
+      S.now.vlcNote = "Source " + (id-1) + " had no peers — trying source " + id + "…";
+    }
+    skipped += 1;
     if(S.now.warming) renderWarmPanel();
     rdy = await vlcWaitReady(id, gen);
   }
-  if(rdy && rdy.rotate){ S.now.vlcErr="No source for this episode had reachable peers."; rdy=false; }
+  if(rdy && (rdy.rotate || rdy.switchTo)){ S.now.vlcErr="No source for this episode had reachable peers."; rdy=false; }
   S.now.vlcNote=null;
   if(rdy==="superseded") return;   // a newer VLC source took over this screen — don't clobber it with an error
   if(rdy!==true){

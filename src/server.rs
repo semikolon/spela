@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -53,6 +54,14 @@ pub struct ServerState {
     /// returned guard drops on ANY do_play return path (success OR the many
     /// early error-returns) — so `/progress` can never report a stale warmup.
     pub warmup: Mutex<Option<Warmup>>,
+    /// When each VLC-path torrent was first polled for readiness, so a stalled source can
+    /// be given up on. The Chromecast path gets this from `check_torrent_progress`, which
+    /// blocks; the readiness endpoint is polled every ~1.5s and cannot block, so it
+    /// measures elapsed time across polls instead.
+    pub vlc_first_poll: Mutex<HashMap<u32, Instant>>,
+    /// Result ids whose source race has already been run, so a ~1.5s poll cannot start a
+    /// fresh race on every tick.
+    pub vlc_raced: Mutex<HashSet<usize>>,
     /// 2026-07-07: the web-remote scrubber's LIVE playback position, distinct
     /// from the resume HWM in state.json. The HWM (`get_position`) is
     /// max-only (`save_position_smart` refuses to move it backward), so it can
@@ -259,6 +268,8 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         torrent_engine,
         host_allowlist,
         warmup: Mutex::new(None),
+        vlc_first_poll: Mutex::new(HashMap::new()),
+        vlc_raced: Mutex::new(HashSet::new()),
         live_position: Mutex::new(None),
         vlc_activity: Mutex::new(None),
         vlc_commands: Mutex::new(Vec::new()),
@@ -1170,6 +1181,76 @@ async fn maybe_race_sources(
         candidates.len()
     );
     race_torrent_sources(state, &candidates, state.config.race_timeout_secs).await
+}
+
+/// The VLC-path twin of `maybe_race_sources`.
+///
+/// Same gate, same tested racer, different return type: the Chromecast path hands
+/// `do_play` a (magnet, file_index) to start, whereas the VLC path addresses sources by
+/// RESULT ID, so this maps the winner back to its id for the remote to switch to.
+///
+/// This matters most exactly when the ranker is blind. Torrentio periodically returns
+/// `seeders: null` for every result — it did for all 23 Diplomat and all 40 Star City
+/// releases on 2026-08-27 — which leaves the ranker's seed tier nothing to sort on and
+/// the seed-health colouring nothing to show. Unknown seeds read as 0, below the
+/// threshold, so a blind ranker is precisely the case that races. The race is the real
+/// empirical delivery test that the stale seed counts only approximate.
+async fn maybe_race_sources_for_vlc(state: &SharedState, rid: usize) -> Option<usize> {
+    if !state.config.race_sources_enabled {
+        return None;
+    }
+    // One race per source per session. The readiness endpoint is polled every ~1.5s and
+    // a race started on every tick would be a stampede, not a rescue.
+    {
+        let mut raced = lock_recover(&state.vlc_raced);
+        if raced.contains(&rid) {
+            return None;
+        }
+        raced.insert(rid);
+    }
+    let search = AppState::load_last_search(&state.state_dir)?;
+    let selected_seeds = search
+        .results
+        .iter()
+        .find(|r| r.id == rid)
+        .map(|r| r.seeds)?;
+    let candidates: Vec<(String, Option<u32>)> = search
+        .results
+        .iter()
+        .filter(|r| r.id >= rid && !r.magnet.is_empty())
+        .take(state.config.race_max_sources)
+        .map(|r| (r.magnet.clone(), r.file_index))
+        .collect();
+    if !should_race_sources(
+        true,
+        selected_seeds,
+        state.config.race_seed_threshold,
+        candidates.len(),
+    ) {
+        return None;
+    }
+    tracing::info!(
+        "race (vlc): result #{} has {} seeds (< {}), racing {} sources",
+        rid,
+        selected_seeds,
+        state.config.race_seed_threshold,
+        candidates.len()
+    );
+    let (winner_magnet, _) =
+        race_torrent_sources(state, &candidates, state.config.race_timeout_secs).await?;
+    let winner_id = search
+        .results
+        .iter()
+        .find(|r| r.magnet == winner_magnet)
+        .map(|r| r.id)?;
+    if winner_id != rid {
+        tracing::info!(
+            "race (vlc): result #{} won, switching from #{}",
+            winner_id,
+            rid
+        );
+    }
+    Some(winner_id)
 }
 
 /// "Is the torrent worker still alive?" check used by the post-playback
@@ -8205,10 +8286,20 @@ async fn handle_vlc_ready(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
 ) -> Json<Value> {
-    // Complete file on disk → instantly ready (served static + fully seekable).
-    if resolve_local_file_for_result(&state, id).is_some()
-        || resolve_local_file_lenient(&state, id).is_some()
-    {
+    // COMPLETE file on disk → instantly ready (served static + fully seekable).
+    //
+    // "Complete" has to be PROVEN, not assumed from a resolver returning Some. The
+    // lenient resolver deliberately passes a sparse >=100MB partial — this project's own
+    // notes say so and warn against gating on it — so this short-circuit was declaring
+    // "on disk, 100%, ready" over a half-downloaded file, and VLC then opened something
+    // with no tail and stalled. Star City S01E01, 2026-08-27: 845MB of a 9.6GB release
+    // reported ready:true. is_physically_full is the same gate the resume start-time
+    // already uses, for exactly this reason.
+    let complete = resolve_local_file_for_result(&state, id)
+        .into_iter()
+        .chain(resolve_local_file_lenient(&state, id))
+        .find(|(path, _)| is_physically_full(path, 0));
+    if complete.is_some() {
         return Json(json!({ "ready": true, "pct": 100, "phase": "on disk" }));
     }
     let Some((magnet, file_index, _, _, _)) = resolve_result_for_vlc(&state, id) else {
@@ -8246,11 +8337,61 @@ async fn handle_vlc_ready(
     state
         .torrent_engine
         .prefetch_ends(tid, file_index.unwrap_or(0) as usize);
-    let (bytes, total, finished) = state
+    let (bytes, total, finished, peers, speed) = state
         .torrent_engine
         .progress(tid)
-        .map(|p| (p.bytes_downloaded, p.bytes_total, p.finished))
-        .unwrap_or((0, 0, false));
+        .map(|p| {
+            (
+                p.bytes_downloaded,
+                p.bytes_total,
+                p.finished,
+                p.peers_connected,
+                p.speed_bps,
+            )
+        })
+        .unwrap_or((0, 0, false, 0, 0));
+
+    // STALL GATE — the VLC twin of do_play's `check_torrent_progress`.
+    //
+    // A source can resolve its metadata (so it is not "dead" in the no-peers sense) and
+    // then deliver nothing at all. Without a gate the remote polled such a source for its
+    // full 15-minute ceiling, which is indistinguishable from a hang.
+    //
+    // The condition is deliberately bytes AND peers AND speed all zero, copied from
+    // check_torrent_progress rather than re-derived. Day-one swarm poisoning fills
+    // connection slots with decoys that handshake but send nothing, so a poisoned source
+    // sits at 0 bytes for ~30s and then flows (measured, HotD S03E04) — it has PEERS
+    // throughout, so it survives this gate and gets its breakthrough. Gating on bytes
+    // alone would kill exactly the sources f30fdca taught us to wait for.
+    let first = {
+        let mut m = lock_recover(&state.vlc_first_poll);
+        *m.entry(tid).or_insert_with(Instant::now)
+    };
+    let gate_secs = if total > 8_000_000_000 { 30 } else { 12 };
+    if bytes == 0 && peers == 0 && speed == 0 && first.elapsed().as_secs() >= gate_secs {
+        tracing::warn!(
+            "vlc: torrent {} has no bytes, peers or speed after {}s — treating source as dead",
+            tid,
+            gate_secs
+        );
+        return Json(json!({
+            "ready": false, "pct": 0, "dead": true, "phase": "no seeds",
+        }));
+    }
+
+    // Race the top candidates when the pick's swarm looks weak — including when the seed
+    // count is UNKNOWN, which reads as 0 and is the common case whenever Torrentio omits
+    // seeders. Runs at most once per source; the winner is returned as a switch so the
+    // remote can move to it using the same rotation plumbing.
+    if bytes == 0 && !finished {
+        if let Some(winner) = maybe_race_sources_for_vlc(&state, id).await {
+            if winner != id {
+                return Json(json!({
+                    "ready": false, "pct": 0, "switch_to": winner, "phase": "better source found",
+                }));
+            }
+        }
+    }
     let frac = if total > 0 {
         bytes as f64 / total as f64
     } else {
