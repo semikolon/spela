@@ -568,7 +568,9 @@
      nowrap), squeezing "Rick and Morty" into three wrapped lines inside a 72px box.
      Giving the title the full width and letting the rest flow underneath is also the
      shape of the To-Watch rows this view was asked to resemble. */
-  #v-rewatch .src{flex-wrap:wrap;align-content:center;row-gap:.2rem}
+  /* .src is a <button>, whose UA default is text-align:center. Invisible while the
+     title was an auto-width flex item; the full-width two-line restack exposed it. */
+  #v-rewatch .src{flex-wrap:wrap;align-content:center;row-gap:.2rem;text-align:left}
   #v-rewatch .q{flex:0 0 100%;font-size:.95rem;font-weight:700;line-height:1.25;
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
   #v-rewatch .gx{display:none}                 /* genre: already known */
