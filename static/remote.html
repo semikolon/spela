@@ -555,8 +555,13 @@
      px across the shelf). The title clamps to two lines instead, so "Terminator 3: Rise
      of the Machines" and "Moon" occupy identical boxes. Two lines rather than one keeps
      long titles readable instead of ellipsing them into ambiguity. */
-  #v-rewatch .src{height:72px;padding:.7rem .9rem;gap:.65rem;align-items:center;
-    overflow:hidden}
+  /* padding-right is EXPLICIT, not left to the lower-specificity `.rwrow>.src` rule:
+     this selector is id+class so it wins, and writing `padding` as a SHORTHAND here
+     silently reset the right inset to .9rem — which let the score box run under the
+     rating buttons on 23 of 80 rows (worst overlap 34px). The reserve must clear the
+     button cluster (81px wide, offset 8.5px from the edge). */
+  #v-rewatch .src{height:72px;padding:.7rem 6.2rem .7rem .9rem;gap:.65rem;
+    align-items:center;overflow:hidden}
   #v-rewatch .q{font-size:1rem;font-weight:700;line-height:1.2;
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
     overflow:hidden;min-width:0}
