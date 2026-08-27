@@ -487,7 +487,11 @@
   .stpill.bad{background:rgba(225,90,90,.14);color:#e58a8a;border-color:rgba(225,90,90,.30)}
   .shownote{margin-top:.35rem;font-size:.85rem;line-height:1.4;color:var(--dim,#9a9aa8);
     max-width:62ch}
+  .shownote.clamped{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;
+    overflow:hidden}
   .shownote .noteage{opacity:.62;font-size:.8em}
+  .notemore{margin-top:.15rem;padding:0;background:none;border:0;cursor:pointer;
+    color:var(--accent);font-size:.8rem;font-weight:600}
 
   @media (max-width:560px){
     .brand small{display:none}               /* drop " remote" — saves width */
@@ -1818,13 +1822,25 @@ async function fillDetailLine(card, title, isTV){
   // The hand-written intel line, underneath. Small and dim: it is commentary, not fact,
   // and it carries its own date once old enough that a reader should discount it.
   if(m.note && !card.querySelector(".shownote")){
-    const nl=el("div",{className:"shownote"});
+    const nl=el("div",{className:"shownote clamped"});
     nl.appendChild(el("span",{textContent:m.note}));
     const age=noteAgeDays(m.note_as_of);
     if(age!=null && age>45){
       nl.appendChild(el("span",{className:"noteage",textContent:" · as of "+m.note_as_of}));
     }
     dl.after(nl);
+    // A note that says WHY (why a show was cancelled, who took over and what they
+    // changed) is worth more than a bare verdict, but it runs long. Clamp to three
+    // lines and let it open, so the extra depth costs nothing when unread. The toggle
+    // only appears when the text ACTUALLY overflows — measured after layout, never
+    // guessed from length, since wrapping depends on the viewport.
+    requestAnimationFrame(()=>{
+      if(nl.scrollHeight <= nl.clientHeight + 2){ nl.classList.remove("clamped"); return; }
+      const more=el("button",{className:"notemore",textContent:"more"});
+      more.onclick=()=>{ const open=nl.classList.toggle("clamped")===false;
+        more.textContent=open?"less":"more"; };
+      nl.after(more);
+    });
   }
   // live RT score (MDBList) → the compact tomato shows the number + links to
   // the real RT page. Without a key m.rt is absent → the tomato stays a search
