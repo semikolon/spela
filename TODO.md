@@ -3,30 +3,33 @@
 ### Rewatch shelf + trailers + list performance — SHIPPED + live-verified 2026-08-27 ✅
 **`#/rewatch`** (sixth nav view): the ledger read as a shelf, Films/Series split on first paint, films as `2h 16m` and series as episode/season counts. **Media-type resolution was the hard part** — `title_meta`'s ladder is `tmdb_id → imdb_id (corrects kind) → typed title-search locked to the caller's guess`, and the Rewatch view has neither id and cannot infer type (a show marked at SHOW level carries no `SxxExx`), so the typed search defaulted to `movie` and returned a DIFFERENT title (Station Eleven → an unrelated 2013 film). Fixed by following the 2026-08-22 history (`efba21e`/`12e1ff0`) rather than a parallel mechanism: a media-type-UNKNOWN rung resolves via the shared scorer and the resolved kind SHADOWS the caller's assumption. **Trailer on the search card** as a click-to-load facade, torn down at `route()` (an eager iframe kept playing audio across every page). **Lists got ~13× cheaper**: To-Watch fired 143 `/title-meta` calls at once (~1.3 s); viewport-gated enrichment cut it to 11 (~0.9 s) — and the three view API calls were never the cost (100 ms measured), so MEASURE before optimising here. Detail: CLAUDE.md § Rewatch tab / § Trailer / § payload-versioned cache.
 
-### Open — completion fires as a CONDITION, not an EVENT (2026-08-27)
-`save_position_smart`'s completion branch is re-evaluated on EVERY position report, and
-`HWM_CLEAR_TAIL_SECS = 300` means it fires for the whole last five minutes. Observed live
-while The Diplomat S03E01 played: "Playback completion detected … clearing resume point"
-every ~17 s from 2200 s of 2487 s. Each firing calls `mark_watched` (which `retain`s the
-row away and re-inserts it at index 0, so the Rewatch shelf's newest-first order churns
-and the timestamp keeps resetting) and `reset_position` (which deletes the resume point
-AND the Continue row) — and the branch RETURNS before the in-progress upsert, so the row
-is never rebuilt.
+### Completion is an event, not a condition — SHIPPED + tested 2026-08-27 ✅
+`save_position_smart`'s completion branch was re-evaluated on EVERY position report, and
+`HWM_CLEAR_TAIL_SECS = 300` meant it fired for the whole last five minutes. Observed live
+on The Diplomat S03E01: "completion detected … clearing resume point" every ~17 s from
+2200 s of 2487 s. The log spam was the symptom; the damage was that each firing called
+`reset_position`, deleting the resume point AND the Continue row, and the branch returns
+before the in-progress upsert — **so pausing four minutes before the end erased where you
+were.**
 
-**The user-visible harm is not the log spam: pausing four minutes before the end erases
-your place entirely.** The conceptual fault is that a completion EVENT is evaluated as a
-CONDITION, fusing two decisions that belong at different moments — "this counts as
-watched" and "throw away where you were".
+**Shipped**: (1) the ledger write is LATCHED, once per playback (`completion_latched`,
+in-memory + serde-skipped, self-healing — a report below half the runtime re-arms it, so
+a rewatch records again with no play path having to remember). (2) The thresholds are
+SPLIT: "effectively seen this" stays generous at `HWM_CLEAR_FRACTION`/`HWM_CLEAR_TAIL_SECS`,
+while discarding the place needs `PLACE_CLEAR_FRACTION` 0.995 or the last 30 s. This moves
+in the SAME direction as the Send Help incident that set 0.96 as a LOWER bound — it
+discards later, never earlier — and `HWM_CLEAR_FRACTION` itself is untouched because
+natural-EOF, the cast health monitor and auto-next-episode all depend on its meaning.
+Three tests encoded the old fused policy and were superseded in place with the reason
+recorded at each.
 
-**Planned fix** (recommended to Fredrik 2026-08-27, not yet built):
-1. Latch the ledger write so it fires ONCE per playback (in-memory, serde-skipped).
-2. Split the thresholds: keep the generous 5 min / 96 % mark for "watched", but discard
-   the resume point only in the last ~60 s or ≥99 %.
-
-Ruled out: narrowing the window alone (treats the symptom, leaves both faults); moving
-the clear to stream teardown (conceptually the right boundary, but VLC gives no reliable
-teardown signal — the bridge just stops posting — so a finished episode could sit in
-Continue forever).
+**CORRECTION to this entry's earlier claim.** It said VLC "gives no reliable teardown
+signal". Too strong: pressing Stop DOES reach spela (`handle_vlc_control` receives it and
+was relaying it to VLC while ignoring it) — it is simply not present on every watch, since
+the stream can end or VLC can be closed. So the thresholds must stand on their own, but
+when the signal is there it is the most reliable statement of intent available, and an
+explicit stop past the watched mark now clears the place. Detail: CLAUDE.md Hard-Won
+"Completion is an EVENT".
 
 ### Open — recommender + ledger follow-ups (2026-08-27)
 - **The ledger has no RATING**, so the Rewatch shelf lists everything watched, not just the loved. A "loved" flag written at mark-time would let it be curated; Fredrik has not asked for it yet, so do not build it unprompted.
