@@ -562,9 +562,15 @@
      button cluster (81px wide, offset 8.5px from the edge). */
   #v-rewatch .src{height:72px;padding:.7rem 6.2rem .7rem .9rem;gap:.65rem;
     align-items:center;overflow:hidden}
-  #v-rewatch .q{font-size:1rem;font-weight:700;line-height:1.2;
-    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
-    overflow:hidden;min-width:0}
+  /* TWO LINES, not one crowded row: title on its own line, metadata beneath. Sharing
+     one horizontal line made the title and the metadata compete for width, and on
+     SERIES rows the metadata wins (year-range + seasons + episodes + status are all
+     nowrap), squeezing "Rick and Morty" into three wrapped lines inside a 72px box.
+     Giving the title the full width and letting the rest flow underneath is also the
+     shape of the To-Watch rows this view was asked to resemble. */
+  #v-rewatch .src{flex-wrap:wrap;align-content:center;row-gap:.2rem}
+  #v-rewatch .q{flex:0 0 100%;font-size:.95rem;font-weight:700;line-height:1.25;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
   #v-rewatch .gx{display:none}                 /* genre: already known */
   #v-rewatch .ty,#v-rewatch .mx,#v-rewatch .stx{font-size:.74rem;color:var(--dim);
     white-space:nowrap;font-weight:600}
