@@ -8220,7 +8220,22 @@ async fn handle_vlc_ready(
     // Ensure the torrent is running + its head/tail (Cues) are being prioritized.
     let tid = match start_torrent_for_play(&state, &magnet, file_index).await {
         Ok((tid, _)) => tid,
-        Err(_) => return Json(json!({ "ready": false, "pct": 0, "phase": "starting" })),
+        Err(e) => {
+            // A magnet whose swarm has no reachable peers never resolves its metadata, so
+            // this used to hang forever and the readiness poll simply stopped answering.
+            // Report it as DEAD and distinctly, so the caller can rotate to the next
+            // ranked source — which is exactly what handle_play's auto-retry loop already
+            // does on the Chromecast path. Until now the VLC path had no equivalent, and
+            // the ▶ button always picks result #1, so one dead top pick meant a spinner
+            // that never resolved (The Diplomat S03E01, 2026-08-27).
+            let dead = e
+                .to_string()
+                .contains(crate::torrent_engine::NO_PEERS_ERROR);
+            return Json(json!({
+                "ready": false, "pct": 0, "dead": dead,
+                "phase": if dead { "no peers" } else { "starting" },
+            }));
+        }
     };
     // Do NOT reap here. /vlc/ready is POLLED (~1s) and can run CONCURRENTLY for
     // several tapped sources; a reap keyed to THIS poll's tid stops the OTHER sources'

@@ -28,7 +28,18 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// How long to wait for a magnet's metadata before calling the source dead. A healthy
+/// swarm answers in well under a second; this ceiling exists for a slow-but-alive one.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a proven-dead magnet is remembered. Short, because a swarm can recover and
+/// a permanent blacklist would outlive the truth.
+const DEAD_MAGNET_MEMORY: Duration = Duration::from_secs(10 * 60);
+/// Recognisable by callers, which turn it into an actionable message rather than a spinner.
+pub const NO_PEERS_ERROR: &str = "no peers — this source appears dead";
 
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
@@ -62,6 +73,9 @@ pub struct TorrentEngine {
     /// logs. The real ID returned to callers is `librqbit::TorrentId` cast to
     /// `u32`, looked up via `session.get(TorrentIdOrHash::Id(id as usize))`.
     started_count: AtomicU32,
+    /// Magnets proven to have no reachable peers, with when that was proven. Bounds the
+    /// cost of a dead source to ONE timeout rather than one per readiness poll.
+    dead_magnets: Mutex<HashMap<String, Instant>>,
 }
 
 /// Information returned to the caller of `start()`. Replaces the
@@ -196,6 +210,7 @@ impl TorrentEngine {
             stream_host: stream_host.into(),
             stream_port,
             started_count: AtomicU32::new(0),
+            dead_magnets: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -220,11 +235,45 @@ impl TorrentEngine {
             ..Default::default()
         };
 
-        let response = self
-            .session
-            .add_torrent(AddTorrent::Url(magnet.into()), Some(opts))
-            .await
-            .context("session.add_torrent failed")?;
+        // A magnet carries no metadata — librqbit must fetch it from the swarm before it
+        // can report a single byte. With NO reachable peers that await never returns, and
+        // it had no bound of any kind: every caller inherited an indefinite hang. That is
+        // what a dead source looked like from the outside — not an error, not slowness,
+        // just a request that never answered, so /vlc/ready stopped responding and the
+        // web remote sat on "Connecting to peers…" forever with nothing to report
+        // (The Diplomat S03E01, MeGusta release, 2026-08-27).
+        //
+        // A healthy magnet resolves in well under a second. The generous ceiling here is
+        // to protect a slow-but-alive swarm, not to wait out a dead one.
+        if let Some(at) = self.dead_magnets.lock().unwrap().get(magnet) {
+            if at.elapsed() < DEAD_MAGNET_MEMORY {
+                // Already proven unreachable moments ago. Answer at once rather than
+                // making every ~1s readiness poll re-serve the full timeout — otherwise
+                // the UI is still stuck, just in slower increments.
+                return Err(anyhow!("{}", NO_PEERS_ERROR));
+            }
+            self.dead_magnets.lock().unwrap().remove(magnet);
+        }
+        let added = tokio::time::timeout(
+            METADATA_TIMEOUT,
+            self.session
+                .add_torrent(AddTorrent::Url(magnet.into()), Some(opts)),
+        )
+        .await;
+        let response = match added {
+            Ok(r) => r.context("session.add_torrent failed")?,
+            Err(_) => {
+                self.dead_magnets
+                    .lock()
+                    .unwrap()
+                    .insert(magnet.to_string(), Instant::now());
+                tracing::warn!(
+                    "librqbit: no peers for magnet after {:?} — treating source as dead",
+                    METADATA_TIMEOUT
+                );
+                return Err(anyhow!("{}", NO_PEERS_ERROR));
+            }
+        };
 
         let (torrent_id, _handle) = match response {
             AddTorrentResponse::Added(id, h) => (id, h),

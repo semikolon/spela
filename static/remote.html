@@ -828,6 +828,12 @@ async function vlcWaitReady(id, gen){
     if(gen!=null && S.vlcGen!==gen) return "superseded";  // re-check after the await
     if(d && d.error){ S.now.vlcErr=d.error; return false; }
     if(d && d.ready) return true;
+    // A source with no reachable peers will NEVER become ready, so waiting on it is
+    // waiting on nothing. Rotate to the next ranked source, exactly as handle_play's
+    // auto-retry loop does on the Chromecast path — the VLC path never had an
+    // equivalent, and since the play button always takes result #1, one dead top pick
+    // was an unresolvable spinner (The Diplomat S03E01, 2026-08-27).
+    if(d && d.dead) return {rotate:true};
     // Drive the loading surface (not a transient toast) — matches the Chromecast warmup.
     S.now.warmup={active:true, vlc:true, pct:(d&&d.pct!=null)?d.pct:0};
     if(S.now.warming) renderWarmPanel();
@@ -850,7 +856,20 @@ async function openInVlc(id,title,poster){
   // torrent never opens to a hung player, and the user always sees progress.
   beginWarming(title||"Opening in VLC…", poster); stopWarmupPoll();  // /progress isn't the VLC source; vlcWaitReady drives the screen
   S.now.vlcErr=null;
-  const rdy = await vlcWaitReady(id, gen);
+  let rdy = await vlcWaitReady(id, gen);
+  // Rotate past dead sources. Bounded, and each skip is ANNOUNCED rather than silent:
+  // a play that quietly switches source is indistinguishable from one that ignored the
+  // pick. Matches the Chromecast retry budget of three.
+  let skipped = 0;
+  const total = (S.search.data && S.search.data.results && S.search.data.results.length) || 0;
+  while(rdy && rdy.rotate && skipped < 3 && id + 1 <= total){
+    id += 1; skipped += 1;
+    S.now.vlcNote = "Source " + (id-1) + " had no peers — trying source " + id + "…";
+    if(S.now.warming) renderWarmPanel();
+    rdy = await vlcWaitReady(id, gen);
+  }
+  if(rdy && rdy.rotate){ S.now.vlcErr="No source for this episode had reachable peers."; rdy=false; }
+  S.now.vlcNote=null;
   if(rdy==="superseded") return;   // a newer VLC source took over this screen — don't clobber it with an error
   if(rdy!==true){
     showPlayError(title||"VLC", poster, S.now.vlcErr||"Couldn’t buffer this source.", ()=>openInVlc(id,title,poster)); return;
@@ -2521,6 +2540,9 @@ function renderWarmPanel(){
   let label, barPct=null, sub="";
   if(w.vlc){
     label="Buffering for VLC…"; barPct=(w.pct!=null)?w.pct:null; sub="opens automatically when ready";
+    // Say it out loud when a dead source is skipped. A play that silently switches
+    // source is indistinguishable from one that ignored what you picked.
+    if(S.now.vlcNote){ label="Switching source…"; sub=S.now.vlcNote; barPct=null; }
   }else if(phase==="downloading" && t){
     label="Downloading…";
     barPct=Math.max(0,Math.min(100,t.percent||0));
