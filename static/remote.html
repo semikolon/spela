@@ -550,8 +550,16 @@
      nothing he does not know; it was also the longest and most wrap-prone field.
      What remains is what a rewatch decision actually needs: the title, the year,
      how long it will take, and the score. */
-  #v-rewatch .src{min-height:64px;padding:.75rem .9rem;gap:.65rem;align-items:center}
-  #v-rewatch .q{font-size:1rem;font-weight:700;line-height:1.25}
+  /* FIXED height, not min-height: a floor still lets a long title wrap and push its
+     row taller than its neighbour, which is the raggedness itself (measured 64/70/91/113
+     px across the shelf). The title clamps to two lines instead, so "Terminator 3: Rise
+     of the Machines" and "Moon" occupy identical boxes. Two lines rather than one keeps
+     long titles readable instead of ellipsing them into ambiguity. */
+  #v-rewatch .src{height:72px;padding:.7rem .9rem;gap:.65rem;align-items:center;
+    overflow:hidden}
+  #v-rewatch .q{font-size:1rem;font-weight:700;line-height:1.2;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+    overflow:hidden;min-width:0}
   #v-rewatch .gx{display:none}                 /* genre: already known */
   #v-rewatch .ty,#v-rewatch .mx,#v-rewatch .stx{font-size:.74rem;color:var(--dim);
     white-space:nowrap;font-weight:600}
@@ -568,7 +576,8 @@
   .rate button.love.on{background:rgba(255,90,120,.28);color:#ff9db0}
   .rate button:active{background:rgba(255,255,255,.3)}
   .rwrow{position:relative;display:block;width:100%}
-  .rwrow>.src{width:100%;padding-right:6rem}
+  .rwrow>.src{width:100%;padding-right:6.2rem}
+  #v-rewatch .rwrow{height:72px}
   .lovedonly{margin-left:auto;font-size:.72rem;font-weight:800;letter-spacing:.06em;
     text-transform:uppercase;background:var(--bg2);border:1px solid var(--line);
     border-radius:999px;padding:.4rem .8rem;min-height:36px;color:var(--dim);cursor:pointer}
