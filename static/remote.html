@@ -1810,7 +1810,10 @@ async function runSearch(q){
   const seGuess=seFromQuery(q);
   const tSkel=seGuess?`<span class="se">${seGuess}</span>`:"&nbsp;";
   out.innerHTML=`<div class="detail skeleton"><div class="card"><div class="poster"><div class="shimmer"></div></div><div class="meta"><div class="t">${tSkel}</div></div></div></div>`;
-  let qs="q="+encodeURIComponent(q); if(S.mode==="movie") qs+="&movie=1";
+  // Send the toggle in BOTH directions. Sending only &movie=1 left TV mode looking
+  // identical to saying nothing, so the server auto-detected and could return a film
+  // of the same name (Furious, 2026-08-27).
+  let qs="q="+encodeURIComponent(q); qs += (S.mode==="movie") ? "&movie=1" : "&tv=1";
   // Pass the selected target so the server ranks for it: native-HEVC targets
   // (vlc/phone) rank by seeds; NVENC targets (chromecast/shannon) prefer H.264.
   if(S.target&&S.target.kind) qs+="&target="+encodeURIComponent(S.target.kind);
@@ -2039,7 +2042,7 @@ async function fastPlay(query, isTV, poster){
   if(!S.target){ S.pending=()=>fastPlay(query,isTV,poster); toast("Pick where to play — it starts right after"); openSheet(); return; }
   setMode(isTV?"tv":"movie"); $("#q").value=query; S.search.q=query;
   beginWarming(query, poster);
-  let d; try{ d=await api("/search?q="+encodeURIComponent(query)+(isTV?"":"&movie=1")); }
+  let d; try{ d=await api("/search?q="+encodeURIComponent(query)+(isTV?"&tv=1":"&movie=1")); }
   catch{ showPlayError(query,poster,"spela unreachable",()=>fastPlay(query,isTV,poster)); return; }
   S.search.data=d;
   const first=(d&&d.results&&d.results[0]);

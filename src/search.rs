@@ -5,6 +5,42 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// What the CALLER knows about the media type. `Auto` means nobody said, and only then
+/// may the server guess.
+///
+/// This used to be a bare `movie: bool` derived from `params.movie.is_some()`, which
+/// gave the server no way to tell "the user chose TV" from "the user said nothing" —
+/// so the web remote's TV toggle was silently downgraded to a guess. Typing "furious"
+/// with TV selected then resolved to a 2017 film of the same name, because auto-detect
+/// scores on vote count and an established film outvotes a brand-new series. An
+/// explicit choice is authoritative. 2026-08-27.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaKind {
+    Auto,
+    Movie,
+    Tv,
+}
+
+/// Read the media kind off the query string. `movie=1` forces movie; `movie=0` means
+/// explicitly NOT a movie rather than "movie mode with a falsy value", which is what a
+/// presence check made it mean; `tv=1` forces TV; neither present is Auto.
+pub fn parse_media_kind(movie: Option<&str>, tv: Option<&str>) -> MediaKind {
+    fn truthy(v: &str) -> bool {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no"
+        )
+    }
+    if tv.is_some_and(truthy) {
+        return MediaKind::Tv;
+    }
+    match movie {
+        Some(v) if truthy(v) => MediaKind::Movie,
+        Some(_) => MediaKind::Tv,
+        None => MediaKind::Auto,
+    }
+}
+
 /// Torrentio API — aggregates 24 torrent sites (TPB, 1337x, YTS, RARBG, TorrentGalaxy, etc.)
 /// Default providers already return 76+ results per movie. All-providers URL doesn't add more.
 /// Other Stremio addons (MediaFusion, Knightcrawler, Comet) require encrypted config URLs.
@@ -601,7 +637,7 @@ impl SearchEngine {
     pub async fn search(
         &self,
         query: &str,
-        movie: bool,
+        kind: MediaKind,
         season: Option<u32>,
         episode: Option<u32>,
     ) -> Result<SearchResult> {
@@ -630,7 +666,7 @@ impl SearchEngine {
         // 97 seconds. Pre-parsing the marker on the engine side makes
         // the natural-language form work first time, every time.
         let (cleaned_query, parsed_season, parsed_episode) = parse_episode_markers(query);
-        let (cleaned_query, tv_episode_intent) = if movie {
+        let (cleaned_query, tv_episode_intent) = if kind == MediaKind::Movie {
             (cleaned_query, TvEpisodeIntent::None)
         } else {
             parse_tv_episode_intent(&cleaned_query)
@@ -648,10 +684,11 @@ impl SearchEngine {
         let final_season = season.or(parsed_season);
         let final_episode = episode.or(parsed_episode);
 
-        if movie {
+        if kind == MediaKind::Movie {
             self.search_movie(q).await
-        } else if final_season.is_some() || final_episode.is_some() {
-            // Explicit season/episode = definitely TV
+        } else if kind == MediaKind::Tv || final_season.is_some() || final_episode.is_some() {
+            // The caller SAID tv, or an explicit season/episode proves it. Either way the
+            // media type is known and the server does not get to guess.
             self.search_tv(q, final_season, final_episode, tv_episode_intent)
                 .await
         } else {
@@ -4293,5 +4330,45 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 4, "all real collision cases must be exercised");
+    }
+}
+
+#[cfg(test)]
+mod media_kind_tests {
+    use super::{parse_media_kind, MediaKind};
+
+    #[test]
+    fn absent_params_mean_auto() {
+        assert_eq!(parse_media_kind(None, None), MediaKind::Auto);
+    }
+
+    #[test]
+    fn explicit_tv_wins_over_auto_detect() {
+        // The bug this exists for: the web remote's TV toggle sent nothing, so an
+        // explicit choice was indistinguishable from silence.
+        assert_eq!(parse_media_kind(None, Some("1")), MediaKind::Tv);
+    }
+
+    #[test]
+    fn movie_one_forces_movie() {
+        assert_eq!(parse_media_kind(Some("1"), None), MediaKind::Movie);
+    }
+
+    #[test]
+    fn movie_zero_means_not_a_movie_not_movie_mode() {
+        // A presence check made `movie=0` select MOVIE, which is the opposite of what
+        // any reader expects and cost a false diagnosis once already.
+        assert_eq!(parse_media_kind(Some("0"), None), MediaKind::Tv);
+        assert_eq!(parse_media_kind(Some("false"), None), MediaKind::Tv);
+    }
+
+    #[test]
+    fn tv_wins_when_both_are_asserted() {
+        assert_eq!(parse_media_kind(Some("1"), Some("1")), MediaKind::Tv);
+    }
+
+    #[test]
+    fn falsy_tv_does_not_force_anything() {
+        assert_eq!(parse_media_kind(None, Some("0")), MediaKind::Auto);
     }
 }

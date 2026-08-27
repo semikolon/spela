@@ -1198,7 +1198,11 @@ async fn handle_torrent_stream(
 #[derive(Deserialize)]
 struct SearchParams {
     q: Option<String>,
+    /// `movie=1` forces movie, `movie=0` means explicitly NOT a movie.
     movie: Option<String>,
+    /// `tv=1` forces TV. Without this the web remote's TV toggle was indistinguishable
+    /// from saying nothing, so the server auto-detected and could return a film.
+    tv: Option<String>,
     season: Option<u32>,
     episode: Option<u32>,
     /// Play target the web remote currently has selected (chromecast / vlc / phone
@@ -1264,10 +1268,10 @@ async fn handle_search(
         Some(q) if !q.is_empty() => q,
         _ => return Json(json!({"error": "Missing q parameter"})),
     };
-    let movie = params.movie.is_some();
+    let kind = crate::search::parse_media_kind(params.movie.as_deref(), params.tv.as_deref());
     match state
         .search_engine
-        .search(&q, movie, params.season, params.episode)
+        .search(&q, kind, params.season, params.episode)
         .await
     {
         Ok(mut result) => {
@@ -5418,7 +5422,12 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
 
     let result = match state
         .search_engine
-        .search(&show, false, Some(season), Some(episode))
+        .search(
+            &show,
+            crate::search::MediaKind::Tv,
+            Some(season),
+            Some(episode),
+        )
         .await
     {
         Ok(r) => r,
