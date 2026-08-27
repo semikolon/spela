@@ -947,7 +947,8 @@ async function renderToWatch(){
     // year + real TMDB genre are filled in by enrichToWatchRow (the old hand-
     // written `note` was inconsistent + jargon-y, replaced by real genres).
     if(x.rt!=null) r.appendChild(el("span",{className:"s "+(x.rt>=88?"":"low"),textContent:"🍅 "+x.rt}));
-    r.onclick=()=>{ setMode(isTV?"tv":"movie"); $("#q").value=x.title; S.search.q=x.title; location.hash="#/search"; runSearch(x.title); };
+    r.onclick=()=>{ setMode(isTV?"tv":"movie"); const q=searchQueryFor(x);
+      $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
     enrichWhenVisible(r,()=>enrichToWatchRow(r,x,isTV));
     return r;
   });
@@ -1039,8 +1040,8 @@ async function renderRewatch(){
     const holder=el("div",{className:"rwrow"});
     const r=el("button",{className:"src"});
     r.appendChild(el("span",{className:"q",textContent:x.title}));
-    r.onclick=()=>{ setMode(x.resolvedTV?"tv":"movie"); $("#q").value=x.title; S.search.q=x.title;
-      location.hash="#/search"; runSearch(x.title); };
+    r.onclick=()=>{ setMode(x.resolvedTV?"tv":"movie"); const q=searchQueryFor(x);
+      $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
     // Two toggles: loved and not-for-me. Neither pressed = unrated, which is the
     // honest default; pressing one clears the other, since they are exclusive.
     const rate=el("div",{className:"rate"});
@@ -1125,6 +1126,21 @@ function trailerBlock(key,title){
   };
   wrap.append(img,btn);
   return wrap;
+}
+
+// A row that taps through to search ALREADY KNOWS the year — pass it, do not throw it
+// away. Without a year the shared scorer falls back on vote count, so a brand-new title
+// loses to an established same-named one: "Furious" resolved to a 2017 Russian battle
+// film (165 votes) instead of the 2026 FBI series (59 votes), and the card showed a
+// medieval poster. `extract_year_from_query` server-side strips a trailing year and
+// passes it as &first_air_date_year / &year, which disambiguates exactly this case.
+// Same lesson as the ID-first title resolution: identity the caller holds must travel
+// with the request. 2026-08-27.
+function searchQueryFor(item){
+  const t=(item&&item.title)||"";
+  // year may be a range ("2026–present") after enrichment — take the first 4 digits.
+  const y=String((item&&item.year)||"").match(/\d{4}/);
+  return y ? `${t} ${y[0]}` : t;
 }
 
 // Lazy enrichment. Every list row used to fire its /title-meta immediately, so
@@ -1632,7 +1648,8 @@ function recItem(it){
     +(it.why?`<span class="fosub">${esc(it.why)}</span>`:"")
     +`<span class="fometa">${isTV?"Series":"Movie"}<span class="rrt">${rtInit}</span></span>`;
   tap.onclick=()=>{ setMode(isTV?"tv":"movie");
-    $("#q").value=it.title; S.search.q=it.title; location.hash="#/search"; runSearch(it.title); };
+    const q=searchQueryFor(it);
+    $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
   if(it.poster_url) paintPoster(tap,it.poster_url);
   enrichWhenVisible(tap,()=>enrichRec(tap,it));
   item.appendChild(tap);
