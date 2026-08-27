@@ -493,6 +493,34 @@
   .notemore{margin-top:.15rem;padding:0;background:none;border:0;cursor:pointer;
     color:var(--accent);font-size:.8rem;font-weight:600}
 
+  /* Now-view goes two-column on a wide viewport (2026-08-27). The single centred
+     column was built for a phone; on a desktop it leaves most of the width empty and
+     pushes the transport controls below the fold — the screenshot that prompted this had
+     the poster scrolled out of frame above the title.
+
+     Scoped with :has(.bigposter) so it applies ONLY to the poster variant. The
+     phone-direct variant reuses .nowfull with a <video> in place of the poster, where a
+     side-by-side split would be wrong. A browser without :has simply keeps the single
+     column, which is the current design rather than a broken one. */
+  @media (min-width:900px){
+    .nowfull:has(.bigposter){
+      display:grid;
+      grid-template-columns:auto minmax(0,1fr);
+      column-gap:2.2rem; row-gap:.55rem;
+      align-content:center; justify-content:center;
+      padding:2rem 1.5rem; max-width:1100px; margin:0 auto;
+    }
+    /* The poster spans every row, so the right-hand stack centres against it. */
+    .nowfull:has(.bigposter) .bigposter{grid-row:1/-1; grid-column:1; align-self:center;
+      width:min(30vw,340px)}
+    .nowfull:has(.bigposter) > *:not(.bigposter){grid-column:2; justify-self:stretch}
+    /* Centred text is right under a centred poster; beside one it should be flush. */
+    .nowfull:has(.bigposter) h2{text-align:left; font-size:1.9rem; margin:0}
+    .nowfull:has(.bigposter) .epline,
+    .nowfull:has(.bigposter) .sub{text-align:left}
+    .nowfull:has(.bigposter) .transport{justify-content:flex-start; margin-top:.5rem}
+  }
+
   @media (max-width:560px){
     .brand small{display:none}               /* drop " remote" — saves width */
     nav a .lbl{display:none}                 /* icon-only tabs */

@@ -8100,6 +8100,31 @@ async fn handle_vlc_control(
     State(state): State<SharedState>,
     Json(cmd): Json<Value>,
 ) -> Json<Value> {
+    // Pressing Stop IS a teardown signal, and spela sees it — it was previously relayed
+    // to VLC and otherwise ignored. It is not available on every watch (the stream can
+    // simply end, or VLC can be closed), which is exactly why the thresholds above must
+    // stand on their own; but when it IS present it is the most reliable statement of
+    // intent available, so honour it: a deliberate stop past the watched mark means the
+    // viewer is done, and the place should not linger in the Continue rail.
+    if cmd.get("cmd").and_then(|c| c.as_str()) == Some("stop") {
+        let pos = lock_recover(&state.live_position).clone();
+        if let Some(p) = pos {
+            if p.dur > 0.0
+                && (p.abs_secs >= p.dur * crate::state::HWM_CLEAR_FRACTION
+                    || p.abs_secs >= p.dur - crate::state::HWM_CLEAR_TAIL_SECS)
+            {
+                let mut app = AppState::load(&state.state_dir);
+                let key = app.reset_position(None, Some(p.title.clone()));
+                let _ = app.save(&state.state_dir);
+                tracing::info!(
+                    "vlc: explicit stop at {:.0}s of {:.0}s — clearing '{}' from Continue",
+                    p.abs_secs,
+                    p.dur,
+                    key
+                );
+            }
+        }
+    }
     let mut q = lock_recover(&state.vlc_commands);
     // Cap the queue so a watcher that isn't running (VLC closed) can't let
     // commands accumulate unbounded.

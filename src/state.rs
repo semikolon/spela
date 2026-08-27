@@ -22,8 +22,33 @@ pub const HWM_CLEAR_FRACTION: f64 = 0.96;
 /// few seconds from EOF).
 pub const HWM_CLEAR_TAIL_SECS: f64 = 300.0;
 
+/// Fraction at which the RESUME POINT is discarded, as distinct from the fraction at
+/// which a title counts as WATCHED.
+///
+/// These were one decision and should always have been two. Completion was evaluated as
+/// a CONDITION on every position report, and each firing both recorded the watch and
+/// deleted the resume point plus the Continue row — so during the whole last five minutes
+/// of anything, pausing meant losing your place entirely (observed live on The Diplomat
+/// S03E01, 2026-08-27: the branch fired every ~17s from 2200s of 2487s).
+///
+/// "You have effectively seen this" is generous by design and stays at
+/// HWM_CLEAR_FRACTION / HWM_CLEAR_TAIL_SECS. "You are finished and want your place
+/// forgotten" is a much stronger claim and needs to be nearly the actual end. Raising
+/// this threshold moves in the SAME direction as the Apr 19 2026 Send Help incident,
+/// which established 0.96 as a LOWER bound precisely because discarding a place too
+/// early amputates the climax of a long film.
+pub const PLACE_CLEAR_FRACTION: f64 = 0.995;
+/// Or within this many seconds of the end — the credits-roll case.
+pub const PLACE_CLEAR_TAIL_SECS: f64 = 30.0;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
+    /// Keys whose completion has already been recorded for the CURRENT watch, so the
+    /// ledger write fires once per playback instead of on every position report. In
+    /// memory only: it describes this playback, not durable state, and persisting it
+    /// would suppress the mark on a later rewatch after a restart.
+    #[serde(skip)]
+    pub completion_latched: std::collections::HashSet<String>,
     pub current: Option<CurrentStream>,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
@@ -283,6 +308,7 @@ impl Default for Preferences {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            completion_latched: std::collections::HashSet::new(),
             current: None,
             history: Vec::new(),
             watched: Vec::new(),
@@ -385,20 +411,38 @@ impl AppState {
         // --- Completion Logic ---
         // Clear the HWM when the user has effectively watched to the end.
         if let Some(dur) = duration {
-            if dur > 0.0 && (t >= dur * HWM_CLEAR_FRACTION || t >= (dur - HWM_CLEAR_TAIL_SECS)) {
-                tracing::info!(
-                    "Playback completion detected for '{}' at {}s (of {}s) — clearing resume point",
-                    key,
-                    t,
-                    dur
-                );
-                // Progress derives from the ledger now (the single source of truth),
-                // so recording the completion here is all that's needed — the
-                // followed-shows tracker recomputes `watched_through` from this write
-                // (see `derive_watched_through`). No separate follow-store update.
-                self.mark_watched(&key, imdb_id.clone(), title.clone());
-                self.reset_position(imdb_id, title);
-                return (key, true);
+            let watched = t >= dur * HWM_CLEAR_FRACTION || t >= (dur - HWM_CLEAR_TAIL_SECS);
+            if dur > 0.0 && watched {
+                // Record the watch ONCE. This used to re-fire on every position report,
+                // which re-inserted the ledger row at index 0 every ~17s (churning the
+                // Rewatch shelf's newest-first order and resetting its timestamp) and
+                // rewrote state on each tick.
+                if self.completion_latched.insert(key.clone()) {
+                    tracing::info!(
+                        "Playback completion detected for '{}' at {}s (of {}s)",
+                        key,
+                        t,
+                        dur
+                    );
+                    // Progress derives from the ledger now (the single source of truth),
+                    // so recording the completion here is all that's needed — the
+                    // followed-shows tracker recomputes `watched_through` from this write
+                    // (see `derive_watched_through`). No separate follow-store update.
+                    self.mark_watched(&key, imdb_id.clone(), title.clone());
+                }
+                // Discarding the resume point is a SEPARATE, stronger claim, and only
+                // near the true end. Between the two thresholds the position keeps being
+                // tracked below, so pausing minutes from the end no longer erases where
+                // you were.
+                if t >= dur * PLACE_CLEAR_FRACTION || t >= (dur - PLACE_CLEAR_TAIL_SECS) {
+                    self.reset_position(imdb_id, title);
+                    return (key, true);
+                }
+            } else if dur > 0.0 && t < dur * 0.5 {
+                // Restarted from near the beginning — a genuine rewatch, so the next
+                // completion should record again. Self-healing, so no play path has to
+                // remember to reset this.
+                self.completion_latched.remove(&key);
             }
         }
 
@@ -841,14 +885,78 @@ mod tests {
             "HWM must survive at 95.5% — below HWM_CLEAR_FRACTION (0.96)"
         );
 
-        // 3. Completion clear at 97.1% (6708s / 6907s) — past HWM_CLEAR_FRACTION.
+        // 3. SUPERSEDED 2026-08-27. This used to assert that 97.1% CLEARS the resume
+        //    point, because marking-watched and forgetting-your-place were one decision.
+        //    They are now separate: 97.1% is past HWM_CLEAR_FRACTION so it counts as
+        //    WATCHED, but the place survives until PLACE_CLEAR_FRACTION. This change
+        //    moves in the same direction as the Send Help incident that set the 0.96
+        //    lower bound — it discards a place LATER, never earlier.
         let (key3, saved3) =
             state.save_position_smart(imdb_id.clone(), title.clone(), 6708.0, Some(6907.0));
         assert!(saved3);
         assert_eq!(
             state.resume_positions.get(&key3),
+            Some(&6708.0),
+            "at 97.1% the title counts as watched but the PLACE must survive — pausing \
+             near the end must not erase where you were"
+        );
+        assert!(
+            state.watched.iter().any(|w| w.key == key3),
+            "97.1% is past HWM_CLEAR_FRACTION, so it must be recorded as watched"
+        );
+
+        // 4. Near the true end, the place IS discarded — a finished title must not
+        //    linger in the Continue rail.
+        let (key4, _) =
+            state.save_position_smart(imdb_id.clone(), title.clone(), 6890.0, Some(6907.0));
+        assert_eq!(
+            state.resume_positions.get(&key4),
             None,
-            "HWM must clear at 97.1% — past HWM_CLEAR_FRACTION"
+            "within PLACE_CLEAR_TAIL_SECS of the end the place must be discarded"
+        );
+    }
+
+    /// The ledger write fires ONCE per playback. It used to re-fire on every position
+    /// report — `mark_watched` removes the row and re-inserts it at index 0, so a
+    /// 17-second cadence churned the Rewatch shelf's newest-first ordering and reset the
+    /// entry's timestamp for the whole last five minutes of every episode.
+    #[test]
+    fn completion_is_recorded_once_per_playback() {
+        let mut state = AppState::default();
+        let title = Some("The Diplomat S03E01".to_string());
+        let imdb = Some("tt17491088".to_string());
+        let dur = Some(2487.0);
+        // The real observed cadence: repeated reports inside the last five minutes.
+        for t in [2200.0, 2217.0, 2235.0, 2252.0, 2270.0] {
+            state.save_position_smart(imdb.clone(), title.clone(), t, dur);
+        }
+        let key = resume_position_key(imdb.as_deref(), title.as_deref()).unwrap();
+        assert_eq!(
+            state.watched.iter().filter(|w| w.key == key).count(),
+            1,
+            "one playback must leave exactly one ledger row"
+        );
+        assert_eq!(
+            state.resume_positions.get(&key),
+            Some(&2270.0),
+            "and the place must keep advancing rather than being erased each tick"
+        );
+    }
+
+    /// Restarting from the beginning is a genuine rewatch, so the next completion must
+    /// record again rather than being suppressed by a stale latch.
+    #[test]
+    fn a_rewatch_from_the_start_can_complete_again() {
+        let mut state = AppState::default();
+        let title = Some("Some Film".to_string());
+        let dur = Some(1000.0);
+        state.save_position_smart(None, title.clone(), 995.0, dur); // watched + place cleared
+        let key = resume_position_key(None, title.as_deref()).unwrap();
+        assert!(state.completion_latched.contains(&key));
+        state.save_position_smart(None, title.clone(), 60.0, dur); // started over
+        assert!(
+            !state.completion_latched.contains(&key),
+            "watching from the start again must re-arm completion"
         );
     }
 
@@ -925,10 +1033,21 @@ mod tests {
         let title = Some("Short Film".to_string());
         let duration = 600.0; // 10 mins
 
-        // 8 mins in (80% but within 5 mins of end)
+        // 8 mins in — 80%, inside the last five minutes, so it counts as WATCHED.
+        // SUPERSEDED 2026-08-27: this used to assert the place was cleared here too.
+        // On a 10-minute item the five-minute tail is HALF the runtime, which made
+        // "watched" and "forget where I was" the same event at the 80% mark.
         let (key, saved) = state.save_position_smart(None, title.clone(), 480.0, Some(duration));
         assert!(saved);
-        assert_eq!(state.resume_positions.get(&key), None); // Should be cleared!
+        assert!(
+            state.watched.iter().any(|w| w.key == key),
+            "inside the five-minute tail it counts as watched"
+        );
+        assert_eq!(
+            state.resume_positions.get(&key),
+            Some(&480.0),
+            "but at 80% the place must survive — two minutes of runtime remain"
+        );
     }
 
     /// Apr 15, 2026 regression pin: TV episodes of the SAME show (sharing an
@@ -1176,11 +1295,26 @@ mod tests {
         );
         assert_eq!(app.in_progress_list().len(), 1);
         assert_eq!(app.in_progress_list()[0].position, 1200.0);
-        // Reaching the end clears it (completion branch → reset_position).
+        // SUPERSEDED 2026-08-27: 8900/9000 is 98.9%, which used to clear the row. Under
+        // the split thresholds that is "watched" but not "finished" — 1:40 of film
+        // remains, which is real content — so the Continue row SURVIVES and can be
+        // resumed.
         app.save_position_smart(
             Some("tt15239678".into()),
             Some("Dune Part Two".into()),
             8900.0,
+            Some(9000.0),
+        );
+        assert_eq!(
+            app.in_progress_list().len(),
+            1,
+            "with 1:40 left the row must survive so the ending can be finished"
+        );
+        // Reaching the ACTUAL end clears it.
+        app.save_position_smart(
+            Some("tt15239678".into()),
+            Some("Dune Part Two".into()),
+            8990.0,
             Some(9000.0),
         );
         assert!(app.in_progress_list().is_empty());
