@@ -187,6 +187,7 @@ pub struct SearchEngine {
     /// `None` value = TVmaze has no verified match (cached so we don't re-hit it
     /// every request — the caller keeps TMDB dates).
     tvmaze_cache: Mutex<HashMap<String, (Instant, Option<Vec<TvEp>>)>>,
+    tvmaze_status_cache: Mutex<HashMap<String, (Instant, Option<String>)>>,
 }
 
 /// TMDB air-date snapshot for a followed series (slice 2b, the followed-shows
@@ -214,6 +215,7 @@ impl SearchEngine {
             tmdb_key,
             mdblist_key,
             tvmaze_cache: Mutex::new(HashMap::new()),
+            tvmaze_status_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -581,6 +583,17 @@ impl SearchEngine {
             .filter(|s| !s.is_empty())
             .map(String::from);
         let status = d["status"].as_str().map(String::from);
+        // TVmaze is only asked about series, and only for the state TMDB cannot express.
+        // Its answer is cached 6h and the whole payload is cached for 30 days, so this
+        // costs about one request per show per month.
+        let status_label = if is_tv {
+            let tvm = self
+                .tvmaze_show_status(title, d["external_ids"]["imdb_id"].as_str())
+                .await;
+            crate::show_notes::describe_status(status.as_deref(), tvm.as_deref())
+        } else {
+            None
+        };
         let year = if is_tv {
             let first = d["first_air_date"].as_str().and_then(|s| s.get(0..4));
             let last = d["last_air_date"].as_str().and_then(|s| s.get(0..4));
@@ -627,6 +640,9 @@ impl SearchEngine {
             "media_type": kind,
             "tmdb": tmdb,
             "status": status,
+            // The one word a viewer wants: Returning / Ended / Cancelled / Renewal
+            // undecided. TMDB alone cannot say "aired, no decision yet"; TVmaze can.
+            "status_label": status_label,
             "seasons": seasons,
             "episodes": episodes,
             "runtime": runtime,
@@ -1255,6 +1271,55 @@ impl SearchEngine {
             .unwrap()
             .insert(key, (Instant::now(), fetched.clone()));
         fetched
+    }
+
+    /// TVmaze's own verdict on whether a show is still running.
+    ///
+    /// Complementary to TMDB rather than redundant: TMDB distinguishes `Canceled` from
+    /// `Ended`, TVmaze carries `To Be Determined` for a show that has aired a season and
+    /// has no renewal decision yet — which is the state a viewer most wants named and
+    /// the one TMDB has no word for. Cached 6h; a status does not move hour to hour.
+    async fn tvmaze_show_status(&self, title: &str, imdb_id: Option<&str>) -> Option<String> {
+        let key = imdb_id
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("st:{s}"))
+            .unwrap_or_else(|| format!("st:title:{}", title.to_lowercase()));
+        if let Some((at, v)) = self.tvmaze_status_cache.lock().unwrap().get(&key) {
+            if at.elapsed() < Duration::from_secs(6 * 3600) {
+                return v.clone();
+            }
+        }
+        let out = self.tvmaze_status_fetch(title, imdb_id).await;
+        self.tvmaze_status_cache
+            .lock()
+            .unwrap()
+            .insert(key, (Instant::now(), out.clone()));
+        out
+    }
+
+    async fn tvmaze_status_fetch(&self, title: &str, imdb_id: Option<&str>) -> Option<String> {
+        let show: Value = self
+            .client
+            .get("https://api.tvmaze.com/singlesearch/shows")
+            .query(&[("q", title)])
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        // Same imdb cross-check the episode path uses: a name search can land on the
+        // wrong show, and a wrong show's status is worse than none.
+        if let Some(want) = imdb_id.filter(|s| !s.is_empty()) {
+            let got = show["externals"]["imdb"].as_str().unwrap_or("");
+            if !got.eq_ignore_ascii_case(want) {
+                return None;
+            }
+        }
+        show.get("status")
+            .and_then(|v| v.as_str())
+            .map(String::from)
     }
 
     async fn tvmaze_fetch(&self, title: &str, imdb_id: Option<&str>) -> Option<Vec<TvEp>> {

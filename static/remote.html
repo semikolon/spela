@@ -476,6 +476,19 @@
      background), drop the "remote" sub-brand, single-column full-width
      search results, and a hard belt against any residual sideways scroll.
      Scoped to phones so desktop keeps labels + the multi-column grid. */
+  /* Show status + intel line (2026-08-27). The pill is quiet by design — it informs a
+     decision, it is not a call to action, so it must not compete with the play button. */
+  .stpill{display:inline-block;margin-left:.5rem;padding:.1rem .5rem;border-radius:999px;
+    font-size:.68rem;font-weight:800;letter-spacing:.05em;text-transform:uppercase;
+    vertical-align:middle;border:1px solid transparent}
+  .stpill.good{background:rgba(80,200,120,.14);color:#7fd6a0;border-color:rgba(80,200,120,.28)}
+  .stpill.warn{background:rgba(230,180,60,.14);color:#e3bd6a;border-color:rgba(230,180,60,.30)}
+  .stpill.done{background:rgba(160,160,175,.13);color:#a9a9b8;border-color:rgba(160,160,175,.26)}
+  .stpill.bad{background:rgba(225,90,90,.14);color:#e58a8a;border-color:rgba(225,90,90,.30)}
+  .shownote{margin-top:.35rem;font-size:.85rem;line-height:1.4;color:var(--dim,#9a9aa8);
+    max-width:62ch}
+  .shownote .noteage{opacity:.62;font-size:.8em}
+
   @media (max-width:560px){
     .brand small{display:none}               /* drop " remote" — saves width */
     nav a .lbl{display:none}                 /* icon-only tabs */
@@ -1771,6 +1784,21 @@ async function unmarkWatched(title){
 // Fill the search-detail metadata line (year-range · genres · runtime/seasons ·
 // TMDB rating) from the cached /title-meta arsenal. TMDB rating (⭐) is shown
 // because a real RT score isn't available for arbitrary search results.
+// Colour carries the verdict faster than the word does: an ending is the one a viewer
+// wants to spot without reading. Undecided is amber because it is genuinely unresolved,
+// not bad news.
+function statusTone(label){
+  if(/cancel/i.test(label)) return "bad";
+  if(/^ended/i.test(label)) return "done";
+  if(/undecided/i.test(label)) return "warn";
+  return "good";
+}
+function noteAgeDays(iso){
+  if(!iso) return null;
+  const t=Date.parse(iso); if(isNaN(t)) return null;
+  return Math.floor((Date.now()-t)/86400000);
+}
+
 async function fillDetailLine(card, title, isTV){
   const dl=card.querySelector(".dline"); if(!dl) return;
   let m; try{ m=await api("/title-meta?title="+encodeURIComponent(title)+(isTV?"&tv=1":"")); }catch{ return; }
@@ -1781,6 +1809,23 @@ async function fillDetailLine(card, title, isTV){
   if(isTV && m.seasons) parts.push(m.seasons+" season"+(m.seasons>1?"s":""));
   else if(m.runtime) parts.push(m.runtime+" min");
   dl.textContent=parts.join("  ·  ");
+  // Status pill sits ON the detail line: "is it coming back" belongs with the year and
+  // season count, not in a separate block the eye has to find.
+  if(m.status_label){
+    const st=el("span",{className:"stpill "+statusTone(m.status_label),textContent:m.status_label});
+    dl.append(document.createTextNode(" "), st);
+  }
+  // The hand-written intel line, underneath. Small and dim: it is commentary, not fact,
+  // and it carries its own date once old enough that a reader should discount it.
+  if(m.note && !card.querySelector(".shownote")){
+    const nl=el("div",{className:"shownote"});
+    nl.appendChild(el("span",{textContent:m.note}));
+    const age=noteAgeDays(m.note_as_of);
+    if(age!=null && age>45){
+      nl.appendChild(el("span",{className:"noteage",textContent:" · as of "+m.note_as_of}));
+    }
+    dl.after(nl);
+  }
   // live RT score (MDBList) → the compact tomato shows the number + links to
   // the real RT page. Without a key m.rt is absent → the tomato stays a search
   // link (unchanged).

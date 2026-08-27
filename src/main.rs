@@ -7,6 +7,7 @@ mod library_origin;
 mod recommendations;
 mod search;
 mod server;
+mod show_notes;
 mod state;
 mod subtitles;
 mod torrent;

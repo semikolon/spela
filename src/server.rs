@@ -361,6 +361,10 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
             get(handle_watchlist).post(handle_watchlist_add),
         )
         .route("/title-meta", get(handle_title_meta))
+        .route(
+            "/show-notes",
+            get(handle_show_notes).post(handle_show_notes_set),
+        )
         // Unified "what do I watch now" home surface (Continue + New Episodes +
         // Recommended). NOT `/queue` — that's the play-FIFO auto-fire list.
         .route("/home", get(handle_home))
@@ -6691,7 +6695,7 @@ async fn handle_title_meta(
     // with a bespoke `has_backdrop` check; versioning replaces it, so the NEXT field
     // added to `title_meta` costs one bumped integer instead of another one-off probe.
     // BUMP THIS whenever title_meta's response shape gains or changes a field.
-    const PAYLOAD_V: u64 = 3;
+    const PAYLOAD_V: u64 = 4;
     if let Some(hit) = cache.get(&cache_key) {
         let fresh = hit
             .get("_ts")
@@ -6700,7 +6704,9 @@ async fn handle_title_meta(
         let current_shape = hit.get("_v").and_then(|v| v.as_u64()) == Some(PAYLOAD_V);
         if fresh && current_shape {
             if let Some(data) = hit.get("data") {
-                return Json(data.clone());
+                let mut d = data.clone();
+                attach_show_note(&mut d, &title);
+                return Json(d);
             }
         }
     }
@@ -6715,7 +6721,71 @@ async fn handle_title_meta(
     if let Some(p) = path {
         let _ = std::fs::write(&p, serde_json::to_string(&cache).unwrap_or_default());
     }
+    let mut data = data;
+    attach_show_note(&mut data, &title);
     Json(data)
+}
+
+/// Layer the hand-written intel note onto a title-meta response.
+///
+/// Deliberately applied AFTER the cache on both paths rather than being stored in it.
+/// The cached payload holds slow-moving facts — poster, genres, runtime, trailer — and
+/// carries a 30-day TTL. A note about how a season is landing, or whether a renewal is
+/// expected, is exactly the kind of thing that would be wrong a month later, and a stale
+/// note that reads as current is worse than none. Reading it costs a local file read.
+fn attach_show_note(data: &mut Value, title: &str) {
+    let imdb = data.get("imdb_id").and_then(|v| v.as_str());
+    let notes = crate::show_notes::load();
+    if let Some(n) = notes.get(imdb, title) {
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("note".into(), json!(n.note));
+            obj.insert("note_as_of".into(), json!(n.as_of));
+            obj.insert("note_source".into(), json!(n.source));
+        }
+    }
+}
+
+/// `GET /show-notes` — the whole store, for the harness that writes it.
+async fn handle_show_notes() -> Json<Value> {
+    Json(serde_json::to_value(crate::show_notes::load()).unwrap_or_else(|_| json!({})))
+}
+
+/// `POST /show-notes` — write one or many notes. Body is either
+/// `{key, note, as_of?, source?}` or `{notes: {key: {note, as_of?, source?}, ...}}`.
+/// A key beginning `tt` is an IMDb id; anything else is normalized as a title. An empty
+/// note clears that entry, so the same endpoint retires stale intel.
+async fn handle_show_notes_set(Json(body): Json<Value>) -> Json<Value> {
+    let mut store = crate::show_notes::load();
+    let mut wrote = 0usize;
+    if let Some(map) = body.get("notes").and_then(|v| v.as_object()) {
+        for (k, v) in map {
+            let n: crate::show_notes::ShowNote = match serde_json::from_value(v.clone()) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            store.set(k, n);
+            wrote += 1;
+        }
+    } else if let Some(k) = body.get("key").and_then(|v| v.as_str()) {
+        let n = crate::show_notes::ShowNote {
+            note: body
+                .get("note")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            as_of: body.get("as_of").and_then(|v| v.as_str()).map(String::from),
+            source: body
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        };
+        store.set(k, n);
+        wrote = 1;
+    }
+    match crate::show_notes::save(&store) {
+        Ok(_) => Json(json!({"ok": true, "wrote": wrote, "total": store.notes.len()})),
+        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
 }
 
 /// `POST /watchlist` — add a title to the to-watch list from the UI (grow it
