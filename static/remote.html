@@ -1190,7 +1190,12 @@ async function enrichToWatchRow(row,x,isTV){
   // must label from that, not from our guess — otherwise a series gets a film's
   // runtime (Station Eleven: "2013 · 85 min" for the 2021 limited series).
   if(m.media_type) isTV = m.media_type === "tv";
-  if(x) x.resolvedTV = isTV;
+  // Write the resolved identity back onto the item, not only into the DOM: a row that
+  // taps through to search reads it from here, and a bare title lets the shared scorer
+  // fall back on vote count (see searchQueryFor).
+  if(x){ x.resolvedTV = isTV;
+         if(m.year && !x.year) x.year = m.year;
+         if(m.imdb_id && !x.imdb_id) x.imdb_id = m.imdb_id; }
   const q=row.querySelector(".q");
   // live RT (MDBList) overrides the static curated score when present; also
   // gives a score to entries that had none.
