@@ -542,6 +542,21 @@
     justify-content:center;font-size:1.6rem;line-height:1}
   .trwrap .trplay:active span{background:rgba(0,0,0,.85)}
   .trwrap iframe{width:100%;height:100%;border:0;display:block}
+  /* Rewatch rows: SPACIOUS + ALWAYS-SYMMETRIC. The crammed, ragged look came from
+     variable-length metadata wrapping differently in each half-width grid cell, so
+     rows never lined up. Two fixes, in order of effect: drop the metadata that
+     earns nothing here, and give every row the same height regardless of content.
+     GENRE is dropped outright — Fredrik has already SEEN these, so genre tells him
+     nothing he does not know; it was also the longest and most wrap-prone field.
+     What remains is what a rewatch decision actually needs: the title, the year,
+     how long it will take, and the score. */
+  #v-rewatch .src{min-height:64px;padding:.75rem .9rem;gap:.65rem;align-items:center}
+  #v-rewatch .q{font-size:1rem;font-weight:700;line-height:1.25}
+  #v-rewatch .gx{display:none}                 /* genre: already known */
+  #v-rewatch .ty,#v-rewatch .mx,#v-rewatch .stx{font-size:.74rem;color:var(--dim);
+    white-space:nowrap;font-weight:600}
+  #v-rewatch .s{font-size:.8rem}
+  #v-rewatch .sources.open{gap:.55rem}
   /* Rating on a Rewatch row: two toggles, not a cycle. Unrated is the honest
      default and is simply "neither pressed" — a cycling control would force the
      reader to remember which state a glyph currently means. */
@@ -933,50 +948,12 @@ async function renderToWatch(){
   if(movies.length){ wrap.appendChild(el("div",{className:"twhead",textContent:`Movies · ${movies.length}`}));
     const box=el("div",{className:"sources open"}); movies.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
   if(!series.length&&!movies.length) wrap.appendChild(el("div",{className:"state",textContent:"To-watch list is empty."}));
-  appendWatchedSection(wrap,d);
+  // The Watched archive moved to its own #/rewatch view (2026-08-27); keeping a
+  // second copy here made To-Watch a list of both what he has not seen AND what he
+  // has, which is two different questions on one page.
   out.appendChild(wrap);
 }
 
-// The hidden set, shown. Everything the ledger counts as watched drops out of the
-// lists above, which is right until it is wrong — and a title hidden by mistake was
-// previously invisible AND unfixable, so there was no way to even notice. Collapsed
-// by default (it is an archive, not a candidate list); each row carries a ✕ that
-// un-marks it and returns it to To-Watch. 2026-08-25.
-function appendWatchedSection(wrap,d){
-  const done=[]
-    .concat((d.series||[]).filter(x=>x.watched).map(x=>({...x,isTV:true})))
-    .concat((d.movies||[]).filter(x=>x.watched).map(x=>({...x,isTV:false})));
-  if(!done.length) return;
-  done.sort((a,b)=>(a.title||"").localeCompare(b.title||""));
-  const head=el("button",{className:"twhead",textContent:`▸ Watched · ${done.length}`});
-  head.setAttribute("aria-expanded","false");
-  const box=el("div",{className:"sources twwatched"});
-  // Rows are BUILT on first expand, not on page load: this is an archive that is
-  // collapsed by default, so constructing 20 rows every time To-Watch opens is work
-  // nobody asked for. 2026-08-27.
-  let built=false;
-  head.onclick=()=>{ const open=box.classList.toggle("open");
-    head.textContent=`${open?"▾":"▸"} Watched · ${done.length}`;
-    head.setAttribute("aria-expanded",open?"true":"false");
-    if(open && !built){ built=true; buildWatchedRows(box,done); } };
-  wrap.append(head,box);
-}
-function buildWatchedRows(box,done){
-  done.forEach(x=>{
-    const holder=el("div",{className:"wrow"});
-    const r=el("button",{className:"src"});
-    r.appendChild(el("span",{className:"q",textContent:x.title}));
-    if(x.rt!=null) r.appendChild(el("span",{className:"s "+(x.rt>=88?"":"low"),textContent:"🍅 "+x.rt}));
-    r.onclick=()=>{ setMode(x.isTV?"tv":"movie"); $("#q").value=x.title; S.search.q=x.title;
-      location.hash="#/search"; runSearch(x.title); };
-    const un=el("button",{className:"unmark",textContent:"✕",title:"I haven't watched "+x.title});
-    un.setAttribute("aria-label","Un-mark "+x.title+" as watched");
-    un.onclick=async(ev)=>{ ev.stopPropagation(); un.disabled=true;
-      if(!await unmarkWatched(x.title)){ un.disabled=false; return; }
-      toast("Back on your to-watch list"); renderToWatch(); };
-    holder.append(r,un); box.appendChild(holder);
-  });
-}
 // Write a rating to the ledger. null clears. Failure leaves the button unchanged
 // rather than showing a state the server does not hold.
 async function rateTitle(title,rating){
