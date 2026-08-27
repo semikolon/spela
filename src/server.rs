@@ -12128,3 +12128,44 @@ fn title_tokens_match(candidate: &str, title: &str) -> bool {
             .iter()
             .all(|&token| s_candidate.contains(token))
 }
+
+#[cfg(test)]
+mod vlc_readiness_completeness_tests {
+    use super::is_physically_full;
+    use std::fs::File;
+
+    /// The VLC readiness short-circuit used to accept whatever the LENIENT local-file
+    /// resolver returned, and that resolver deliberately passes a sparse partial. It
+    /// therefore reported "on disk, 100%, ready" over a half-downloaded file and VLC
+    /// opened something with no tail (Star City S01E01: 845MB of a 9.6GB release).
+    ///
+    /// The fixture is a REAL sparse file rather than a hand-written size, because sparse
+    /// is exactly the property under test and only the filesystem can produce it.
+    #[test]
+    fn a_sparse_partial_is_not_complete() {
+        let dir = std::env::temp_dir().join(format!("spela_sparse_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("partial.mkv");
+        let f = File::create(&path).unwrap();
+        // Logical 500MB, zero blocks written — what a just-started torrent looks like.
+        f.set_len(500 * 1024 * 1024).unwrap();
+        drop(f);
+        assert!(
+            !is_physically_full(&path, 0),
+            "a sparse file must not pass as complete — this is the check the readiness \
+             short-circuit was missing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_fully_written_file_is_complete() {
+        let dir = std::env::temp_dir().join(format!("spela_full_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("done.mkv");
+        // Small but genuinely written: physical blocks match logical length.
+        std::fs::write(&path, vec![7u8; 256 * 1024]).unwrap();
+        assert!(is_physically_full(&path, 0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
