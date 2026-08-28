@@ -706,6 +706,13 @@
     .unmark:hover,.playicon:hover,.srcbtn:hover,.tgt:hover,.tbtn:hover,
     .topt:hover,.newbadge:hover,nav a:hover,.seg button:hover,
     .toast button:hover,.banner button:hover,
+    /* "More sources" is bare text by design — no background, no border — so it was the
+       one gleam target with square corners, and the inset glow drew a hard-edged box
+       around it. The radius is applied ON HOVER ONLY, which keeps the resting state bare
+       and rounds the glow (and the sweep, since ::after inherits the radius). Audited
+       2026-08-28: every other gleam target already had one, so this is the single
+       exception rather than a class of them. */
+    .src-toggle:hover{border-radius:12px}
     .markw:hover,.followbtn:hover,.rtlink:hover,.src-toggle:hover{
       box-shadow:inset 0 0 14px rgba(255,255,255,var(--gleam-rest));
       /* Rises across the WHOLE sweep (1.1s, no delay) rather than arriving as
