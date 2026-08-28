@@ -1322,6 +1322,37 @@ impl SearchEngine {
             .map(String::from)
     }
 
+    /// Name + air date for ONE episode, TVmaze-corrected.
+    ///
+    /// `episode_detail` goes straight to TMDB, whose date-only `air_date` lags the real
+    /// platform drop by about a day — the reason TVmaze correction exists at all. Using
+    /// it raw made `/home` and `/search` disagree by one day about the SAME episode
+    /// (Silo S03E09 "Farewell": /home said Aug 27, search said Aug 28), so before
+    /// midnight the landing page offered an episode that the search it opened then
+    /// refused as unaired. Two sources for one fact is the bug; this is the one door.
+    pub async fn episode_air(
+        &self,
+        tmdb_id: u64,
+        imdb_id: Option<&str>,
+        title: &str,
+        season: u32,
+        episode: u32,
+    ) -> (String, String) {
+        if let Some(eps) = self.tvmaze_episodes(title, imdb_id).await {
+            if let Some((name, date)) = tvmaze_date_for(&eps, season, episode) {
+                // Keep TMDB's name if TVmaze has none, but the DATE is TVmaze's job.
+                if let Some(d) = date {
+                    let tmdb = self.episode_detail(tmdb_id, season, episode).await;
+                    let nm = name.unwrap_or_else(|| tmdb.map(|(n, _)| n).unwrap_or_default());
+                    return (nm, d);
+                }
+            }
+        }
+        self.episode_detail(tmdb_id, season, episode)
+            .await
+            .unwrap_or_default()
+    }
+
     async fn tvmaze_fetch(&self, title: &str, imdb_id: Option<&str>) -> Option<Vec<TvEp>> {
         // 1. Resolve the show by name; verify it's the right one via imdb.
         let show: Value = self
@@ -1382,7 +1413,15 @@ impl SearchEngine {
     /// tracker to show the NEXT-UNWATCHED episode's title + air date (which isn't
     /// in the show payload when it's earlier than `last_episode_to_air`). None on
     /// any error, and ("", "") fields tolerated (episode name/date can be blank).
-    pub async fn episode_detail(
+    /// RAW TMDB episode lookup — PRIVATE ON PURPOSE.
+    ///
+    /// TMDB's date-only `air_date` lags the real platform drop by about a day, so this
+    /// is not a safe source for "has it aired?". `/home` called it directly and ended up
+    /// a day out of step with `/search` on the same episode, offering an episode the
+    /// search then refused as unaired. Callers outside this module use `episode_air`,
+    /// which applies the TVmaze correction; privacy is what keeps that the ONLY door,
+    /// since a comment would not have stopped the call that caused this.
+    async fn episode_detail(
         &self,
         tmdb_id: u64,
         season: u32,

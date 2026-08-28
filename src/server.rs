@@ -4832,14 +4832,18 @@ async fn compute_following_shows(state: &SharedState, app: &AppState) -> (Vec<Va
             None => (0, None),
         };
         total_new += new_count;
-        // Next-unwatched episode's title + air date — a separate TMDB call, since the
-        // show payload only carries last/next AIRED, not an arbitrary earlier episode.
+        // Next-unwatched episode's title + air date. The show payload only carries
+        // last/next AIRED, not an arbitrary earlier episode, so this is a separate
+        // lookup — but it goes through the TVmaze-corrected door, NOT raw TMDB. Raw
+        // TMDB lags the platform drop about a day, which made this page and the search
+        // it opens disagree about the same episode.
         let (nu_name, nu_air) = match next_se {
-            Some((s, e)) => state
-                .search_engine
-                .episode_detail(show.tmdb_id, s, e)
-                .await
-                .unwrap_or_default(),
+            Some((s, e)) => {
+                state
+                    .search_engine
+                    .episode_air(show.tmdb_id, show.imdb_id.as_deref(), &show.title, s, e)
+                    .await
+            }
             None => (String::new(), String::new()),
         };
         let next_air = st
