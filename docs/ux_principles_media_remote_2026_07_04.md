@@ -272,6 +272,49 @@ Combining severity-grading + progressive disclosure + optimistic-rollback UX:
 
 ---
 
+## 8. House visual conventions (NOT research — Fredrik's rulings, added as they are made)
+
+Everything above is researched and cited. This section is different in kind: it records
+**decisions about how the remote should look**, made by Fredrik in review. It lives here
+because there is nowhere better, and it is fenced off so a reader never mistakes a taste
+call for a sourced principle.
+
+### 8.1 Hover gleam — the effect follows the CONTROL'S OWN SHAPE (2026-08-28)
+
+The hover treatment (a 120° white sweep settling into a faint inset glow, ported from
+brf-auto's dashboard swoosh) exists in **two forms, and the form is chosen by what the
+control actually is**:
+
+- **Boxed controls** — anything with a background, a border or a radius (cards, rows,
+  nav pills, transport buttons, badges) get the **box gleam**: the sweep runs inside the
+  element and settles into `box-shadow: inset`.
+- **Bare-text controls** — anything with no background and no border ("More sources") get
+  the **text gleam** instead: the sweep runs across the GLYPHS via `background-clip:text`,
+  and no box treatment at all.
+
+**Why the distinction is a rule and not a detail**: applying the box form to bare text
+draws a hard-edged glowing rectangle around nothing, which is what "More sources" looked
+like before this ruling. Rounding it was offered as a fix and **rejected** — Fredrik:
+*"I don't want the sources toggle to have this hover effect at all. Instead make the text
+itself gleam, fits better when it's not a button style."* The point is that a bare-text
+control should not acquire button chrome on hover; giving it a radius would have made it
+briefly a button, which is the thing being avoided.
+
+Implementation notes worth not rediscovering:
+- The text form needs **explicit colours, never `currentColor`** — the sweep sets
+  `-webkit-text-fill-color: transparent`, which makes `currentColor` resolve to
+  transparent and erase the text. The partial-download variant carries its own green.
+- Both forms stay inside `@media (hover:hover)`. iOS strands `:hover` after a tap, which
+  would leave the effect burned onto the last-tapped element.
+- The box form's sweep is a `::after` with `border-radius: inherit`, so a boxed control
+  needs a radius or the sweep is square — audited 2026-08-28, every boxed target already
+  had one.
+
+**When adding a new control, pick the form from the control's resting appearance**, not
+from which selector list is easier to append to.
+
+---
+
 ## Sources (primary, cited inline above)
 
 - Nielsen, *Response Times: The 3 Important Limits* — https://www.nngroup.com/articles/response-times-3-important-limits/
