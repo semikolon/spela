@@ -503,23 +503,30 @@
      side-by-side split would be wrong. A browser without :has simply keeps the single
      column, which is the current design rather than a broken one. */
   @media (min-width:900px){
+    /* Poster left, everything else in ONE stacked column beside it. The first attempt
+       made each child its own grid row spanning the poster's height, so the title floated
+       mid-air while the scrubber sank to the bottom — the space was filled, but by gaps.
+       A single wrapper (.nowmeta) is what actually makes a column. */
     .nowfull:has(.bigposter){
-      display:grid;
-      grid-template-columns:auto minmax(0,1fr);
-      column-gap:2.2rem; row-gap:.55rem;
-      align-content:center; justify-content:center;
-      padding:2rem 1.5rem; max-width:1100px; margin:0 auto;
+      display:flex; align-items:center; justify-content:center;
+      gap:2.6rem; padding:2rem 2rem; max-width:1200px; margin:0 auto;
     }
-    /* The poster spans every row, so the right-hand stack centres against it. */
-    .nowfull:has(.bigposter) .bigposter{grid-row:1/-1; grid-column:1; align-self:center;
-      width:min(30vw,340px)}
-    .nowfull:has(.bigposter) > *:not(.bigposter){grid-column:2; justify-self:stretch}
-    /* Centred text is right under a centred poster; beside one it should be flush. */
-    .nowfull:has(.bigposter) h2{text-align:left; font-size:1.9rem; margin:0}
-    .nowfull:has(.bigposter) .epline,
-    .nowfull:has(.bigposter) .sub{text-align:left}
-    .nowfull:has(.bigposter) .transport{justify-content:flex-start; margin-top:.5rem}
+    .nowfull:has(.bigposter) .bigposter{width:min(28vw,320px); flex:0 0 auto}
+    .nowfull:has(.bigposter) .nowmeta{
+      flex:1 1 auto; min-width:0; display:flex; flex-direction:column;
+      align-items:stretch; gap:.85rem; text-align:left;
+    }
+    /* The title carries the page at this size; it was competing with the poster before. */
+    .nowfull:has(.bigposter) .nowmeta h2{font-size:2.4rem; line-height:1.1; margin:0; text-align:left}
+    .nowfull:has(.bigposter) .nowmeta .epline{font-size:1.15rem; text-align:left; margin:0}
+    .nowfull:has(.bigposter) .nowmeta .sub{text-align:left; margin:0}
+    /* Full-width scrubber is the point of the extra room. */
+    .nowfull:has(.bigposter) .nowmeta .scrub{width:100%; margin:.4rem 0 .2rem}
+    /* Transport sits under the scrubber it controls, left-aligned with the text. */
+    .nowfull:has(.bigposter) .nowmeta .transport{justify-content:flex-start; margin:.2rem 0 0}
+    .nowfull:has(.bigposter) .nowmeta .starting{justify-content:flex-start}
   }
+
 
   @media (max-width:560px){
     .brand small{display:none}               /* drop " remote" — saves width */
@@ -2666,10 +2673,12 @@ function renderNowFull(){
   if(S.now.cold){
     root.innerHTML=`<div class="nowfull">
       <img class="bigposter" src="${esc(posterSrc(c.poster_url||""))}" alt="">
+      <div class="nowmeta">
       <h2>${esc(c.title||"")}</h2>
       ${epLine()}
       <div class="starting"><div class="spin"></div>Starting on ${esc((c.target||"").split(":")[1]||S.target?.name||"TV")}…</div>
       <div class="sub">Cold-start can take up to a minute — this is normal, not an error.</div>
+      </div>
     </div>`;
     return;
   }
@@ -2677,6 +2686,7 @@ function renderNowFull(){
   const fpct=(S.now.dur&&!S.now.endlist&&S.now.frontier)?Math.min(100,S.now.frontier/S.now.dur*100):100;
   root.innerHTML=`<div class="nowfull">
     <img class="bigposter" src="${esc(posterSrc(c.poster_url||""))}" alt="">
+    <div class="nowmeta">
     <h2>${esc(c.title||"")}</h2>
     ${epLine()}
     <div class="sub">${esc(c.quality||"")} · ${esc((c.target||"").split(":")[1]||"")}</div>
@@ -2691,6 +2701,7 @@ function renderNowFull(){
       <button class="tbtn" id="tStop" title="Stop" aria-label="Stop">${ic("stop")}</button>
     </div>
     ${!S.now.endlist&&S.now.frontier?`<div class="sub">Seekable up to ${fmt(S.now.frontier)} (still transcoding)</div>`:""}
+    </div>
   </div>`;
   const sl=$("#fSeek");
   sl.addEventListener("input",()=>{ S.now.seekDrag=true;
