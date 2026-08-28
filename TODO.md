@@ -32,8 +32,8 @@ explicit stop past the watched mark now clears the place. Detail: CLAUDE.md Hard
 "Completion is an EVENT".
 
 ### Open — recommender + ledger follow-ups (2026-08-27)
-- **The ledger has no RATING**, so the Rewatch shelf lists everything watched, not just the loved. A "loved" flag written at mark-time would let it be curated; Fredrik has not asked for it yet, so do not build it unprompted.
-- **Backfilled ledger entries carry no `imdb_id`** (they were written title-only), so they resolve by the title path rather than the bulletproof ID-first path. A one-time id backfill would make every future lookup mismatch-proof — cheap, and it is the same fix class as the Station Eleven bug.
+- **Rating — SHIPPED 2026-08-27.** `WatchedEntry.rating: Option<i8>` (`1` loved / `0` fine / `-1` no; `None` = UNRATED and MUST stay distinguishable from "fine"). `POST /watched-rate`; rating a SHOW applies to all its episode rows and a re-mark carries the judgement across. Rewatch renders TWO toggles, never a cycle, plus a Loved-only filter.
+- **imdb_id backfill — DONE 2026-08-27.** `POST /watched-backfill-ids` resolves ONE id per distinct title via `title_meta` with `auto_kind`, applies it to every row, idempotent — re-run it whenever the ledger grows. Ran clean: 107/107 rows carry a well-formed id.
 - **`media_type=auto` is opt-in**; the To-Watch and rec rows still pass an explicit hint because they know it. Do not flip the default — OMITTING the hint has always meant "movie" and existing callers rely on it.
 
 ### Ledger backfill from the taste profile — DONE 2026-08-26 ✅
