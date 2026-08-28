@@ -31,11 +31,17 @@ when the signal is there it is the most reliable statement of intent available, 
 explicit stop past the watched mark now clears the place. Detail: CLAUDE.md Hard-Won
 "Completion is an EVENT".
 
-### Open — auto-next-episode for VLC (a UX call, not a gap)
-The queue auto-fire lives in `cast_health_monitor`, so it is Chromecast-only. Everything
-needed for VLC exists now (completion fires as an event via the bridge's position posts),
-but auto-LAUNCHING VLC on Fredrik's desktop is more intrusive than advancing a cast on a
-TV he is already watching. **Ask before building** — it is a Layer-1 behaviour question.
+### Open — should the play QUEUE fire on the VLC path? (a UX call, not a gap)
+CORRECTION to this entry's first wording, which called it "auto-next-episode": it is a
+MANUAL FIFO, not automatic episode advancement. You line something up (`spela queue <N>` /
+`POST /queue`) and `cast_health_monitor` pops the front item at natural EOF and self-calls
+`/play`. Nothing chooses the next episode for you.
+
+It is Chromecast-only because it lives in that monitor. Everything needed for VLC exists
+now (completion fires as an event via the bridge's position posts), but firing it would
+RELAUNCH VLC on Fredrik's desktop, which is more intrusive than advancing a cast on a TV
+he is already sitting in front of. **Ask before building** — Layer-1 behaviour question,
+and low value while the queue is rarely used.
 
 ### Open — recommender + ledger follow-ups (2026-08-27)
 - **Rating — SHIPPED 2026-08-27.** `WatchedEntry.rating: Option<i8>` (`1` loved / `0` fine / `-1` no; `None` = UNRATED and MUST stay distinguishable from "fine"). `POST /watched-rate`; rating a SHOW applies to all its episode rows and a re-mark carries the judgement across. Rewatch renders TWO toggles, never a cycle, plus a Loved-only filter.
