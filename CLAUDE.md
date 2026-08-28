@@ -256,6 +256,32 @@ Incident narratives + RCA + journal evidence: `git log` (every fix-commit carrie
 
 Hardcoded fallback IPs in `src/cast.rs`. DNS: `darwin.home` → darwin.home (AdGuard Home rewrite, configured Mar 18)
 
+## docs/ index
+
+Every file in `docs/`, with the one thing it is FOR. Added 2026-08-28 after an audit found
+**7 of 12 unreferenced from this file** — a doc nothing links to is a doc no future session
+opens, however good it is. Keep this list complete when adding one.
+
+**Read before touching that area:**
+- [`ux_principles_media_remote_2026_07_04.md`](docs/ux_principles_media_remote_2026_07_04.md) — **read before ANY web-remote UI work.** Researched, citation-backed latency/feedback principles for a cast remote (Nielsen's 3 limits, Doherty, optimistic UI, minimal-by-default loading, stop-vs-disconnect semantics), plus **§ 8 = house VISUAL conventions from Fredrik's rulings** (the two-form hover gleam), deliberately fenced off from the researched material.
+- [`CAST_DEBUGGING_RECIPES.md`](docs/CAST_DEBUGGING_RECIPES.md) — three diagnostic techniques for a cast that starts and then misbehaves. Reach for these FIRST on a cast bug.
+- [`watch_tracker_roadmap.md`](docs/watch_tracker_roadmap.md) — the why + phasing behind the whole watch-tracker/recommender arc (spela replacing TV Time, which shut down 2026-07-15).
+- [`LOCAL_LIBRARY_STREAMING_PLAN.md`](docs/LOCAL_LIBRARY_STREAMING_PLAN.md) — the design behind Local Bypass + serve-library (v3.6.0).
+
+**Research, when you are about to re-derive something:**
+- [`slow_torrent_strategies_research_2026_07_05.md`](docs/slow_torrent_strategies_research_2026_07_05.md) — making obscure/slow swarms stream fast; the source of the racing + anti-poisoning work.
+- [`librqbit_streaming_faststart_research_2026_07_05.md`](docs/librqbit_streaming_faststart_research_2026_07_05.md) — engine-internal fixes for the 0-bytes-for-10-15s cold start.
+- [`subtitle_sync_research_2026_07_04.md`](docs/subtitle_sync_research_2026_07_04.md) — how the embedded-first + alass sync guarantee was arrived at.
+- [`rt_score_fetch_research_2026-07-13.md`](docs/rt_score_fetch_research_2026-07-13.md) — why RT scores come from MDBList rather than scraping.
+- [`barrage_findings_2026_07_05.md`](docs/barrage_findings_2026_07_05.md) — overnight latency/stability results across 20 titles, blockbuster to ultra-obscure. The empirical baseline any "is it slow?" claim should be checked against.
+
+**History, read only when the past is the question:**
+- [`INCIDENT_REPORT_WILDERPEOPLE_2026_05_01.md`](docs/INCIDENT_REPORT_WILDERPEOPLE_2026_05_01.md) — the five-bug cast-failure arc that produced the debugging recipes.
+- [`session_2026_04_29_30_librqbit_migration_and_security_audit.md`](docs/session_2026_04_29_30_librqbit_migration_and_security_audit.md) — the webtorrent → librqbit migration and the security audit that came with it.
+- [`cc_session_audit_2026_04_29.md`](docs/cc_session_audit_2026_04_29.md) — a session audit, marked TENTATIVE by its own author.
+
+---
+
 ## See also
 
 - [`~/dotfiles/docs/shannon_bedroom_kiosk_plan_2026_05_06.md`](~/dotfiles/docs/shannon_bedroom_kiosk_plan_2026_05_06.md) — bedroom Shannon as local renderer + kiosk. Picks up the "Shannon could run mpv/Kodi/spela-as-local-player to bypass the wedge class entirely" thread from this doc's CrKey 1.56 EOL section. Phase-7 spela-thin-client (Option A): the Rust `spela play --local-renderer` flag is shipped (`e5ca156`); the **working deploy is the `spela-local` shell client** on Shannon (Darwin NVENC H.264 1080p HLS → mpv — data pipeline proven 2026-05-18). That plan's **research §6 is the AUTHORITATIVE deploy spec** for the remaining layers (patched mpv via apt.undo.it for `--hwdec=drm`; cage + `vo=dmabuf-wayland`; evdev→mpv-IPC controller shim; partial Chromecast retirement — Netflix/HBO keep the Chromecast). Read §6 there; do not duplicate it here.
