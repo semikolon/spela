@@ -348,6 +348,17 @@ impl Config {
         // `dirs::config_dir()` resolves to ~/Library/Application Support on macOS,
         // which silently hides an existing ~/.config/spela/config.toml and makes
         // the CLI fall back to the default `localhost:7890` server address.
+        // `SPELA_CONFIG_DIR` override, matching the existing SPELA_STATE_DIR /
+        // SPELA_MEDIA_DIR convention. Two uses: an isolated second instance, and TESTS —
+        // `following.json`, `recommendations.json` and `show_notes.json` all derive their
+        // location from this one function, so without an override none of them could be
+        // exercised without writing to Fredrik's real config. That is precisely why
+        // following.rs carried a user-data MIGRATION with zero tests.
+        if let Ok(d) = std::env::var("SPELA_CONFIG_DIR") {
+            if !d.trim().is_empty() {
+                return PathBuf::from(d).join("config.toml");
+            }
+        }
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("~"))
             .join(".config")

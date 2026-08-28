@@ -1183,6 +1183,36 @@ async fn maybe_race_sources(
     race_torrent_sources(state, &candidates, state.config.race_timeout_secs).await
 }
 
+/// Should the VLC path give up on a source that resolved but is delivering nothing?
+///
+/// Pure so the POLICY can be tested without a live swarm. The condition mirrors
+/// `check_torrent_progress` deliberately rather than being re-derived: a source is dead
+/// only when bytes AND peers AND speed are all zero. Day-one swarm poisoning fills
+/// connection slots with decoys that handshake but never send, so a poisoned source sits
+/// at zero bytes for ~30s and then breaks through — it has PEERS the whole time, so it
+/// must survive. Gating on bytes alone would kill exactly what f30fdca taught us to wait
+/// for.
+pub fn vlc_source_is_stalled(
+    bytes: u64,
+    peers: usize,
+    speed_bps: u64,
+    elapsed_secs: u64,
+    total_bytes: u64,
+) -> bool {
+    let gate = vlc_stall_gate_secs(total_bytes);
+    bytes == 0 && peers == 0 && speed_bps == 0 && elapsed_secs >= gate
+}
+
+/// 12s normally, 30s for a large source — the same split do_play uses, because a big
+/// release legitimately takes longer to get its first pieces moving.
+pub fn vlc_stall_gate_secs(total_bytes: u64) -> u64 {
+    if total_bytes > 8_000_000_000 {
+        30
+    } else {
+        12
+    }
+}
+
 /// The VLC-path twin of `maybe_race_sources`.
 ///
 /// Same gate, same tested racer, different return type: the Chromecast path hands
@@ -3755,6 +3785,12 @@ pub fn compute_cast_seek_target(
     Ok(absolute_pos - ss_offset)
 }
 
+/// Deadline-parameterised fail-fast. A resumed torrent play (`seek_to > 0` on a
+/// non-local source) needs the seek-offset pieces to download before ffmpeg can
+/// emit a segment — much slower than a cold-start's first piece — so it uses
+/// `RESUMED_TORRENT_FAIL_FAST_SECS` instead of the 20s default. Aug 3 2026: a
+/// Fargo S01E05 resume-to-41min failed EVERY source at 20s/0-segments; the seek
+/// pieces simply hadn't arrived, and the "bad source" fail-fast killed each one.
 /// Decision: should we declare a stream-start failure and return an error
 /// for `handle_play`'s auto-retry loop to handle?
 ///
@@ -3777,16 +3813,11 @@ pub fn compute_cast_seek_target(
 /// causes. The seed-disparity ranker (May 13 v3.4.0, search.rs) also
 /// reduces incidence at the ranker layer; this fail-fast catches the
 /// residue when the ranker's top pick still has issues.
-pub fn should_fail_fast_stream_start(elapsed_secs: u64, segments_count: usize) -> bool {
-    should_fail_fast_with_deadline(elapsed_secs, segments_count, FAIL_FAST_STREAM_START_SECS)
-}
-
-/// Deadline-parameterised fail-fast. A resumed torrent play (`seek_to > 0` on a
-/// non-local source) needs the seek-offset pieces to download before ffmpeg can
-/// emit a segment — much slower than a cold-start's first piece — so it uses
-/// `RESUMED_TORRENT_FAIL_FAST_SECS` instead of the 20s default. Aug 3 2026: a
-/// Fargo S01E05 resume-to-41min failed EVERY source at 20s/0-segments; the seek
-/// pieces simply hadn't arrived, and the "bad source" fail-fast killed each one.
+/// SUPERSEDED WRAPPER REMOVED 2026-08-28: `should_fail_fast_stream_start` was a
+/// thin shim over this with the default deadline, unreferenced outside its own
+/// tests since the resumed-play variant landed. Its tests now call this directly
+/// with `FAIL_FAST_STREAM_START_SECS`, so the policy stays pinned with no dead code.
+///
 pub fn should_fail_fast_with_deadline(
     elapsed_secs: u64,
     segments_count: usize,
@@ -6780,7 +6811,7 @@ async fn handle_title_meta(
     // with a bespoke `has_backdrop` check; versioning replaces it, so the NEXT field
     // added to `title_meta` costs one bumped integer instead of another one-off probe.
     // BUMP THIS whenever title_meta's response shape gains or changes a field.
-    const PAYLOAD_V: u64 = 4;
+    const PAYLOAD_V: u64 = 5;
     if let Some(hit) = cache.get(&cache_key) {
         let fresh = hit
             .get("_ts")
@@ -8396,8 +8427,8 @@ async fn handle_vlc_ready(
         let mut m = lock_recover(&state.vlc_first_poll);
         *m.entry(tid).or_insert_with(Instant::now)
     };
-    let gate_secs = if total > 8_000_000_000 { 30 } else { 12 };
-    if bytes == 0 && peers == 0 && speed == 0 && first.elapsed().as_secs() >= gate_secs {
+    let gate_secs = vlc_stall_gate_secs(total);
+    if vlc_source_is_stalled(bytes, peers, speed, first.elapsed().as_secs(), total) {
         tracing::warn!(
             "vlc: torrent {} has no bytes, peers or speed after {}s — treating source as dead",
             tid,
@@ -8515,7 +8546,29 @@ async fn handle_vlc_library_playlist(
     match resolve_library_vlc_url(&state, title, file).await {
         Some(url) => {
             let label = file.unwrap_or(title);
-            let body = format!("#EXTM3U\n#EXTINF:-1,{}\n{}\n", label, url);
+            // PARITY WITH THE TORRENT .m3u (2026-08-28). This playlist carried NO
+            // EXTVLCOPT at all, so a library play got neither the "never a dub"
+            // audio-language preference nor the jitter buffer that the torrent path has
+            // had since the auhal work — the two VLC entry points behaved differently
+            // for no reason anyone chose.
+            //
+            // Best-effort: the language lookup is a TMDB round-trip on a user-initiated
+            // play, and any failure simply omits the option and leaves VLC's own default.
+            let lang_opt = {
+                let clean = crate::search::clean_title_for_tmdb(label);
+                let meta = state
+                    .search_engine
+                    .title_meta(&clean, false, true, None, None, None)
+                    .await;
+                meta.get("original_language")
+                    .and_then(|v| v.as_str())
+                    .map(|o| format!("#EXTVLCOPT:audio-language={}\n", vlc_audio_lang_pref(o)))
+                    .unwrap_or_default()
+            };
+            let body = format!(
+                "#EXTM3U\n#EXTINF:-1,{}\n{}#EXTVLCOPT:network-caching=3000\n{}\n",
+                label, lang_opt, url
+            );
             (
                 [(axum::http::header::CONTENT_TYPE, "audio/x-mpegurl")],
                 body,
@@ -8537,7 +8590,7 @@ async fn handle_vlc_library_playlist(
 /// via input-slave so VLC auto-loads it; 404 → VLC plays without subs. 2026-08-08.
 async fn handle_vlc_sub(
     State(state): State<SharedState>,
-    axum::extract::Path(_id): axum::extract::Path<usize>,
+    axum::extract::Path(id): axum::extract::Path<usize>,
 ) -> axum::response::Response {
     let search = AppState::load_last_search(&state.state_dir);
     let imdb = search
@@ -8551,6 +8604,11 @@ async fn handle_vlc_sub(
     let Some(imdb) = imdb.filter(|i| !i.is_empty()) else {
         return (axum::http::StatusCode::NOT_FOUND, "no imdb for subtitles").into_response();
     };
+    let local_source: Option<std::path::PathBuf> = resolve_local_file_for_result(&state, id)
+        .into_iter()
+        .chain(resolve_local_file_lenient(&state, id))
+        .map(|(p, _)| p)
+        .find(|p| is_physically_full(p, 0));
     let client = reqwest::Client::new();
     match crate::subtitles::fetch_subtitles(
         &client,
@@ -8559,7 +8617,18 @@ async fn handle_vlc_sub(
         episode,
         "eng", // OpenSubtitles uses ISO 639-2 ("eng"), not "en" — same as the cast path
         &state.media_dir,
-        None, // download-only: no embedded/alass pass (fast for the slave load)
+        // 2026-08-28: pass the SOURCE when a COMPLETE local file exists, which unlocks
+        // the two rungs the Chromecast path has always had and this one lacked: the
+        // embedded text track (synced by construction, and the reason same-file releases
+        // play right) and, failing that, alass alignment of the OpenSubtitles file. A
+        // wrong-release SRT is the documented desync cause, and download-only could
+        // never correct it.
+        //
+        // Gated on PHYSICAL completeness, not merely on a path resolving: alass needs to
+        // read the whole file, and the lenient resolver passes a sparse partial — the
+        // same trap that made readiness report a half-downloaded file as ready. A
+        // still-downloading torrent keeps the fast download-only path.
+        local_source.as_deref(),
     )
     .await
     {
@@ -9458,6 +9527,11 @@ async fn handle_hls_cache_file(
 
 #[cfg(test)]
 mod tests {
+    /// The default-deadline policy the removed wrapper used to express.
+    fn should_fail_fast_with_deadline_default(elapsed: u64, segs: usize) -> bool {
+        super::should_fail_fast_with_deadline(elapsed, segs, super::FAIL_FAST_STREAM_START_SECS)
+    }
+
     use super::*;
 
     // ---- v3.22 (2026-08-04): Continue-dedup + Tier B boot-resume + seen-seasons ----
@@ -11770,7 +11844,7 @@ mod tests {
         // we MUST trigger. The May 13 Cinecalidad-99-seeds case had 0
         // segments at the 60s pre-buffer timeout — this would have caught
         // it 40s earlier and auto-fallback to MeGusta-7116-seeds.
-        assert!(should_fail_fast_stream_start(20, 0));
+        assert!(should_fail_fast_with_deadline_default(20, 0));
     }
 
     #[test]
@@ -11779,9 +11853,9 @@ mod tests {
         // H.264 NVENC transcode bootstrap. Triggering at <20 s would
         // create false-positive auto-fallbacks on healthy slow-starting
         // streams.
-        assert!(!should_fail_fast_stream_start(19, 0));
-        assert!(!should_fail_fast_stream_start(10, 0));
-        assert!(!should_fail_fast_stream_start(0, 0));
+        assert!(!should_fail_fast_with_deadline_default(19, 0));
+        assert!(!should_fail_fast_with_deadline_default(10, 0));
+        assert!(!should_fail_fast_with_deadline_default(0, 0));
     }
 
     #[test]
@@ -11790,10 +11864,10 @@ mod tests {
         // are confirmed working. Don't fail-fast even past the 20 s
         // deadline — let the existing 60 s pre-buffer timeout handle
         // segment-count gating from there.
-        assert!(!should_fail_fast_stream_start(20, 1));
-        assert!(!should_fail_fast_stream_start(45, 5));
-        assert!(!should_fail_fast_stream_start(60, 10));
-        assert!(!should_fail_fast_stream_start(120, 100));
+        assert!(!should_fail_fast_with_deadline_default(20, 1));
+        assert!(!should_fail_fast_with_deadline_default(45, 5));
+        assert!(!should_fail_fast_with_deadline_default(60, 10));
+        assert!(!should_fail_fast_with_deadline_default(120, 100));
     }
 
     #[test]
@@ -11801,9 +11875,9 @@ mod tests {
         // After 60s with 0 segments (existing pre-buffer timeout case),
         // fail-fast still applies — return error rather than cast with
         // 0 segments (the legacy 75s-blue-cast-icon failure mode).
-        assert!(should_fail_fast_stream_start(30, 0));
-        assert!(should_fail_fast_stream_start(60, 0));
-        assert!(should_fail_fast_stream_start(120, 0));
+        assert!(should_fail_fast_with_deadline_default(30, 0));
+        assert!(should_fail_fast_with_deadline_default(60, 0));
+        assert!(should_fail_fast_with_deadline_default(120, 0));
     }
 
     #[test]
@@ -11834,7 +11908,7 @@ mod tests {
         ];
         for (elapsed, segments, expected_trigger) in observed_log_progression {
             assert_eq!(
-                should_fail_fast_stream_start(*elapsed, *segments),
+                should_fail_fast_with_deadline_default(*elapsed, *segments),
                 *expected_trigger,
                 "elapsed={elapsed}s segments={segments} expected trigger={expected_trigger}"
             );
@@ -12196,5 +12270,54 @@ mod vlc_readiness_completeness_tests {
         std::fs::write(&path, vec![7u8; 256 * 1024]).unwrap();
         assert!(is_physically_full(&path, 0));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod vlc_stall_gate_tests {
+    use super::{vlc_source_is_stalled, vlc_stall_gate_secs};
+
+    #[test]
+    fn a_poisoned_swarm_survives_because_it_has_peers() {
+        // f30fdca measured HotD S03E04 at 0 bytes for ~30s, then 11MB: decoy peers
+        // handshake but send nothing. Killing on bytes alone would kill this source
+        // right before its breakthrough — the exact regression that fix exists to
+        // prevent. It has peers, so it must NOT be judged stalled, however long it sits.
+        assert!(!vlc_source_is_stalled(0, 12, 0, 300, 1_000_000_000));
+    }
+
+    #[test]
+    fn a_trickle_of_speed_also_survives() {
+        assert!(!vlc_source_is_stalled(0, 0, 900, 60, 1_000_000_000));
+    }
+
+    #[test]
+    fn any_bytes_at_all_means_alive() {
+        assert!(!vlc_source_is_stalled(1, 0, 0, 999, 1_000_000_000));
+    }
+
+    #[test]
+    fn nothing_at_all_past_the_gate_is_dead() {
+        assert!(vlc_source_is_stalled(0, 0, 0, 12, 1_000_000_000));
+    }
+
+    #[test]
+    fn nothing_yet_but_inside_the_gate_gets_more_time() {
+        assert!(!vlc_source_is_stalled(0, 0, 0, 11, 1_000_000_000));
+    }
+
+    #[test]
+    fn a_large_source_gets_the_longer_gate() {
+        // A 4K release legitimately takes longer to get its first pieces moving.
+        assert_eq!(vlc_stall_gate_secs(9_000_000_000), 30);
+        assert_eq!(vlc_stall_gate_secs(1_000_000_000), 12);
+        assert!(!vlc_source_is_stalled(0, 0, 0, 20, 9_000_000_000));
+        assert!(vlc_source_is_stalled(0, 0, 0, 30, 9_000_000_000));
+    }
+
+    #[test]
+    fn an_unknown_total_uses_the_short_gate() {
+        // Metadata resolved but size unknown → treat as ordinary, not as large.
+        assert_eq!(vlc_stall_gate_secs(0), 12);
     }
 }

@@ -197,12 +197,205 @@ pub fn migrate_if_needed(state_dir: &std::path::Path) {
     }
 }
 
-/// Lowercase alphanumerics only — tolerant title key ("Rick and Morty" vs
-/// "rick & morty" both → "rickandmorty"), so the spela stream title matches the
-/// followed-show title without exact-punctuation coupling.
+/// Lowercase alphanumerics only, so the spela stream title matches the followed-show
+/// title without exact-punctuation coupling ("The.Boys" / "THE BOYS" / "  The Boys  "
+/// all → "theboys").
+///
+/// CORRECTED 2026-08-28: this used to claim "Rick and Morty" and "rick & morty" both
+/// yield "rickandmorty". They do not — `&` is not alphanumeric, so it is DROPPED, giving
+/// "rickmorty". Anything spelled out on one side and punctuated on the other ("and" vs
+/// "&", "Part Two" vs "II") lands on different keys.
+///
+/// That is a LATENT hazard rather than a live bug: this is the join between the followed
+/// set and the watch ledger, and a miss does not throw — progress silently reads as zero
+/// and every episode reappears as new. Verified 2026-08-28 against the real data: all 13
+/// followed shows join cleanly, because both sides take the title from TMDB. It would
+/// only bite if a title were entered by hand with different punctuation.
+#[allow(rustdoc::invalid_html_tags)]
 pub fn clean_title(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric())
         .flat_map(|c| c.to_lowercase())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `clean_title` is the JOIN KEY between the followed-shows set and the watch
+    /// ledger (`derive_watched_through`). A regression here does not throw — it
+    /// silently stops matching, so a followed show's progress quietly reads as zero and
+    /// every episode reappears as new. Worth pinning tightly.
+    #[test]
+    fn clean_title_is_a_tolerant_join_key() {
+        assert_eq!(clean_title("Rick and Morty"), "rickandmorty");
+        // NOT "rickandmorty": `&` is dropped rather than expanded, so a spelled-out
+        // conjunction and a punctuated one land on DIFFERENT keys. Pinned deliberately
+        // because the docstring used to claim the opposite.
+        assert_eq!(clean_title("rick & morty"), "rickmorty");
+        assert_ne!(clean_title("Rick & Morty"), clean_title("Rick and Morty"));
+        assert_eq!(clean_title("The Boys"), "theboys");
+        assert_eq!(clean_title("THE BOYS"), "theboys");
+        assert_eq!(clean_title("The.Boys"), "theboys");
+        assert_eq!(clean_title("  The Boys  "), "theboys");
+        assert_eq!(clean_title("Widow's Bay"), "widowsbay");
+        assert_eq!(clean_title("9-1-1"), "911");
+    }
+
+    /// Non-ASCII must survive rather than being stripped: a Swedish or accented title
+    /// would otherwise collapse toward a different show's key.
+    #[test]
+    fn clean_title_keeps_non_ascii_letters() {
+        assert_eq!(clean_title("Ängelby"), "ängelby");
+        assert_eq!(clean_title("Kärlek & Anarki"), "kärlekanarki");
+        assert_ne!(clean_title("Ängelby"), clean_title("Angelby"));
+    }
+
+    #[test]
+    fn parse_se_is_tolerant_of_case_and_padding() {
+        assert_eq!(parse_se("S03E04"), Some((3, 4)));
+        assert_eq!(parse_se("s3e4"), Some((3, 4)));
+        assert_eq!(parse_se(" S03E04 "), Some((3, 4)));
+        assert_eq!(parse_se("S10E11"), Some((10, 11)));
+        assert_eq!(parse_se("S00E00"), Some((0, 0)));
+    }
+
+    #[test]
+    fn parse_se_rejects_what_is_not_an_episode_marker() {
+        // Returning Some for junk would seed a bogus ledger baseline during migration.
+        assert_eq!(parse_se(""), None);
+        assert_eq!(parse_se("S03"), None);
+        assert_eq!(parse_se("E04"), None);
+        assert_eq!(parse_se("SxxEyy"), None);
+        assert_eq!(parse_se("3x04"), None);
+        assert_eq!(parse_se("season 3"), None);
+    }
+
+    #[test]
+    fn fmt_se_zero_pads_and_round_trips() {
+        assert_eq!(fmt_se(3, 4), "S03E04");
+        assert_eq!(fmt_se(10, 11), "S10E11");
+        for (s, e) in [(1u32, 1u32), (3, 4), (10, 11), (12, 9)] {
+            assert_eq!(parse_se(&fmt_se(s, e)), Some((s, e)));
+        }
+    }
+}
+
+/// Migration + persistence tests. These write real files, so they redirect
+/// `SPELA_CONFIG_DIR` (added 2026-08-28 for exactly this) into a temp dir — without it
+/// a user-data MIGRATION shipped with zero coverage, because exercising it meant
+/// writing to Fredrik's real `following.json`.
+///
+/// Serialised with a mutex: the override is process-global env, so parallel tests would
+/// otherwise redirect each other mid-run.
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("spela_follow_{}_{}", name, std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    fn write_v1(dir: &std::path::Path, body: &str) {
+        std::fs::write(dir.join("following.json"), body).unwrap();
+    }
+
+    #[test]
+    fn migration_moves_baselines_into_the_ledger_and_is_idempotent() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = scratch("mig");
+        let state = scratch("mig_state");
+        std::env::set_var("SPELA_CONFIG_DIR", &cfg);
+        write_v1(
+            &cfg,
+            r#"{"schema_version":1,"shows":[{"title":"Silo","tmdb_id":125988,
+                "imdb_id":"tt14688458","watched_through":"S03E08"}]}"#,
+        );
+
+        migrate_if_needed(&state);
+
+        let f = load();
+        assert_eq!(f.schema_version, 2, "schema must advance");
+        assert!(
+            f.shows[0].watched_through.is_none(),
+            "a MIGRATED baseline is consumed, not left behind to be applied twice"
+        );
+        let app = crate::state::AppState::load(&state);
+        assert!(
+            app.watched.iter().any(|w| w.key.contains("s03e08")),
+            "the baseline must land in the ledger, which is now the SSoT for progress"
+        );
+        let rows_after_first = app.watched.len();
+
+        migrate_if_needed(&state); // second run must be a no-op
+        let app2 = crate::state::AppState::load(&state);
+        assert_eq!(
+            app2.watched.len(),
+            rows_after_first,
+            "re-running must not duplicate ledger rows"
+        );
+        std::env::remove_var("SPELA_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&cfg);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// An unparseable baseline must be PRESERVED, never silently dropped — losing it
+    /// would reset a followed show's progress to zero with no trace.
+    #[test]
+    fn an_unparseable_baseline_is_kept_not_discarded() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = scratch("mig_bad");
+        let state = scratch("mig_bad_state");
+        std::env::set_var("SPELA_CONFIG_DIR", &cfg);
+        write_v1(
+            &cfg,
+            r#"{"schema_version":1,"shows":[{"title":"Fargo","tmdb_id":60622,
+                "watched_through":"whenever"}]}"#,
+        );
+
+        migrate_if_needed(&state);
+
+        let f = load();
+        assert_eq!(f.schema_version, 2);
+        assert_eq!(
+            f.shows[0].watched_through.as_deref(),
+            Some("whenever"),
+            "an unparseable baseline must survive the migration"
+        );
+        std::env::remove_var("SPELA_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&cfg);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The migration takes a timestamped backup before touching anything.
+    #[test]
+    fn migration_backs_up_the_original_first() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = scratch("mig_bak");
+        let state = scratch("mig_bak_state");
+        std::env::set_var("SPELA_CONFIG_DIR", &cfg);
+        write_v1(&cfg, r#"{"schema_version":1,"shows":[]}"#);
+
+        migrate_if_needed(&state);
+
+        let backups: Vec<_> = std::fs::read_dir(&cfg)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("following.json.bak-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one timestamped backup expected");
+        std::env::remove_var("SPELA_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&cfg);
+        let _ = std::fs::remove_dir_all(&state);
+    }
 }

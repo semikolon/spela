@@ -638,6 +638,9 @@ impl SearchEngine {
             "year": if year.is_empty() { Value::Null } else { Value::String(year) },
             "genres": genres,
             "media_type": kind,
+            // Needed by the library→VLC playlist to pick the ORIGINAL-language audio
+            // track ("never a dub"); the search path already had it via ShowInfo.
+            "original_language": d["original_language"].as_str(),
             "tmdb": tmdb,
             "status": status,
             // The one word a viewer wants: Returning / Ended / Cancelled / Renewal

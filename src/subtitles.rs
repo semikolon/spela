@@ -490,3 +490,76 @@ fn srt_to_vtt(srt: &str) -> String {
     }
     vtt
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{iso639_1_to_2, srt_to_vtt};
+
+    /// OpenSubtitles takes ISO 639-2, spela's config and TMDB speak 639-1, and a wrong
+    /// code does not error — it silently fetches nothing, or the wrong language.
+    #[test]
+    fn language_codes_map_to_the_three_letter_form() {
+        assert_eq!(iso639_1_to_2("en"), "eng");
+        assert_eq!(iso639_1_to_2("sv"), "swe");
+        assert_eq!(iso639_1_to_2("da"), "dan");
+        assert_eq!(iso639_1_to_2("ja"), "jpn");
+        assert_eq!(iso639_1_to_2("ko"), "kor");
+    }
+
+    /// A code that is ALREADY 639-2 must pass through untouched rather than being
+    /// mangled — callers legitimately pass "eng" directly (the VLC sub endpoint does).
+    #[test]
+    fn an_already_three_letter_code_passes_through() {
+        assert_eq!(iso639_1_to_2("eng"), "eng");
+        assert_eq!(iso639_1_to_2("swe"), "swe");
+        assert_eq!(iso639_1_to_2("zz"), "zz");
+        assert_eq!(iso639_1_to_2(""), "");
+    }
+
+    #[test]
+    fn vtt_has_the_required_header() {
+        // A WebVTT file without this exact opening is rejected outright by browsers.
+        let out = srt_to_vtt("1\n00:00:01,000 --> 00:00:02,000\nHej\n");
+        assert!(out.starts_with("WEBVTT\n\n"), "got: {out:?}");
+    }
+
+    /// SRT separates milliseconds with a comma, WebVTT with a dot. Only the TIMING
+    /// lines may be rewritten — a comma inside dialogue must survive, or every subtitle
+    /// containing a comma is quietly corrupted.
+    #[test]
+    fn only_timing_commas_become_dots() {
+        let srt = "1\n00:00:01,500 --> 00:00:02,750\nWell, hello, there\n";
+        let out = srt_to_vtt(srt);
+        assert!(out.contains("00:00:01.500 --> 00:00:02.750"));
+        assert!(
+            out.contains("Well, hello, there"),
+            "dialogue commas must be untouched: {out:?}"
+        );
+    }
+
+    /// CRLF is the common wire format for SRT files and the documented source of a past
+    /// parsing bug. `lines()` must absorb it so no stray carriage return reaches the VTT.
+    #[test]
+    fn crlf_input_produces_clean_lf_output() {
+        let srt = "1\r\n00:00:01,000 --> 00:00:02,000\r\nHej\r\n";
+        let out = srt_to_vtt(srt);
+        assert!(!out.contains('\r'), "carriage return leaked: {out:?}");
+        assert!(out.contains("00:00:01.000 --> 00:00:02.000"));
+    }
+
+    #[test]
+    fn empty_input_still_yields_a_valid_header() {
+        assert_eq!(srt_to_vtt(""), "WEBVTT\n\n");
+    }
+
+    /// Multi-cue files must keep their blank-line separators, which is what delimits
+    /// cues; losing them merges every subtitle into one.
+    #[test]
+    fn cue_separation_survives() {
+        let srt =
+            "1\n00:00:01,000 --> 00:00:02,000\nOne\n\n2\n00:00:03,000 --> 00:00:04,000\nTwo\n";
+        let out = srt_to_vtt(srt);
+        assert!(out.contains("One\n\n2"), "cue separator lost: {out:?}");
+        assert!(out.contains("00:00:03.000 --> 00:00:04.000"));
+    }
+}
