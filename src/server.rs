@@ -226,7 +226,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     // validated peer attach + end-to-end cast). Init is fail-fast: if the
     // Session can't bootstrap, surface the error and abort startup.
     tracing::info!("Initializing librqbit torrent engine");
-    let torrent_engine = TorrentEngine::new(&media_dir, config.stream_host.clone(), config.port)
+    let torrent_engine = TorrentEngine::new(&media_dir, config.port)
         .await
         .context("librqbit engine bootstrap failed")?;
     tracing::info!(
@@ -885,7 +885,7 @@ async fn start_torrent_for_play(
     let should_prune = {
         let mut lp = lock_recover(&state.last_prune);
         let now = Instant::now();
-        let due = lp.map_or(true, |t| {
+        let due = lp.is_none_or(|t| {
             now.duration_since(t) >= std::time::Duration::from_secs(PRUNE_DEBOUNCE_SECS)
         });
         if due {
@@ -1198,7 +1198,15 @@ pub fn vlc_source_is_stalled(
     speed_bps: u64,
     elapsed_secs: u64,
     total_bytes: u64,
+    initializing: bool,
 ) -> bool {
+    // A torrent still INITIALIZING (hashing existing data, resolving) legitimately has
+    // no bytes, no peers and no speed — it has not started trying yet. Condemning it
+    // would be the same false positive as judging a poisoned swarm on bytes alone, just
+    // one phase earlier. librqbit already reports the phase; it was simply unread.
+    if initializing {
+        return false;
+    }
     let gate = vlc_stall_gate_secs(total_bytes);
     bytes == 0 && peers == 0 && speed_bps == 0 && elapsed_secs >= gate
 }
@@ -2116,7 +2124,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // quality label (set at result_id resolution). Function-scope so both the
     // progress gate (in the !is_local block) and the codec probe (in the
     // cache-miss block below) can read it.
-    let is_large_source = req.quality.as_deref().map_or(false, |q| {
+    let is_large_source = req.quality.as_deref().is_some_and(|q| {
         let q = q.to_lowercase();
         q.contains("2160") || q.contains("4k") || q.contains("uhd")
     });
@@ -2418,7 +2426,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
 
         let need_audio_tc = audio_codec
             .as_deref()
-            .map_or(false, transcode::audio_needs_transcode);
+            .is_some_and(transcode::audio_needs_transcode);
         // May 12, 2026: the old CrKey 1.56 receiver is materially happier when
         // Chromecast-targeted HLS is a single canonical profile:
         // H.264 High@4.0, 30 fps, fixed 6 s GOP, AAC stereo. Merely wrapping a
@@ -2432,7 +2440,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         } else {
             video_codec
                 .as_deref()
-                .map_or(false, transcode::video_needs_transcode)
+                .is_some_and(transcode::video_needs_transcode)
         };
         let use_hls = should_use_hls_for_playback(
             &target,
@@ -2494,7 +2502,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
             // the only things that still force the re-encode path. The whole
             // Chromecast path (CrKey 1.56 can't do HEVC/4K) is unchanged.
             let want_4k_passthrough = target != "chromecast"
-                && video_codec.as_deref().map_or(false, |c| {
+                && video_codec.as_deref().is_some_and(|c| {
                     let c = c.to_ascii_lowercase();
                     c == "hevc" || c == "h265" || c == "h.265"
                 })
@@ -2557,7 +2565,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                         )
                         .await
                         {
-                            do_cleanup(&state);
+                            do_cleanup(state);
                             return Json(json!({
                                 "error": format!(
                                     "Chromecast local-HLS completion gate failed before cast: {}",
@@ -2601,7 +2609,9 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                         // the local-file `race_ahead_safe` gate so a fast swarm
                         // casts even sooner and a slow one waits longer — see
                         // docs/barrage_findings_2026_07_05.md.
-                        let min_segments: usize = if target == "chromecast" { 10 } else { 10 };
+                        // Both targets take 10 since 26b5ec2 halved the Chromecast pre-buffer from 20;
+                        // the branch was left behind, not a policy.
+                        let min_segments: usize = 10;
                         let seg_ext = if hls_info.fmp4 { "m4s" } else { "ts" };
                         let target_segment = hls_dir.join(format!(
                             "{}{:05}.{}",
@@ -2810,7 +2820,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 // linger as orphans until the next play, the next server
                 // restart, or `spela kill-workers`. This is the exact class
                 // of leak the Apr 8 incident report warns about.
-                do_cleanup(&state);
+                do_cleanup(state);
                 return Json(json!({
                     "error": format!("Cast failed: {}", e),
                     "url": final_url,
@@ -2820,7 +2830,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
             Err(e) => {
                 // Same defense as above — async task panic must not leak
                 // the freshly-spawned worker pipeline.
-                do_cleanup(&state);
+                do_cleanup(state);
                 return Json(json!({"error": format!("Cast task failed: {}", e)}));
             }
         }
@@ -3195,13 +3205,13 @@ fn do_cleanup(state: &SharedState) {
                         for sub_entry in sub_entries.flatten() {
                             let path = sub_entry.path();
                             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                            if ext == "mp4" || ext == "mkv" {
-                                if is_physically_full(&path, expected_bytes) {
-                                    let marker_path = entry.path().join(".spela_done");
-                                    if !marker_path.exists() {
-                                        let _ = std::fs::File::create(&marker_path);
-                                        tracing::info!("Auto-Verification: Marked '{}' as .spela_done (Physically Full)", current.title);
-                                    }
+                            if (ext == "mp4" || ext == "mkv")
+                                && is_physically_full(&path, expected_bytes)
+                            {
+                                let marker_path = entry.path().join(".spela_done");
+                                if !marker_path.exists() {
+                                    let _ = std::fs::File::create(&marker_path);
+                                    tracing::info!("Auto-Verification: Marked '{}' as .spela_done (Physically Full)", current.title);
                                 }
                             }
                         }
@@ -4340,7 +4350,7 @@ async fn cast_health_monitor(
                     // position crosses HWM_CLEAR_FRACTION of duration or within
                     // HWM_CLEAR_TAIL_SECS of the end, it clears the entry so the next
                     // play starts fresh.
-                    let absolute = info.current_time as f64 + ss_offset;
+                    let absolute = info.current_time + ss_offset;
                     // Record the freshest non-idle position for the IDLE-cleanup
                     // HWM-clear decision (Apr 19, 2026). Only trust positive
                     // current_time readings — at LOAD, Chromecast briefly reports 0.
@@ -4357,12 +4367,12 @@ async fn cast_health_monitor(
                             });
                         }
                     }
-                    let duration_hint = duration_snapshot.or_else(|| {
+                    let duration_hint = duration_snapshot.or({
                         // info.duration is -1 for HLS live manifests (ENDLIST missing).
                         // Prefer CurrentStream.duration; fall back to info.duration only
                         // if positive.
                         if info.duration > 0.0 {
-                            Some(info.duration as f64)
+                            Some(info.duration)
                         } else {
                             None
                         }
@@ -4943,7 +4953,7 @@ fn dedup_continue_furthest(entries: Vec<InProgressEntry>) -> Vec<InProgressEntry
     entries
         .into_iter()
         .filter(|e| match (e.season, e.episode) {
-            (Some(s), Some(ep)) => !furthest.get(&show_key(e)).is_some_and(|f| (s, ep) < *f),
+            (Some(s), Some(ep)) => furthest.get(&show_key(e)).is_none_or(|f| (s, ep) >= *f),
             _ => true,
         })
         .collect()
@@ -5531,13 +5541,11 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         cur_ep + 1
     } else if cur_ep > 1 {
         cur_ep - 1
+    } else if season > 1 {
+        season -= 1;
+        99 // Will be clamped by results
     } else {
-        if season > 1 {
-            season -= 1;
-            99 // Will be clamped by results
-        } else {
-            return Json(json!({"error": "Already at first episode"}));
-        }
+        return Json(json!({"error": "Already at first episode"}));
     };
 
     let result = match state
@@ -6307,8 +6315,8 @@ async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
         else {
             continue;
         };
-        if let Some(rest) = k.splitn(2, ':').nth(1) {
-            let title = rest.rsplitn(2, ':').nth(1).unwrap_or(rest);
+        if let Some(rest) = k.split_once(':').map(|x| x.1) {
+            let title = rest.rsplit_once(':').map(|x| x.0).unwrap_or(rest);
             if !title.is_empty() && !title.starts_with('t') && !title.starts_with('i') {
                 by_title.insert(title.to_string(), mt.to_string());
             }
@@ -8281,7 +8289,7 @@ async fn handle_vlc_stream(
     let is_initial_open = headers
         .get("range")
         .and_then(|v| v.to_str().ok())
-        .map_or(true, |r| r == "bytes=0-");
+        .is_none_or(|r| r == "bytes=0-");
     if is_initial_open {
         state
             .torrent_engine
@@ -8397,7 +8405,7 @@ async fn handle_vlc_ready(
     state
         .torrent_engine
         .prefetch_ends(tid, file_index.unwrap_or(0) as usize);
-    let (bytes, total, finished, peers, speed) = state
+    let (bytes, total, finished, peers, speed, initializing) = state
         .torrent_engine
         .progress(tid)
         .map(|p| {
@@ -8407,9 +8415,10 @@ async fn handle_vlc_ready(
                 p.finished,
                 p.peers_connected,
                 p.speed_bps,
+                p.state == crate::torrent_engine::TorrentState::Initializing,
             )
         })
-        .unwrap_or((0, 0, false, 0, 0));
+        .unwrap_or((0, 0, false, 0, 0, false));
 
     // STALL GATE — the VLC twin of do_play's `check_torrent_progress`.
     //
@@ -8428,7 +8437,14 @@ async fn handle_vlc_ready(
         *m.entry(tid).or_insert_with(Instant::now)
     };
     let gate_secs = vlc_stall_gate_secs(total);
-    if vlc_source_is_stalled(bytes, peers, speed, first.elapsed().as_secs(), total) {
+    if vlc_source_is_stalled(
+        bytes,
+        peers,
+        speed,
+        first.elapsed().as_secs(),
+        total,
+        initializing,
+    ) {
         tracing::warn!(
             "vlc: torrent {} has no bytes, peers or speed after {}s — treating source as dead",
             tid,
@@ -9206,7 +9222,7 @@ fn get_current_device(state: &ServerState) -> String {
     let app_state = AppState::load(&state.state_dir);
     app_state
         .current
-        .and_then(|c| c.target.splitn(2, ':').nth(1).map(String::from))
+        .and_then(|c| c.target.split_once(':').map(|x| x.1).map(String::from))
         .or(app_state.preferences.chromecast_name)
         .unwrap_or_else(|| state.config.default_device.clone())
 }
@@ -9368,7 +9384,7 @@ async fn wait_for_complete_hls_before_cast(
             .map(|d| {
                 d.filter(|e| {
                     e.as_ref()
-                        .map(|e| e.path().extension().map_or(false, |ext| ext == "ts"))
+                        .map(|e| e.path().extension().is_some_and(|ext| ext == "ts"))
                         .unwrap_or(false)
                 })
                 .count()
@@ -12283,27 +12299,27 @@ mod vlc_stall_gate_tests {
         // handshake but send nothing. Killing on bytes alone would kill this source
         // right before its breakthrough — the exact regression that fix exists to
         // prevent. It has peers, so it must NOT be judged stalled, however long it sits.
-        assert!(!vlc_source_is_stalled(0, 12, 0, 300, 1_000_000_000));
+        assert!(!vlc_source_is_stalled(0, 12, 0, 300, 1_000_000_000, false));
     }
 
     #[test]
     fn a_trickle_of_speed_also_survives() {
-        assert!(!vlc_source_is_stalled(0, 0, 900, 60, 1_000_000_000));
+        assert!(!vlc_source_is_stalled(0, 0, 900, 60, 1_000_000_000, false));
     }
 
     #[test]
     fn any_bytes_at_all_means_alive() {
-        assert!(!vlc_source_is_stalled(1, 0, 0, 999, 1_000_000_000));
+        assert!(!vlc_source_is_stalled(1, 0, 0, 999, 1_000_000_000, false));
     }
 
     #[test]
     fn nothing_at_all_past_the_gate_is_dead() {
-        assert!(vlc_source_is_stalled(0, 0, 0, 12, 1_000_000_000));
+        assert!(vlc_source_is_stalled(0, 0, 0, 12, 1_000_000_000, false));
     }
 
     #[test]
     fn nothing_yet_but_inside_the_gate_gets_more_time() {
-        assert!(!vlc_source_is_stalled(0, 0, 0, 11, 1_000_000_000));
+        assert!(!vlc_source_is_stalled(0, 0, 0, 11, 1_000_000_000, false));
     }
 
     #[test]
@@ -12311,8 +12327,18 @@ mod vlc_stall_gate_tests {
         // A 4K release legitimately takes longer to get its first pieces moving.
         assert_eq!(vlc_stall_gate_secs(9_000_000_000), 30);
         assert_eq!(vlc_stall_gate_secs(1_000_000_000), 12);
-        assert!(!vlc_source_is_stalled(0, 0, 0, 20, 9_000_000_000));
-        assert!(vlc_source_is_stalled(0, 0, 0, 30, 9_000_000_000));
+        assert!(!vlc_source_is_stalled(0, 0, 0, 20, 9_000_000_000, false));
+        assert!(vlc_source_is_stalled(0, 0, 0, 30, 9_000_000_000, false));
+    }
+
+    #[test]
+    fn a_torrent_still_initializing_is_never_stalled() {
+        // Hashing existing data / resolving: no bytes, no peers, no speed, because it
+        // has not started trying yet. librqbit reports the phase and this reads it —
+        // condemning here would be the poisoned-swarm false positive one phase earlier.
+        assert!(!vlc_source_is_stalled(0, 0, 0, 600, 1_000_000_000, true));
+        // ...but once it IS live, the same numbers mean dead.
+        assert!(vlc_source_is_stalled(0, 0, 0, 600, 1_000_000_000, false));
     }
 
     #[test]

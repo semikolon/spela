@@ -61,10 +61,6 @@ use librqbit::{
 /// integration code.
 pub struct TorrentEngine {
     session: Arc<Session>,
-    /// Configured stream host (LAN IP that the Chromecast and ffmpeg will fetch
-    /// from). Built into URLs returned from `start()`. Same value spela uses
-    /// for the Chromecast LOAD message — ensures the cast hijack still works.
-    stream_host: String,
     /// Port spela's axum router listens on. The new streaming endpoint
     /// (`/torrent/{id}/stream/{file_idx}`) lives on the same axum router as
     /// `/hls/master.m3u8`, so `:7890` for both.
@@ -88,7 +84,13 @@ pub struct TorrentStartInfo {
     /// next-session `do_play` integration will treat this as opaque.
     pub id: u32,
     /// Fully-qualified HTTP URL ffmpeg will fetch the file from. Format:
-    /// `http://{stream_host}:{stream_port}/torrent/{id}/stream/{file_idx}`.
+    /// `http://127.0.0.1:{stream_port}/torrent/{id}/stream/{file_idx}`.
+    ///
+    /// CORRECTED 2026-08-28: this said `{stream_host}`. It has been LOOPBACK since the
+    /// Apr-30 H4 hardening — `/torrent/*` is loopback-only and ffmpeg is its only
+    /// legitimate consumer, so the URL must come from 127.0.0.1 to pass that middleware
+    /// whatever `stream_host` is configured as. The engine no longer takes a stream host
+    /// at all; keeping the parameter implied a control that did not exist.
     pub url: String,
     /// File index within the torrent that we instructed librqbit to download
     /// (via `only_files`). For single-file torrents this is always 0.
@@ -118,14 +120,10 @@ pub enum TorrentState {
 
 impl TorrentEngine {
     /// Construct an engine with a freshly-created `Session` rooted at `media_dir`.
-    /// `stream_host` and `stream_port` are baked into URLs returned from `start`.
+    /// `stream_port` is baked into the loopback URLs returned from `start`.
     /// Asynchronous because `Session::new` performs DHT bootstrap setup +
     /// listener binding.
-    pub async fn new(
-        media_dir: &Path,
-        stream_host: impl Into<String>,
-        stream_port: u16,
-    ) -> Result<Arc<Self>> {
+    pub async fn new(media_dir: &Path, stream_port: u16) -> Result<Arc<Self>> {
         std::fs::create_dir_all(media_dir).context("creating media_dir for torrent engine")?;
         // Apr 30, 2026 (L1 hardening — partial): librqbit 8.1.1 doesn't
         // expose a peer-count cap in SessionOptions / PeerConnectionOptions
@@ -207,7 +205,6 @@ impl TorrentEngine {
             .context("librqbit::Session::new_with_opts failed during engine bootstrap")?;
         Ok(Arc::new(Self {
             session,
-            stream_host: stream_host.into(),
             stream_port,
             started_count: AtomicU32::new(0),
             dead_magnets: Mutex::new(HashMap::new()),
@@ -450,10 +447,6 @@ impl TorrentEngine {
             false
         }
     }
-
-    pub fn started_count(&self) -> u32 {
-        self.started_count.load(Ordering::Relaxed)
-    }
 }
 
 /// Reject anything that isn't a magnet URI. Apr 30, 2026 — security audit
@@ -544,7 +537,7 @@ fn stats_to_progress(stats: &TorrentStats) -> TorrentProgress {
             // exact precision doesn't matter, but format-stability does.
             let mbps = parse_mbps_string(&format!("{}", live.download_speed));
             let bps = (mbps * 125_000.0) as u64; // mbps * 1e6 / 8
-            (live.snapshot.peer_stats.live as usize, bps)
+            (live.snapshot.peer_stats.live, bps)
         }
         None => (0, 0),
     };

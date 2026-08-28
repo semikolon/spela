@@ -590,7 +590,7 @@ pub async fn transcode(
 ) -> Result<(PathBuf, u32)> {
     let output_path = media_dir.join("transcoded_aac.mp4");
     let has_intro = intro_path.is_some();
-    let has_subs = subtitle_path.map_or(false, |p| p.exists());
+    let has_subs = subtitle_path.is_some_and(|p| p.exists());
 
     let mut args: Vec<String> = Vec::new();
 
@@ -869,7 +869,7 @@ pub async fn transcode_hls(
     let effective_subtitle_path = resolve_subtitle_path_for_seek(subtitle_path, &hls_dir, seek_to);
     let subtitle_path = effective_subtitle_path.as_deref();
     let has_intro = intro_path.is_some();
-    let has_subs = subtitle_path.map_or(false, |p| p.exists());
+    let has_subs = subtitle_path.is_some_and(|p| p.exists());
     let main_idx = if has_intro { 1 } else { 0 };
 
     let mut args: Vec<String> = Vec::new();

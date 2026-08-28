@@ -438,7 +438,10 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             seek,
         } => {
             // Smart source detection: number = result ID, magnet: = magnet link
-            let is_result_id = source.parse::<usize>().ok().filter(|&n| n >= 1 && n <= 20);
+            let is_result_id = source
+                .parse::<usize>()
+                .ok()
+                .filter(|&n| (1..=20).contains(&n));
             let seek_to = if let Some(s) = seek {
                 Some(parse_position_string(&s)?)
             } else {

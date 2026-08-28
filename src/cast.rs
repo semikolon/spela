@@ -209,29 +209,28 @@ impl CastController {
         let deadline = Instant::now() + DISCOVERY_TIMEOUT;
 
         while Instant::now() < deadline {
-            match receiver.recv_timeout(Duration::from_millis(500)) {
-                Ok(ServiceEvent::ServiceResolved(info)) => {
-                    let name = info
-                        .get_property_val_str("fn")
-                        .unwrap_or("Unknown")
-                        .to_string();
-                    let model = info
-                        .get_property_val_str("md")
-                        .unwrap_or("Unknown")
-                        .to_string();
+            if let Ok(ServiceEvent::ServiceResolved(info)) =
+                receiver.recv_timeout(Duration::from_millis(500))
+            {
+                let name = info
+                    .get_property_val_str("fn")
+                    .unwrap_or("Unknown")
+                    .to_string();
+                let model = info
+                    .get_property_val_str("md")
+                    .unwrap_or("Unknown")
+                    .to_string();
 
-                    if let Some(addr) = info.get_addresses().iter().next() {
-                        let device = DeviceInfo {
-                            name: name.clone(),
-                            ip: addr.to_string(),
-                            port: info.get_port(),
-                            model,
-                        };
-                        self.device_cache.insert(name, device.clone());
-                        devices.push(device);
-                    }
+                if let Some(addr) = info.get_addresses().iter().next() {
+                    let device = DeviceInfo {
+                        name: name.clone(),
+                        ip: addr.to_string(),
+                        port: info.get_port(),
+                        model,
+                    };
+                    self.device_cache.insert(name, device.clone());
+                    devices.push(device);
                 }
-                _ => {}
             }
         }
 
@@ -456,7 +455,7 @@ impl CastController {
                             .media
                             .as_ref()
                             .and_then(|m| m.metadata.as_ref())
-                            .map(|md| extract_metadata_title(md))
+                            .map(extract_metadata_title)
                             .unwrap_or_default();
 
                         return Ok(PlaybackInfo {

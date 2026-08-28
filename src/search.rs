@@ -1569,8 +1569,8 @@ pub fn rank_results_mut_prefer(results: &mut Vec<TorrentResult>, prefer_h264: bo
 
     results.sort_by(|a, b| {
         // Tier 1: single-file > pack
-        let a_single = a.file_index.map_or(true, |i| i == 0);
-        let b_single = b.file_index.map_or(true, |i| i == 0);
+        let a_single = a.file_index.is_none_or(|i| i == 0);
+        let b_single = b.file_index.is_none_or(|i| i == 0);
         if a_single != b_single {
             return if a_single {
                 std::cmp::Ordering::Less
@@ -2372,7 +2372,6 @@ fn parse_torrentio_title(title: &str) -> (u32, String, String) {
         .find("⚙️")
         .and_then(|i| {
             title[i + "⚙️".len()..]
-                .trim()
                 .split_whitespace()
                 .next()
                 .map(String::from)

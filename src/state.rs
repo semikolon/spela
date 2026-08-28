@@ -41,7 +41,7 @@ pub const PLACE_CLEAR_FRACTION: f64 = 0.995;
 /// Or within this many seconds of the end — the credits-roll case.
 pub const PLACE_CLEAR_TAIL_SECS: f64 = 30.0;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppState {
     /// Keys whose completion has already been recorded for the CURRENT watch, so the
     /// ledger write fires once per playback instead of on every position report. In
@@ -301,24 +301,6 @@ impl Default for Preferences {
             default_target: default_target(),
             chromecast_name: None,
             preferred_quality: default_quality(),
-        }
-    }
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self {
-            completion_latched: std::collections::HashSet::new(),
-            current: None,
-            history: Vec::new(),
-            watched: Vec::new(),
-            preferences: Preferences::default(),
-            resume_positions: HashMap::new(),
-            queue: Vec::new(),
-            corrupt_files: std::collections::HashSet::new(),
-            pending_watched: Vec::new(),
-            dismissed_watched: std::collections::HashSet::new(),
-            in_progress: HashMap::new(),
         }
     }
 }
