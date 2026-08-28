@@ -58,6 +58,10 @@ pub struct ServerState {
     /// be given up on. The Chromecast path gets this from `check_torrent_progress`, which
     /// blocks; the readiness endpoint is polled every ~1.5s and cannot block, so it
     /// measures elapsed time across polls instead.
+    /// Media duration per torrent, probed ONCE from the partial file. Runway is only
+    /// meaningful in seconds-of-video, which needs a duration, and while a stream is still
+    /// buffering nothing is playing yet so `live_position` has none.
+    pub media_dur: Mutex<HashMap<u32, f64>>,
     pub vlc_first_poll: Mutex<HashMap<u32, Instant>>,
     /// Result ids whose source race has already been run, so a ~1.5s poll cannot start a
     /// fresh race on every tick.
@@ -271,6 +275,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         torrent_engine,
         host_allowlist,
         warmup: Mutex::new(None),
+        media_dur: Mutex::new(HashMap::new()),
         vlc_first_poll: Mutex::new(HashMap::new()),
         vlc_raced: Mutex::new(HashSet::new()),
         live_position: Mutex::new(None),
@@ -8657,27 +8662,56 @@ async fn handle_vlc_ready(
     // RUNWAY, not percent. Percent-downloaded is the number that told Fredrik "32%" while
     // he had seven minutes of watchable video, and playback stalled exactly at the seven.
     // The contiguous run from the playhead is what he can actually act on.
-    let runway = state
+    let file_path = state
         .torrent_engine
         .file_relative_path(tid, file_index.unwrap_or(0) as usize)
-        .map(|rel| resolve_media_dir(&state).join(rel))
-        .and_then(|p| {
-            let dur = lock_recover(&state.live_position)
-                .as_ref()
-                .map(|lp| lp.dur)
-                .filter(|d| *d > 0.0)
-                .unwrap_or(0.0);
-            let from = lock_recover(&state.live_position)
-                .as_ref()
-                .map(|lp| lp.abs_secs)
-                .unwrap_or(0.0);
-            let from_byte = if dur > 0.0 && total > 0 {
-                (from / dur * total as f64) as u64
-            } else {
-                0
-            };
-            disk::runway_secs(p.as_path(), from_byte, total, dur)
-        });
+        .map(|rel| resolve_media_dir(&state).join(rel));
+    // Runway needs a DURATION to be expressed in minutes, and while a stream is still
+    // buffering nothing is playing yet so `live_position` has none. The file itself does:
+    // the container header downloads first, so ffprobe reads it off the partial. Cached
+    // per torrent — it never changes, and the probe is the only non-trivial cost here.
+    // Runway needs a DURATION to be expressed in minutes, and while a stream is still
+    // buffering nothing is playing yet so `live_position` has none. The file itself does:
+    // the container header downloads first, so ffprobe reads it off the partial. Cached
+    // per torrent — it never changes, and the probe is the only non-trivial cost here.
+    //
+    // Every guard is read into a plain value and DROPPED before the await: holding a
+    // std::sync MutexGuard across an await makes the future non-Send, which axum rejects
+    // at compile time with a Handler trait error that names nothing useful.
+    let live_dur = {
+        let g = lock_recover(&state.live_position);
+        g.as_ref().map(|lp| lp.dur).filter(|d| *d > 0.0)
+    };
+    let cached_dur = { lock_recover(&state.media_dur).get(&tid).copied() };
+    let dur = match (live_dur, cached_dur) {
+        (Some(d), _) | (None, Some(d)) => Some(d),
+        (None, None) => match (&file_path, bytes > 0) {
+            (Some(p), true) => {
+                let probed = crate::transcode::detect_codecs(&p.to_string_lossy(), None)
+                    .await
+                    .ok()
+                    .and_then(|c| c.duration)
+                    .filter(|d| *d > 0.0);
+                if let Some(d) = probed {
+                    lock_recover(&state.media_dur).insert(tid, d);
+                }
+                probed
+            }
+            _ => None,
+        },
+    };
+    let playhead = {
+        let g = lock_recover(&state.live_position);
+        g.as_ref().map(|lp| lp.abs_secs).unwrap_or(0.0)
+    };
+    let runway = file_path.as_ref().zip(dur).and_then(|(p, d)| {
+        let from_byte = if total > 0 {
+            (playhead / d * total as f64) as u64
+        } else {
+            0
+        };
+        disk::runway_secs(p.as_path(), from_byte, total, d)
+    });
     Json(json!({
         "ready": ready,
         "pct": (frac * 100.0) as u32,
