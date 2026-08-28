@@ -31,17 +31,17 @@ when the signal is there it is the most reliable statement of intent available, 
 explicit stop past the watched mark now clears the place. Detail: CLAUDE.md Hard-Won
 "Completion is an EVENT".
 
-### Open — should the play QUEUE fire on the VLC path? (a UX call, not a gap)
-CORRECTION to this entry's first wording, which called it "auto-next-episode": it is a
-MANUAL FIFO, not automatic episode advancement. You line something up (`spela queue <N>` /
-`POST /queue`) and `cast_health_monitor` pops the front item at natural EOF and self-calls
-`/play`. Nothing chooses the next episode for you.
+### Next-episode enqueue into the running VLC — SHIPPED 2026-08-28, ONE live step left ✅
+Supersedes "port the Chromecast queue": Fredrik's idea is better. VLC's `in_enqueue`
+appends to its own playlist, so the next episode continues with NO relaunch and no gap.
+Verified against a headless VLC (advances by itself at EOF), and the serving half verified
+live (206 + Range by title; traversal attempt → 404). Auto-fires off the completion latch;
+`vlc_autoqueue_next` disables it.
 
-It is Chromecast-only because it lives in that monitor. Everything needed for VLC exists
-now (completion fires as an event via the bridge's position posts), but firing it would
-RELAUNCH VLC on Fredrik's desktop, which is more intrusive than advancing a cast on a TV
-he is already sitting in front of. **Ask before building** — Layer-1 behaviour question,
-and low value while the queue is rarely used.
+**The one thing not yet seen end-to-end**: an actual hand-off between two episodes, because
+it is LOCAL-ONLY and Star City S01E02 is a sparse placeholder from a season pack, not
+downloaded. Download E02 first, then play E01 to the watched mark and watch it roll. Detail:
+CLAUDE.md Hard-Won "Next-episode ENQUEUE".
 
 ### Open — recommender + ledger follow-ups (2026-08-27)
 - **Rating — SHIPPED 2026-08-27.** `WatchedEntry.rating: Option<i8>` (`1` loved / `0` fine / `-1` no; `None` = UNRATED and MUST stay distinguishable from "fine"). `POST /watched-rate`; rating a SHOW applies to all its episode rows and a re-mark carries the judgement across. Rewatch renders TWO toggles, never a cycle, plus a Loved-only filter.
