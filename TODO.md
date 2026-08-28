@@ -43,6 +43,30 @@ it is LOCAL-ONLY and Star City S01E02 is a sparse placeholder from a season pack
 downloaded. Download E02 first, then play E01 to the watched mark and watch it roll. Detail:
 CLAUDE.md Hard-Won "Next-episode ENQUEUE".
 
+### Open — streaming plays need SEQUENTIAL piece priority (2026-08-28)
+Measured on a live 4K stall (Silo S03E09, 9.91 GB): **3.14 GB present (32%) spread over 289
+separate extents**, with only **1.12 GB contiguous from the start ≈ 7.0 min of video**.
+Fredrik stalled at 5:56 — the contiguous frontier, exactly. The other 2 GB was downloaded
+but unusable for linear playback.
+
+So a third of the file bought seven minutes. With sequential priority the same 32% would
+have been ~20 minutes of runway, and the same stall would have happened three times later
+or not at all on a faster swarm.
+
+**Also corrected here**: an earlier explanation in this session blamed `prefetch_ends` for
+the scatter. Wrong — it reads **2 MB per end, 4 MB total**, 0.04% of a 9.9 GB file. The
+fragmentation is librqbit's default piece picker, not spela's prefetch.
+
+Next step: check whether librqbit exposes a sequential/streaming piece-priority mode for a
+handle (it drives `FileStream` reads today, which prioritise but do not order the rest),
+and if so set it for every play that is being STREAMED rather than merely downloaded.
+Measure the same way afterwards: `filefrag -v` on the file, contiguous-run-from-zero in
+minutes-of-video, not percent-downloaded.
+
+**Percent-downloaded is the wrong metric to show a viewer** — the `/vlc/ready` pct and any
+UI built on it say 32% while the truth is seven minutes. Contiguous runway is what the
+viewer actually has.
+
 ### Open — recommender + ledger follow-ups (2026-08-27)
 - **Rating — SHIPPED 2026-08-27.** `WatchedEntry.rating: Option<i8>` (`1` loved / `0` fine / `-1` no; `None` = UNRATED and MUST stay distinguishable from "fine"). `POST /watched-rate`; rating a SHOW applies to all its episode rows and a re-mark carries the judgement across. Rewatch renders TWO toggles, never a cycle, plus a Loved-only filter.
 - **imdb_id backfill — DONE 2026-08-27.** `POST /watched-backfill-ids` resolves ONE id per distinct title via `title_meta` with `auto_kind`, applies it to every row, idempotent — re-run it whenever the ledger grows. Ran clean: 107/107 rows carry a well-formed id.
