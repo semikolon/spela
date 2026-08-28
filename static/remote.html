@@ -508,7 +508,10 @@
        mid-air while the scrubber sank to the bottom — the space was filled, but by gaps.
        A single wrapper (.nowmeta) is what actually makes a column. */
     .nowfull:has(.bigposter){
-      display:flex; align-items:center; justify-content:center;
+      /* flex-direction MUST be restated: the base .nowfull rule is a column, and
+         setting display:flex alone leaves that column intact — the first fix looked
+         applied and changed nothing. */
+      display:flex; flex-direction:row; align-items:center; justify-content:center;
       gap:2.6rem; padding:2rem 2rem; max-width:1200px; margin:0 auto;
     }
     .nowfull:has(.bigposter) .bigposter{width:min(28vw,320px); flex:0 0 auto}
