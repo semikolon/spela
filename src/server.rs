@@ -430,6 +430,8 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/vlc/{id}/sub.srt", get(handle_vlc_sub))
         .route("/vlc/control", post(handle_vlc_control))
         .route("/vlc/pending", get(handle_vlc_pending))
+        .route("/vlc/enqueue-next", post(handle_vlc_enqueue_next))
+        .route("/vlc/episode/stream", get(handle_vlc_episode_stream))
         .route("/hls/master.m3u8", get(handle_hls_master))
         .route("/hls/playlist.m3u8", get(handle_hls_playlist))
         .route("/hls/init.mp4", get(handle_hls_init))
@@ -5295,8 +5297,23 @@ async fn handle_position(
         req.seconds,
         req.duration,
     );
+    // Did THIS report record the completion? The latch makes that observable exactly
+    // once per playback, which is the natural hook: it fires at the WATCHED mark rather
+    // than at the very end, so the remaining minutes double as buffer for the next
+    // episode. Compared before and after rather than changing the signature.
+    let just_completed = app.completion_latched.contains(&key);
     if changed {
         let _ = app.save(&state.state_dir);
+    }
+    if just_completed && state.config.vlc_autoqueue_next {
+        if let Some(t) = req.title.as_deref() {
+            let r = enqueue_next_episode(&state, t);
+            if r.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                // Not a failure worth surfacing: most often simply "the next episode is
+                // not downloaded", which is the ordinary case mid-season.
+                tracing::debug!("vlc autoqueue skipped: {}", r);
+            }
+        }
     }
     // 2026-08-04: the Mac-side VLC watcher POSTs VLC's true playhead here every
     // poll. Mirror it into the live cell (non-max, unlike the HWM) so the
@@ -8177,8 +8194,141 @@ async fn handle_vlc_control(
     Json(json!({ "ok": true }))
 }
 
+/// Work out the NEXT episode after the one whose title is given.
+///
+/// Pure so the decision is testable without a running VLC. Returns the next episode's
+/// `SxxExx` within the same season — deliberately NOT crossing a season boundary, because
+/// the next season's episode count is not knowable from the title alone and guessing
+/// would enqueue something that does not exist.
+pub fn next_episode_marker(title: &str) -> Option<(String, String)> {
+    let (show, season, episode) = crate::search::parse_episode_markers(title);
+    let (s, e) = (season?, episode?);
+    if show.trim().is_empty() {
+        return None;
+    }
+    Some((show, crate::following::fmt_se(s, e + 1)))
+}
+
 /// `GET /vlc/pending` — the watcher drains all queued VLC commands (returns +
 /// clears). Returns `{"cmds":[{"cmd":..,"val":..}, ...]}`.
+/// Percent-encode a query-string component. Small and local: spela has no url crate, and
+/// the one caller needs only this.
+fn urlencode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// `GET /vlc/episode/stream?title=<show SxxExx>` — serve a COMPLETE local episode by
+/// title, for an item VLC has been handed via `in_enqueue`.
+///
+/// Resolution happens HERE, from the title, through the same Local-Bypass matcher the
+/// rest of the server uses. The enqueued URL therefore never contains a filesystem path,
+/// so there is nothing for a traversal attempt to aim at, and the file served is by
+/// definition one spela already matched to a known episode.
+async fn handle_vlc_episode_stream(
+    State(state): State<SharedState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let title = params.get("title").map(|s| s.as_str()).unwrap_or("");
+    if title.is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, "title required").into_response();
+    }
+    let mut roots = vec![resolve_media_dir(&state)];
+    roots.extend(state.config.library_dirs());
+    let corrupt = AppState::load(&state.state_dir).corrupt_files;
+    match first_local_bypass_match(&roots, title, None, 0, &corrupt) {
+        Some(path) if is_physically_full(&path, 0) => {
+            serve_static_with_range(path, "video/x-matroska", &headers).await
+        }
+        _ => (axum::http::StatusCode::NOT_FOUND, "no complete local file").into_response(),
+    }
+}
+
+/// `POST /vlc/enqueue-next` — line the NEXT episode up inside the RUNNING VLC.
+///
+/// Fredrik's idea, and better than the Chromecast queue's shape: rather than stopping and
+/// relaunching, VLC's own `in_enqueue` appends to its playlist. Verified 2026-08-28
+/// against a live headless VLC — the current item keeps playing untouched and VLC
+/// advances to the appended one BY ITSELF at end of file, so there is no relaunch and no
+/// gap between episodes.
+///
+/// LOCAL-ONLY BY DESIGN, for now. It enqueues only an episode that is already complete on
+/// disk, because an enqueued URL that is not ready yet would hand VLC a stalling stream
+/// with no way to report why. Searching for a torrent here would also clobber
+/// `last_search`, which `play N` depends on — so a not-yet-downloaded next episode
+/// answers honestly instead of guessing.
+async fn handle_vlc_enqueue_next(
+    State(state): State<SharedState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    // Prefer the caller's title; fall back to whatever VLC is currently reporting.
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            lock_recover(&state.live_position)
+                .as_ref()
+                .map(|p| p.title.clone())
+        })
+        .unwrap_or_default();
+    Json(enqueue_next_episode(&state, &title))
+}
+
+/// Resolve the next episode and hand the bridge an `enqueue` command.
+///
+/// Shared by the manual endpoint and the automatic fire at completion so the two can
+/// never drift apart.
+fn enqueue_next_episode(state: &SharedState, title: &str) -> Value {
+    let Some((show, next_se)) = next_episode_marker(title) else {
+        return json!({"ok": false, "error": "no SxxExx in the current title"});
+    };
+    let wanted = format!("{} {}", show.trim(), next_se);
+
+    let mut roots = vec![resolve_media_dir(state)];
+    roots.extend(state.config.library_dirs());
+    let corrupt = AppState::load(&state.state_dir).corrupt_files;
+    let Some(path) = first_local_bypass_match(&roots, &wanted, None, 0, &corrupt) else {
+        return json!({
+            "ok": false, "next": wanted,
+            "error": "next episode is not downloaded yet"
+        });
+    };
+    if !is_physically_full(&path, 0) {
+        return json!({
+            "ok": false, "next": wanted,
+            "error": "next episode is still downloading"
+        });
+    }
+
+    // The URL carries the TITLE, never a path. `/vlc/episode/stream` re-resolves it
+    // server-side through the same matcher, so no client-supplied filesystem path is ever
+    // honoured and a traversal attempt has nothing to aim at.
+    let url = format!(
+        "http://{}:{}/vlc/episode/stream?title={}",
+        state.config.stream_host,
+        state.config.port,
+        urlencode_component(&wanted)
+    );
+    {
+        let mut q = lock_recover(&state.vlc_commands);
+        if q.len() < 32 {
+            q.push(json!({"cmd": "enqueue", "val": url}));
+        }
+    }
+    tracing::info!("vlc: enqueued '{}' into the running playlist", wanted);
+    json!({"ok": true, "next": wanted})
+}
+
 async fn handle_vlc_pending(State(state): State<SharedState>) -> Json<Value> {
     let cmds: Vec<Value> = std::mem::take(&mut *lock_recover(&state.vlc_commands));
     Json(json!({ "cmds": cmds }))
@@ -12377,5 +12527,61 @@ mod spa_pure_tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(stdout.contains("ALL PASS"), "unexpected output:\n{stdout}");
+    }
+}
+
+#[cfg(test)]
+mod vlc_enqueue_next_tests {
+    use super::{next_episode_marker, urlencode_component};
+
+    #[test]
+    fn the_next_episode_is_the_one_after_it_in_the_same_season() {
+        let (show, se) = next_episode_marker("Star City S01E01 The Eyes 1080p WEB-DL").unwrap();
+        assert_eq!(se, "S01E02");
+        assert!(
+            show.to_lowercase().contains("star city"),
+            "got show {show:?}"
+        );
+    }
+
+    #[test]
+    fn double_digit_episodes_keep_their_padding() {
+        assert_eq!(
+            next_episode_marker("Silo S03E09 Farewell").unwrap().1,
+            "S03E10"
+        );
+        assert_eq!(next_episode_marker("Show S02E10").unwrap().1, "S02E11");
+    }
+
+    /// A film, or anything without a marker, has no "next" — returning a guess would
+    /// enqueue something that does not exist.
+    #[test]
+    fn a_title_without_an_episode_marker_has_no_next() {
+        assert!(next_episode_marker("The Matrix 1999 1080p BluRay").is_none());
+        assert!(next_episode_marker("").is_none());
+    }
+
+    /// Deliberately does NOT cross a season boundary: the season's episode count is not
+    /// knowable from the title, so rolling S01E10 into S02E01 would be a guess. The last
+    /// episode of a season simply yields the non-existent next one, which the caller then
+    /// fails to find locally and reports honestly — better than inventing a season jump.
+    #[test]
+    fn it_does_not_invent_a_season_rollover() {
+        assert_eq!(next_episode_marker("Show S01E10").unwrap().1, "S01E11");
+    }
+
+    #[test]
+    fn the_enqueued_url_component_is_escaped() {
+        // Spaces and punctuation must survive the round trip into VLC's input= param.
+        assert_eq!(
+            urlencode_component("Star City S01E02"),
+            "Star%20City%20S01E02"
+        );
+        assert_eq!(urlencode_component("a&b=c"), "a%26b%3Dc");
+        assert_eq!(urlencode_component("Widow's Bay"), "Widow%27s%20Bay");
+        assert_eq!(
+            urlencode_component("plain-Title_1.0~x"),
+            "plain-Title_1.0~x"
+        );
     }
 }

@@ -149,6 +149,15 @@ pub struct Config {
     /// (relevant after the 2026-07-05 e1000e NIC-hang fix). `false` = today's
     /// single-source behavior, zero regression. Local Bypass plays never race
     /// (the local file is already instant).
+    /// 2026-08-28: when a VLC watch reaches the WATCHED threshold, line the next
+    /// episode up inside the RUNNING VLC via its own `in_enqueue`, so it continues with
+    /// no relaunch and no gap. Fires at the watched mark rather than at the very end,
+    /// which leaves the remaining minutes as buffer.
+    ///
+    /// Local-only: it enqueues an episode already complete on disk. Set false to switch
+    /// it off without a rebuild.
+    #[serde(default = "default_true")]
+    pub vlc_autoqueue_next: bool,
     #[serde(default = "default_true")]
     pub race_sources_enabled: bool,
     /// Race only when the top pick's reported seed count is below this. Default
@@ -250,6 +259,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: default_server(),
+            vlc_autoqueue_next: true,
             default_device: String::new(),
             subtitles: default_subtitles(),
             quality: default_quality(),
