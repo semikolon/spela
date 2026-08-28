@@ -2676,7 +2676,8 @@ function renderNowFull(){
     { const vEl=$("#phvid"); if(vEl) vEl.addEventListener("playing",()=>{ const b=$("#phbuf"); if(b) b.remove(); },{once:true}); }
     $("#phStop").onclick=async()=>{ const v=$("#phvid"); if(v){ v.pause(); v.remove(); }
       await api("/stop",{method:"POST"}).catch(()=>{});
-      S.now.phone=false; S.now.data=null; $("#nowbar").classList.remove("on"); stopPolling(); renderNowFull(); };
+      S.now.phone=false; S.now.data=null; $("#nowbar").classList.remove("on"); stopPolling(); renderNowFull();
+      leaveNowViewAfterStop(); };
     $("#phTo").onclick=()=>{ const v=$("#phvid"); if(v) v.pause(); openSheet(); };
     return;
   }
@@ -2758,6 +2759,16 @@ async function transport(path){ await api(path,{method:"POST"}).catch(()=>toast(
    playing. Now: optimistically fade the now-playing surface the instant you tap
    (the fade-out IS the confirmation — NN/g: smooth transition, not a snap), a
    brief "Stopped" toast, and the backend stops the cast itself. */
+// After a stop there is nothing left to look at on the Now view, so return to the
+// landing page — which is also where the Continue rail now reflects what just happened.
+//
+// Guarded on ACTUALLY being on the Now view: a stop triggered from anywhere else must not
+// yank the user off the page they are on. Uses the hash, so `route()` does the render and
+// this stays one line rather than a second rendering path.
+function leaveNowViewAfterStop(){
+  if((location.hash||"").startsWith("#/now")) location.hash = "#/home";
+}
+
 async function stopPlayback(){
   if(S.now.stopping) return;
   if(S.now.vlc){   // VLC: tell the Mac watcher to stop VLC, clear the now-view
@@ -2765,7 +2776,7 @@ async function stopPlayback(){
     await api("/vlc/control",{method:"POST",body:{cmd:"stop"}}).catch(()=>{});
     toast("Stopped VLC");
     S.now.vlc=false; S.now.data=null; S.now.playing=false; S.now.stopping=false;
-    $("#nowbar").classList.remove("on"); renderNowFull(); return;
+    $("#nowbar").classList.remove("on"); renderNowFull(); leaveNowViewAfterStop(); return;
   }
   S.now.stopping=true; stopPolling();
   const nf=$("#nowFull");
@@ -2778,6 +2789,7 @@ async function stopPlayback(){
   $("#nowbar").classList.remove("on","fading");
   if(nf) nf.style.opacity="";
   renderNowFull();
+  leaveNowViewAfterStop();
 }
 async function togglePlay(){
   const toPause=S.now.playing;
