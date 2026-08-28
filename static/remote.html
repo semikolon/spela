@@ -531,6 +531,11 @@
   }
 
 
+  /* Runway line: quiet by default, amber when thin, red when actually stalled. */
+  .sub.rw{font-variant-numeric:tabular-nums}
+  .sub.rw.warn{color:#e3bd6a}
+  .sub.rw.bad{color:#e58a8a;font-weight:600}
+
   @media (max-width:560px){
     .brand small{display:none}               /* drop " remote" — saves width */
     nav a .lbl{display:none}                 /* icon-only tabs */
@@ -897,7 +902,10 @@ async function vlcWaitReady(id, gen){
     // Switch to it rather than keep waiting on a source that is losing.
     if(d && d.switch_to) return {switchTo:d.switch_to};
     // Drive the loading surface (not a transient toast) — matches the Chromecast warmup.
-    S.now.warmup={active:true, vlc:true, pct:(d&&d.pct!=null)?d.pct:0};
+    // Runway, not percent: "32%" said nothing while seven minutes were left, and
+    // playback stalled at exactly seven. Minutes are what a viewer can act on.
+    S.now.warmup={active:true, vlc:true, pct:(d&&d.pct!=null)?d.pct:0,
+      runway:(d&&d.runway_secs!=null)?d.runway_secs:null};
     if(S.now.warming) renderWarmPanel();
     await new Promise(r=>setTimeout(r,1500));
   }
@@ -2295,6 +2303,24 @@ function prettyEp(name){
 // 148 -> "2h 28m"; under an hour stays in minutes. A bare "148 min" makes the reader
 // do the division every time, and runtime is exactly the number you scan when deciding
 // what fits tonight.
+// Runway is a decision aid, so it reads in the units the decision is made in. Under a
+// minute is the "about to stall" case and says so plainly.
+// The line that was missing when a 4K stream stalled with no warning: how much is
+// downloaded AHEAD of where you are. Amber when the buffer is thin, plain when it is
+// comfortable, and explicit when playback has actually stopped moving.
+function runwayLine(){
+  const r=S.now.runway;
+  if(S.now.stalled) return `<div class="sub rw bad">Stalled — waiting for data${r!=null?" · "+fmtRunway(r)+" ready":""}</div>`;
+  if(r==null) return "";
+  const thin = r < 180;
+  return `<div class="sub rw${thin?" warn":""}">${fmtRunway(r)} downloaded ahead${thin?" · may stall":""}</div>`;
+}
+function fmtRunway(secs){
+  if(secs==null) return "";
+  if(secs < 60) return "under a minute";
+  const m=Math.round(secs/60);
+  return m < 60 ? "~"+m+" min" : "~"+Math.floor(m/60)+"h "+(m%60)+"m";
+}
 function fmtRuntime(min){
   if(!min) return "";
   if(min < 60) return min+" min";
@@ -2483,7 +2509,12 @@ async function pollVlc(){
   if(title){
     try{ const p=await api(`/api/position?title=${encodeURIComponent(title)}`);
       if(p){ if(typeof p.t==="number"&&p.t>=0){ S.now.posAbs=p.t; S.now.lastSync=Date.now(); }
-             if(p.dur>0) S.now.dur=p.dur; } }catch{}
+             if(p.dur>0) S.now.dur=p.dur;
+             // How much is watchable AHEAD of the playhead, and whether the picture is
+             // actually moving. VLC reports "playing" while starved, so the clock is the
+             // only honest signal and the bridge derives it there.
+             S.now.runway = (p.runway_secs!=null) ? p.runway_secs : null;
+             S.now.stalled = !!p.stalled; } }catch{}
   }
   $("#nowbar").classList.add("on"); updateNowBar();
   if(currentView()==="now" && !S.now.seekDrag) renderNowFull();
@@ -2609,7 +2640,10 @@ function renderWarmPanel(){
   const phase=w.phase||"connecting", t=w.torrent;
   let label, barPct=null, sub="";
   if(w.vlc){
-    label="Buffering for VLC…"; barPct=(w.pct!=null)?w.pct:null; sub="opens automatically when ready";
+    label="Buffering for VLC…"; barPct=(w.pct!=null)?w.pct:null;
+    sub = (w.runway!=null && w.runway>0)
+      ? fmtRunway(w.runway)+" ready · opens automatically"
+      : "opens automatically when ready";
     // Say it out loud when a dead source is skipped. A play that silently switches
     // source is indistinguishable from one that ignored what you picked.
     if(S.now.vlcNote){ label="Switching source…"; sub=S.now.vlcNote; barPct=null; }
@@ -2726,6 +2760,7 @@ function renderNowFull(){
       <button class="tbtn" id="tStop" title="Stop" aria-label="Stop">${ic("stop")}</button>
     </div>
     ${!S.now.endlist&&S.now.frontier?`<div class="sub">Seekable up to ${fmt(S.now.frontier)} (still transcoding)</div>`:""}
+    ${runwayLine()}
     </div>
   </div>`;
   const sl=$("#fSeek");

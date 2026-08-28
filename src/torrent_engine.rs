@@ -24,7 +24,7 @@
 // on `config.torrent_backend = "librqbit"`, which defaults to "webtorrent" for now.
 
 use anyhow::{anyhow, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -350,6 +350,24 @@ impl TorrentEngine {
     /// NEVER blocks the caller or the serve path (safe to stage unverified — it's
     /// additive and isolated). The read of a not-yet-downloaded tail simply waits
     /// while librqbit fetches it with priority; that's the point.
+    /// On-disk path of one file in a torrent, for measuring what is actually there.
+    ///
+    /// Needed because the runway measurement reads the FILE (one `lseek(SEEK_HOLE)`)
+    /// rather than a piece bitmap — librqbit's `TorrentStats` exposes no bitmap, and the
+    /// file is the ground truth anyway.
+    /// RELATIVE path — librqbit's output folder lives on a crate-private options struct,
+    /// so the caller joins this with the media dir it already knows.
+    pub fn file_relative_path(&self, id: u32, file_idx: usize) -> Option<PathBuf> {
+        let handle = self.handle(id)?;
+        handle
+            .with_metadata(|m| {
+                m.file_infos
+                    .get(file_idx)
+                    .map(|fi| fi.relative_filename.clone())
+            })
+            .ok()?
+    }
+
     pub fn prefetch_ends(&self, id: u32, file_idx: usize) {
         let Some(handle) = self.handle(id) else {
             return;

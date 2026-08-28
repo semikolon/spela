@@ -87,3 +87,12 @@ eq(api.prettyEp("S01E01"), "S01E01", "a well-formed marker passes through");
 
 console.log(failed === 0 ? "ALL PASS" : `${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);
+
+// --- fmtRunway: the replacement for percent-downloaded ------------------------------
+const RW = new Function(extract("fmtRunway") + "\nreturn fmtRunway;")();
+eq(RW(null), "", "no measurement → say nothing rather than zero");
+eq(RW(30), "under a minute", "the about-to-stall case says so plainly");
+eq(RW(59), "under a minute", "just under the boundary");
+eq(RW(420), "~7 min", "the Silo case: 7 minutes, which is what 32% actually meant");
+eq(RW(3600), "~1h 0m", "an hour reads as hours");
+eq(RW(4500), "~1h 15m", "over an hour keeps the minutes");

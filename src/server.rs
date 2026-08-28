@@ -104,6 +104,9 @@ pub struct ServerState {
 pub struct LivePosition {
     pub title: String,
     pub abs_secs: f64,
+    /// Playback is not advancing even though VLC reports "playing". Carried so /status
+    /// and /api/position describe the SCREEN rather than repeating VLC's label.
+    pub stalled: bool,
     /// 2026-08-04: media duration (0 if unknown). Only the VLC scrubber reads
     /// this (via `/api/position`) — the Chromecast scrubber takes duration from
     /// `/status`'s `current.duration`. The VLC watcher's `/position` POST feeds it.
@@ -4366,6 +4369,9 @@ async fn cast_health_monitor(
                                 title: t.clone(),
                                 abs_secs: absolute,
                                 dur: 0.0,
+                                // Chromecast path: cast_health_monitor owns liveness
+                                // here, so there is no VLC stall to report.
+                                stalled: false,
                             });
                         }
                     }
@@ -5276,6 +5282,11 @@ struct SetResumeRequest {
     title: Option<String>,
     seconds: f64,
     duration: Option<f64>,
+    /// True when the VLC bridge sees the CLOCK standing still while VLC still calls
+    /// itself "playing" — a starved stream. VLC's own state field cannot be trusted for
+    /// this, so the bridge derives it from clock advancement and reports it here.
+    #[serde(default)]
+    stalled: bool,
 }
 
 /// `POST /position` {imdb_id, title, seconds, duration} — set the resume high-water
@@ -5325,6 +5336,7 @@ async fn handle_position(
             title: t,
             abs_secs: req.seconds,
             dur: req.duration.unwrap_or(0.0),
+            stalled: req.stalled,
         });
     }
     Json(json!({ "ok": changed, "key": key }))
@@ -5496,6 +5508,8 @@ async fn handle_seek(
                 title: current.title.clone(),
                 abs_secs: absolute_pos,
                 dur: 0.0,
+                // A just-issued seek is by definition not a stall.
+                stalled: false,
             });
             tracing::info!(
                 "Seek: '{}' on '{}' to absolute {:.0}s (stream {:.0}s, ss_offset={:.0}s)",
@@ -8640,11 +8654,36 @@ async fn handle_vlc_ready(
                 .torrent_engine
                 .ends_present(tid, file_index.unwrap_or(0) as usize)
                 .await);
+    // RUNWAY, not percent. Percent-downloaded is the number that told Fredrik "32%" while
+    // he had seven minutes of watchable video, and playback stalled exactly at the seven.
+    // The contiguous run from the playhead is what he can actually act on.
+    let runway = state
+        .torrent_engine
+        .file_relative_path(tid, file_index.unwrap_or(0) as usize)
+        .map(|rel| resolve_media_dir(&state).join(rel))
+        .and_then(|p| {
+            let dur = lock_recover(&state.live_position)
+                .as_ref()
+                .map(|lp| lp.dur)
+                .filter(|d| *d > 0.0)
+                .unwrap_or(0.0);
+            let from = lock_recover(&state.live_position)
+                .as_ref()
+                .map(|lp| lp.abs_secs)
+                .unwrap_or(0.0);
+            let from_byte = if dur > 0.0 && total > 0 {
+                (from / dur * total as f64) as u64
+            } else {
+                0
+            };
+            disk::runway_secs(p.as_path(), from_byte, total, dur)
+        });
     Json(json!({
         "ready": ready,
         "pct": (frac * 100.0) as u32,
         "bytes": bytes,
         "total": total,
+        "runway_secs": runway,
         "phase": if finished { "complete" } else if ready { "buffered" } else { "buffering" },
     }))
 }
@@ -9314,11 +9353,46 @@ async fn handle_get_position(
             .map(|lp| lp.dur)
             .unwrap_or(0.0)
     };
+    let stalled = {
+        let g = lock_recover(&state.live_position);
+        g.as_ref()
+            .filter(|lp| Some(lp.title.as_str()) == query.title.as_deref())
+            .map(|lp| lp.stalled)
+            .unwrap_or(false)
+    };
     let pos = match live {
         Some(p) => p,
         None => AppState::load(&state.state_dir).get_position(query.imdb_id.clone(), query.title),
     };
-    Json(json!({"imdb_id": query.imdb_id, "t": pos, "dur": dur}))
+    // RUNWAY while playing — the number that would have warned Fredrik the 4K stall was
+    // coming instead of surprising him at 5:56. Measured from the CURRENT playhead, since
+    // that is where the question "how much can I still watch" is asked from. Best-effort:
+    // absent for a Chromecast stream or a complete local file, where it means nothing.
+    let runway = active_vlc_runway_secs(&state, pos, dur);
+    Json(json!({
+        "imdb_id": query.imdb_id, "t": pos, "dur": dur,
+        "runway_secs": runway,
+        "stalled": stalled,
+    }))
+}
+
+/// Contiguous runway in seconds for whichever torrent the VLC path is currently serving.
+///
+/// Returns None when there is no such torrent (Chromecast stream, complete local file, or
+/// nothing playing) — the caller then simply shows no runway rather than a wrong zero.
+fn active_vlc_runway_secs(state: &SharedState, playhead: f64, dur: f64) -> Option<f64> {
+    if dur <= 0.0 {
+        return None;
+    }
+    let tid = *lock_recover(&state.vlc_torrents).last()?;
+    let p = state.torrent_engine.progress(tid)?;
+    if p.finished || p.bytes_total == 0 {
+        return None;
+    }
+    let rel = state.torrent_engine.file_relative_path(tid, 0)?;
+    let path = resolve_media_dir(state).join(rel);
+    let from_byte = (playhead / dur * p.bytes_total as f64) as u64;
+    disk::runway_secs(path.as_path(), from_byte, p.bytes_total, dur)
 }
 
 /// Pure decision for the scrubber's live position: return the live cell's
@@ -9970,6 +10044,7 @@ mod tests {
             title: "Spider-Noir S01E02".into(),
             abs_secs: 1375.0,
             dur: 0.0,
+            stalled: false,
         };
         // Backward seek to 1375 on the SAME stream → live wins (would snap to
         // the 1575 HWM without this).
