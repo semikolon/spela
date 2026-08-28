@@ -12347,3 +12347,35 @@ mod vlc_stall_gate_tests {
         assert_eq!(vlc_stall_gate_secs(0), 12);
     }
 }
+
+/// The web remote's pure helpers, exercised through `tests/spa_pure.mjs`.
+///
+/// static/remote.html is a deliberately build-free single asset, so there is nothing to
+/// import from and most of it needs a DOM — a fine reason for the DOM-heavy parts to go
+/// untested and a poor one for the pure policy functions. Running them from here means
+/// `cargo test` remains the ONE command that covers the project, rather than a JS suite
+/// nobody remembers to run.
+#[cfg(test)]
+mod spa_pure_tests {
+    #[test]
+    fn web_remote_pure_helpers() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/spa_pure.mjs");
+        let out = match std::process::Command::new("node").arg(script).output() {
+            Ok(o) => o,
+            // No node on this machine: SKIP rather than fail. A missing toolchain is not
+            // a broken remote, and failing here would make the Rust suite unrunnable on a
+            // host that never touches the frontend.
+            Err(_) => {
+                eprintln!("node not found — skipping the web-remote helper tests");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "web-remote pure helpers failed:\n{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("ALL PASS"), "unexpected output:\n{stdout}");
+    }
+}
