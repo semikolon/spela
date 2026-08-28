@@ -8201,8 +8201,13 @@ async fn handle_vlc_control(
 /// the next season's episode count is not knowable from the title alone and guessing
 /// would enqueue something that does not exist.
 pub fn next_episode_marker(title: &str) -> Option<(String, String)> {
-    let (show, season, episode) = crate::search::parse_episode_markers(title);
+    let (_, season, episode) = crate::search::parse_episode_markers(title);
     let (s, e) = (season?, episode?);
+    // The SHOW name comes from `clean_title_for_tmdb`, which truncates at the scene
+    // stop-token, NOT from parse_episode_markers — that only removes the SxxExx and
+    // leaves the release junk, so a real name yielded
+    // "Star.City..1080p.HEVC.x265-MeGusta S01E02" and matched nothing on disk.
+    let show = crate::search::clean_title_for_tmdb(title);
     if show.trim().is_empty() {
         return None;
     }
@@ -12541,6 +12546,22 @@ mod vlc_enqueue_next_tests {
         assert!(
             show.to_lowercase().contains("star city"),
             "got show {show:?}"
+        );
+    }
+
+    /// A REAL release name, copied from what is actually on disk. The show name must come
+    /// out clean: parse_episode_markers alone only strips the SxxExx and leaves the rest,
+    /// which produced "Star.City..1080p.HEVC.x265-MeGusta S01E02" and matched nothing.
+    #[test]
+    fn a_real_release_name_yields_a_clean_show_name() {
+        let (show, se) = next_episode_marker("Star.City.S01E01.1080p.HEVC.x265-MeGusta").unwrap();
+        assert_eq!(se, "S01E02");
+        assert_eq!(show.trim(), "Star City", "release junk must not survive");
+        let (show2, _) =
+            next_episode_marker("The.Diplomat.US.S03E01.1080p.WEB.h264-GRACE[EZTVx.to]").unwrap();
+        assert!(
+            !show2.contains("1080p") && !show2.contains("GRACE"),
+            "got {show2:?}"
         );
     }
 
