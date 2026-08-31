@@ -3103,7 +3103,21 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         // Apr 15, 2026: surfaces auto-resume to the CLI / voice-assistant
         // consumers. Some(pos) when do_play picked up a saved HWM,
         // None otherwise (fresh start, or explicit --seek that cleared HWM).
-        "resumed_from": auto_resumed_from
+        "resumed_from": auto_resumed_from,
+        // 2026-08-31: `resumed_from` alone is ambiguous for a browser client and
+        // acting on it blind is actively harmful. When the resume was honoured by
+        // ffmpeg's `-ss`, the stream ALREADY starts at that position and segment 0
+        // IS the resume point — so a client that also seeks there would land
+        // `resumed_from` seconds FURTHER in, past the transcode frontier, and stall.
+        // When the resume was not applied to the transcode (a cache HIT serves the
+        // complete set from 0 and expects the client to seek), it must seek.
+        // `ss_offset` is what distinguishes the two: seek only when it is 0.
+        //
+        // MUST mirror the CurrentStream fill exactly (`if is_transcoded { seek_to }
+        // else { 0.0 }`) — `seek_to` alone is NOT the offset. A cache HIT or a
+        // direct local-file play can carry a `seek_to` from auto-resume while
+        // running no ffmpeg at all, so its stream still starts at 0.
+        "ss_offset": if is_transcoded { seek_to.unwrap_or(0.0) } else { 0.0 }
     }))
 }
 

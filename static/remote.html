@@ -926,7 +926,7 @@ const S={
        vlc:false,vlcTitle:"",   // 2026-08-04 VLC-on-this-Mac remote-control now-view
        epLabel:"",epShort:"",   // 2026-08-06 which episode is playing ("S04E03 · Human Best Friend" / "S04E03")
        error:null},   // 2026-07-08 persistent play-start failure {title,poster,msg,retry}
-  pollTimer:null, frontierTimer:null, warmTimer:null, vlcTimer:null,
+  pollTimer:null, frontierTimer:null, warmTimer:null, vlcTimer:null, phoneFrontierTimer:null,
   pending:null,   // deferred play: tapped before a target was set → picker → resume
   followedIds:null   // Set<tmdb_id> of followed shows; lazily loaded (ensureFollowedIds)
 };
@@ -2344,9 +2344,81 @@ async function doPhoneDirect(opts,cardForSources,label){
   endWarming();
   if(r&&r.error){ showPlayError(label||opts.title,opts.poster_url,r.error,()=>doPhoneDirect(opts,cardForSources,label)); return; }
   S.now.phone=true; S.now.phoneLoading=false; S.now.everRan=true; S.now.playing=true;
-  S.now.data={title:label||"Playing",quality:"",poster_url:opts.poster_url||""};
+  // 2026-08-31: carry the resume + offset so the <video> can finish the job.
+  // `ss_offset` is the discriminator, NOT `resumed_from`: when ffmpeg honoured the
+  // resume with `-ss`, segment 0 already IS the resume point and seeking again would
+  // land ss_offset seconds further in — past the frontier, and stalled. Only when
+  // ss_offset is 0 (a cache HIT, or a complete local file, serving from the start)
+  // does the client owe a seek. The Chromecast path has always done this via
+  // cast.seek; the browser path never did, so resume was silently lost there.
+  S.now.phoneResume = (r && r.ss_offset ? 0 : (r && r.resumed_from) || 0);
+  S.now.phoneSought = false;
+  S.now.frontier=0; S.now.endlist=false;
+  S.now.data={title:label||"Playing",quality:"",poster_url:opts.poster_url||"",
+              ss_offset:(r&&r.ss_offset)||0};
   location.hash="#/now"; renderNowFull();                       // playing → now-view builds the <video> + buffering overlay
   pollNow(true);
+  startPhoneFrontierPoll();
+}
+/* The transcode frontier matters on the phone for exactly the reason it matters on
+   the Chromecast: VOD padding advertises the FULL episode duration, so the whole
+   timeline looks scrubbable while only the transcoded prefix exists. Seeking past it
+   makes handle_hls_segment long-poll 28s for a segment that is not there, and the
+   player gives up (observed 2026-08-31: four 499s on seg_00182, then a fall back to
+   seg_00000). pollNow() bails early for phone-direct, so the frontier has to be
+   pumped separately here. Stops at ENDLIST — once the whole file is transcoded the
+   entire timeline is genuinely seekable and there is nothing left to poll for. */
+function startPhoneFrontierPoll(){
+  stopPhoneFrontierPoll();
+  S.phoneFrontierTimer=setInterval(()=>{
+    if(!S.now.phone||S.now.endlist){ stopPhoneFrontierPoll(); return; }
+    pollFrontier();
+  },5000);
+  pollFrontier();
+}
+function stopPhoneFrontierPoll(){ clearInterval(S.phoneFrontierTimer); S.phoneFrontierTimer=null; }
+/* Give the phone's <video> the two things the Chromecast scrubber has always had:
+   a resume, and a seek that knows where the transcode actually reaches (2026-08-31).
+
+   RESUME — fires once, on loadedmetadata, only when the server did NOT already apply
+   the offset itself (see doPhoneDirect for why ss_offset is the discriminator).
+
+   SEEK — the native controls ARE the transport here, so we cannot intercept before
+   the fact; we react to `seeking` and correct. Past the frontier while transcoding,
+   or before the transcode's own start point, we hand it to /seek-retranscode — the
+   SAME endpoint the Chromecast scrubber uses, which restarts ffmpeg at that position.
+   Within the transcoded window it is left alone: those segments exist and the native
+   seek is instant. Without this the player silently stalls on a segment that will not
+   exist for minutes. */
+function wirePhoneSeek(v){
+  if(!v||v._spelaSeekWired) return;
+  v._spelaSeekWired=true;
+  v.addEventListener("loadedmetadata",()=>{
+    const t=S.now.phoneResume||0;
+    if(t>0&&!S.now.phoneSought){ S.now.phoneSought=true;
+      try{ v.currentTime=t; toast("Resuming at "+fmt(t)); }catch{} }
+  });
+  v.addEventListener("seeking",async()=>{
+    if(S.now.phoneRetranscoding) return;                 // our own rebuild, not a user seek
+    const ss=(S.now.data&&S.now.data.ss_offset)||0;
+    const abs=v.currentTime+ss;                          // native timeline is stream-relative
+    const pastFrontier=!S.now.endlist&&S.now.frontier>0&&abs>S.now.frontier;
+    const beforeStart=abs<ss-1;
+    if(!pastFrontier&&!beforeStart) return;              // inside the window — segments exist
+    S.now.phoneRetranscoding=true;
+    v.pause();
+    toast("Transcoding from "+fmt(abs)+"…");
+    const r=await api("/seek-retranscode",{method:"POST",body:{t:abs}}).catch(()=>({error:"unreachable"}));
+    if(r&&r.error){ toast("Couldn’t seek there: "+r.error); S.now.phoneRetranscoding=false; return; }
+    // The restart makes segment 0 mean `abs`, so the element must be rebuilt against
+    // the new stream rather than kept on a timeline that no longer applies.
+    S.now.data.ss_offset=abs; S.now.frontier=0; S.now.endlist=false;
+    S.now.phoneResume=0; S.now.phoneSought=true;
+    const old=$("#phvid"); if(old){ old.pause(); old.remove(); }
+    renderNowFull();
+    S.now.phoneRetranscoding=false;
+    startPhoneFrontierPoll();
+  });
 }
 let _hlsLoading;
 function attachPhoneVideo(v,src){
@@ -2821,8 +2893,10 @@ function renderNowFull(){
     </div>`;
     attachPhoneVideo($("#phvid"),"/hls/master.m3u8");
     { const vEl=$("#phvid"); if(vEl) vEl.addEventListener("playing",()=>{ const b=$("#phbuf"); if(b) b.remove(); },{once:true}); }
+    wirePhoneSeek($("#phvid"));
     $("#phStop").onclick=async()=>{ const v=$("#phvid"); if(v){ v.pause(); v.remove(); }
       await api("/stop",{method:"POST"}).catch(()=>{});
+      stopPhoneFrontierPoll();
       S.now.phone=false; S.now.data=null; $("#nowbar").classList.remove("on"); stopPolling(); renderNowFull();
       leaveNowViewAfterStop(); };
     $("#phTo").onclick=()=>{ const v=$("#phvid"); if(v) v.pause(); openSheet(); };

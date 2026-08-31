@@ -707,15 +707,40 @@ mod runway_tests {
         f.write_all(&vec![7u8; 1024 * 1024]).unwrap();
         f.sync_all().unwrap();
         drop(f);
+
+        // 2026-08-31: verify the FILESYSTEM actually made a hole before asserting that
+        // we detect one. `set_len` + a partial write is a REQUEST for sparseness, not a
+        // guarantee — on the dev Mac's APFS the file comes back fully allocated, so
+        // `contiguous_from` correctly reports all 8MB and the assertion below failed for
+        // a filesystem reason rather than a logic one. (It failed on a clean checkout of
+        // HEAD too, so it was never related to the change under test.) Production runs on
+        // Darwin/ext4, where the hole is real and this test does its job.
+        //
+        // st_blocks is the ground truth: a genuinely sparse 8MB file allocates far fewer
+        // than 8MB of 512-byte blocks. If the FS declined to make a hole, the premise
+        // does not hold and there is nothing here to assert.
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(&p).unwrap();
+        let allocated = md.blocks() * 512;
+        let logical = 8 * 1024 * 1024;
+        if allocated >= logical {
+            eprintln!(
+                "skipping: this filesystem did not create a hole \
+                 (allocated {allocated} >= logical {logical}); nothing sparse to detect"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
         match contiguous_from(&p, 0) {
             // Filesystems may round the run up to their own block granularity; what must
             // NOT happen is reporting the full 8MB logical length.
             Some(run) => assert!(
-                run < 8 * 1024 * 1024,
+                run < logical,
                 "a sparse file must not report its logical length as contiguous, got {run}"
             ),
-            // APFS on the dev Mac does not implement SEEK_HOLE the same way; None is the
-            // documented "no opinion" answer and callers fall back.
+            // A filesystem that has a hole but no SEEK_HOLE opinion returns None, and
+            // callers fall back. Acceptable.
             None => {}
         }
         std::fs::remove_dir_all(&dir).ok();
