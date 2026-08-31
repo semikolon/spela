@@ -536,35 +536,47 @@
   .sub.rw.warn{color:#e3bd6a}
   .sub.rw.bad{color:#e58a8a;font-weight:600}
 
-  /* New-Episodes rows: fold the four controls into a 2x2 square (2026-08-31).
-     Lined up horizontally, play/watched/unfollow/seasons ate ~190px of a 393px
-     phone viewport, so the title + episode name + air date were squeezed into a
-     narrow column that wrapped to four lines. Squared, the text column roughly
-     doubles and the buttons occupy the same footprint.
+  /* New-Episodes rows: stack the controls instead of lining them all up
+     (2026-08-31). In one horizontal row, play/watched/unfollow/seasons ate
+     ~190px of a 393px phone viewport, so the title + episode name + air date
+     were squeezed into a narrow column that wrapped to four lines.
+
+     Play keeps a full-height column of its own — it is the one control you
+     reach for, and a tall target is the easiest to hit — and the three
+     secondary controls sit to its right over two rows, with the seasons bar
+     spanning the width beneath watched and unfollow. Net effect: the text
+     column goes from ~176px to ~210px and no control drops below its touch
+     size.
 
      Scoped by :has(.foseasonbtn) — only a followed-show row carries all four.
      Continue rows share the .foitem class but have two controls and keep the
      single line. :has() is already load-bearing here (the now-view two-column
      rule above), and @supports keeps the flex layout for anything without it.
 
-     Rows are floored at 44px so each of the four stays a legal touch target —
-     the 2026-05-18 overhaul's whole point — which makes the row ~94px tall.
-     Extending this override block rather than editing the base .foitem rule,
-     per the same overhaul's convention: later cascade wins by design. */
+     Rows are floored at 44px so every control stays a legal touch target —
+     the 2026-05-18 overhaul's whole point. Extending this override block
+     rather than editing the base .foitem rule, per that overhaul's
+     convention: later cascade wins by design. */
   @supports (selector(:has(*))){
     .foitem:has(.foseasonbtn){
       display:grid;
-      grid-template-columns:minmax(0,1fr) auto auto;
+      grid-template-columns:minmax(0,1fr) auto auto auto;
       grid-template-rows:minmax(44px,1fr) minmax(44px,1fr);
       align-items:stretch;
     }
     .foitem:has(.foseasonbtn)>.fotap{grid-column:1;grid-row:1/span 2}
+    .foitem:has(.foseasonbtn)>.foplay{grid-column:2;grid-row:1/span 2}
+    .foitem:has(.foseasonbtn)>.fomark{grid-column:3;grid-row:1}
+    .foitem:has(.foseasonbtn)>.founfollow{grid-column:4;grid-row:1}
+    /* The seasons control spans both secondary columns rather than leaving a
+       hole in the fourth cell. */
+    .foitem:has(.foseasonbtn)>.foseasonbtn{grid-column:3/span 2;grid-row:2}
     /* Uniform cells: flex-basis (flex:0 0 46px / 40px) is inert in grid, so the
-       two columns would otherwise be ragged. */
+       columns would otherwise be ragged. */
     .foitem:has(.foseasonbtn)>.foplay,
     .foitem:has(.foseasonbtn)>.fomark,
-    .foitem:has(.foseasonbtn)>.founfollow,
-    .foitem:has(.foseasonbtn)>.foseasonbtn{width:46px;min-width:46px}
+    .foitem:has(.foseasonbtn)>.founfollow{width:46px;min-width:46px}
+    .foitem:has(.foseasonbtn)>.foseasonbtn{width:auto;min-width:46px}
   }
 
   @media (max-width:560px){
