@@ -456,3 +456,30 @@ All ten Apr 15 bug fixes + the resolution-preference ranker tier are live on Dar
 
 ### Subtitle source priority — prefer the torrent's BUNDLED sidecar .srt over OpenSubtitles
 The VLC sub path (`handle_vlc_sub`) always fetches OpenSubtitles, which is often NOT synced to the specific rip → misaligned (T2 2026-08-14: OpenSubtitles srt drifted; the YIFY release's own sibling `.srt` was perfectly synced by construction). Fix: detect a sidecar `.srt` next to the video — either already on disk (`~/media/<release>/<name>.srt`) or by selecting+downloading its file index in the torrent (currently `only_files` selects the video index only). Priority order should be: embedded text track (already done) → bundled sidecar `.srt` (release-matched) → OpenSubtitles + alass align. Applies to the VLC path AND any future cast/browser sub path. Bonus: also honour multiple bundled langs (pick original-language per the never-a-dub rule).
+
+### Browser seek: resume on a cached title, and an honest frontier guard (2026-08-31)
+Agreed with Fredrik after the iPhone session; the third option (re-transcode at the
+seek point) was deliberately NOT taken — see the reasoning below before reviving it.
+
+- [ ] **Resume on a cache HIT.** A cache hit serves the complete VOD from 0 and expects
+  the CLIENT to seek; the Chromecast path does that with `cast.seek`, and the browser
+  path has no seek code at all (zero `currentTime` writes, zero listeners in
+  `static/remote.html`). So resume is silently lost on any cached title. Every segment
+  already exists, so the fix is `video.currentTime = pos` once `loadedmetadata` fires,
+  reading the position `/play` already returns as `resumed_from`. Bonus: lets a cached
+  episode start instantly instead of re-transcoding from the resume point — auto-resume
+  currently sets `seek_to`, which forces `ss_offset != 0` and so SKIPS the cache.
+- [ ] **Honest guard on a forward seek past the transcode frontier.** Seeking beyond the
+  frontier makes `handle_hls_segment` long-poll 28 s for a segment that does not exist
+  yet; the player gives up (observed: four 499s on `seg_00182`, then a fall back to
+  `seg_00000`). VOD padding advertises the full duration, so the whole timeline LOOKS
+  seekable when only the transcoded prefix is. Clamp the seek and say "still
+  transcoding, ~N min to there" rather than stalling.
+
+NOT doing (recorded so it is not re-derived): re-transcoding at the seek point via the
+existing `seek_to` machinery would make any seek instant, but the native `<video>` is
+the transport on phone-direct, and after an `-ss` restart its timeline is
+stream-relative — so the phone would need the SPA's own scrubber instead of native
+controls. Measured transcode speed is ~6x realtime, so a forward jump can only fail
+during roughly the first 1/6 of an episode (~9 min of a 52-min one). Not worth the UX
+cost unless that window actually starts to bother him.
