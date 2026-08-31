@@ -536,6 +536,37 @@
   .sub.rw.warn{color:#e3bd6a}
   .sub.rw.bad{color:#e58a8a;font-weight:600}
 
+  /* New-Episodes rows: fold the four controls into a 2x2 square (2026-08-31).
+     Lined up horizontally, play/watched/unfollow/seasons ate ~190px of a 393px
+     phone viewport, so the title + episode name + air date were squeezed into a
+     narrow column that wrapped to four lines. Squared, the text column roughly
+     doubles and the buttons occupy the same footprint.
+
+     Scoped by :has(.foseasonbtn) — only a followed-show row carries all four.
+     Continue rows share the .foitem class but have two controls and keep the
+     single line. :has() is already load-bearing here (the now-view two-column
+     rule above), and @supports keeps the flex layout for anything without it.
+
+     Rows are floored at 44px so each of the four stays a legal touch target —
+     the 2026-05-18 overhaul's whole point — which makes the row ~94px tall.
+     Extending this override block rather than editing the base .foitem rule,
+     per the same overhaul's convention: later cascade wins by design. */
+  @supports (selector(:has(*))){
+    .foitem:has(.foseasonbtn){
+      display:grid;
+      grid-template-columns:minmax(0,1fr) auto auto;
+      grid-template-rows:minmax(44px,1fr) minmax(44px,1fr);
+      align-items:stretch;
+    }
+    .foitem:has(.foseasonbtn)>.fotap{grid-column:1;grid-row:1/span 2}
+    /* Uniform cells: flex-basis (flex:0 0 46px / 40px) is inert in grid, so the
+       two columns would otherwise be ragged. */
+    .foitem:has(.foseasonbtn)>.foplay,
+    .foitem:has(.foseasonbtn)>.fomark,
+    .foitem:has(.foseasonbtn)>.founfollow,
+    .foitem:has(.foseasonbtn)>.foseasonbtn{width:46px;min-width:46px}
+  }
+
   @media (max-width:560px){
     .brand small{display:none}               /* drop " remote" — saves width */
     nav a .lbl{display:none}                 /* icon-only tabs */
@@ -840,8 +871,25 @@ const fmt=s=>{ s=Math.max(0,Math.round(s||0)); const h=s/3600|0,m=(s%3600)/60|0,
 
 /* ---------- state ---------- */
 const TKEY="spela_target", MKEY="spela_mode";
+/* Default target is DEVICE-AWARE (2026-08-31). It used to be a flat {kind:"vlc"}
+   for everyone, which is right at the desk — the Mac monitor is the main watch
+   surface — and wrong in the hand: opening the remote on the phone silently
+   aimed ▶ at the Mac's desktop VLC, so a tap did nothing you could see on the
+   phone you were holding. The target lives in sessionStorage, so every fresh
+   phone visit landed back on that same wrong default.
+
+   A handheld is identified the way the hover-gleam block already splits the two
+   worlds: no hover + coarse pointer. That is a capability test, not UA sniffing,
+   so it survives new devices and iPadOS's desktop-class UA. On a handheld the
+   browser IS the screen in your hand, so "This device" is the honest default;
+   the desk keeps VLC. Either is one tap away on the target chip. */
+function defaultTarget(){
+  const handheld = window.matchMedia
+    && window.matchMedia("(hover: none) and (pointer: coarse)").matches;
+  return handheld ? {kind:"phone",name:"This device"} : {kind:"vlc",name:"VLC"};
+}
 const S={
-  target:JSON.parse(sessionStorage.getItem(TKEY)||"null")||{kind:"vlc",name:"VLC"},   // {kind:'chromecast'|'phone'|'vlc'|'shannon', name}; default VLC — the Mac monitor is the main watch surface. Switch via the target chip; the pick lasts the session.
+  target:JSON.parse(sessionStorage.getItem(TKEY)||"null")||defaultTarget(),   // {kind:'chromecast'|'phone'|'vlc'|'shannon', name}; the pick lasts the session.
   mode:sessionStorage.getItem(MKEY)||"movie",                 // 'movie' | 'tv'
   search:{q:"",abort:null,data:null},
   library:{data:null,loading:false},
@@ -885,6 +933,30 @@ let toastT;
 // file → instant; partial torrent → when the head/tail Cues are primed + a buffer
 // cushion exists). Returns true when ready, false if the user gave up / it errored.
 // Progress via a re-fired toast (stays visible); a complete file returns on poll 0.
+/* Hand an http(s) URL to the VLC app on WHATEVER device tapped it (2026-08-31).
+   Two schemes, because the two platforms register different ones:
+
+   macOS — `vlc://host/path`, mapped back to http:// by the handler that
+   install-vlc-url-handler.sh registers (which also pins --auhal-audio-device and
+   passes --audio-language). Unchanged behaviour.
+
+   iOS/iPadOS — `vlc-x-callback://x-callback-url/stream?url=<percent-encoded>`.
+   This is the DOCUMENTED entry point (VideoLAN wiki, Documentation:iOS): path
+   `stream` plays the `url` parameter, and both the wiki and VLC's own
+   integration patch require the url to be percent-escaped so it cannot break the
+   outer scheme. VLC-iOS does also register a bare `vlc://`, but its syntax is
+   undocumented and has been reported broken across several releases, so a phone
+   is never aimed at it.
+
+   iPadOS is detected by touch points rather than UA: "Request Desktop Website"
+   is the default there and makes the UA claim MacIntel. */
+function fireVlcUrl(httpUrl){
+  const ios = /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  window.location.href = ios
+    ? "vlc-x-callback://x-callback-url/stream?url=" + encodeURIComponent(httpUrl)
+    : httpUrl.replace(/^https?:\/\//, "vlc://");
+}
 async function vlcWaitReady(id, gen){
   for(let i=0;i<600;i++){   // ~15 min cap at 1.5s/poll
     if(gen!=null && S.vlcGen!==gen) return "superseded";  // a newer VLC source took over — stop this loop silently
@@ -976,7 +1048,7 @@ async function openInVlc(id,title,poster){
   // is installed on the Mac (install-vlc-url-handler.sh + Chrome AutoLaunch); no
   // page-navigation fallback (it double-opened in browser+VLC on multi-monitor, 2026-08-05).
   const m3uUrl=url.replace(/\/stream\?/,"/open.m3u?");
-  window.location.href=m3uUrl.replace(/^https?:\/\//,"vlc://");
+  fireVlcUrl(m3uUrl);
 }
 // Library file → VLC. The file is COMPLETE on the origin, so there's no torrent
 // buffering to poll: resolve its serve-library URL (/library/vlc.m3u) and fire vlc://
@@ -1005,9 +1077,9 @@ async function openLibraryInVlc(spec){
   stopPolling();
   location.hash="#/now"; renderNowFull(); startVlcPoll();
   toast("Opening in VLC…");
-  // vlc:// only — no page-navigation fallback (see openInVlc: the blur-timeout fallback
+  // Scheme only — no page-navigation fallback (see openInVlc: the blur-timeout fallback
   // double-opened in browser + VLC on a multi-monitor setup where VLC doesn't blur Chrome).
-  window.location.href=url.replace(/^https?:\/\//,"vlc://");
+  fireVlcUrl(url);
 }
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("on");
   clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("on"),4200); }

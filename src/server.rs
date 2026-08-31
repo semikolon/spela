@@ -1700,13 +1700,28 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                             .as_ref()
                             .and_then(|s| s.original_language.clone());
                         req.file_index = req.file_index.or(r.file_index);
-                        // Auto-fill metadata from the search context
-                        if req.title.is_none() {
-                            req.title = Some(bypass_match_title(
-                                search.show.as_ref().map(|s| s.title.as_str()),
-                                search.searching.as_ref().map(|e| (e.season, e.episode)),
-                                &r.title,
-                            ));
+                        // Auto-fill metadata from the search context.
+                        //
+                        // A caller-supplied `title` is a DISPLAY label; the Local-Bypass
+                        // matcher needs an episode-bearing IDENTITY. Until 2026-08-31 this
+                        // was gated on `req.title.is_none()`, so ANY caller that sent a
+                        // title suppressed the derivation — and the web remote always sends
+                        // one (`d.show.title`, e.g. "Star City", with the episode stripped).
+                        // `find_local_bypass_match`'s episode-strictness then saw no SxxExx,
+                        // fell back to pure title matching, and a request for S01E02 played
+                        // the S01E01 file already on disk. Reproduced live on iPhone.
+                        //
+                        // So: still never overwrite a caller title that already names an
+                        // episode, but when it does NOT and the search context knows which
+                        // episode we asked for, the derived identity wins. Movies are
+                        // untouched (no markers on either side → same string as before).
+                        if let Some(identity) = choose_bypass_title(
+                            req.title.as_deref(),
+                            search.show.as_ref().map(|s| s.title.as_str()),
+                            search.searching.as_ref().map(|e| (e.season, e.episode)),
+                            &r.title,
+                        ) {
+                            req.title = Some(identity);
                         }
                         if req.imdb_id.is_none() {
                             req.imdb_id = search.show.as_ref().and_then(|s| s.imdb_id.clone());
@@ -5360,13 +5375,24 @@ async fn handle_progress(State(state): State<SharedState>) -> Json<Value> {
     let Some(w) = warm else {
         return Json(json!({ "active": false }));
     };
-    // FRESH segments only — a `.ts` written since this warmup began. Ignoring
-    // stale leftovers keeps the download phase from being mislabeled
-    // "transcoding" (a 0%-downloaded torrent has produced nothing yet).
+    // FRESH segments only — one written since this warmup began. Ignoring stale
+    // leftovers keeps the download phase from being mislabeled "transcoding"
+    // (a 0%-downloaded torrent has produced nothing yet).
+    //
+    // 2026-08-31: count `.m4s` as well as `.ts`. The browser HEVC pass-through
+    // writes `.m4s`, so a `.ts`-only count reported "0 segments ready" for the
+    // entire warmup of every x265 play — the loading panel looked frozen while
+    // the transcode was in fact racing ahead, and the phase inference below fell
+    // through to "transcoding" with nothing to show. Matches count_hls_segments,
+    // which has covered both extensions since the pass-through path landed.
     let segments = std::fs::read_dir(&w.hls_dir)
         .map(|d| {
             d.filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|x| x == "ts"))
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .is_some_and(|x| x == "ts" || x == "m4s")
+                })
                 .filter(|e| {
                     e.metadata()
                         .and_then(|m| m.modified())
@@ -5770,6 +5796,37 @@ fn name_matches_episode(name: &str, required: (u32, u32)) -> bool {
 /// episode-strict instead of matching any on-disk episode of the show
 /// (2026-08-23). Movies / no-episode results fall back to the show title, or
 /// the raw result title when there's no show context.
+/// Decide which title the Local-Bypass matcher should work from, given what the
+/// caller sent and what the search context knows.
+///
+/// The distinction that matters: a caller's `title` is a DISPLAY label, while the
+/// matcher needs an episode-bearing IDENTITY. The web remote sends `show.title`
+/// ("Star City") with the episode stripped, so gating the derivation on "the
+/// caller sent nothing" — as this did until 2026-08-31 — meant the derivation
+/// effectively never ran for the app's main play path, and
+/// `find_local_bypass_match`'s episode-strictness had no SxxExx to enforce.
+/// Result: asking for S01E02 played the S01E01 file already on disk.
+///
+/// Returns `Some(identity)` when the caller's title should be upgraded, `None` to
+/// leave it alone. A caller who already named an episode is always trusted.
+pub(crate) fn choose_bypass_title(
+    caller_title: Option<&str>,
+    show_title: Option<&str>,
+    searching: Option<(u32, u32)>,
+    result_title: &str,
+) -> Option<String> {
+    let caller_names_episode = caller_title
+        .map(|t| {
+            let (_, s, e) = crate::search::parse_episode_markers(t);
+            s.is_some() && e.is_some()
+        })
+        .unwrap_or(false);
+    if caller_names_episode {
+        return None;
+    }
+    Some(bypass_match_title(show_title, searching, result_title))
+}
+
 pub(crate) fn bypass_match_title(
     show_title: Option<&str>,
     searching: Option<(u32, u32)>,
@@ -7854,9 +7911,28 @@ pub fn build_padded_vod_manifest(
         out.push('\n');
     }
     // Pad with placeholder segments using the predicted EXTINF.
+    //
+    // The extension is DERIVED, never assumed. The NVENC path writes `seg_NNNNN.ts`;
+    // the browser HEVC pass-through writes `seg_NNNNN.m4s`. Hardcoding `.ts` here is
+    // what forced `handle_hls_playlist` to skip padding entirely for fMP4 (padding
+    // would have pointed at `.ts` files that never exist) — and that skip is what
+    // served iOS a bare LIVE playlist, so its native player started at the live edge
+    // and stalled forever. See the caller for the full reasoning. Prefer the real
+    // emitted entries; fall back to the `#EXT-X-MAP` header, which marks fMP4 even
+    // when ffmpeg has not written a single segment yet.
+    let seg_ext = entries
+        .last()
+        .and_then(|(_, name)| name.rsplit_once('.').map(|(_, ext)| ext.to_string()))
+        .unwrap_or_else(|| {
+            if header_lines.iter().any(|l| l.starts_with("#EXT-X-MAP")) {
+                "m4s".to_string()
+            } else {
+                "ts".to_string()
+            }
+        });
     for i in entries.len()..predicted_total {
         out.push_str(&format!("#EXTINF:{:.6},\n", avg_extinf));
-        out.push_str(&format!("seg_{:05}.ts\n", i));
+        out.push_str(&format!("seg_{:05}.{}\n", i, seg_ext));
     }
     out.push_str("#EXT-X-ENDLIST\n");
     out
@@ -7888,16 +7964,28 @@ async fn handle_hls_playlist(
     // of DMR rendering a persistent progress-bar overlay.  Default off;
     // live mode (this path skipped) = no overlay AND no total display.
     // See spela CLAUDE.md § "DMR overlay is stream-type-dependent".
-    // 2026-07-13: the browser 4K pass-through emits an fMP4 EVENT playlist
-    // (init.mp4 present). VOD-padding appends `.ts` placeholder entries, which
-    // would 404 against `.m4s` segments and stall the player — so skip padding
-    // for fMP4 and serve ffmpeg's EVENT playlist raw (it already starts at 0
-    // and gains ENDLIST when the copy finishes).
-    let is_fmp4_passthrough = resolve_media_dir(&state)
-        .join("transcoded_hls")
-        .join("init.mp4")
-        .exists();
-    if state.config.vod_manifest_padded && !is_fmp4_passthrough {
+    // 2026-08-31: fMP4 is padded like everything else. It used to be SKIPPED —
+    // "VOD-padding appends `.ts` placeholders, which would 404 against `.m4s`
+    // segments" — true of the old hardcoded extension, but the skip was a far
+    // worse bug than the one it dodged, and `build_padded_vod_manifest` now
+    // derives the extension instead.
+    //
+    // What the skip cost: an unpadded playlist carries no ENDLIST and no
+    // PLAYLIST-TYPE, which per the HLS spec means LIVE — so a player starts
+    // near the LIVE EDGE, i.e. the segment ffmpeg is writing right now. That was
+    // survivable only because the SPA's hls.js is configured `startPosition:0`.
+    // iOS never runs hls.js: `canPlayType("application/vnd.apple.mpegurl")` is
+    // truthy there, so the native AVPlayer takes the stream, honours LIVE
+    // semantics, labels it "Live Broadcast" and starts at the edge. Reproduced
+    // 2026-08-31 on iPhone: Star City (x265 → pass-through) fetched segments
+    // 21-27, stalled, and then re-polled the playlist forever without ever
+    // requesting another segment — endless "Buffering…". The Diplomat (H.264 →
+    // NVENC → `.ts` → padded) played fine on the same phone, minutes apart.
+    //
+    // Padding gives every browser path one shape: starts at 0, honest total
+    // duration, real scrubbing. Do NOT reintroduce an fMP4 exemption here; if a
+    // future muxer emits some third extension, teach the padder that extension.
+    if state.config.vod_manifest_padded {
         match tokio::fs::read_to_string(&path).await {
             Ok(body) => {
                 let app_state = AppState::load(&state.state_dir);
@@ -12355,6 +12443,127 @@ seg_00002.ts
         let segment_count = out.matches("seg_").count();
         assert_eq!(segment_count, 12);
         assert!(out.contains("#EXT-X-ENDLIST"));
+    }
+
+    /// The iPhone "endless Buffering…" bug, 2026-08-31.
+    ///
+    /// Body copied verbatim from the live pass-through playlist spela was serving
+    /// for Star City S01E01 (`curl http://spela.home/hls/playlist.m3u8`), not
+    /// hand-written: `#EXT-X-VERSION:7`, an `#EXT-X-MAP` init segment and `.m4s`
+    /// segment names are exactly what ffmpeg's fmp4 muxer emits here.
+    ///
+    /// RED before the fix in two different ways, and the second is the one that
+    /// bit: with a hardcoded `.ts` placeholder the padded manifest pointed at
+    /// files that never exist, which is why `handle_hls_playlist` skipped padding
+    /// for fMP4 at all — and an unpadded playlist has no ENDLIST, so iOS's native
+    /// player treats it as LIVE and starts at the live edge instead of at 0.
+    #[test]
+    fn padded_manifest_pads_m4s_for_fmp4_passthrough() {
+        let body = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-VERSION:7\n",
+            "#EXT-X-TARGETDURATION:10\n",
+            "#EXT-X-MEDIA-SEQUENCE:0\n",
+            "#EXT-X-MAP:URI=\"init.mp4\"\n",
+            "#EXTINF:10.427000,\n",
+            "seg_00000.m4s\n",
+            "#EXTINF:10.427000,\n",
+            "seg_00001.m4s\n",
+        );
+        let out = build_padded_vod_manifest(body, 120.0, 6.0);
+        assert!(
+            !out.contains(".ts"),
+            "padded fMP4 manifest must not invent .ts placeholders:\n{out}"
+        );
+        assert!(out.contains("seg_00002.m4s"), "must pad in .m4s:\n{out}");
+        // The init segment must survive padding, or the player has no decoder config.
+        assert!(out.contains("#EXT-X-MAP:URI=\"init.mp4\""));
+        // ENDLIST is the whole point: it makes the playlist VOD, so a native
+        // player starts at segment 0 rather than at the live edge.
+        assert!(out.contains("#EXT-X-ENDLIST"));
+    }
+
+    /// Same path, but before ffmpeg has written its first segment — there is no
+    /// entry to read an extension from, so the `#EXT-X-MAP` header is the only
+    /// evidence that this is fMP4. Without this fallback the very first playlist
+    /// fetch of every x265 play would still hand out `.ts` names.
+    #[test]
+    fn padded_manifest_infers_m4s_from_ext_x_map_before_any_segment() {
+        let body = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-VERSION:7\n",
+            "#EXT-X-TARGETDURATION:10\n",
+            "#EXT-X-MEDIA-SEQUENCE:0\n",
+            "#EXT-X-MAP:URI=\"init.mp4\"\n",
+        );
+        let out = build_padded_vod_manifest(body, 60.0, 6.0);
+        assert!(out.contains("seg_00000.m4s"), "{out}");
+        assert!(!out.contains(".ts"), "{out}");
+    }
+
+    /// Regression guard for the path that already worked: the NVENC mpegts
+    /// transcode must keep getting `.ts` placeholders. (The Diplomat played
+    /// correctly on the same iPhone, minutes before Star City did not.)
+    #[test]
+    fn padded_manifest_still_pads_ts_for_mpegts() {
+        let body = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-VERSION:3\n",
+            "#EXT-X-TARGETDURATION:6\n",
+            "#EXT-X-MEDIA-SEQUENCE:0\n",
+            "#EXTINF:6.000000,\n",
+            "seg_00000.ts\n",
+        );
+        let out = build_padded_vod_manifest(body, 60.0, 6.0);
+        assert!(out.contains("seg_00001.ts"), "{out}");
+        assert!(!out.contains(".m4s"), "{out}");
+    }
+
+    /// The wrong-episode bug, 2026-08-31: the web remote always sends a title, so
+    /// the old `req.title.is_none()` gate meant the episode-bearing identity was
+    /// never derived, and a request for S01E02 matched the S01E01 file on disk.
+    #[test]
+    fn bypass_title_upgrades_a_caller_title_that_omits_the_episode() {
+        // Exactly what the SPA sends: `d.show.title`, episode stripped.
+        assert_eq!(
+            choose_bypass_title(
+                Some("Star City"),
+                Some("Star City"),
+                Some((1, 2)),
+                "Star.City.S01E02.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+            ),
+            Some("Star City S01E02".to_string())
+        );
+    }
+
+    /// A caller that already named an episode is authoritative — don't second-guess
+    /// it from the search context (which may be a stale `last_search`).
+    #[test]
+    fn bypass_title_leaves_an_explicit_episode_alone() {
+        assert_eq!(
+            choose_bypass_title(
+                Some("Star City S01E03"),
+                Some("Star City"),
+                Some((1, 2)),
+                "Star.City.S01E02.mkv",
+            ),
+            None
+        );
+    }
+
+    /// Movies have no markers on either side, so the derived identity is just the
+    /// show title — same string the old code produced. Unchanged behaviour.
+    #[test]
+    fn bypass_title_movie_is_unchanged() {
+        assert_eq!(
+            choose_bypass_title(
+                Some("From Russia with Love"),
+                Some("From Russia with Love"),
+                None,
+                "From.Russia.with.Love.1963.1080p.mkv",
+            ),
+            Some("From Russia with Love".to_string())
+        );
     }
 
     #[test]
