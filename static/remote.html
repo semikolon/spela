@@ -977,12 +977,71 @@ let toastT;
 
    iPadOS is detected by touch points rather than UA: "Request Desktop Website"
    is the default there and makes the UA claim MacIntel. */
-function fireVlcUrl(httpUrl){
-  const ios = /iPad|iPhone|iPod/.test(navigator.userAgent)
+function isIosDevice(){
+  return /iPad|iPhone|iPod/.test(navigator.userAgent)
     || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-  window.location.href = ios
-    ? "vlc-x-callback://x-callback-url/stream?url=" + encodeURIComponent(httpUrl)
-    : httpUrl.replace(/^https?:\/\//, "vlc://");
+}
+/* The two iOS forms, in the order we try them. Both are registered by VLC-iOS
+   (verified in its own Info.plist on master: CFBundleURLSchemes carries `vlc` AND
+   `vlc-x-callback`). x-callback is the DOCUMENTED one — VideoLAN's wiki specifies
+   path `stream`, parameter `url`, percent-escaped — so it leads; the bare form is
+   the fallback because its syntax is undocumented and has been reported broken
+   across releases. */
+function iosVlcUrls(httpUrl){
+  return [
+    {label:"the documented VLC link",
+     url:"vlc-x-callback://x-callback-url/stream?url=" + encodeURIComponent(httpUrl)},
+    {label:"the short VLC link",
+     url:httpUrl.replace(/^https?:\/\//, "vlc://")},
+  ];
+}
+/* Hand an http(s) URL to the VLC app on whatever device tapped it, and SAY SO when
+   nothing opens (2026-08-31).
+
+   The first attempt at this failed on Fredrik's iPhone with Chrome's "Something went
+   wrong. The application couldn't be opened." Two causes fit that equally well and
+   neither can be told apart from here: the installed VLC may not register the scheme
+   we fired, or iOS may have refused because the tap's user-activation had already
+   expired — `openInVlc` awaits a readiness poll before reaching this point, which can
+   take seconds. Rather than guess, the page now finds out for itself.
+
+   How: fire, then watch for the page going hidden. If VLC actually opened, iOS
+   backgrounds us and `visibilitychange`/`pagehide` fires. If we are still visible
+   after a beat, nothing opened, and we surface a button offering the OTHER form. That
+   second press is a fresh user gesture, so it also clears the activation-expiry case
+   if that was the real one. Whichever press works tells us which cause it was.
+
+   NOT a page-navigation fallback: the 2026-08-05 blur-timeout version navigated the
+   page to the .m3u and double-opened in browser + VLC on a multi-monitor Mac. This
+   only ever renders a button. Desktop keeps firing vlc:// straight through to the
+   handler installed by install-vlc-url-handler.sh. */
+function fireVlcUrl(httpUrl){
+  if(!isIosDevice()){ window.location.href = httpUrl.replace(/^https?:\/\//, "vlc://"); return; }
+  const forms = iosVlcUrls(httpUrl);
+  tryIosVlc(forms, 0, httpUrl);
+}
+function tryIosVlc(forms, i, httpUrl){
+  const form = forms[i]; if(!form) return;
+  let left = false;
+  const marker = () => { left = true; };
+  document.addEventListener("visibilitychange", marker, {once:true});
+  window.addEventListener("pagehide", marker, {once:true});
+  window.location.href = form.url;
+  setTimeout(()=>{
+    document.removeEventListener("visibilitychange", marker);
+    window.removeEventListener("pagehide", marker);
+    if(left || document.hidden) return;            // VLC took it — nothing to do
+    const next = forms[i+1];
+    if(next){
+      toastAction("VLC didn’t open. Try "+next.label+"?", "Try it",
+                  ()=>tryIosVlc(forms, i+1, httpUrl));
+    }else{
+      toastAction("VLC still didn’t open — is it installed?", "Copy link",
+                  ()=>{ navigator.clipboard?.writeText(httpUrl)
+                          .then(()=>toast("Link copied — paste it into VLC ▸ Network Stream"))
+                          .catch(()=>toast(httpUrl)); });
+    }
+  }, 1500);
 }
 async function vlcWaitReady(id, gen){
   for(let i=0;i<600;i++){   // ~15 min cap at 1.5s/poll

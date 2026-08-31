@@ -85,10 +85,11 @@ eq(api.fmtRuntime(60), "1h", "exactly the boundary crosses to hours");
 eq(api.fmtRuntime(0), "", "zero runtime renders as nothing rather than '0m'");
 eq(api.prettyEp("S01E01"), "S01E01", "a well-formed marker passes through");
 
-console.log(failed === 0 ? "ALL PASS" : `${failed} FAILED`);
-process.exit(failed === 0 ? 0 : 1);
-
 // --- fmtRunway: the replacement for percent-downloaded ------------------------------
+// NOTE 2026-08-31: this block used to sit AFTER the process.exit() below, so not one of
+// these six assertions had ever executed — a test file that reported ALL PASS while
+// silently skipping its own tail. Moved above the exit. Same shape as the "a detector
+// that never fires looks exactly like one that works" rule.
 const RW = new Function(extract("fmtRunway") + "\nreturn fmtRunway;")();
 eq(RW(null), "", "no measurement → say nothing rather than zero");
 eq(RW(30), "under a minute", "the about-to-stall case says so plainly");
@@ -96,3 +97,23 @@ eq(RW(59), "under a minute", "just under the boundary");
 eq(RW(420), "~7 min", "the Silo case: 7 minutes, which is what 32% actually meant");
 eq(RW(3600), "~1h 0m", "an hour reads as hours");
 eq(RW(4500), "~1h 15m", "over an hour keeps the minutes");
+
+// --- iosVlcUrls: the two schemes handed to VLC-iOS, in try order --------------------
+// Both are registered by VLC-iOS (its own Info.plist lists `vlc` and `vlc-x-callback`).
+// The documented x-callback form leads; the undocumented short form is the fallback.
+const VU = new Function(extract("iosVlcUrls") + "\nreturn iosVlcUrls;")();
+const forms = VU("http://spela.home/vlc/1/open.m3u?al=eng");
+eq(forms.length, 2, "two forms to try, so a failure has somewhere to go");
+eq(forms[0].url.startsWith("vlc-x-callback://x-callback-url/stream?url="), true,
+   "the DOCUMENTED form leads: path `stream`, parameter `url`");
+eq(forms[0].url.includes("%3A%2F%2F"), true,
+   "the inner url is percent-escaped, or it breaks the outer scheme");
+eq(forms[0].url.includes("?al=eng"), false,
+   "the inner query must be escaped too, not left to split the outer one");
+eq(forms[1].url, "vlc://spela.home/vlc/1/open.m3u?al=eng",
+   "the fallback is the bare form the Mac handler already uses");
+eq(forms.every(f => f.label && !/vlc-x-callback|vlc:\/\//.test(f.label)), true,
+   "labels are human-readable, since they are offered to Fredrik in a toast");
+
+console.log(failed === 0 ? "ALL PASS" : `${failed} FAILED`);
+process.exit(failed === 0 ? 0 : 1);
