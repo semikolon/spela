@@ -9889,6 +9889,25 @@ async fn handle_hls_cache_file(
     };
     let md = resolve_media_dir(&state);
     let path = crate::hls_cache::cache_dir_for_key(&md, &key).join(&file);
+    // A cached master needs the SAME codec normalization the live one gets
+    // (2026-08-31). ffmpeg writes HEVC as `hvc1.2.4.L150.B01`, and Chrome's MSE
+    // answers false to isTypeSupported() for that constraint-flags tail, so
+    // hls.js rejects the whole manifest with manifestIncompatibleCodecsError.
+    // `handle_hls_master` has stripped it since v3.17, but the cache route
+    // served the file verbatim — so a cache HIT on any x265 title handed the
+    // browser a manifest the live path had been careful to fix. Found while
+    // verifying the fMP4 padding fix: /hls/master.m3u8 read `hvc1.2.4.L150`
+    // while the cached master for the same episode read `hvc1.2.4.L150.B01`.
+    if file == "master.m3u8" {
+        if let Ok(body) = tokio::fs::read_to_string(&path).await {
+            return axum::response::Response::builder()
+                .status(200)
+                .header("Content-Type", content_type)
+                .header("Access-Control-Allow-Origin", "*")
+                .body(axum::body::Body::from(normalize_hls_master_codecs(&body)))
+                .unwrap();
+        }
+    }
     serve_static_with_range(path, content_type, &headers).await
 }
 

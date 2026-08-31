@@ -568,6 +568,21 @@
   }
 
   @media (max-width:560px){
+    /* The header no longer fits on one row (2026-08-31). Six icon-only tabs are
+       278px, and brand + the new-episodes badge push the target chip to x=457 on
+       a 393px iPhone — past the right edge, and `html{overflow-x:clip}` below
+       means it cannot even be scrolled to. So there was NO reachable way to
+       change where playback goes from the phone, which is what made the
+       VLC-by-default bug unrecoverable rather than merely wrong: the fix for it
+       lived behind a button that was off-screen. Measured, not guessed:
+       #tgtBtn's client rect was x=457 right=500 against clientWidth 393.
+
+       Wrap instead of shrinking further — the tabs are already at the 46px
+       touch-target floor the 2026-05-18 overhaul set, so there is nothing left
+       to take. Row one keeps brand + badge + target chip; nav gets its own
+       full-width row. */
+    header{flex-wrap:wrap;row-gap:.4rem}
+    header nav{order:3;flex:0 0 100%;margin-left:0;justify-content:space-between}
     .brand small{display:none}               /* drop " remote" — saves width */
     nav a .lbl{display:none}                 /* icon-only tabs */
     nav a{padding:.55rem .78rem}             /* compact square-ish pills */
