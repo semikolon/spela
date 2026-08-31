@@ -977,6 +977,29 @@ let toastT;
 
    iPadOS is detected by touch points rather than UA: "Request Desktop Website"
    is the default there and makes the UA claim MacIntel. */
+/* Copy a link, or show it when copying is impossible. The Clipboard API needs a SECURE
+   context and the remote is served over plain http on the LAN, so navigator.clipboard
+   is undefined here — the earlier `navigator.clipboard?.writeText(...)` short-circuited
+   the whole chain and produced NOTHING: no copy, no message, a button that looked
+   broken. Falls back to the legacy execCommand path, then to simply showing the URL so
+   there is always an outcome. */
+function copyOrShowLink(url){
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(url)
+      .then(()=>toast("Link copied — paste into VLC ▸ Network Stream"))
+      .catch(()=>toast(url));
+    return;
+  }
+  try{
+    const ta=document.createElement("textarea");
+    ta.value=url; ta.setAttribute("readonly","");
+    ta.style.position="fixed"; ta.style.opacity="0";
+    document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, url.length);
+    const ok=document.execCommand("copy");
+    ta.remove();
+    toast(ok ? "Link copied — paste into VLC ▸ Network Stream" : url);
+  }catch{ toast(url); }
+}
 function isIosDevice(){
   return /iPad|iPhone|iPod/.test(navigator.userAgent)
     || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
@@ -999,11 +1022,22 @@ function iosVlcUrls(httpUrl){
    nothing opens (2026-08-31).
 
    The first attempt at this failed on Fredrik's iPhone with Chrome's "Something went
-   wrong. The application couldn't be opened." Two causes fit that equally well and
-   neither can be told apart from here: the installed VLC may not register the scheme
-   we fired, or iOS may have refused because the tap's user-activation had already
-   expired — `openInVlc` awaits a readiness poll before reaching this point, which can
-   take seconds. Rather than guess, the page now finds out for itself.
+   wrong. The application couldn't be opened." Claude proposed two causes — the scheme
+   not being registered, or the tap's user-activation having expired during the
+   readiness poll — and BOTH WERE WRONG. The actual cause, found by Fredrik searching
+   his phone for VLC: **iOS had OFFLOADED the app** (Settings ▸ Apps ▸ App Store ▸
+   Offload Unused Apps, which was on). `openURL` genuinely had no app to hand it to.
+   Reinstalling fixed it; Star City then played with scrubbing working.
+
+   Worth keeping anyway, and the reason is the lesson: a deep link that fails is
+   indistinguishable from a deep link nobody handled, so guessing between causes was
+   never going to work. The chain below turns that into a question the PHONE answers.
+   Note its final message names exactly the cause that turned out to be real — had this
+   shipped first, it would have pointed straight at it.
+
+   Offloading is driven by DEVICE storage pressure, not iCloud, and it is silent: the
+   icon stays on the home screen with a small cloud badge, so the app looks installed
+   while its scheme is unregistered. Expect this to recur on any iOS deep link.
 
    How: fire, then watch for the page going hidden. If VLC actually opened, iOS
    backgrounds us and `visibilitychange`/`pagehide` fires. If we are still visible
@@ -1036,10 +1070,11 @@ function tryIosVlc(forms, i, httpUrl){
       toastAction("VLC didn’t open. Try "+next.label+"?", "Try it",
                   ()=>tryIosVlc(forms, i+1, httpUrl));
     }else{
-      toastAction("VLC still didn’t open — is it installed?", "Copy link",
-                  ()=>{ navigator.clipboard?.writeText(httpUrl)
-                          .then(()=>toast("Link copied — paste it into VLC ▸ Network Stream"))
-                          .catch(()=>toast(httpUrl)); });
+      // Names the cause that actually bit him (2026-08-31): iOS had offloaded VLC, so
+      // the icon was still on the home screen with a cloud badge while its scheme was
+      // unregistered. "Is it installed?" was too weak a hint for a silent offload.
+      toastAction("VLC didn’t open. Offloaded by iOS? Tap its icon to reinstall.",
+                  "Copy link", ()=>copyOrShowLink(httpUrl));
     }
   }, 1500);
 }
