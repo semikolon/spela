@@ -199,13 +199,37 @@ enum QueueAction {
     Clear,
 }
 
+/// Install tracing with a default filter that keeps spela's own log readable.
+///
+/// Measured 2026-08-31 over three days of the live journal: **14,074 of 16,390
+/// lines — 86% — were a single librqbit message**, `"Outgoing ip … for peer is
+/// in blocklist skipping"`, emitted at INFO from `torrent_state::live` once per
+/// rejected peer. That is not a cosmetic annoyance: forensics on a real playback
+/// failure the same night meant paging through thousands of blocklist lines to
+/// find the handful of `spela::server` events that mattered, and any `-n`-bounded
+/// look at the log showed nothing but noise.
+///
+/// What this costs: `torrent_state::live` also emits "torrent finished
+/// downloading" (7 lines in those same three days) and per-chunk
+/// "we already requested ChunkInfo …" spam. Losing the first to be rid of the
+/// other two is the right trade — spela reports its own stream lifecycle — but
+/// it IS a loss, so the module is silenced rather than the message, and
+/// `RUST_LOG` still overrides everything for a debugging session:
+///   `RUST_LOG=info,librqbit=debug spela server`
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,librqbit::torrent_state::live=warn"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Server { port, host } => {
-            tracing_subscriber::fmt::init();
+            init_tracing();
 
             // Apr 30, 2026: rustls 0.23+ requires an explicit default
             // CryptoProvider before any TLS use. librqbit's tracker/UPnP HTTPS
@@ -226,7 +250,7 @@ async fn main() {
             }
         }
         Commands::ServeLibrary { port } => {
-            tracing_subscriber::fmt::init();
+            init_tracing();
             let config = config::Config::load().unwrap_or_default();
             if let Err(e) = library_origin::run(config, port).await {
                 eprintln!("serve-library error: {}", e);

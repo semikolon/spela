@@ -15,7 +15,7 @@ toml = "0.8"
 rust_cast = "0.21"
 mdns-sd = "0.18"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"   # Europe/Stockholm DST-correct tz for TVmaze airstamp -> local air-date
