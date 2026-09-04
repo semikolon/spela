@@ -2393,7 +2393,16 @@ async function fastPlay(query, isTV, poster){
   if(!S.target){ S.pending=()=>fastPlay(query,isTV,poster); toast("Pick where to play — it starts right after"); openSheet(); return; }
   setMode(isTV?"tv":"movie"); $("#q").value=query; S.search.q=query;
   beginWarming(query, poster);
-  let d; try{ d=await api("/search?q="+encodeURIComponent(query)+(isTV?"&tv=1":"&movie=1")); }
+  // The TARGET must reach the SEARCH, not just the play. The ranker's codec tier is
+  // target-scoped: for an NVENC-transcode target it prefers H.264, and for a
+  // native-HEVC target (vlc/phone) it skips that tier so seeds decide. fastPlay
+  // takes results[0] blind, so omitting the target here picked the H.264 even when
+  // the HEVC had far more peers. Measured on Silo S03E10 (2026-09-04): without the
+  // target, #1 was a 919-seed 4.56 GB H.264; with it, #1 was a 3024-seed 2.73 GB
+  // HEVC -- 3.3x the peers and 1.7x fewer bytes to move. S.target is guaranteed set
+  // by the guard above, so there is nothing to fall back to.
+  const tq = (S.target && S.target.kind) ? "&target="+encodeURIComponent(S.target.kind) : "";
+  let d; try{ d=await api("/search?q="+encodeURIComponent(query)+(isTV?"&tv=1":"&movie=1")+tq); }
   catch{ showPlayError(query,poster,"spela unreachable",()=>fastPlay(query,isTV,poster)); return; }
   S.search.data=d;
   const first=(d&&d.results&&d.results[0]);

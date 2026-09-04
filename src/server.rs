@@ -1237,12 +1237,17 @@ pub fn vlc_stall_gate_secs(total_bytes: u64) -> u64 {
 /// `do_play` a (magnet, file_index) to start, whereas the VLC path addresses sources by
 /// RESULT ID, so this maps the winner back to its id for the remote to switch to.
 ///
-/// This matters most exactly when the ranker is blind. Torrentio periodically returns
-/// `seeders: null` for every result — it did for all 23 Diplomat and all 40 Star City
-/// releases on 2026-08-27 — which leaves the ranker's seed tier nothing to sort on and
-/// the seed-health colouring nothing to show. Unknown seeds read as 0, below the
-/// threshold, so a blind ranker is precisely the case that races. The race is the real
-/// empirical delivery test that the stale seed counts only approximate.
+/// Racing earns its keep because a seed count is a CLAIM, not deliverable capacity:
+/// the race is the empirical delivery test that a tracker scrape only approximates.
+///
+/// ⚠ CORRECTED 2026-09-04. This comment used to justify itself with "Torrentio
+/// periodically returns `seeders: null` for every result". That never happened.
+/// `TorrentResult.seeds` is a `u32` serialised as **`seeds`**, so a null is not
+/// representable; every observation of it came from a diagnostic that read a
+/// `seeders` key which has never existed, and `.get()` duly returned None.
+/// Measured against the live API the same day: Silo S03E10 came back 3024 / 1844 /
+/// 919 seeds, and the counts sit in Torrentio's `title` text as `👤 <n>`, parsed
+/// correctly by `parse_torrentio_title` throughout. The ranker is not blind.
 async fn maybe_race_sources_for_vlc(state: &SharedState, rid: usize) -> Option<usize> {
     if !state.config.race_sources_enabled {
         return None;
