@@ -907,8 +907,14 @@ impl SearchEngine {
         let results = if unaired {
             Vec::new()
         } else {
-            self.torrentio_streams(&imdb_id, &show_info.title, Some(s), Some(e))
-                .await?
+            self.torrentio_streams(
+                &imdb_id,
+                &show_info.title,
+                show_info.original_language.as_deref(),
+                Some(s),
+                Some(e),
+            )
+            .await?
         };
         Ok(SearchResult {
             query: query.into(),
@@ -968,7 +974,13 @@ impl SearchEngine {
         };
 
         let results = self
-            .torrentio_streams(&imdb_id, &show_info.title, None, None)
+            .torrentio_streams(
+                &imdb_id,
+                &show_info.title,
+                show_info.original_language.as_deref(),
+                None,
+                None,
+            )
             .await?;
         Ok(SearchResult {
             query: query.into(),
@@ -1042,6 +1054,7 @@ impl SearchEngine {
         &self,
         imdb_id: &str,
         show_title: &str,
+        original_language: Option<&str>,
         season: Option<u32>,
         episode: Option<u32>,
     ) -> Result<Vec<TorrentResult>> {
@@ -1160,7 +1173,7 @@ impl SearchEngine {
         // as a top-seeded candidate for a `The Boys` S05E03 query (IMDb-ID
         // routed, no cross-show data should have been possible — but it was).
         let mut results = filter_results_by_show_title(results, show_title);
-        rank_results_mut(&mut results);
+        rank_results_mut_prefer(&mut results, true, original_language);
         // 2026-07-13: keep more results so 4K/2160p survives to the UI. The
         // ranker demotes 2160p to the bottom tier (right for the 1080p-capped
         // Chromecast path), and the old take(8) then truncated every 4K release
@@ -1547,10 +1560,12 @@ pub(crate) fn effective_res_tier(r: &TorrentResult) -> u32 {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // test entry point; production ranks via rank_results_mut_prefer
 pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
     // Default preserves the historical behaviour (Chromecast/NVENC needs H.264).
     // CLI + Ruby default to the Chromecast target, so this is the right default.
-    rank_results_mut_prefer(results, true);
+    // `None` language → `language_fit_bucket` falls back to English.
+    rank_results_mut_prefer(results, true, None);
 }
 
 /// `prefer_h264`: when true (Chromecast — NVENC can't cheaply decode HEVC, so an
@@ -1560,7 +1575,11 @@ pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
 /// well-seeded HEVC (e.g. 253-seed x265) beats a starved H.264 (18-seed). The
 /// original H.264 preference (v3.0.0) predates non-Chromecast targets; scoping it
 /// to Chromecast is the correct refinement now that VLC/browser handle HEVC.
-pub fn rank_results_mut_prefer(results: &mut Vec<TorrentResult>, prefer_h264: bool) {
+pub fn rank_results_mut_prefer(
+    results: &mut Vec<TorrentResult>,
+    prefer_h264: bool,
+    original_language: Option<&str>,
+) {
     const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
     // May 13, 2026 v3.4.0: when the HEVC alternative has ≥SEED_DISPARITY_OVERRIDE×
     // the seeds of the H.264 tier-4 winner, override the codec preference. See
@@ -1601,7 +1620,20 @@ pub fn rank_results_mut_prefer(results: &mut Vec<TorrentResult>, prefer_h264: bo
             return a_eff.cmp(&b_eff);
         }
 
-        // Tier 4: H.264 > HEVC within same resolution + DV status (insta-play tiebreak).
+        // Tier 4 (2026-09-05): language fit, WITHIN an equal resolution+viability
+        // bucket. Star City S01E06 is the anchor — all three top candidates were
+        // well-seeded 1080p, so they tied on every existing tier and seed count
+        // alone decided: a Polish AI-dub (903) and a French MULTI (174) outranked
+        // the plain English release (166), and it played with six French subtitle
+        // tracks and no English one. Sits below resolution so a dead clean swarm
+        // can't win; see `effective_lang_tier` for why it carries no seed term.
+        let a_lang = effective_lang_tier(a, original_language);
+        let b_lang = effective_lang_tier(b, original_language);
+        if a_lang != b_lang {
+            return a_lang.cmp(&b_lang);
+        }
+
+        // Tier 5: H.264 > HEVC within same resolution + DV status (insta-play tiebreak).
         // May 13, 2026 v3.4.0 amendment — seed-disparity override:
         // when the HEVC alternative has ≥30× the seeds of the H.264 winner,
         // promote the HEVC. Rationale: well-seeded swarms (MeGusta-class,
@@ -1618,8 +1650,8 @@ pub fn rank_results_mut_prefer(results: &mut Vec<TorrentResult>, prefer_h264: bo
         // codec WITHIN the same resolution + DV bucket.
         let a_hevc = is_hevc_from_title(&a.title);
         let b_hevc = is_hevc_from_title(&b.title);
-        // Tier 4 fires ONLY for the Chromecast target (prefer_h264). Native-HEVC
-        // targets (VLC / browser / phone) fall through to Tier 5 (seed count), so a
+        // Tier 5 fires ONLY for the Chromecast target (prefer_h264). Native-HEVC
+        // targets (VLC / browser / phone) fall through to Tier 6 (seed count), so a
         // well-seeded HEVC wins instead of being demoted below a starved H.264.
         if prefer_h264 && a_hevc != b_hevc {
             let (h264_seeds, hevc_seeds, h264_is_a) = if a_hevc {
@@ -1651,7 +1683,7 @@ pub fn rank_results_mut_prefer(results: &mut Vec<TorrentResult>, prefer_h264: bo
             }
         }
 
-        // Tier 5: more seeds > fewer seeds
+        // Tier 6: more seeds > fewer seeds
         b.seeds.cmp(&a.seeds)
     });
 
@@ -1810,6 +1842,119 @@ fn extract_significant_tokens(title: &str) -> Vec<String> {
         .filter(|w| !w.is_empty() && !STOP_WORDS.contains(w))
         .map(String::from)
         .collect()
+}
+
+/// 2026-09-05: scene-release language markers → the ISO 639-1 code of the
+/// language the release is packaged FOR.
+///
+/// A release tagged for a language the show was not made in ships that
+/// market's dub and/or only that market's subtitles. That is how Star City
+/// S01E06 reached the screen with six French subtitle tracks and no English
+/// one: Torrentio's top two candidates were a Polish AI-dub (903 seeds) and a
+/// French `MULTI` (174 seeds), and the plain English release sat third at 166
+/// seeds — the ranker sorted on seeds, resolution and codec, and had no notion
+/// of language at all.
+///
+/// Tokens match EXACTLY against the release name split on scene separators
+/// (`.` `-` `_` space), never as substrings. Substring matching is what makes
+/// this class of table dangerous: `PL` inside `SAMPLE`, `IT` inside `WITH`.
+/// `DL` is deliberately ABSENT even as an exact token — German releases use it
+/// for "Dual Language", but `WEB-DL` splits to `WEB` + `DL`, so including it
+/// would demote essentially every web release in existence.
+fn release_language_marker(token: &str) -> Option<&'static str> {
+    Some(match token {
+        "ENG" | "ENGLISH" => "en",
+        "FRENCH" | "TRUEFRENCH" | "VOSTFR" | "VFF" | "VFQ" => "fr",
+        "GERMAN" | "DEUTSCH" => "de",
+        "ITA" | "ITALIAN" => "it",
+        "SPANISH" | "ESPANOL" | "CASTELLANO" | "LATINO" | "SUBESPANOL" => "es",
+        "PL" | "POLISH" | "PLDUB" | "PLSUB" | "LEKTOR" | "DUBBINGPL" => "pl",
+        "RUS" | "RUSSIAN" => "ru",
+        "PORTUGUESE" | "DUBLADO" | "NACIONAL" | "LEGENDADO" => "pt",
+        "HINDI" | "HIN" | "TAMIL" | "TELUGU" => "hi",
+        "KOREAN" => "ko",
+        "JAPANESE" => "ja",
+        "CZECH" | "DABING" => "cs",
+        "HUNGARIAN" | "HUNSUB" => "hu",
+        "TURKISH" => "tr",
+        "ARABIC" => "ar",
+        "SWEDISH" => "sv",
+        "DANISH" => "da",
+        "NORWEGIAN" => "no",
+        "FINNISH" => "fi",
+        "DUTCH" => "nl",
+        "NORDIC" => "sv",
+        _ => return None,
+    })
+}
+
+/// Markers that mean "packaged for several markets at once". The original
+/// audio is usually still in the file — the MULTI release of Star City S01E06
+/// carried English EAC-3 alongside French AC-3 — but the SUBTITLE set is the
+/// other market's, which is the half that bites.
+fn is_multi_language_marker(token: &str) -> bool {
+    matches!(token, "MULTI" | "MULTI4" | "MULTI6" | "MULTILANG" | "DUAL")
+}
+
+/// Split a release name into uppercase scene tokens.
+fn release_tokens(title: &str) -> Vec<String> {
+    title
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_uppercase())
+        .collect()
+}
+
+/// How well a release's advertised language fits the show's own. Lower is better.
+///
+///   0 → clean: no foreign marker at all, or a marker naming the show's OWN
+///        language (a `FRENCH` tag on a French film is the right release)
+///   1 → multi-language packaging: original audio usually present, foreign subs
+///   2 → a foreign dub/sub marker: the release is FOR another language
+///
+/// `original_language` is TMDB's `original_language` for the title. `None`
+/// falls back to `"en"` — nearly everything watched here is English-original,
+/// and a bare `rank_results_mut` call (CLI, tests) has no show context.
+pub(crate) fn language_fit_bucket(title: &str, original_language: Option<&str>) -> u32 {
+    let orig = original_language.unwrap_or("en").to_ascii_lowercase();
+    let (mut has_foreign, mut has_orig, mut has_multi) = (false, false, false);
+    for token in release_tokens(title) {
+        if let Some(lang) = release_language_marker(&token) {
+            if lang == orig {
+                has_orig = true;
+            } else {
+                has_foreign = true;
+            }
+        } else if is_multi_language_marker(&token) {
+            has_multi = true;
+        }
+    }
+    // A foreign marker ALONGSIDE the show's own language is a dual-language
+    // release (`...DDP5.1.ENG.Atmos.ITA.H265...`) — the original audio is
+    // there, so it ranks with MULTI rather than with a full dub.
+    match (has_foreign, has_orig, has_multi) {
+        (true, false, _) => 2,
+        (true, true, _) | (false, _, true) => 1,
+        (false, _, false) => 0,
+    }
+}
+
+/// Language fit as a plain ranker tier.
+///
+/// Deliberately carries NO seed-viability term, unlike `effective_res_tier`.
+/// The first draft baked viability in here and it was wrong twice over: it
+/// duplicated work the resolution tier already does, and — because it ran
+/// first — it turned into a seed filter BETWEEN two equally-clean releases,
+/// silently overriding the codec tier's own tuned 30x seed-disparity rule
+/// (caught by `test_ranking_h264_over_hevc_with_enough_seeds`).
+///
+/// Running BELOW resolution instead gives the dead-swarm guard for free:
+/// `effective_res_tier` demotes an unseeded release to buckets 3-5, so a
+/// 3-seed clean release loses to a 400-seed MULTI before language is ever
+/// consulted, and language then only ever reorders releases already equal on
+/// resolution and viability.
+pub(crate) fn effective_lang_tier(r: &TorrentResult, original_language: Option<&str>) -> u32 {
+    language_fit_bucket(&r.title, original_language)
 }
 
 /// Classify a torrent title into a resolution bucket. Lower is better.
@@ -3008,6 +3153,151 @@ mod tests {
             file_index,
             partial_pct: None,
         }
+    }
+
+    /// 2026-09-05 anchor. Release names copied VERBATIM out of the live
+    /// `last_search.json` for the Star City S01E06 play that reached the screen
+    /// with six French subtitle tracks and no English one. Seeds are the real
+    /// ones Torrentio reported that evening.
+    #[test]
+    fn test_ranking_star_city_s01e06_prefers_the_english_release() {
+        let mut results = vec![
+            make_result(
+                1,
+                "Star.City.S01E06.PL.Ai.1080p.ATVP.WEB-DL.DDPA5.1.H.264-XuploaD.mkv",
+                903,
+                None,
+            ),
+            make_result(
+                2,
+                "Star City S01E06 MULTI 1080p WEB H264-HiggsBoson.mkv",
+                174,
+                None,
+            ),
+            make_result(
+                3,
+                "Star.City.S01E06.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                166,
+                None,
+            ),
+        ];
+        rank_results_mut_prefer(&mut results, true, Some("en"));
+        assert!(
+            results[0].title.contains("MeGusta"),
+            "the plain English release must win over a Polish AI-dub (903 seeds) \
+             and a French MULTI (174 seeds); got {:?}",
+            results[0].title
+        );
+        assert!(
+            results[1].title.contains("MULTI"),
+            "MULTI keeps English audio, so it outranks the full Polish dub; got {:?}",
+            results[1].title
+        );
+        assert!(results[2].title.contains("PL.Ai"));
+    }
+
+    #[test]
+    fn test_language_fit_bucket_clean_english_release() {
+        // Real names from the same search + the previously-working episodes.
+        for title in [
+            "Star.City.S01E06.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+            "Star.City.S01E06.Awl.in.a.Sack.1080p.WEBRip.10Bit.DDP5.1.x265-NeoNoir.mkv",
+            "The Boys S05E02 Teenage Kix 1080p AMZN WEB-DL DDP5 1 Atmos H 264-playWEB.mkv",
+        ] {
+            assert_eq!(
+                language_fit_bucket(title, Some("en")),
+                0,
+                "clean English release misclassified: {title}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_language_fit_bucket_foreign_and_multi() {
+        assert_eq!(
+            language_fit_bucket(
+                "Star.City.S01E06.PL.Ai.1080p.ATVP.WEB-DL.DDPA5.1.H.264-XuploaD.mkv",
+                Some("en")
+            ),
+            2,
+            "a Polish dub of an English show is a foreign release"
+        );
+        assert_eq!(
+            language_fit_bucket(
+                "Star City S01E06 MULTI 1080p WEB H264-HiggsBoson.mkv",
+                Some("en")
+            ),
+            1,
+            "MULTI is multi-market packaging, not a full dub"
+        );
+        // Dual-language: the show's OWN language is tagged alongside the foreign
+        // one, so the original audio is present — ranks with MULTI, not with a dub.
+        assert_eq!(
+            language_fit_bucket(
+                "Star.City.S01E06.Awl.in.a.Sack.1080p.ATVP.WEB-DL.DDP5.1.ENG.Atmos.ITA.H265-TheBlackKing.mkv",
+                Some("en")
+            ),
+            1
+        );
+    }
+
+    /// `WEB-DL` splits to `WEB` + `DL`, and German scene releases use `DL` for
+    /// "Dual Language" — including it in the marker table would demote nearly
+    /// every web release ever made. This test is the guard on that omission.
+    #[test]
+    fn test_language_fit_bucket_web_dl_is_not_a_language_marker() {
+        assert_eq!(
+            language_fit_bucket(
+                "Star.City.S01E06.Awl.in.a.Sack.1080p.ATVP.WEB-DL.DDP5.1.Atmos.H265-Group.mkv",
+                Some("en")
+            ),
+            0
+        );
+        // Substring traps: PL inside SAMPLE, IT inside WITH, ITA inside CAPITAL.
+        assert_eq!(
+            language_fit_bucket(
+                "Sample.Movie.With.Capital.Letters.1080p.x264.mkv",
+                Some("en")
+            ),
+            0
+        );
+    }
+
+    /// A marker naming the show's OWN language is the RIGHT release, never a
+    /// demotion: a `FRENCH` tag on a French-original film means the original.
+    #[test]
+    fn test_language_fit_bucket_respects_non_english_originals() {
+        assert_eq!(
+            language_fit_bucket(
+                "Anatomie.d.une.chute.2023.FRENCH.1080p.BluRay.x264.mkv",
+                Some("fr")
+            ),
+            0
+        );
+        // …and the English dub of that same French film IS the mismatch.
+        assert_eq!(
+            language_fit_bucket(
+                "Anatomy.of.a.Fall.2023.ENGLISH.1080p.BluRay.x264.mkv",
+                Some("fr")
+            ),
+            2
+        );
+    }
+
+    /// The language tier must not strand him on a dead swarm. It carries no seed
+    /// term of its own — `effective_res_tier` runs first and demotes the 3-seed
+    /// clean release below the well-seeded MULTI, so the guard is structural.
+    #[test]
+    fn test_language_tier_yields_to_a_dead_clean_swarm() {
+        let mut results = vec![
+            make_result(1, "Show.S01E01.1080p.WEB.x264-Clean.mkv", 3, None),
+            make_result(2, "Show S01E01 MULTI 1080p WEB H264-Group.mkv", 400, None),
+        ];
+        rank_results_mut_prefer(&mut results, true, Some("en"));
+        assert!(
+            results[0].title.contains("MULTI"),
+            "a 3-seed clean release is not playable; the well-seeded MULTI must win"
+        );
     }
 
     #[test]

@@ -66,6 +66,19 @@ pub struct ServerState {
     /// Result ids whose source race has already been run, so a ~1.5s poll cannot start a
     /// fresh race on every tick.
     pub vlc_raced: Mutex<HashSet<usize>>,
+    /// 2026-09-05: episode keys with no English subtitle anywhere, and when that was
+    /// established. VLC re-requests a failing `--input-slave` about four times before
+    /// giving up (measured), and a cold miss can cost tens of seconds, so without this
+    /// a subtitle-less title would stall the open once per retry. Expires
+    /// (`SUB_MISSING_TTL`) because OpenSubtitles gains files for a fresh episode over
+    /// the following days.
+    pub sub_missing: Mutex<HashMap<String, Instant>>,
+    /// 2026-09-05: subtitle cache keys already warmed (or warming) in the background.
+    /// `/vlc/{id}/ready` is polled ~1.5s and the warm can take tens of seconds when
+    /// alass aligns against a complete 5GB file, so without this guard every tick
+    /// would spawn another identical fetch. Membership means "do not spawn again",
+    /// never "the file is on disk" — the cache file's own existence is that answer.
+    pub sub_warmed: Mutex<HashSet<String>>,
     /// 2026-07-07: the web-remote scrubber's LIVE playback position, distinct
     /// from the resume HWM in state.json. The HWM (`get_position`) is
     /// max-only (`save_position_smart` refuses to move it backward), so it can
@@ -285,6 +298,8 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         media_dur: Mutex::new(HashMap::new()),
         vlc_first_poll: Mutex::new(HashMap::new()),
         vlc_raced: Mutex::new(HashSet::new()),
+        sub_warmed: Mutex::new(HashSet::new()),
+        sub_missing: Mutex::new(HashMap::new()),
         live_position: Mutex::new(None),
         vlc_activity: Mutex::new(None),
         vlc_commands: Mutex::new(Vec::new()),
@@ -1433,7 +1448,15 @@ async fn handle_search(
                 .as_deref()
                 .is_some_and(|t| matches!(t, "vlc" | "phone"))
             {
-                crate::search::rank_results_mut_prefer(&mut result.results, false);
+                let orig_lang = result
+                    .show
+                    .as_ref()
+                    .and_then(|sh| sh.original_language.clone());
+                crate::search::rank_results_mut_prefer(
+                    &mut result.results,
+                    false,
+                    orig_lang.as_deref(),
+                );
             }
             // 2026-06-30: enrich each result with its on-disk partial-download
             // % so the web remote can tint already-(part-)downloaded sources
@@ -8826,8 +8849,14 @@ async fn handle_vlc_ready(
         .chain(resolve_local_file_lenient(&state, id))
         .find(|(path, _)| is_physically_full(path, 0));
     if complete.is_some() {
+        // Warm the external English subtitle before VLC asks for it. On a complete
+        // file this is the SLOW case (alass aligns over the whole file, 38.9s measured
+        // on Star City S01E06) and VLC blocks on its `--input-slave`, so doing it here
+        // — during the poll the SPA already runs — is what keeps the open instant.
+        spawn_vlc_subtitle_warm(&state, id);
         return Json(json!({ "ready": true, "pct": 100, "phase": "on disk" }));
     }
+    spawn_vlc_subtitle_warm(&state, id);
     let Some((magnet, file_index, _, _, _)) = resolve_result_for_vlc(&state, id) else {
         return Json(json!({ "ready": false, "error": "Result not found — search again." }));
     };
@@ -9111,67 +9140,175 @@ async fn handle_vlc_library_playlist(
     }
 }
 
-/// `GET /vlc/{id}/sub.srt` — external English subtitle for the VLC path (native
-/// decode = no burn-in). Fetches OpenSubtitles for the current title on demand
-/// (download-only, no alass — fast enough for VLC's input-slave load; alass-sync
-/// for the VLC path is a follow-up) and serves the .srt. The .m3u attaches this
-/// via input-slave so VLC auto-loads it; 404 → VLC plays without subs. 2026-08-08.
-async fn handle_vlc_sub(
-    State(state): State<SharedState>,
-    axum::extract::Path(id): axum::extract::Path<usize>,
-) -> axum::response::Response {
+/// How long a "no English subtitle exists for this episode" answer is trusted.
+/// Short on purpose: OpenSubtitles gains files for a just-aired episode over the
+/// following days, so a re-play tomorrow must look again.
+const SUB_MISSING_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// 2026-09-05: cache key for one title's external English subtitle. Keyed by
+/// IMDb id + `sNNeMM`, because `fetch_subtitles` writes to a single shared
+/// `subtitle_<lang>.srt` in media_dir — one path for every title on the box, so
+/// two episodes fetched in succession overwrite each other's file.
+fn vlc_sub_cache_key(imdb: &str, season: Option<u32>, episode: Option<u32>) -> String {
+    match (season, episode) {
+        (Some(s), Some(e)) => format!("{imdb}_s{s:02}e{e:02}_eng"),
+        _ => format!("{imdb}_eng"),
+    }
+}
+
+fn vlc_sub_cache_path(media_dir: &std::path::Path, key: &str) -> std::path::PathBuf {
+    media_dir.join("subs").join(format!("{key}.srt"))
+}
+
+/// Resolve the external English subtitle for a VLC-path result, using an on-disk
+/// per-episode cache. Returns the cached path, or `None` when no English subtitle
+/// exists anywhere for this title.
+///
+/// Why a cache at all: with the subtitle now passed to VLC as `--input-slave`
+/// (see the handler script), VLC BLOCKS on fetching it while opening the item.
+/// A cold fetch against a fully-downloaded release runs alass alignment over the
+/// whole file and measured 38.9s on Star City S01E06 — far past anything VLC
+/// will wait through. `/vlc/{id}/ready` warms this in the background during the
+/// seconds the SPA is already polling, so by the time VLC launches it is a
+/// local file read.
+async fn ensure_vlc_subtitle(state: &SharedState, id: usize) -> Option<std::path::PathBuf> {
     let search = AppState::load_last_search(&state.state_dir);
     let imdb = search
         .as_ref()
         .and_then(|s| s.show.as_ref())
-        .and_then(|sh| sh.imdb_id.clone());
+        .and_then(|sh| sh.imdb_id.clone())
+        .filter(|i| !i.is_empty())?;
     let (season, episode) = match search.as_ref().and_then(|s| s.searching.as_ref()) {
         Some(e) => (Some(e.season), Some(e.episode)),
         None => (None, None),
     };
-    let Some(imdb) = imdb.filter(|i| !i.is_empty()) else {
-        return (axum::http::StatusCode::NOT_FOUND, "no imdb for subtitles").into_response();
-    };
-    let local_source: Option<std::path::PathBuf> = resolve_local_file_for_result(&state, id)
+    let key = vlc_sub_cache_key(&imdb, season, episode);
+    let cached = vlc_sub_cache_path(&state.media_dir, &key);
+    // Answer a known-missing subtitle instantly rather than re-running the whole
+    // lookup for each of VLC's retries.
+    if let Some(at) = lock_recover(&state.sub_missing).get(&key) {
+        if at.elapsed() < SUB_MISSING_TTL {
+            return None;
+        }
+    }
+    // A cached file that is merely present is not enough — an empty or truncated
+    // one would be served forever. 200 bytes is the same non-trivial bar
+    // `extract_embedded_subtitle` applies to a freshly extracted track.
+    if std::fs::metadata(&cached).map(|m| m.len()).unwrap_or(0) > 200 {
+        return Some(cached);
+    }
+    let local_source: Option<std::path::PathBuf> = resolve_local_file_for_result(state, id)
         .into_iter()
-        .chain(resolve_local_file_lenient(&state, id))
+        .chain(resolve_local_file_lenient(state, id))
         .map(|(p, _)| p)
         .find(|p| is_physically_full(p, 0));
     let client = reqwest::Client::new();
-    match crate::subtitles::fetch_subtitles(
+    let fetched = crate::subtitles::fetch_subtitles(
         &client,
         &imdb,
         season,
         episode,
         "eng", // OpenSubtitles uses ISO 639-2 ("eng"), not "en" — same as the cast path
         &state.media_dir,
-        // 2026-08-28: pass the SOURCE when a COMPLETE local file exists, which unlocks
-        // the two rungs the Chromecast path has always had and this one lacked: the
-        // embedded text track (synced by construction, and the reason same-file releases
-        // play right) and, failing that, alass alignment of the OpenSubtitles file. A
-        // wrong-release SRT is the documented desync cause, and download-only could
-        // never correct it.
-        //
+        // Pass the SOURCE when a COMPLETE local file exists, which unlocks the two rungs
+        // the Chromecast path has always had: the embedded text track (synced by
+        // construction) and, failing that, alass alignment of the OpenSubtitles file.
         // Gated on PHYSICAL completeness, not merely on a path resolving: alass needs to
-        // read the whole file, and the lenient resolver passes a sparse partial — the
-        // same trap that made readiness report a half-downloaded file as ready. A
-        // still-downloading torrent keeps the fast download-only path.
+        // read the whole file, and the lenient resolver passes a sparse partial.
         local_source.as_deref(),
     )
     .await
-    {
-        Ok(Some(_)) => {
-            let srt = state.media_dir.join("subtitle_eng.srt");
-            match tokio::fs::read(&srt).await {
-                Ok(bytes) => axum::response::Response::builder()
-                    .status(200)
-                    .header("Content-Type", "application/x-subrip")
-                    .body(axum::body::Body::from(bytes))
-                    .unwrap(),
-                Err(_) => (axum::http::StatusCode::NOT_FOUND, "no sub file").into_response(),
-            }
+    .ok()
+    .flatten();
+    if fetched.is_none() {
+        lock_recover(&state.sub_missing).insert(key.clone(), Instant::now());
+        return None;
+    }
+    // `fetch_subtitles` returns the VTT path but writes the SRT beside it; VLC wants
+    // the SRT. Copy it under the per-episode key so the next play is instant and a
+    // different title cannot overwrite it.
+    let shared_srt = state.media_dir.join("subtitle_eng.srt");
+    if std::fs::metadata(&shared_srt).map(|m| m.len()).unwrap_or(0) <= 200 {
+        lock_recover(&state.sub_missing).insert(key.clone(), Instant::now());
+        return None;
+    }
+    if let Some(dir) = cached.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    lock_recover(&state.sub_missing).remove(&key);
+    match std::fs::copy(&shared_srt, &cached) {
+        Ok(_) => {
+            tracing::info!("VLC subtitle cached: {}", cached.display());
+            Some(cached)
         }
-        _ => (axum::http::StatusCode::NOT_FOUND, "no subtitles found").into_response(),
+        Err(e) => {
+            tracing::warn!("VLC subtitle cache write failed ({e}) — serving uncached");
+            Some(shared_srt)
+        }
+    }
+}
+
+/// Kick off a background subtitle warm for this result, at most once per episode
+/// key. Lifetime: one bounded fetch that completes on its own; the guard set is
+/// what stops the ~1.5s readiness poll from spawning a new one every tick.
+fn spawn_vlc_subtitle_warm(state: &SharedState, id: usize) {
+    let search = AppState::load_last_search(&state.state_dir);
+    let Some(imdb) = search
+        .as_ref()
+        .and_then(|s| s.show.as_ref())
+        .and_then(|sh| sh.imdb_id.clone())
+        .filter(|i| !i.is_empty())
+    else {
+        return;
+    };
+    let (season, episode) = match search.as_ref().and_then(|s| s.searching.as_ref()) {
+        Some(e) => (Some(e.season), Some(e.episode)),
+        None => (None, None),
+    };
+    let key = vlc_sub_cache_key(&imdb, season, episode);
+    {
+        let mut warmed = lock_recover(&state.sub_warmed);
+        if !warmed.insert(key.clone()) {
+            return;
+        }
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let found = ensure_vlc_subtitle(&state, id).await;
+        if found.is_none() {
+            // Nothing exists for this title — allow a later retry (OpenSubtitles
+            // gains files for a fresh episode over the following days).
+            lock_recover(&state.sub_warmed).remove(&key);
+            tracing::info!("no English subtitle found yet for {key}");
+        }
+    });
+}
+
+/// `GET /vlc/{id}/sub.srt` — external English subtitle for the VLC path (native
+/// decode = no burn-in). Served from the per-episode cache when warm, else fetched
+/// on demand.
+///
+/// 2026-09-05: this endpoint was live and correct for months while reaching VLC
+/// exactly never. The playlist attached it as `#EXTVLCOPT:input-slave=...`, and
+/// VLC ignores `input-slave` when it arrives from a playlist file (verified by
+/// experiment: the same URL fetched when passed as a command-line flag, not
+/// fetched when passed in an m3u). It is now passed as `--input-slave` by the
+/// `vlc://` handler instead. Every release before Star City S01E06 shipped an
+/// embedded English track, which is why nothing looked broken.
+async fn handle_vlc_sub(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<usize>,
+) -> axum::response::Response {
+    match ensure_vlc_subtitle(&state, id).await {
+        Some(path) => match tokio::fs::read(&path).await {
+            Ok(bytes) => axum::response::Response::builder()
+                .status(200)
+                .header("Content-Type", "application/x-subrip")
+                .body(axum::body::Body::from(bytes))
+                .unwrap(),
+            Err(_) => (axum::http::StatusCode::NOT_FOUND, "no sub file").into_response(),
+        },
+        None => (axum::http::StatusCode::NOT_FOUND, "no subtitles found").into_response(),
     }
 }
 
@@ -9228,13 +9365,16 @@ async fn handle_vlc_playlist(
     // A resumed play needs more buffer runway while the download ramps at the seek
     // offset; a fresh start streams sequentially, so the 3s default is fine there.
     let netcache = if start_opt.is_empty() { 3000 } else { 8000 };
-    // Attach an external English subtitle as an input-slave. The VLC path decodes
-    // natively (no burn-in like Chromecast), and most releases (e.g. YIFY) ship NO
-    // embedded subs, so `sub-language` alone finds nothing to select (2026-08-08:
-    // Predestination played with no subs). /vlc/{id}/sub.srt fetches OpenSubtitles
-    // on demand; VLC loads the slave URL when it opens the item, and a 404 (no sub
-    // found) is graceful — VLC just plays without subs.
-    let sub_opt = format!("#EXTVLCOPT:input-slave={}/vlc/{}/sub.srt\n", base, id);
+    // 2026-09-05: the external English subtitle is NOT attached here any more.
+    // `#EXTVLCOPT:input-slave=` was silently ignored for the whole life of this
+    // feature — VLC refuses `input-slave` when it comes from a playlist file (it
+    // can read arbitrary paths, so it is not on VLC's playlist-safe option list).
+    // Verified by experiment: the same URL fetched when passed as `--input-slave`
+    // on the command line, and produced zero requests when passed in an m3u. The
+    // `vlc://` handler now passes it as a flag; `sub-language=en,eng` below still
+    // selects an EMBEDDED English track when the release ships one, which is why
+    // this looked like it worked until a release turned up with only French.
+    let sub_opt = String::new();
     // `ih` pins this URL to the RELEASE, not to a position in last_search. VLC
     // re-requests it on every reconnect and seek, and a search run meanwhile
     // would otherwise repoint the id at a different file mid-playback. Empty
@@ -13201,6 +13341,44 @@ mod vlc_enqueue_next_tests {
         assert_eq!(
             urlencode_component("plain-Title_1.0~x"),
             "plain-Title_1.0~x"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vlc_subtitle_cache_tests {
+    use super::{vlc_sub_cache_key, vlc_sub_cache_path};
+    use std::path::Path;
+
+    /// `fetch_subtitles` writes one shared `subtitle_eng.srt` per media dir, so two
+    /// episodes fetched in succession overwrite each other's file. The cache key is
+    /// what keeps them apart — real IMDb id from the Star City S01E06 search.
+    #[test]
+    fn episodes_of_one_show_get_distinct_keys() {
+        let e6 = vlc_sub_cache_key("tt32140872", Some(1), Some(6));
+        let e7 = vlc_sub_cache_key("tt32140872", Some(1), Some(7));
+        assert_eq!(e6, "tt32140872_s01e06_eng");
+        assert_ne!(e6, e7);
+    }
+
+    /// A film has no season/episode, and must not collide with that show's episodes.
+    #[test]
+    fn a_film_key_carries_no_episode_marker() {
+        assert_eq!(vlc_sub_cache_key("tt0133093", None, None), "tt0133093_eng");
+        assert_ne!(
+            vlc_sub_cache_key("tt0133093", None, None),
+            vlc_sub_cache_key("tt0133093", Some(1), Some(1))
+        );
+    }
+
+    /// Keys go in their own subdirectory so the pruner's top-level media sweep and a
+    /// `ls` of the media dir both stay readable.
+    #[test]
+    fn cache_path_is_under_a_subs_subdirectory() {
+        let p = vlc_sub_cache_path(Path::new("/mnt/hdd/spela-media"), "tt32140872_s01e06_eng");
+        assert_eq!(
+            p,
+            Path::new("/mnt/hdd/spela-media/subs/tt32140872_s01e06_eng.srt")
         );
     }
 }
