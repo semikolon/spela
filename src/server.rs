@@ -8217,6 +8217,93 @@ fn resolve_local_file_impl(
 /// Resolve a search-result id to `(magnet, file_index, display_title)`,
 /// REGARDLESS of download state. Lets the VLC endpoints work for fresh, partial,
 /// and fully-downloaded sources alike.
+/// The infohash of a result, for pinning a VLC URL to CONTENT rather than to a
+/// position. See `remap_id_by_infohash`.
+fn infohash_for_result(state: &SharedState, rid: usize) -> Option<String> {
+    let search = AppState::load_last_search(&state.state_dir)?;
+    search
+        .results
+        .iter()
+        .find(|r| r.id == rid)
+        .map(|r| r.info_hash.clone())
+        .filter(|h| !h.is_empty())
+}
+
+/// Translate a VLC URL's result id back to whatever id that RELEASE occupies now.
+///
+/// Result ids are positional against a single mutable `last_search`, so any new
+/// search — from the remote, another device, or a diagnostic — silently
+/// repoints every in-flight `/vlc/{id}/…` URL at a different release. VLC is
+/// launched with `--http-reconnect` and re-requests that exact URL on every
+/// reconnect and seek, so a mid-film search could hand it a different film.
+///
+/// Observed 2026-09-04: while an episode was playing from `/vlc/4/`, searches
+/// run in the same minutes moved id 4 from a 4.88 GB release to a 2.36 GB one,
+/// visible in the log as the expected size changing under a live stream. It
+/// kept working only because Local Bypass matches on TITLE and both releases
+/// were the same episode — luck, not design.
+///
+/// So the playlist now embeds `&ih=<infohash>` and this maps it back to the
+/// current id. Falls back to the positional id (with a warning) when the
+/// release has left `last_search` entirely, which is no worse than before.
+fn remap_id_by_infohash(state: &SharedState, rid: usize, ih: Option<&str>) -> usize {
+    let Some(ih) = ih.filter(|s| !s.is_empty()) else {
+        return rid;
+    };
+    let Some(search) = AppState::load_last_search(&state.state_dir) else {
+        return rid;
+    };
+    let short = &ih[..8.min(ih.len())];
+    let pairs: Vec<(usize, &str)> = search
+        .results
+        .iter()
+        .map(|r| (r.id, r.info_hash.as_str()))
+        .collect();
+    match pick_id_for_infohash(&pairs, rid, ih) {
+        PinOutcome::Unchanged => rid,
+        PinOutcome::Remapped(new_id) => {
+            tracing::warn!(
+                "VLC: #{} no longer names infohash {} (last_search changed mid-stream) — remapped to #{}",
+                rid, short, new_id
+            );
+            new_id
+        }
+        PinOutcome::Absent => {
+            tracing::warn!(
+                "VLC: infohash {} is absent from the current last_search — falling back to positional #{}",
+                short, rid
+            );
+            rid
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PinOutcome {
+    /// The id still names the pinned release.
+    Unchanged,
+    /// The release moved; this is where it lives now.
+    Remapped(usize),
+    /// The release is not in the current search at all — the caller keeps the
+    /// positional id, which is exactly the old behaviour and no worse.
+    Absent,
+}
+
+/// Pure core of `remap_id_by_infohash`, so the decision is testable without a
+/// live server state.
+pub(crate) fn pick_id_for_infohash(pairs: &[(usize, &str)], rid: usize, ih: &str) -> PinOutcome {
+    if pairs
+        .iter()
+        .any(|(id, h)| *id == rid && h.eq_ignore_ascii_case(ih))
+    {
+        return PinOutcome::Unchanged;
+    }
+    match pairs.iter().find(|(_, h)| h.eq_ignore_ascii_case(ih)) {
+        Some((id, _)) => PinOutcome::Remapped(*id),
+        None => PinOutcome::Absent,
+    }
+}
+
 fn resolve_result_for_vlc(
     state: &SharedState,
     rid: usize,
@@ -8489,11 +8576,22 @@ fn reap_previous_vlc_torrents(state: &SharedState, keep: u32) {
     }
 }
 
+/// Query for the VLC id-addressed routes. `ih` pins the URL to a release's
+/// CONTENT so a concurrent search cannot repoint a live stream; `al` is the
+/// audio-language hint the `vlc://` handler forwards.
+#[derive(serde::Deserialize, Default)]
+struct VlcPinQuery {
+    #[serde(default)]
+    ih: Option<String>,
+}
+
 async fn handle_vlc_stream(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
+    axum::extract::Query(pin): axum::extract::Query<VlcPinQuery>,
     headers: HeaderMap,
 ) -> axum::response::Response {
+    let id = remap_id_by_infohash(&state, id, pin.ih.as_deref());
     // 2026-07-28: stamp VLC activity so /status can report vlc_active — this path
     // serves VLC directly and never creates a CurrentStream.
     if let Some((_, _, name, _, _)) = resolve_result_for_vlc(&state, id) {
@@ -8634,7 +8732,9 @@ async fn handle_vlc_stream(
 async fn handle_vlc_ready(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
+    axum::extract::Query(pin): axum::extract::Query<VlcPinQuery>,
 ) -> Json<Value> {
+    let id = remap_id_by_infohash(&state, id, pin.ih.as_deref());
     // COMPLETE file on disk → instantly ready (served static + fully seekable).
     //
     // "Complete" has to be PROVEN, not assumed from a resolver returning Some. The
@@ -9058,9 +9158,17 @@ async fn handle_vlc_playlist(
     // on demand; VLC loads the slave URL when it opens the item, and a 404 (no sub
     // found) is graceful — VLC just plays without subs.
     let sub_opt = format!("#EXTVLCOPT:input-slave={}/vlc/{}/sub.srt\n", base, id);
+    // `ih` pins this URL to the RELEASE, not to a position in last_search. VLC
+    // re-requests it on every reconnect and seek, and a search run meanwhile
+    // would otherwise repoint the id at a different file mid-playback. Empty
+    // when the result carries no infohash (library plays), which is harmless:
+    // `remap_id_by_infohash` then just keeps the positional id.
+    let pin = infohash_for_result(&state, id)
+        .map(|h| format!("&ih={}", h))
+        .unwrap_or_default();
     let body = format!(
-        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:sub-language=en,eng\n#EXTVLCOPT:network-caching={}\n{}{}{}/vlc/{}/stream?al={}\n",
-        name, audio_lang, netcache, sub_opt, start_opt, base, id, audio_lang
+        "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:sub-language=en,eng\n#EXTVLCOPT:network-caching={}\n{}{}{}/vlc/{}/stream?al={}{}\n",
+        name, audio_lang, netcache, sub_opt, start_opt, base, id, audio_lang, pin
     );
     axum::response::Response::builder()
         .status(200)
@@ -9938,6 +10046,53 @@ mod tests {
     }
 
     use super::*;
+
+    // Infohashes copied verbatim from a real Torrentio response for Silo
+    // S01E01 / S03E10 rather than invented, per the fixtures-from-reality rule.
+    const KITSUNE: &str = "a797a83f999dc1d03261c994208ccc189b4e2456";
+    const OTHER: &str = "b1c2d3e4f5a6978800112233445566778899aabb";
+
+    #[test]
+    fn pin_keeps_the_id_when_it_still_names_the_same_release() {
+        let pairs = [(1usize, KITSUNE), (2usize, OTHER)];
+        assert_eq!(
+            pick_id_for_infohash(&pairs, 1, KITSUNE),
+            PinOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn pin_follows_the_release_when_a_search_reorders_it() {
+        // The 2026-09-04 case: a search run mid-stream moved the playing release
+        // from id 4 to a different slot, and the live VLC URL still said 4.
+        let pairs = [(1usize, OTHER), (4usize, "ffffffff"), (7usize, KITSUNE)];
+        assert_eq!(
+            pick_id_for_infohash(&pairs, 4, KITSUNE),
+            PinOutcome::Remapped(7)
+        );
+    }
+
+    #[test]
+    fn pin_is_case_insensitive_since_infohash_case_is_not_meaningful() {
+        let pairs = [(3usize, KITSUNE)];
+        assert_eq!(
+            pick_id_for_infohash(&pairs, 9, &KITSUNE.to_uppercase()),
+            PinOutcome::Remapped(3)
+        );
+    }
+
+    #[test]
+    fn pin_reports_absent_rather_than_guessing_when_the_release_is_gone() {
+        // A wholly different search. Guessing here would be worse than the old
+        // positional behaviour; the caller keeps the id and logs.
+        let pairs = [(1usize, OTHER)];
+        assert_eq!(pick_id_for_infohash(&pairs, 1, KITSUNE), PinOutcome::Absent);
+    }
+
+    #[test]
+    fn pin_on_an_empty_search_is_absent_not_a_panic() {
+        assert_eq!(pick_id_for_infohash(&[], 1, KITSUNE), PinOutcome::Absent);
+    }
 
     // ---- v3.22 (2026-08-04): Continue-dedup + Tier B boot-resume + seen-seasons ----
 
