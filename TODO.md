@@ -7,24 +7,24 @@ endpoint answers and `/api/position` carries `gone`, but nobody has watched the
 Now-view clear and land back on the previous page. Needs a human at a machine
 with VLC: play something, quit VLC, watch the remote.
 
-### 🔓 OPEN — `install-extra-binaries` builds the whole spela binary on MERIAN, which needs none of it
-MERIAN's VLC path is `spela-vlc` (shell + curl), the python bridge, and the
-`vlc://` handler. **Nothing there uses the Rust binary**; it is provisioned only
-because MERIAN carries `role = "dev"` and the trigger installs the fleet's dev
-tools wholesale. The cost is a full Rust build on the oldest, slowest Mac — it
-drove load to 44 and made the fans audible in someone else's living room on
-2026-09-04, and it re-fires while `need spela` stays true. Decide: exclude spela
-(and other heavy Rust builds) on machines that only consume spela over HTTP, or
-accept the rebuild. Fleet-policy change → Fredrik's call.
+### ✅ RESOLVED 2026-09-05 — MERIAN no longer rebuilds a spela it never uses
+`install-extra-binaries` has no `watch`, so it provisioned the fleet's dev tools
+on EVERY apply — meaning a machine that only reaches spela over HTTP still built
+the Rust binary from source. On MERIAN that drove load to 44 and made the fans
+audible across a room. Fixed with an explicit per-machine `skip_builds` list in
+`fleet.toml`, reusing rebuild-nit.sh's reader shape; explicit rather than derived
+from the "laptop" role, per the principle `[machines.turing]` already records.
+**The Mac Mini is deliberately NOT in the list** — it runs `spela serve-library`
+as a launchd agent and Ruby drives the CLI by local subprocess. Verified live:
+MERIAN's sync ran the installer and spela stayed absent.
 
-### 🔓 OPEN — no triggers appeared to run during MERIAN's 2026-09-05 `nit update`
-The sync deployed 27 templates and reported `ok`, but printed no
-`nit: trigger '…' succeeded` lines at all — neither the new
-`42-restart-spela-vlc-bridge` (whose script runs correctly when invoked by hand
-over SSH, and did kickstart the agent) nor `install-extra-binaries`. nit's own
-logic counts a NEW trigger as changed, so 42 should have fired. Diagnosing means
-an apply with full output, which also starts the spela build above — so settle
-that one first. Until then a bridge change on MERIAN needs a manual
+### 📌 NOTE — one MERIAN sync printed no trigger lines; not reproducing
+The 2026-09-05 09:24 sync deployed 27 templates and reported `ok` with no
+`nit: trigger '…' succeeded` lines at all. The 11:2x sync printed three,
+including the new `42-restart-spela-vlc-bridge`. Unexplained; nit's own logic
+counts a new trigger as changed, so it should have fired the first time. Watch
+for a recurrence rather than chasing it — a bridge change that appears not to
+take effect is the symptom, and the manual fallback is
 `bash ~/dotfiles/scripts/darwin/42-restart-spela-vlc-bridge.sh`.
 
 ### Rewatch shelf + trailers + list performance — SHIPPED + live-verified 2026-08-27 ✅
