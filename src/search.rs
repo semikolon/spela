@@ -1564,11 +1564,16 @@ impl SearchEngine {
 /// Viability is baked into the value in BOTH mappings, which is what keeps this
 /// a strict total order (see the history note above) and what stops an
 /// unreachable 4K from winning: a 2160p release under
-/// `MIN_SEEDS_FOR_RESOLUTION_PREF` seeds drops below every viable lower
-/// resolution, so 4K is preferred only when it can actually be delivered.
+/// the viability bar drops below every viable lower resolution, so 4K is
+/// preferred only when it can actually be delivered.
 pub(crate) fn effective_res_tier(r: &TorrentResult, transcoding: bool) -> u32 {
     let base = resolution_tier(&r.title);
-    let viable = r.seeds >= MIN_SEEDS_FOR_RESOLUTION_PREF;
+    let viable = r.seeds
+        >= if transcoding {
+            MIN_SEEDS_TRANSCODING
+        } else {
+            MIN_SEEDS_NATIVE
+        };
     if transcoding {
         match (base, viable) {
             (0, true) => 0,  // 1080p viable
@@ -1638,10 +1643,30 @@ pub fn rank_results_mut_prefer(
             };
         }
 
-        // Tier 2: non-DV > DV (HARD GPU gate, fires before any quality tier)
+        // Tier 2: non-DV > DV — a HARD gate, but ONLY for the transcoding target.
+        //
+        // The reason it exists is specific to one piece of hardware: Darwin's GTX
+        // 1650 NVENC cannot parse a Dolby Vision profile 5/7 RPU, so a DV release
+        // cast to a Chromecast produces no output at all. That is a genuine
+        // capability wall and stays absolute.
+        //
+        // It is NOT a wall for the M2 decoding natively in VLC, and leaving it in
+        // place there had a cost that only became visible once 4K was wanted:
+        // essentially every 2160p WEB-DL of a streaming title ships with DV, so a
+        // gate written about a GPU was quietly excluding the entire 4K catalogue
+        // from a 4K monitor. For Star City S01E08 the single well-seeded 2160p was
+        // a DV release sitting at position 37 of 39.
+        //
+        // So for native targets DV is demoted to a PREFERENCE (tier 6 below) rather
+        // than a gate: a 4K DV release still beats a 1080p non-DV one, because
+        // resolution is decided first, while between two otherwise-equal releases
+        // the non-DV one still wins. Fredrik's own testimony is the evidence for
+        // the lift — he has played DV before without noticing wrong colour — and
+        // the failure mode if that is ever wrong is washed-out picture, visible in
+        // the first second and revertible by moving this tier back up.
         let a_dv = has_dolby_vision_in_title(&a.title);
         let b_dv = has_dolby_vision_in_title(&b.title);
-        if a_dv != b_dv {
+        if prefer_h264 && a_dv != b_dv {
             return if a_dv {
                 std::cmp::Ordering::Greater
             } else {
@@ -1736,7 +1761,20 @@ pub fn rank_results_mut_prefer(
             return a_size.cmp(&b_size);
         }
 
-        // Tier 7: more seeds > fewer seeds
+        // Tier 7 (2026-09-05): non-DV > DV for NATIVE targets, as a last preference
+        // rather than the tier-2 gate. Everything else has tied, so this only ever
+        // separates two releases that are otherwise the same pick — which is the
+        // one place a mild uncertainty about VLC's Dolby Vision handling should be
+        // allowed to decide anything.
+        if !prefer_h264 && a_dv != b_dv {
+            return if a_dv {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
+        }
+
+        // Tier 8: more seeds > fewer seeds
         b.seeds.cmp(&a.seeds)
     });
 
@@ -1992,10 +2030,22 @@ pub(crate) fn language_fit_bucket(title: &str, original_language: Option<&str>) 
     }
 }
 
-/// 2026-09-05: how many seeds a release needs before its resolution counts as
-/// "real". Shared by the resolution tier so an unreachable 4K cannot outrank a
-/// well-seeded 1080p just by being 4K.
-const MIN_SEEDS_FOR_RESOLUTION_PREF: u32 = 50;
+/// How many seeds a release needs before its resolution counts as "real", so an
+/// unreachable 4K cannot outrank a well-seeded 1080p just by being 4K.
+///
+/// Target-scoped since 2026-09-05. 50 is the long-standing transcoding-target
+/// number, tuned when the goal was purely "start fast on a 1080p TV". Native
+/// targets get 20, because 4K swarms are structurally thinner than 1080p ones
+/// and 50 was excluding them wholesale — the best 2160p for Star City S01E08 had
+/// **48** seeds, two short, and was demoted to the bottom of the list while the
+/// monitor sat there wanting it. The looser bar is safe here rather than
+/// reckless: a source that cannot deliver is caught downstream by the readiness
+/// gate, the 12s/30s stall gate, source racing and dead-source rotation, all of
+/// which surface a bad pick in seconds. Seed count is a poor delivery predictor
+/// anyway (a "344-seed" release once connected 3 real peers at 0 B/s), so this
+/// bar was never the real protection.
+const MIN_SEEDS_TRANSCODING: u32 = 50;
+const MIN_SEEDS_NATIVE: u32 = 20;
 
 /// Bitrate preference, expressed through FILE SIZE.
 ///
@@ -3480,24 +3530,29 @@ mod tests {
     fn test_ranking_prefers_the_fatter_encode_on_the_4k_monitor() {
         let mut results = star_city_s01e08_live_candidates();
         rank_results_mut_prefer(&mut results, false, Some("en")); // vlc — native decode
+                                                                  // The fattest CLEAN, VIABLE 1080p wins: 2.78 GB at 47 seeds, which the
+                                                                  // native 20-seed bar admits and the old 50-seed one excluded outright.
+                                                                  // The 5.09 GB release is larger still but carries an ITA marker, and
+                                                                  // language outranks bitrate — a fat release in the wrong language is
+                                                                  // unwatchable rather than merely soft.
         assert!(
-            results[0].title.contains("Silence"),
-            "the 2.33 GB WEB-DL should win over the 1.00 GB x265 that seeds better; got {:?}",
+            results[0].title.contains("ENG.Atmos"),
+            "expected the 2.78 GB clean WEB-DL; got {:?}",
             results[0].title
         );
-        // The old winner is still respectable, just no longer first: same
-        // resolution, same language, smaller file.
-        let megusta = results
-            .iter()
-            .position(|r| r.title.contains("MeGusta") && r.title.contains("1080p"))
-            .unwrap();
-        let neonoir = results
-            .iter()
-            .position(|r| r.title.contains("NeoNoir"))
-            .unwrap();
+        // Below it the order is by SIZE, not by seeds, which is the whole point:
+        // the 274-seed 1.00 GB used to be first and now sits behind both fatter
+        // encodes of the same episode.
+        let pos = |needle: &str| {
+            results
+                .iter()
+                .position(|r| r.title.contains(needle))
+                .unwrap()
+        };
+        assert!(pos("Silence") < pos("NeoNoir"), "2.33 GB before 1.3 GB");
         assert!(
-            neonoir < megusta,
-            "1.3 GB should outrank 1.00 GB at equal resolution"
+            pos("NeoNoir") < pos("MeGusta[EZTVx.to].mkv"),
+            "1.3 GB before 1.00 GB"
         );
     }
 
