@@ -1566,7 +1566,11 @@ impl SearchEngine {
 /// unreachable 4K from winning: a 2160p release under
 /// the viability bar drops below every viable lower resolution, so 4K is
 /// preferred only when it can actually be delivered.
-pub(crate) fn effective_res_tier(r: &TorrentResult, transcoding: bool) -> u32 {
+pub(crate) fn effective_res_tier(
+    r: &TorrentResult,
+    transcoding: bool,
+    best_1080p_bpp: Option<f64>,
+) -> u32 {
     let base = resolution_tier(&r.title);
     let viable = r.seeds
         >= if transcoding {
@@ -1586,21 +1590,24 @@ pub(crate) fn effective_res_tier(r: &TorrentResult, transcoding: bool) -> u32 {
             _ => 7,          // unknown / unclassified
         }
     } else {
-        match (base, viable) {
-            (3, true) => 0, // 2160p viable — the monitor's native resolution
-            (0, true) => 1, // 1080p viable
-            (1, true) => 2, // 720p viable
-            (2, true) => 3, // 480p viable
+        // A 4K is only 4K if its bitrate backs the pixels.
+        let starved = is_starved_4k(r, best_1080p_bpp);
+        match (base, viable, starved) {
+            (3, true, false) => 0, // 2160p viable, and the bitrate backs it
+            (0, true, _) => 1,     // 1080p viable
+            (3, true, true) => 2,  // 2160p viable but STARVED → below good 1080p
+            (1, true, _) => 3,     // 720p viable
+            (2, true, _) => 4,     // 480p viable
             // Below the viability bar the binding constraint is delivery, not
             // pixels, so the order INVERTS here: 2160p needs roughly five times
             // the sustained bitrate of 1080p, which makes a dead 4K the least
             // likely of all of these to ever play. A 1-seed 11 GB 2160p must not
             // outrank a 47-seed 1080p just for being 4K.
-            (0, false) => 4, // 1080p unviable
-            (1, false) => 5, // 720p unviable
-            (2, false) => 6, // 480p unviable
-            (3, false) => 7, // 2160p unviable → last; the hungriest and the deadest
-            _ => 8,          // unknown / unclassified
+            (0, false, _) => 5, // 1080p unviable
+            (1, false, _) => 6, // 720p unviable
+            (2, false, _) => 7, // 480p unviable
+            (3, false, _) => 8, // 2160p unviable → last; hungriest and deadest
+            _ => 9,             // unknown / unclassified
         }
     }
 }
@@ -1630,6 +1637,10 @@ pub fn rank_results_mut_prefer(
     // the seeds of the H.264 tier-4 winner, override the codec preference. See
     // tier 4 body below for the full rationale + Apr/May 2026 anchoring incident.
     const SEED_DISPARITY_OVERRIDE: u32 = 30;
+
+    // Pre-pass: the 1080p yardstick a 2160p release is judged against. Computed
+    // once, outside the comparator, so every tier stays a per-result value.
+    let best_1080p_bpp = best_1080p_bytes_per_pixel(results);
 
     results.sort_by(|a, b| {
         // Tier 1: single-file > pack
@@ -1679,8 +1690,8 @@ pub fn rank_results_mut_prefer(
         // doc for the full mapping + the non-transitive-comparator history
         // that motivated the redesign. Direct `cmp` on the bucket guarantees
         // total ordering; tier 4 only fires within the same bucket.
-        let a_eff = effective_res_tier(a, prefer_h264);
-        let b_eff = effective_res_tier(b, prefer_h264);
+        let a_eff = effective_res_tier(a, prefer_h264, best_1080p_bpp);
+        let b_eff = effective_res_tier(b, prefer_h264, best_1080p_bpp);
         if a_eff != b_eff {
             return a_eff.cmp(&b_eff);
         }
@@ -2028,6 +2039,73 @@ pub(crate) fn language_fit_bucket(title: &str, original_language: Option<&str>) 
         (true, true, _) | (false, _, true) => 1,
         (false, _, false) => 0,
     }
+}
+
+/// Pixel count per raw resolution bucket, for judging whether a release's bitrate
+/// is actually backed by the resolution it claims. `None` for an unclassified
+/// title, where no such judgement is possible.
+fn pixels_for_res_tier(tier: u32) -> Option<f64> {
+    Some(match tier {
+        0 => 1920.0 * 1080.0,
+        1 => 1280.0 * 720.0,
+        2 => 854.0 * 480.0,
+        3 => 3840.0 * 2160.0,
+        _ => return None,
+    })
+}
+
+/// Bytes per pixel for a release: size divided by the pixels its resolution
+/// implies. Runtime cancels out because every candidate in one search is the same
+/// minutes, so this is a clean proxy for bits-per-pixel-per-frame — which is what
+/// compression artefacts are made of.
+fn bytes_per_pixel(r: &TorrentResult) -> Option<f64> {
+    let px = pixels_for_res_tier(resolution_tier(&r.title))?;
+    let bytes = crate::server::parse_size_to_bytes(&r.size)?;
+    (bytes > 0).then(|| bytes as f64 / px)
+}
+
+/// The best bytes-per-pixel any 1080p candidate in this search reaches — the
+/// yardstick a 2160p release is measured against, since 1080p is what it would
+/// otherwise displace. Computed in a pre-pass so the comparator stays a pure
+/// function of per-result values.
+fn best_1080p_bytes_per_pixel(results: &[TorrentResult]) -> Option<f64> {
+    results
+        .iter()
+        .filter(|r| resolution_tier(&r.title) == 0)
+        .filter_map(bytes_per_pixel)
+        .fold(None, |acc: Option<f64>, v| {
+            Some(acc.map_or(v, |a: f64| a.max(v)))
+        })
+}
+
+/// A 2160p release is STARVED when its bytes-per-pixel falls below this fraction
+/// of the best 1080p on offer, and is then ranked BELOW that 1080p instead of
+/// above it. Without this the resolution CLASS alone would decide, and a thin
+/// 3 GB 2160p would outrank a 5 GB 1080p of the same episode purely for saying
+/// 2160 in its name — the opposite of wanting a crisp picture.
+///
+/// Half, rather than one, because equal perceived quality does NOT need equal
+/// bits per pixel: larger frames encode more efficiently per pixel (more spatial
+/// correlation to exploit), and the working rule of thumb is that 2160p needs
+/// roughly 2 to 2.5x the bitrate of 1080p for parity, not the 4x its pixel count
+/// would suggest. Parity therefore sits near half the bytes-per-pixel.
+///
+/// Checked against the real Star City S01E08 list: the 11.85 GB 2160p is about
+/// 24 Mbps and 1532 bytes/pixel against the best 1080p's 2643, a ratio of 0.58 —
+/// a genuine 4K, and it passes. A hypothetical 4 GB 4K of the same episode lands
+/// at 519, a ratio of 0.20, and is correctly demoted: it carries less data per
+/// pixel than even the 1.00 GB 1080p rip.
+const STARVED_4K_FRACTION: f64 = 0.5;
+
+fn is_starved_4k(r: &TorrentResult, best_1080p_bpp: Option<f64>) -> bool {
+    if resolution_tier(&r.title) != 3 {
+        return false;
+    }
+    // No 1080p to compare against, or no size to compare with: no judgement.
+    let (Some(reference), Some(bpp)) = (best_1080p_bpp, bytes_per_pixel(r)) else {
+        return false;
+    };
+    bpp < reference * STARVED_4K_FRACTION
 }
 
 /// How many seeds a release needs before its resolution counts as "real", so an
@@ -3526,6 +3604,60 @@ mod tests {
         ]
     }
 
+    /// The bitrate has to back the pixels. A release does not become sharp by
+    /// carrying "2160p" in its name, and a starved 4K spreading too few bits over
+    /// four times the pixels looks WORSE than a fat 1080p — which is the whole
+    /// reason this test exists rather than a plain resolution preference.
+    ///
+    /// Sizes are the real Star City S01E08 ones plus one hypothetical thin 4K.
+    #[test]
+    fn test_a_starved_4k_loses_to_a_fat_1080p() {
+        let fat_1080p = make_sized(
+            1,
+            "Star.City.S01E08.1080p.WEB-DL.H.264-NTb.mkv",
+            200,
+            "5.09 GB",
+        );
+        let thin_4k = make_sized(2, "Star.City.S01E08.2160p.WEB.h265-Group", 200, "4 GB");
+        let real_4k = make_sized(3, "Star.City.S01E08.2160p.WEB.h265-Group", 200, "11.85 GB");
+
+        // Yardstick: the best 1080p in the set.
+        let bpp = best_1080p_bytes_per_pixel(&[fat_1080p.clone(), thin_4k.clone()]);
+        assert!(bpp.is_some());
+
+        // The thin 4K carries less data per pixel than the 1080p it would
+        // displace, so it ranks BELOW it.
+        assert!(is_starved_4k(&thin_4k, bpp));
+        assert!(
+            effective_res_tier(&thin_4k, false, bpp) > effective_res_tier(&fat_1080p, false, bpp)
+        );
+
+        // The real 24 Mbps 4K is not starved and still wins.
+        assert!(!is_starved_4k(&real_4k, bpp));
+        assert!(
+            effective_res_tier(&real_4k, false, bpp) < effective_res_tier(&fat_1080p, false, bpp)
+        );
+
+        // End to end through the ranker, both 4Ks present at once.
+        let mut results = vec![fat_1080p, thin_4k, real_4k];
+        rank_results_mut_prefer(&mut results, false, Some("en"));
+        assert!(
+            results[0].size.contains("11.85"),
+            "got {:?}",
+            results[0].size
+        );
+        assert!(
+            results[1].size.contains("5.09"),
+            "got {:?}",
+            results[1].size
+        );
+        assert!(
+            results[2].size.contains("4 GB"),
+            "got {:?}",
+            results[2].size
+        );
+    }
+
     #[test]
     fn test_ranking_prefers_the_fatter_encode_on_the_4k_monitor() {
         let mut results = star_city_s01e08_live_candidates();
@@ -3979,18 +4111,23 @@ mod tests {
         let r2160 = make_result(0, "X.2160p.x265.mkv", 500, Some(0));
         let r_unknown = make_result(0, "X.no.resolution.tag.mkv", 1000, Some(0));
 
-        assert_eq!(effective_res_tier(&r1080_viable, true), 0);
-        assert_eq!(effective_res_tier(&r720_viable, true), 1);
-        assert_eq!(effective_res_tier(&r480_viable, true), 2);
-        assert_eq!(effective_res_tier(&r1080_unviable, true), 3);
-        assert_eq!(effective_res_tier(&r720_unviable, true), 4);
-        assert_eq!(effective_res_tier(&r2160, true), 6);
-        assert_eq!(effective_res_tier(&r_unknown, true), 7);
+        assert_eq!(effective_res_tier(&r1080_viable, true, None), 0);
+        assert_eq!(effective_res_tier(&r720_viable, true, None), 1);
+        assert_eq!(effective_res_tier(&r480_viable, true, None), 2);
+        assert_eq!(effective_res_tier(&r1080_unviable, true, None), 3);
+        assert_eq!(effective_res_tier(&r720_unviable, true, None), 4);
+        assert_eq!(effective_res_tier(&r2160, true, None), 6);
+        assert_eq!(effective_res_tier(&r_unknown, true, None), 7);
 
         // Critical invariant: viable lower resolution beats unviable higher.
-        assert!(effective_res_tier(&r720_viable, true) < effective_res_tier(&r1080_unviable, true));
+        assert!(
+            effective_res_tier(&r720_viable, true, None)
+                < effective_res_tier(&r1080_unviable, true, None)
+        );
         // 2160p with great seeds STILL ranks below any viable 1080p/720p/480p.
-        assert!(effective_res_tier(&r2160, true) > effective_res_tier(&r480_viable, true));
+        assert!(
+            effective_res_tier(&r2160, true, None) > effective_res_tier(&r480_viable, true, None)
+        );
     }
 
     /// The NATIVE-decode mapping (vlc / phone — the 4K monitor). Same function,
@@ -4004,35 +4141,44 @@ mod tests {
         let r1080_viable = make_result(0, "X.1080p.x264.mkv", 900, Some(0));
         let r720_viable = make_result(0, "X.720p.x264.mkv", 900, Some(0));
 
-        assert_eq!(effective_res_tier(&r2160_viable, false), 0);
-        assert_eq!(effective_res_tier(&r1080_viable, false), 1);
-        assert_eq!(effective_res_tier(&r720_viable, false), 2);
+        assert_eq!(effective_res_tier(&r2160_viable, false, None), 0);
+        assert_eq!(effective_res_tier(&r1080_viable, false, None), 1);
+        // 2 is reserved for a viable-but-STARVED 2160p, so 720p sits at 3.
+        assert_eq!(effective_res_tier(&r720_viable, false, None), 3);
 
         // A 4K nobody is seeding is worse than a 1080p that plays. This is the
         // guard that keeps "prefer 4K" from meaning "prefer a spinner".
         assert!(
-            effective_res_tier(&r2160_unviable, false) > effective_res_tier(&r1080_viable, false)
+            effective_res_tier(&r2160_unviable, false, None)
+                > effective_res_tier(&r1080_viable, false, None)
         );
         assert!(
-            effective_res_tier(&r2160_unviable, false) > effective_res_tier(&r720_viable, false)
+            effective_res_tier(&r2160_unviable, false, None)
+                > effective_res_tier(&r720_viable, false, None)
         );
         // And it loses to every OTHER dead source too: below the bar the question
         // is what can be delivered, and 4K is the hungriest thing on the list.
         let r1080_unviable = make_result(0, "X.1080p.x264.mkv", 47, Some(0));
         let r480_unviable = make_result(0, "X.480p.x264.mkv", 4, Some(0));
         assert!(
-            effective_res_tier(&r2160_unviable, false) > effective_res_tier(&r1080_unviable, false)
+            effective_res_tier(&r2160_unviable, false, None)
+                > effective_res_tier(&r1080_unviable, false, None)
         );
         assert!(
-            effective_res_tier(&r2160_unviable, false) > effective_res_tier(&r480_unviable, false)
+            effective_res_tier(&r2160_unviable, false, None)
+                > effective_res_tier(&r480_unviable, false, None)
         );
 
         // And the two targets genuinely disagree — the same 4K release ranks
         // first on the monitor and last on the Chromecast.
         assert!(
-            effective_res_tier(&r2160_viable, false) < effective_res_tier(&r1080_viable, false)
+            effective_res_tier(&r2160_viable, false, None)
+                < effective_res_tier(&r1080_viable, false, None)
         );
-        assert!(effective_res_tier(&r2160_viable, true) > effective_res_tier(&r1080_viable, true));
+        assert!(
+            effective_res_tier(&r2160_viable, true, None)
+                > effective_res_tier(&r1080_viable, true, None)
+        );
     }
 
     #[test]
