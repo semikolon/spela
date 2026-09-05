@@ -5716,7 +5716,7 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
 
 // --- Helpers ---
 
-fn parse_size_to_bytes(size_str: &str) -> Option<u64> {
+pub(crate) fn parse_size_to_bytes(size_str: &str) -> Option<u64> {
     let lower = size_str.to_lowercase();
     let parts: Vec<&str> = lower.split_whitespace().collect();
     if parts.len() < 2 {

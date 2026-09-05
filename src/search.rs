@@ -1544,19 +1544,59 @@ impl SearchEngine {
 /// non-transitive comparators. Bake all per-operand attributes into a SINGLE
 /// per-operand value, then compare values directly — total order is then
 /// structurally guaranteed.
-pub(crate) fn effective_res_tier(r: &TorrentResult) -> u32 {
-    const MIN_SEEDS_FOR_RESOLUTION_PREF: u32 = 50;
+/// 2026-09-05: the resolution policy is TARGET-SCOPED, exactly as the codec
+/// preference has been since v3.19, and along the same axis — does this target
+/// re-encode through Darwin's NVENC, or decode natively?
+///
+/// `transcoding` TRUE (chromecast, shannon): the historical Sarpetorp mapping.
+/// Those screens are 1080p, and 4K NVENC transcode is about 3x the work for
+/// pixels the panel cannot show, so 2160p stays demoted below everything.
+///
+/// `transcoding` FALSE (vlc, phone/browser): the Mac monitor is 4K and decodes
+/// HEVC natively, so 2160p is the NATIVE resolution and ranks FIRST. This
+/// reverses the demotion for that target only. The reason is optical rather
+/// than a preference: a 1080p source shown on a 4K panel is upscaled 2x, and at
+/// close viewing distance it reads as soft no matter how high its bitrate goes.
+/// Anchor (2026-09-05): a 2.33 GB 1080p WEB-DL at roughly 5.2 Mbps — already
+/// 2.5x the bitrate of what the ranker had been picking — was still visibly
+/// compressed at close distance on the 4K monitor.
+///
+/// Viability is baked into the value in BOTH mappings, which is what keeps this
+/// a strict total order (see the history note above) and what stops an
+/// unreachable 4K from winning: a 2160p release under
+/// `MIN_SEEDS_FOR_RESOLUTION_PREF` seeds drops below every viable lower
+/// resolution, so 4K is preferred only when it can actually be delivered.
+pub(crate) fn effective_res_tier(r: &TorrentResult, transcoding: bool) -> u32 {
     let base = resolution_tier(&r.title);
     let viable = r.seeds >= MIN_SEEDS_FOR_RESOLUTION_PREF;
-    match (base, viable) {
-        (0, true) => 0,  // 1080p viable
-        (1, true) => 1,  // 720p viable
-        (2, true) => 2,  // 480p viable
-        (0, false) => 3, // 1080p unviable → demoted
-        (1, false) => 4, // 720p unviable
-        (2, false) => 5, // 480p unviable
-        (3, _) => 6,     // 2160p — always demoted per Sarpetorp policy
-        _ => 7,          // unknown / unclassified
+    if transcoding {
+        match (base, viable) {
+            (0, true) => 0,  // 1080p viable
+            (1, true) => 1,  // 720p viable
+            (2, true) => 2,  // 480p viable
+            (0, false) => 3, // 1080p unviable → demoted
+            (1, false) => 4, // 720p unviable
+            (2, false) => 5, // 480p unviable
+            (3, _) => 6,     // 2160p — always demoted for a 1080p-capped screen
+            _ => 7,          // unknown / unclassified
+        }
+    } else {
+        match (base, viable) {
+            (3, true) => 0, // 2160p viable — the monitor's native resolution
+            (0, true) => 1, // 1080p viable
+            (1, true) => 2, // 720p viable
+            (2, true) => 3, // 480p viable
+            // Below the viability bar the binding constraint is delivery, not
+            // pixels, so the order INVERTS here: 2160p needs roughly five times
+            // the sustained bitrate of 1080p, which makes a dead 4K the least
+            // likely of all of these to ever play. A 1-seed 11 GB 2160p must not
+            // outrank a 47-seed 1080p just for being 4K.
+            (0, false) => 4, // 1080p unviable
+            (1, false) => 5, // 720p unviable
+            (2, false) => 6, // 480p unviable
+            (3, false) => 7, // 2160p unviable → last; the hungriest and the deadest
+            _ => 8,          // unknown / unclassified
+        }
     }
 }
 
@@ -1614,8 +1654,8 @@ pub fn rank_results_mut_prefer(
         // doc for the full mapping + the non-transitive-comparator history
         // that motivated the redesign. Direct `cmp` on the bucket guarantees
         // total ordering; tier 4 only fires within the same bucket.
-        let a_eff = effective_res_tier(a);
-        let b_eff = effective_res_tier(b);
+        let a_eff = effective_res_tier(a, prefer_h264);
+        let b_eff = effective_res_tier(b, prefer_h264);
         if a_eff != b_eff {
             return a_eff.cmp(&b_eff);
         }
@@ -1683,7 +1723,20 @@ pub fn rank_results_mut_prefer(
             }
         }
 
-        // Tier 6: more seeds > fewer seeds
+        // Tier 6 (2026-09-05): bitrate, via file size. Everything above this has
+        // tied — same resolution bucket, same viability, same language, same
+        // codec — so these are genuinely alternative encodes of the same minutes,
+        // and the bigger one is the less compressed one. This sits ABOVE seeds
+        // deliberately: seed count was the de-facto quality decision and it
+        // consistently picked the smallest file, because the tiny x265 rips are
+        // the ones everybody seeds.
+        let a_size = size_tier(a);
+        let b_size = size_tier(b);
+        if a_size != b_size {
+            return a_size.cmp(&b_size);
+        }
+
+        // Tier 7: more seeds > fewer seeds
         b.seeds.cmp(&a.seeds)
     });
 
@@ -1939,6 +1992,53 @@ pub(crate) fn language_fit_bucket(title: &str, original_language: Option<&str>) 
     }
 }
 
+/// 2026-09-05: how many seeds a release needs before its resolution counts as
+/// "real". Shared by the resolution tier so an unreachable 4K cannot outrank a
+/// well-seeded 1080p just by being 4K.
+const MIN_SEEDS_FOR_RESOLUTION_PREF: u32 = 50;
+
+/// Bitrate preference, expressed through FILE SIZE.
+///
+/// Within one search every candidate is the same episode or film, so runtime is
+/// constant and size IS bitrate — no duration lookup needed, and none is
+/// available for a TV episode anyway.
+///
+/// Returned as a per-result BAND rather than compared pairwise with a ratio
+/// threshold, because a pairwise threshold is the documented non-transitive
+/// comparator trap this ranker was already bitten by (see `effective_res_tier`).
+/// Bands step by 1.5x, so a release must be about half again as large to win
+/// one — ordinary encode-to-encode variation stays a tie and falls through to
+/// seeds. Lower is better, matching every other tier.
+///
+/// Anchor (Star City S01E08, 2026-09-05, real sizes from the live search): a
+/// 1.00 GB x265 at roughly 2.1 Mbps was winning on seed count alone, and read as
+/// visibly compressed on a 4K monitor at close viewing distance. A 2.33 GB
+/// WEB-DL of the same episode with 103 seeds sat two rows below it.
+pub(crate) fn size_tier(r: &TorrentResult) -> u32 {
+    // 1.25x steps: a release must be about a quarter larger to win a band, so
+    // ordinary encode-to-encode variation (measured: 2.33 GB vs 2.60 GB for the
+    // same episode) stays a tie and falls through to seeds, while a real step up
+    // in bitrate does not. 1.5x was tried first and was too coarse — it tied a
+    // 1.00 GB x265 with a 1.30 GB one, a 30% bitrate difference that is visible
+    // on this monitor.
+    const BAND_STEP: f64 = 1.25;
+    // Must exceed the band of the largest release anyone will ever see, or big
+    // files clamp together and stop being distinguishable. ln(100 GB)/ln(1.25)
+    // is about 114, so 140 leaves headroom and still leaves room below zero for
+    // nothing to hit the floor.
+    const WORST: u32 = 140;
+    match crate::server::parse_size_to_bytes(&r.size) {
+        Some(bytes) if bytes > 0 => {
+            let band = ((bytes as f64).ln() / BAND_STEP.ln()).floor() as i64;
+            (WORST as i64 - band).clamp(0, WORST as i64) as u32
+        }
+        // An unparseable or absent size must not win by accident. Ranking it
+        // last within its resolution bucket is the honest answer: we know
+        // nothing about it, and there is always another candidate.
+        _ => WORST,
+    }
+}
+
 /// Language fit as a plain ranker tier.
 ///
 /// Deliberately carries NO seed-viability term, unlike `effective_res_tier`.
@@ -1957,25 +2057,24 @@ pub(crate) fn effective_lang_tier(r: &TorrentResult, original_language: Option<&
     language_fit_bucket(&r.title, original_language)
 }
 
-/// Classify a torrent title into a resolution bucket. Lower is better.
-/// Used by tier 3 of `rank_results_mut`.
+/// Classify a torrent title into a RAW resolution bucket. This is a pure
+/// reading of the release name and carries NO policy about which resolution is
+/// wanted — that belongs to `effective_res_tier`, which is target-scoped.
 ///
-/// **Apr 15 v3.1.0 ordering** (Sarpetorp policy: 1080p target, 4K demoted):
-///
-///   0 → 1080p (target — native TV resolution + fast transcode)
-///   1 → 720p  (fallback when 1080p isn't viable)
-///   2 → 480p  (last viable fallback for dead 1080p/720p)
-///   3 → 2160p / 4K / UHD (DEMOTED — TVs can't display the extra pixels,
-///        4K NVENC transcode is ~3x heavier than 1080p, pure waste)
-///   4 → unknown / anything else (sorts last)
+///   0 → 1080p     1 → 720p     2 → 480p
+///   3 → 2160p / 4K / UHD       4 → unknown / anything else
 ///
 /// Pattern matches are tolerant to the usual scene release separators:
 /// `1080p`, `1080P`, `1080 p`, `1080.p`. 2160p also matches `4k` / `4K`
 /// / `uhd` tags. Called on lowercased title internally.
 ///
-/// If you upgrade the house to 4K TVs, flip the ordering so 2160p is 0
-/// and 1080p is 1 — that's the only change needed in the ranker's
-/// resolution bucket semantics.
+/// 2026-09-05, correcting a note that stood here since Apr 15: this doc used to
+/// bake the "1080p target, 4K demoted" Sarpetorp policy into the bucket numbers
+/// and told the next reader that flipping them was "the only change needed" for
+/// 4K. Both halves were wrong by then. The policy is now per-target and lives in
+/// `effective_res_tier` (a Chromecast wants 1080p, the Mac monitor wants 2160p,
+/// from the same list), and resolution was never the only lever anyway: the
+/// codec tier and the bitrate tier both bear on how sharp the result looks.
 fn resolution_tier(title: &str) -> u32 {
     let lower = title.to_lowercase();
     // Normalize separator before `p` so `1080 p` / `1080.p` count.
@@ -3083,6 +3182,19 @@ mod tests {
         assert!(!is_hevc_from_title("Movie h 264.mkv"));
     }
 
+    /// HDR10 is NOT Dolby Vision, and the difference decides whether a 4K release
+    /// is reachable at all: tier 2 hard-gates DV (the GTX 1650 cannot parse its
+    /// RPU, and VLC renders profile 5 with wrong colour), while plain HDR decodes
+    /// fine everywhere. Real 2160p release name from the Star City S01E08 search.
+    #[test]
+    fn test_plain_hdr_is_not_gated_as_dolby_vision() {
+        assert!(!has_dolby_vision_in_title(
+            "Star.City.S01E08.HDR.2160p.WEB.h265.HeBits-GRACE"
+        ));
+        assert!(!has_dolby_vision_in_title("Movie.2160p.HDR10.WEB.x265"));
+        assert!(has_dolby_vision_in_title("Movie.2160p.DV.HDR.HEVC.mkv"));
+    }
+
     #[test]
     fn test_has_dolby_vision_in_title() {
         // Real problematic filename from the failed Boys S05E01 play
@@ -3297,6 +3409,218 @@ mod tests {
         assert!(
             results[0].title.contains("MULTI"),
             "a 3-seed clean release is not playable; the well-seeded MULTI must win"
+        );
+    }
+
+    fn make_sized(id: usize, title: &str, seeds: u32, size: &str) -> TorrentResult {
+        let mut r = make_result(id, title, seeds, Some(0));
+        r.size = size.into();
+        r
+    }
+
+    /// The full Star City S01E08 candidate list, copied VERBATIM from the live
+    /// server on 2026-09-05 (titles, seed counts and size strings all real).
+    /// Ranked for the 4K monitor, this is the case that motivated the bitrate
+    /// tier: the 1.00 GB x265 at roughly 2.1 Mbps was winning on seeds alone and
+    /// read as visibly compressed at close viewing distance.
+    fn star_city_s01e08_live_candidates() -> Vec<TorrentResult> {
+        vec![
+            make_sized(
+                1,
+                "Star.City.S01E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                274,
+                "1001.27 MB",
+            ),
+            make_sized(
+                2,
+                "Star City (2026) - S01E08 - The Wolves (1080p ATV WEB-DL x265 Silence)",
+                103,
+                "2.33 GB",
+            ),
+            make_sized(
+                3,
+                "Star.City.S01E08.The.Wolves.1080p.WEBRip.10Bit.DDP5.1.x265-NeoNoir.mkv",
+                91,
+                "1.3 GB",
+            ),
+            make_sized(
+                4,
+                "Star.City.S01E08.720p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                76,
+                "602.24 MB",
+            ),
+            make_sized(
+                5,
+                "Star.City.S01E08.480p.x264-mSD[EZTVx.to].mkv",
+                58,
+                "488.45 MB",
+            ),
+            make_sized(
+                7,
+                "Star.City.S01E08.The.Wolves.1080p.ATVP.WEB-DL.DDP5.1.ENG.Atmos.H.264-NTb.mkv",
+                47,
+                "2.78 GB",
+            ),
+            make_sized(
+                8,
+                "Star.City.S01E08.I.lupi.ITA.ENG.1080p.ATVP.WEB-DL.DD5.1.H.264-MeM.mkv",
+                21,
+                "5.09 GB",
+            ),
+            make_sized(
+                12,
+                "Star.City.S01E08.HDR.2160p.WEB.h265.HeBits-GRACE",
+                1,
+                "11.28 GB",
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_ranking_prefers_the_fatter_encode_on_the_4k_monitor() {
+        let mut results = star_city_s01e08_live_candidates();
+        rank_results_mut_prefer(&mut results, false, Some("en")); // vlc — native decode
+        assert!(
+            results[0].title.contains("Silence"),
+            "the 2.33 GB WEB-DL should win over the 1.00 GB x265 that seeds better; got {:?}",
+            results[0].title
+        );
+        // The old winner is still respectable, just no longer first: same
+        // resolution, same language, smaller file.
+        let megusta = results
+            .iter()
+            .position(|r| r.title.contains("MeGusta") && r.title.contains("1080p"))
+            .unwrap();
+        let neonoir = results
+            .iter()
+            .position(|r| r.title.contains("NeoNoir"))
+            .unwrap();
+        assert!(
+            neonoir < megusta,
+            "1.3 GB should outrank 1.00 GB at equal resolution"
+        );
+    }
+
+    /// The 4K in this list has ONE seed. Preferring 2160p must not mean
+    /// preferring a spinner, so it has to lose to every viable 1080p here.
+    #[test]
+    fn test_ranking_does_not_pick_the_one_seed_4k() {
+        let mut results = star_city_s01e08_live_candidates();
+        rank_results_mut_prefer(&mut results, false, Some("en"));
+        let four_k = results
+            .iter()
+            .position(|r| r.title.contains("2160p"))
+            .unwrap();
+        assert!(
+            four_k > 2,
+            "a 1-seed 11 GB 2160p must not rank near the top; got position {four_k}"
+        );
+    }
+
+    /// The same list on the Chromecast, whose panel is 1080p and whose path
+    /// re-encodes through NVENC: 2160p stays demoted, and the bitrate tier still
+    /// applies underneath the codec preference.
+    #[test]
+    fn test_ranking_keeps_4k_demoted_for_the_transcoding_target() {
+        let mut results = star_city_s01e08_live_candidates();
+        rank_results_mut_prefer(&mut results, true, Some("en"));
+        let four_k = results
+            .iter()
+            .position(|r| r.title.contains("2160p"))
+            .unwrap();
+        assert_eq!(
+            four_k,
+            results.len() - 1,
+            "4K ranks last for a 1080p screen"
+        );
+    }
+
+    /// A well-seeded 4K DOES win on the monitor — the reversal is real, not
+    /// cosmetic. Synthetic seed count, because no such release existed for this
+    /// episode; everything else is the real list.
+    #[test]
+    fn test_ranking_prefers_a_well_seeded_4k_on_the_monitor() {
+        let mut results = star_city_s01e08_live_candidates();
+        results.push(make_sized(
+            99,
+            "Star.City.S01E08.HDR.2160p.WEB.h265-Group",
+            120,
+            "11.28 GB",
+        ));
+        rank_results_mut_prefer(&mut results, false, Some("en"));
+        assert!(
+            results[0].title.contains("2160p"),
+            "got {:?}",
+            results[0].title
+        );
+        // …and the identical list still puts it LAST on the Chromecast.
+        let mut chromecast = star_city_s01e08_live_candidates();
+        chromecast.push(make_sized(
+            99,
+            "Star.City.S01E08.HDR.2160p.WEB.h265-Group",
+            120,
+            "11.28 GB",
+        ));
+        rank_results_mut_prefer(&mut chromecast, true, Some("en"));
+        assert!(chromecast.last().unwrap().title.contains("2160p"));
+    }
+
+    #[test]
+    fn test_size_tier_bands() {
+        let big = make_sized(1, "X.1080p.mkv", 100, "2.33 GB");
+        let small = make_sized(2, "X.1080p.mkv", 100, "1001.27 MB");
+        assert!(
+            size_tier(&big) < size_tier(&small),
+            "bigger file = better band"
+        );
+
+        // Encode-to-encode noise must not become a DECISIVE difference. Fixed
+        // band boundaries cannot promise an exact tie — two sizes 12% apart can
+        // still straddle one, which is the price of a per-result value (the
+        // pairwise-ratio alternative is the non-transitive comparator this
+        // ranker is on record as having been broken by). What must hold is that
+        // small differences move at most one band while real ones move several,
+        // so noise is worth at most a nudge and a genuine step up in bitrate wins.
+        let a = make_sized(1, "X.1080p.mkv", 100, "2.33 GB");
+        let b = make_sized(2, "X.1080p.mkv", 100, "2.60 GB");
+        assert!(
+            size_tier(&a).abs_diff(size_tier(&b)) <= 1,
+            "a 12% difference must be worth at most one band"
+        );
+        let much_bigger = make_sized(3, "X.1080p.mkv", 100, "5.09 GB");
+        assert!(
+            size_tier(&a).abs_diff(size_tier(&much_bigger)) >= 3,
+            "a 2.2x difference must be decisive"
+        );
+
+        // An unparseable size ranks last rather than winning by accident.
+        let unknown = make_sized(3, "X.1080p.mkv", 100, "");
+        assert!(size_tier(&unknown) > size_tier(&small));
+    }
+
+    /// Bitrate must never outrank language: a fat French release still loses to
+    /// a leaner English one, because the fat one is unwatchable rather than soft.
+    #[test]
+    fn test_bitrate_does_not_override_language() {
+        let mut results = vec![
+            make_sized(
+                1,
+                "Star City S01E08 MULTI 1080p WEB H264-Group.mkv",
+                300,
+                "5.09 GB",
+            ),
+            make_sized(
+                2,
+                "Star.City.S01E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                274,
+                "1001.27 MB",
+            ),
+        ];
+        rank_results_mut_prefer(&mut results, false, Some("en"));
+        assert!(
+            results[0].title.contains("MeGusta"),
+            "got {:?}",
+            results[0].title
         );
     }
 
@@ -3585,11 +3909,12 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_res_tier_classification() {
-        // Pin the effective_res_tier value mapping. Lower = ranked higher.
+    fn test_effective_res_tier_classification_transcoding_target() {
+        // Pin the TRANSCODING mapping (chromecast / shannon — 1080p screens fed by
+        // Darwin's NVENC). Lower = ranked higher.
         // 0..=2: 1080p/720p/480p with ≥50 seeds (target-resolution viable)
         // 3..=5: 1080p/720p/480p with <50 seeds (demoted below viable 480p)
-        // 6: 2160p / 4K / UHD (always deprioritized — Sarpetorp policy)
+        // 6: 2160p / 4K / UHD (always deprioritized — the panel is 1080p)
         // 7: unknown / not classified
         let r1080_viable = make_result(0, "X.1080p.x264.mkv", 50, Some(0));
         let r1080_unviable = make_result(0, "X.1080p.x264.mkv", 49, Some(0));
@@ -3599,18 +3924,60 @@ mod tests {
         let r2160 = make_result(0, "X.2160p.x265.mkv", 500, Some(0));
         let r_unknown = make_result(0, "X.no.resolution.tag.mkv", 1000, Some(0));
 
-        assert_eq!(effective_res_tier(&r1080_viable), 0);
-        assert_eq!(effective_res_tier(&r720_viable), 1);
-        assert_eq!(effective_res_tier(&r480_viable), 2);
-        assert_eq!(effective_res_tier(&r1080_unviable), 3);
-        assert_eq!(effective_res_tier(&r720_unviable), 4);
-        assert_eq!(effective_res_tier(&r2160), 6);
-        assert_eq!(effective_res_tier(&r_unknown), 7);
+        assert_eq!(effective_res_tier(&r1080_viable, true), 0);
+        assert_eq!(effective_res_tier(&r720_viable, true), 1);
+        assert_eq!(effective_res_tier(&r480_viable, true), 2);
+        assert_eq!(effective_res_tier(&r1080_unviable, true), 3);
+        assert_eq!(effective_res_tier(&r720_unviable, true), 4);
+        assert_eq!(effective_res_tier(&r2160, true), 6);
+        assert_eq!(effective_res_tier(&r_unknown, true), 7);
 
         // Critical invariant: viable lower resolution beats unviable higher.
-        assert!(effective_res_tier(&r720_viable) < effective_res_tier(&r1080_unviable));
+        assert!(effective_res_tier(&r720_viable, true) < effective_res_tier(&r1080_unviable, true));
         // 2160p with great seeds STILL ranks below any viable 1080p/720p/480p.
-        assert!(effective_res_tier(&r2160) > effective_res_tier(&r480_viable));
+        assert!(effective_res_tier(&r2160, true) > effective_res_tier(&r480_viable, true));
+    }
+
+    /// The NATIVE-decode mapping (vlc / phone — the 4K monitor). Same function,
+    /// opposite verdict on 2160p, and that reversal is the whole point: a 1080p
+    /// source is upscaled 2x on that panel and reads as soft at close distance
+    /// however high its bitrate is.
+    #[test]
+    fn test_effective_res_tier_classification_native_target() {
+        let r2160_viable = make_result(0, "X.2160p.x265.mkv", 60, Some(0));
+        let r2160_unviable = make_result(0, "X.2160p.x265.mkv", 3, Some(0));
+        let r1080_viable = make_result(0, "X.1080p.x264.mkv", 900, Some(0));
+        let r720_viable = make_result(0, "X.720p.x264.mkv", 900, Some(0));
+
+        assert_eq!(effective_res_tier(&r2160_viable, false), 0);
+        assert_eq!(effective_res_tier(&r1080_viable, false), 1);
+        assert_eq!(effective_res_tier(&r720_viable, false), 2);
+
+        // A 4K nobody is seeding is worse than a 1080p that plays. This is the
+        // guard that keeps "prefer 4K" from meaning "prefer a spinner".
+        assert!(
+            effective_res_tier(&r2160_unviable, false) > effective_res_tier(&r1080_viable, false)
+        );
+        assert!(
+            effective_res_tier(&r2160_unviable, false) > effective_res_tier(&r720_viable, false)
+        );
+        // And it loses to every OTHER dead source too: below the bar the question
+        // is what can be delivered, and 4K is the hungriest thing on the list.
+        let r1080_unviable = make_result(0, "X.1080p.x264.mkv", 47, Some(0));
+        let r480_unviable = make_result(0, "X.480p.x264.mkv", 4, Some(0));
+        assert!(
+            effective_res_tier(&r2160_unviable, false) > effective_res_tier(&r1080_unviable, false)
+        );
+        assert!(
+            effective_res_tier(&r2160_unviable, false) > effective_res_tier(&r480_unviable, false)
+        );
+
+        // And the two targets genuinely disagree — the same 4K release ranks
+        // first on the monitor and last on the Chromecast.
+        assert!(
+            effective_res_tier(&r2160_viable, false) < effective_res_tier(&r1080_viable, false)
+        );
+        assert!(effective_res_tier(&r2160_viable, true) > effective_res_tier(&r1080_viable, true));
     }
 
     #[test]
