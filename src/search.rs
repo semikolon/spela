@@ -1566,6 +1566,7 @@ impl SearchEngine {
 /// unreachable 4K from winning: a 2160p release under
 /// the viability bar drops below every viable lower resolution, so 4K is
 /// preferred only when it can actually be delivered.
+#[cfg_attr(not(test), allow(dead_code))] // test entry point; production calls the _forced form
 pub(crate) fn effective_res_tier(
     r: &TorrentResult,
     transcoding: bool,
@@ -1629,7 +1630,7 @@ pub(crate) fn effective_res_tier_forced(
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // test entry point; production ranks via rank_results_mut_prefer
-pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
+pub fn rank_results_mut(results: &mut [TorrentResult]) {
     // Default preserves the historical behaviour (Chromecast/NVENC needs H.264).
     // CLI + Ruby default to the Chromecast target, so this is the right default.
     // `None` language → `language_fit_bucket` falls back to English.
@@ -1666,7 +1667,7 @@ pub struct RankOpts<'a> {
 }
 
 pub fn rank_results_mut_prefer(
-    results: &mut Vec<TorrentResult>,
+    results: &mut [TorrentResult],
     prefer_h264: bool,
     original_language: Option<&str>,
 ) {
@@ -1680,7 +1681,7 @@ pub fn rank_results_mut_prefer(
     );
 }
 
-pub fn rank_results_mut_opts(results: &mut Vec<TorrentResult>, opts: RankOpts<'_>) {
+pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) {
     let prefer_h264 = opts.transcoding;
     let original_language = opts.original_language;
     const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
@@ -1694,18 +1695,7 @@ pub fn rank_results_mut_opts(results: &mut Vec<TorrentResult>, opts: RankOpts<'_
     let best_1080p_bpp = best_1080p_bytes_per_pixel(results);
 
     results.sort_by(|a, b| {
-        // Tier 1: single-file > pack
-        let a_single = a.file_index.is_none_or(|i| i == 0);
-        let b_single = b.file_index.is_none_or(|i| i == 0);
-        if a_single != b_single {
-            return if a_single {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            };
-        }
-
-        // Tier 2: non-DV > DV — a HARD gate, but ONLY for the transcoding target.
+        // Tier 1: non-DV > DV — a HARD gate, but ONLY for the transcoding target.
         //
         // The reason it exists is specific to one piece of hardware: Darwin's GTX
         // 1650 NVENC cannot parse a Dolby Vision profile 5/7 RPU, so a DV release
@@ -1736,7 +1726,7 @@ pub fn rank_results_mut_opts(results: &mut Vec<TorrentResult>, opts: RankOpts<'_
             };
         }
 
-        // Tier 3 (v3.4.1): composite `effective_res_tier` value that bakes
+        // Tier 2 (v3.4.1): composite `effective_res_tier` value that bakes
         // seed-viability into the resolution bucket. See `effective_res_tier`
         // doc for the full mapping + the non-transitive-comparator history
         // that motivated the redesign. Direct `cmp` on the bucket guarantees
@@ -1747,7 +1737,7 @@ pub fn rank_results_mut_opts(results: &mut Vec<TorrentResult>, opts: RankOpts<'_
             return a_eff.cmp(&b_eff);
         }
 
-        // Tier 4 (2026-09-05): language fit, WITHIN an equal resolution+viability
+        // Tier 3 (2026-09-05): language fit, WITHIN an equal resolution+viability
         // bucket. Star City S01E06 is the anchor — all three top candidates were
         // well-seeded 1080p, so they tied on every existing tier and seed count
         // alone decided: a Polish AI-dub (903) and a French MULTI (174) outranked
@@ -1760,7 +1750,7 @@ pub fn rank_results_mut_opts(results: &mut Vec<TorrentResult>, opts: RankOpts<'_
             return a_lang.cmp(&b_lang);
         }
 
-        // Tier 5: H.264 > HEVC within same resolution + DV status (insta-play tiebreak).
+        // Tier 4: H.264 > HEVC within same resolution + DV status (insta-play tiebreak).
         // May 13, 2026 v3.4.0 amendment — seed-disparity override:
         // when the HEVC alternative has ≥30× the seeds of the H.264 winner,
         // promote the HEVC. Rationale: well-seeded swarms (MeGusta-class,
@@ -1777,7 +1767,7 @@ pub fn rank_results_mut_opts(results: &mut Vec<TorrentResult>, opts: RankOpts<'_
         // codec WITHIN the same resolution + DV bucket.
         let a_hevc = is_hevc_from_title(&a.title);
         let b_hevc = is_hevc_from_title(&b.title);
-        // Tier 5 fires ONLY for the Chromecast target (prefer_h264). Native-HEVC
+        // Tier 4 fires ONLY for the Chromecast target (prefer_h264). Native-HEVC
         // targets (VLC / browser / phone) fall through to Tier 6 (seed count), so a
         // well-seeded HEVC wins instead of being demoted below a starved H.264.
         if prefer_h264 && a_hevc != b_hevc {
@@ -1810,7 +1800,7 @@ pub fn rank_results_mut_opts(results: &mut Vec<TorrentResult>, opts: RankOpts<'_
             }
         }
 
-        // Tier 6 (2026-09-05): bitrate, via file size. Everything above this has
+        // Tier 5 (2026-09-05): bitrate, via file size. Everything above this has
         // tied — same resolution bucket, same viability, same language, same
         // codec — so these are genuinely alternative encodes of the same minutes,
         // and the bigger one is the less compressed one. This sits ABOVE seeds
@@ -1822,6 +1812,29 @@ pub fn rank_results_mut_opts(results: &mut Vec<TorrentResult>, opts: RankOpts<'_
         if a_size != b_size {
             return a_size.cmp(&b_size);
         }
+
+        // NO PACK PENALTY. It was tier 1 until 2026-09-05 — ahead of resolution,
+        // language, codec and bitrate together — so a single episode taken from a
+        // season pack lost to every standalone release however much better it was.
+        // That is how the only well-seeded 2160p of Star City S01E08 (48 seeds,
+        // 11.85 GB, about 24 Mbps) came to sit at position 16 behind a 1.00 GB
+        // rip: it is `file_index: 7`, an episode inside a pack, as were all three
+        // good 4Ks for that episode. The one that ranked HIGHER had a single seed.
+        //
+        // It was first moved below the quality tiers, then removed outright the
+        // same evening, both on Fredrik's call. The reasoning: a pack costs
+        // nothing extra to fetch. spela selects the single file (`only_files`),
+        // Torrentio reports THAT file's size rather than the pack's, and the
+        // pruner bounds the disk either way. The tier carried a one-line comment
+        // and no recorded reason, so there was no intent to reconcile against.
+        //
+        // The one signal on the other side, recorded because it is the thing that
+        // would bring this back: the Silence season pack is the source that died
+        // nine seconds into playback on 2026-09-05. Being a pack was never shown
+        // to be WHY — the vanish was `--play-and-exit`, and the stumble underneath
+        // it was not diagnosed. If packs do turn out to stall more often, that is
+        // the evidence to look for, and a penalty belongs below the quality tiers
+        // rather than above them.
 
         // Tier 7 (2026-09-05): non-DV > DV for NATIVE targets, as a last preference
         // rather than the tier-2 gate. Everything else has tied, so this only ever
@@ -3771,6 +3784,48 @@ mod tests {
         );
     }
 
+    /// The 48-seed 2160p for this episode is `file_index: 7` — one episode inside
+    /// a season pack — and while the pack penalty was tier 1 that put it at
+    /// position 16, behind a 1.00 GB rip. All three well-seeded 4Ks for this
+    /// episode are pack files; the only standalone one has a single seed.
+    ///
+    /// Record copied verbatim from the live server, 2026-09-05.
+    #[test]
+    fn test_a_4k_inside_a_season_pack_wins_on_the_monitor() {
+        let mut results = star_city_s01e08_live_candidates();
+        results.push({
+            let mut r = make_sized(
+                16,
+                "Star.City.S01E08.2160p.ATVP.WEB-DL.DV.HDR.H.265.RGzsRutracker.mkv",
+                48,
+                "11.85 GB",
+            );
+            r.file_index = Some(7);
+            r
+        });
+        rank_results_mut_prefer(&mut results, false, Some("en"));
+        assert!(
+            results[0].title.contains("2160p"),
+            "the pack penalty must no longer outrank resolution; got {:?}",
+            results[0].title
+        );
+        // Pack membership is not a tiebreak either: two releases identical on
+        // everything else rank equally whether or not one sits inside a pack.
+        let mut pair = vec![
+            {
+                let mut r = make_sized(1, "Show.S01E01.1080p.WEB.x264-Grp.mkv", 100, "3 GB");
+                r.file_index = Some(4);
+                r
+            },
+            make_sized(2, "Show.S01E01.1080p.WEB.x264-Grp.mkv", 90, "3 GB"),
+        ];
+        rank_results_mut_prefer(&mut pair, false, Some("en"));
+        assert_eq!(
+            pair[0].seeds, 100,
+            "seeds decide; being inside a pack costs nothing"
+        );
+    }
+
     /// The 4K in this list has ONE seed. Preferring 2160p must not mean
     /// preferring a spinner, so it has to lose to every viable 1080p here.
     #[test]
@@ -3895,13 +3950,22 @@ mod tests {
     }
 
     #[test]
-    fn test_ranking_single_file_over_pack() {
+    /// SUPERSEDED 2026-09-05: this pinned "single file wins despite fewer seeds",
+    /// which was tier 1 for the ranker's whole life. The penalty is gone — see the
+    /// NO PACK PENALTY note in the comparator — so the same fixture must now rank
+    /// by seeds like anything else. Kept rather than deleted because the fixture
+    /// is the one that documents what the old behaviour WAS.
+    #[test]
+    fn test_pack_membership_no_longer_decides_the_ranking() {
         let mut results = vec![
-            make_result(1, "Movie.x264.mkv", 100, Some(3)), // pack
-            make_result(2, "Movie.x264.mkv", 50, Some(0)),  // single file
+            make_result(1, "Movie.x264.mkv", 100, Some(3)), // an episode inside a pack
+            make_result(2, "Movie.x264.mkv", 50, Some(0)),  // standalone
         ];
         rank_results_mut(&mut results);
-        assert_eq!(results[0].seeds, 50); // single file wins despite fewer seeds
+        assert_eq!(
+            results[0].seeds, 100,
+            "with the penalty removed, a pack file ranks on its own merits"
+        );
     }
 
     #[test]
