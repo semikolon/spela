@@ -1,5 +1,32 @@
 # Spela TODOs 🎬🍿
 
+### 🔓 OPEN — verify the VLC-quit teardown by actually quitting VLC
+Shipped + deployed 2026-09-05 (server, remote, bridge, all live on Darwin; bridge
+restarted on macmini AND merian). **Not once exercised by a real quit** — the
+endpoint answers and `/api/position` carries `gone`, but nobody has watched the
+Now-view clear and land back on the previous page. Needs a human at a machine
+with VLC: play something, quit VLC, watch the remote.
+
+### 🔓 OPEN — `install-extra-binaries` builds the whole spela binary on MERIAN, which needs none of it
+MERIAN's VLC path is `spela-vlc` (shell + curl), the python bridge, and the
+`vlc://` handler. **Nothing there uses the Rust binary**; it is provisioned only
+because MERIAN carries `role = "dev"` and the trigger installs the fleet's dev
+tools wholesale. The cost is a full Rust build on the oldest, slowest Mac — it
+drove load to 44 and made the fans audible in someone else's living room on
+2026-09-04, and it re-fires while `need spela` stays true. Decide: exclude spela
+(and other heavy Rust builds) on machines that only consume spela over HTTP, or
+accept the rebuild. Fleet-policy change → Fredrik's call.
+
+### 🔓 OPEN — no triggers appeared to run during MERIAN's 2026-09-05 `nit update`
+The sync deployed 27 templates and reported `ok`, but printed no
+`nit: trigger '…' succeeded` lines at all — neither the new
+`42-restart-spela-vlc-bridge` (whose script runs correctly when invoked by hand
+over SSH, and did kickstart the agent) nor `install-extra-binaries`. nit's own
+logic counts a NEW trigger as changed, so 42 should have fired. Diagnosing means
+an apply with full output, which also starts the spela build above — so settle
+that one first. Until then a bridge change on MERIAN needs a manual
+`bash ~/dotfiles/scripts/darwin/42-restart-spela-vlc-bridge.sh`.
+
 ### Rewatch shelf + trailers + list performance — SHIPPED + live-verified 2026-08-27 ✅
 **`#/rewatch`** (sixth nav view): the ledger read as a shelf, Films/Series split on first paint, films as `2h 16m` and series as episode/season counts. **Media-type resolution was the hard part** — `title_meta`'s ladder is `tmdb_id → imdb_id (corrects kind) → typed title-search locked to the caller's guess`, and the Rewatch view has neither id and cannot infer type (a show marked at SHOW level carries no `SxxExx`), so the typed search defaulted to `movie` and returned a DIFFERENT title (Station Eleven → an unrelated 2013 film). Fixed by following the 2026-08-22 history (`efba21e`/`12e1ff0`) rather than a parallel mechanism: a media-type-UNKNOWN rung resolves via the shared scorer and the resolved kind SHADOWS the caller's assumption. **Trailer on the search card** as a click-to-load facade, torn down at `route()` (an eager iframe kept playing audio across every page). **Lists got ~13× cheaper**: To-Watch fired 143 `/title-meta` calls at once (~1.3 s); viewport-gated enrichment cut it to 11 (~0.9 s) — and the three view API calls were never the cost (100 ms measured), so MEASURE before optimising here. Detail: CLAUDE.md § Rewatch tab / § Trailer / § payload-versioned cache.
 
