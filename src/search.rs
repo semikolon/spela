@@ -2032,12 +2032,27 @@ pub(crate) fn language_fit_bucket(title: &str, original_language: Option<&str>) 
         }
     }
     // A foreign marker ALONGSIDE the show's own language is a dual-language
-    // release (`...DDP5.1.ENG.Atmos.ITA.H265...`) — the original audio is
-    // there, so it ranks with MULTI rather than with a full dub.
+    // release — `...DDP5.1.ENG.Atmos.ITA.H265...` names English Atmos AND
+    // Italian — so the original audio is documented as present, spela's audio
+    // picker selects it by `original_language`, and the English subtitle now
+    // comes from OpenSubtitles regardless of what the file ships. It is
+    // therefore CLEAN, not a compromise (2026-09-05).
+    //
+    // That correction has a real cost if you get it wrong in the other
+    // direction, which is why it is scoped this tightly: demoting these was
+    // costing about 20% of bitrate for nothing. The 2.78 GB ENG+ITA release of
+    // Star City S01E08 carries 1440 bytes/pixel against the clean winner's
+    // 1207, and was ranking below it purely for naming a second language.
+    //
+    // `MULTI` stays at 1. It does not say WHICH languages, so nothing about it
+    // documents the original as present — and a French `MULTI` reaching the
+    // screen with six French subtitle tracks and no English one is the incident
+    // this whole tier was forged from.
     match (has_foreign, has_orig, has_multi) {
-        (true, false, _) => 2,
-        (true, true, _) | (false, _, true) => 1,
-        (false, _, false) => 0,
+        (true, false, _) => 2,    // a foreign dub, original not named
+        (_, _, true) => 1,        // MULTI: unnamed languages
+        (true, true, false) => 0, // dual-language, original explicitly present
+        (false, _, false) => 0,   // clean
     }
 }
 
@@ -3471,13 +3486,17 @@ mod tests {
             "MULTI is multi-market packaging, not a full dub"
         );
         // Dual-language: the show's OWN language is tagged alongside the foreign
-        // one, so the original audio is present — ranks with MULTI, not with a dub.
+        // one (`ENG.Atmos` beside `ITA`), so the original audio is DOCUMENTED as
+        // present. That makes it clean, not a compromise — the audio picker takes
+        // English by `original_language`, and the English subtitle comes from
+        // OpenSubtitles regardless of what the file ships. Demoting these was
+        // costing real bitrate for nothing.
         assert_eq!(
             language_fit_bucket(
                 "Star.City.S01E06.Awl.in.a.Sack.1080p.ATVP.WEB-DL.DDP5.1.ENG.Atmos.ITA.H265-TheBlackKing.mkv",
                 Some("en")
             ),
-            1
+            0
         );
     }
 
@@ -3548,6 +3567,14 @@ mod tests {
 
     /// The full Star City S01E08 candidate list, copied VERBATIM from the live
     /// server on 2026-09-05 (titles, seed counts and size strings all real).
+    ///
+    /// The first version of this fixture was NOT verbatim, and it cost a wrong
+    /// test: two titles were reconstructed from a 62-character truncated
+    /// terminal display, which silently dropped the `ITA` marker from
+    /// `...ENG.Atmos.ITA.H265-TheBlackKing` and invented a group name. The test
+    /// then asserted that release should rank first, the live server correctly
+    /// ranked it fifth, and the live server was briefly accused of being wrong.
+    /// Copy the string out of the artifact, never out of your own rendering.
     /// Ranked for the 4K monitor, this is the case that motivated the bitrate
     /// tier: the 1.00 GB x265 at roughly 2.1 Mbps was winning on seeds alone and
     /// read as visibly compressed at close viewing distance.
@@ -3585,13 +3612,13 @@ mod tests {
             ),
             make_sized(
                 7,
-                "Star.City.S01E08.The.Wolves.1080p.ATVP.WEB-DL.DDP5.1.ENG.Atmos.H.264-NTb.mkv",
+                "Star.City.S01E08.The.Wolves.1080p.ATVP.WEB-DL.DDP5.1.ENG.Atmos.ITA.H265-TheBlackKing.mkv",
                 47,
                 "2.78 GB",
             ),
             make_sized(
                 8,
-                "Star.City.S01E08.I.lupi.ITA.ENG.1080p.ATVP.WEB-DL.DD5.1.H.264-MeM.mkv",
+                "Star.City.S01E08.I.lupi.ITA.ENG.1080p.ATVP.WEB-DL.DD5.1.H.264-MeM.GP.mkv",
                 21,
                 "5.09 GB",
             ),
@@ -3662,25 +3689,30 @@ mod tests {
     fn test_ranking_prefers_the_fatter_encode_on_the_4k_monitor() {
         let mut results = star_city_s01e08_live_candidates();
         rank_results_mut_prefer(&mut results, false, Some("en")); // vlc — native decode
-                                                                  // The fattest CLEAN, VIABLE 1080p wins: 2.78 GB at 47 seeds, which the
-                                                                  // native 20-seed bar admits and the old 50-seed one excluded outright.
-                                                                  // The 5.09 GB release is larger still but carries an ITA marker, and
-                                                                  // language outranks bitrate — a fat release in the wrong language is
-                                                                  // unwatchable rather than merely soft.
+
+        // The fattest usable 1080p wins: 5.09 GB, about 10.6 Mbps, at 21 seeds.
+        // Two changes had to land for that: the native 20-seed viability bar (the
+        // old 50 excluded it outright) and treating an explicitly dual-language
+        // release as clean, since `ITA.ENG` documents the original audio as
+        // present and the audio picker takes English by `original_language`.
         assert!(
-            results[0].title.contains("ENG.Atmos"),
-            "expected the 2.78 GB clean WEB-DL; got {:?}",
+            results[0].title.contains("I.lupi"),
+            "expected the 5.09 GB dual-language WEB-DL; got {:?}",
             results[0].title
         );
-        // Below it the order is by SIZE, not by seeds, which is the whole point:
-        // the 274-seed 1.00 GB used to be first and now sits behind both fatter
-        // encodes of the same episode.
+        // Order below it is by SIZE, not by seeds, which is the whole point: the
+        // 274-seed 1.00 GB used to be first and now sits behind every fatter
+        // encode of the same episode.
         let pos = |needle: &str| {
             results
                 .iter()
                 .position(|r| r.title.contains(needle))
                 .unwrap()
         };
+        assert!(
+            pos("TheBlackKing") < pos("Silence"),
+            "2.78 GB before 2.33 GB"
+        );
         assert!(pos("Silence") < pos("NeoNoir"), "2.33 GB before 1.3 GB");
         assert!(
             pos("NeoNoir") < pos("MeGusta[EZTVx.to].mkv"),
