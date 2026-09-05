@@ -1571,6 +1571,22 @@ pub(crate) fn effective_res_tier(
     transcoding: bool,
     best_1080p_bpp: Option<f64>,
 ) -> u32 {
+    effective_res_tier_forced(r, transcoding, best_1080p_bpp, false)
+}
+
+pub(crate) fn effective_res_tier_forced(
+    r: &TorrentResult,
+    transcoding: bool,
+    best_1080p_bpp: Option<f64>,
+    force_4k: bool,
+) -> u32 {
+    // An explicit ask for 4K puts every 2160p at the top, ahead of the two
+    // guards that exist to stop the ranker CHOOSING a bad one on its own. He is
+    // choosing; among the 4Ks the later tiers still sort by language, size and
+    // seeds, so he gets the best of them rather than an arbitrary one.
+    if force_4k && resolution_tier(&r.title) == 3 {
+        return 0;
+    }
     let base = resolution_tier(&r.title);
     let viable = r.seeds
         >= if transcoding {
@@ -1627,11 +1643,46 @@ pub fn rank_results_mut(results: &mut Vec<TorrentResult>) {
 /// well-seeded HEVC (e.g. 253-seed x265) beats a starved H.264 (18-seed). The
 /// original H.264 preference (v3.0.0) predates non-Chromecast targets; scoping it
 /// to Chromecast is the correct refinement now that VLC/browser handle HEVC.
+/// What the ranker is ranking FOR. Introduced 2026-09-05 when a third knob
+/// arrived: three positional arguments, two of them bare bools, is the shape
+/// where a caller silently swaps them and nothing complains.
+#[derive(Clone, Copy)]
+pub struct RankOpts<'a> {
+    /// This target re-encodes through Darwin's NVENC (chromecast, shannon), as
+    /// opposed to decoding natively (vlc, phone). Drives the codec preference,
+    /// the resolution policy and the Dolby Vision gate — all three turn on the
+    /// same question.
+    pub transcoding: bool,
+    /// The show's TMDB `original_language`, for judging language fit.
+    pub original_language: Option<&'a str>,
+    /// The user asked for 4K explicitly (shift-click), overriding the ranker's
+    /// own judgement about whether a 2160p release is worth it here. Skips both
+    /// guards that would otherwise demote it: the seed-viability bar and the
+    /// bits-per-pixel starvation test. Deliberately an OVERRIDE and not a
+    /// preference — the ranker already prefers a good 4K on a native target, so
+    /// this only ever fires for a 4K it decided against, and the point is to let
+    /// him decide anyway.
+    pub force_4k: bool,
+}
+
 pub fn rank_results_mut_prefer(
     results: &mut Vec<TorrentResult>,
     prefer_h264: bool,
     original_language: Option<&str>,
 ) {
+    rank_results_mut_opts(
+        results,
+        RankOpts {
+            transcoding: prefer_h264,
+            original_language,
+            force_4k: false,
+        },
+    );
+}
+
+pub fn rank_results_mut_opts(results: &mut Vec<TorrentResult>, opts: RankOpts<'_>) {
+    let prefer_h264 = opts.transcoding;
+    let original_language = opts.original_language;
     const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
     // May 13, 2026 v3.4.0: when the HEVC alternative has ≥SEED_DISPARITY_OVERRIDE×
     // the seeds of the H.264 tier-4 winner, override the codec preference. See
@@ -1690,8 +1741,8 @@ pub fn rank_results_mut_prefer(
         // doc for the full mapping + the non-transitive-comparator history
         // that motivated the redesign. Direct `cmp` on the bucket guarantees
         // total ordering; tier 4 only fires within the same bucket.
-        let a_eff = effective_res_tier(a, prefer_h264, best_1080p_bpp);
-        let b_eff = effective_res_tier(b, prefer_h264, best_1080p_bpp);
+        let a_eff = effective_res_tier_forced(a, prefer_h264, best_1080p_bpp, opts.force_4k);
+        let b_eff = effective_res_tier_forced(b, prefer_h264, best_1080p_bpp, opts.force_4k);
         if a_eff != b_eff {
             return a_eff.cmp(&b_eff);
         }

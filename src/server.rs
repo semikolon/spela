@@ -6221,17 +6221,27 @@ fn is_physically_full(path: &std::path::Path, expected_bytes: u64) -> bool {
 /// a stub file, not a real movie file.
 ///
 /// 2026-06-30: the expected-size WINDOW (formerly ±25% of the ranked torrent's
-/// size) was REMOVED. It contradicted this function's own intent: a complete
+/// size) was REMOVED here. It contradicted this function's own intent: a complete
 /// different-release copy of the same episode legitimately varies 2x or more in
 /// size (a high-bitrate x264 vs an efficient x265 of the same 1080p episode),
 /// and the window wrongly rejected it, forcing a fresh torrent download. The
 /// Pantheon glhf(3.4GB)-vs-CATS(1.71GB) rejection was this bug. Content identity
 /// is already proven upstream (title + year + quality); the NON-SPARSE check
-/// below is the real completeness guard (a half-downloaded torrent file is
-/// sparse — physical blocks < logical size — and is rejected there). Size-vs-
-/// ranked-torrent carried no reliable signal, so it is gone. The directory-
-/// bypass path keeps its strict ±1% check (`is_physically_full`) because it
-/// must disambiguate multiple files inside a season pack.
+/// below is the real completeness guard.
+///
+/// 2026-09-05 — that removal's PREMISE has since been falsified, and the
+/// correction lives one layer up rather than here. "Size-vs-ranked-torrent
+/// carried no reliable signal" was true while the ranker sorted on seeds and
+/// resolution; it stopped being true when `size_tier` made size the quality
+/// signal it ranks on. `resolve_local_file_impl` now applies a ONE-SIDED floor
+/// (`bypass_size_is_acceptable`, `MIN_BYPASS_SIZE_FRACTION`): bigger is always
+/// fine, and only a material downgrade is refused. That keeps everything the
+/// June removal was protecting — a remux a few hundred MB smaller still bypasses
+/// — while stopping a 1.00 GB rip from standing in for a 5.09 GB release, which
+/// it did on 2026-09-05 and thereby made the whole bitrate tier invisible. This
+/// function is left lenient so the fix has ONE home. The directory-bypass path
+/// keeps its strict ±1% check (`is_physically_full`) because it must
+/// disambiguate multiple files inside a season pack.
 fn top_level_file_is_healthy(path: &std::path::Path, _expected_bytes: u64) -> bool {
     const MIN_MOVIE_SIZE_BYTES: u64 = 100 * 1024 * 1024;
     if let Ok(meta) = std::fs::metadata(path) {
@@ -8198,6 +8208,29 @@ fn normalize_hls_master_codecs(master: &str) -> String {
 /// path + a human display name. None if the source isn't downloaded yet.
 /// (2026-07-13: "Open in VLC" feature — VLC decodes HEVC/DV/anything natively
 /// with full seek, sidestepping the browser HLS pipeline entirely.)
+/// How small an on-disk file may be, relative to the release the ranker chose,
+/// and still stand in for it. Below this it is a quality DOWNGRADE rather than
+/// a different copy of the same thing, and Bypass declines it.
+///
+/// 0.75 is picked to keep both cases on the record. A remux a few hundred MB
+/// smaller than the ranked one (Apr 15: ~0.93) is the same encode class and must
+/// still bypass — forcing a fresh download for that was a real bug. A 1.00 GB
+/// x265 standing in for a 5.09 GB WEB-DL (0.19) is not the same thing at all.
+const MIN_BYPASS_SIZE_FRACTION: f64 = 0.75;
+
+/// Whether an on-disk file is close enough in size to the chosen release to
+/// stand in for it. One-sided on purpose: BIGGER is always fine — it is the same
+/// content at equal or better quality, or simply a different container — and only
+/// materially smaller is refused. `have == 0` means the size could not be read,
+/// which is not evidence of a downgrade, so it passes and the other health checks
+/// decide.
+pub(crate) fn bypass_size_is_acceptable(have: u64, want: u64) -> bool {
+    if want == 0 || have == 0 {
+        return true;
+    }
+    have >= (want as f64 * MIN_BYPASS_SIZE_FRACTION) as u64
+}
+
 fn resolve_local_file_for_result(
     state: &SharedState,
     rid: usize,
@@ -8246,6 +8279,42 @@ fn resolve_local_file_impl(
         expected_bytes,
         &corrupt,
     )?;
+    // DOWNGRADE FLOOR (2026-09-05). Bypass matches on title + year + quality, so
+    // "the same episode" is all it ever checked — and it would happily serve a
+    // 1.05 GB rip in place of the 5.09 GB release the ranker had just chosen.
+    // Measured tonight: the log read `expected 5465345884B` and handed VLC a
+    // 1.00 GB x265, which is the exact ~2.1 Mbps encode the whole bitrate tier
+    // exists to avoid. Every quality improvement upstream was invisible,
+    // because whatever was already cached won.
+    //
+    // This SUPERSEDES the 2026-06-30 removal of the ±25% size window rather
+    // than reverting it. That removal was right for its premise — "size-vs-
+    // ranked-torrent carried no reliable signal" — and that premise is what
+    // changed: size IS the quality signal now, it is literally what `size_tier`
+    // ranks on. What comes back is not the old symmetric window but a ONE-SIDED
+    // floor, which keeps the case that removal was protecting: a release a few
+    // hundred MB smaller than the ranked one (the Apr-15 FLUX remux, ~0.93) is
+    // still the same encode class and still bypasses. Only a real downgrade is
+    // refused, and refusing it costs a download, never a failure.
+    //
+    // Applied HERE rather than inside the matcher so it covers the lenient
+    // resolver too. The lenient one passes expected_bytes = 0 to skip the strict
+    // ±1% match, and would otherwise re-admit through the back door exactly the
+    // file the strict path had just refused.
+    if let Some(want) = parse_size_to_bytes(&r.size).filter(|b| *b > 0) {
+        let (_, have) = phys_logical_bytes(&path);
+        if !bypass_size_is_acceptable(have, want) {
+            tracing::info!(
+                "Local Bypass: on-disk {:?} is {}B against the chosen release's {}B \
+                 ({:.0}%) — too small to substitute, downloading the ranked one",
+                path,
+                have,
+                want,
+                have as f64 / want as f64 * 100.0
+            );
+            return None;
+        }
+    }
     let name = title.replace(['/', '\\'], "-");
     Some((path, name))
 }
@@ -13380,5 +13449,55 @@ mod vlc_subtitle_cache_tests {
             p,
             Path::new("/mnt/hdd/spela-media/subs/tt32140872_s01e06_eng.srt")
         );
+    }
+}
+
+#[cfg(test)]
+mod bypass_downgrade_floor_tests {
+    use super::bypass_size_is_acceptable;
+
+    /// The 2026-09-05 incident, in its real numbers: the ranker chose a 5.09 GB
+    /// release and Local Bypass served a 1.00 GB x265 already on disk, because it
+    /// matched on title and episode alone. The log said `expected 5465345884B`.
+    #[test]
+    fn a_one_gigabyte_rip_cannot_stand_in_for_a_five_gigabyte_release() {
+        let want = 5_465_345_884; // straight out of the journal line
+        let have = 1_050_000_000;
+        assert!(!bypass_size_is_acceptable(have, want));
+    }
+
+    /// The case the June 2026 removal existed to protect, and which must keep
+    /// working: a remux a few hundred MB smaller is the same encode class.
+    #[test]
+    fn a_slightly_smaller_remux_still_bypasses() {
+        let want = 4_500_000_000;
+        assert!(bypass_size_is_acceptable(want - 311 * 1024 * 1024, want));
+    }
+
+    /// Bigger is never a downgrade — same content at equal or better quality, or
+    /// just a different container.
+    #[test]
+    fn bigger_is_always_fine() {
+        assert!(bypass_size_is_acceptable(11_000_000_000, 5_000_000_000));
+    }
+
+    /// Missing information is not evidence of a downgrade: an unreadable size or
+    /// an unparseable result size leaves the decision to the other health checks.
+    #[test]
+    fn unknown_sizes_do_not_refuse() {
+        assert!(bypass_size_is_acceptable(0, 5_000_000_000));
+        assert!(bypass_size_is_acceptable(1_000, 0));
+    }
+
+    /// Exactly at the boundary passes, so the threshold is inclusive and a file
+    /// sitting on it does not flip between runs.
+    #[test]
+    fn the_boundary_itself_is_accepted() {
+        let want = 4_000_000_000u64;
+        assert!(bypass_size_is_acceptable((want as f64 * 0.75) as u64, want));
+        assert!(!bypass_size_is_acceptable(
+            (want as f64 * 0.74) as u64,
+            want
+        ));
     }
 }
