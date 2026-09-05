@@ -115,6 +115,13 @@ pub struct LivePosition {
     /// this (via `/api/position`) — the Chromecast scrubber takes duration from
     /// `/status`'s `current.duration`. The VLC watcher's `/position` POST feeds it.
     pub dur: f64,
+    /// VLC has QUIT (2026-09-05). Distinct from "no bytes lately": the bridge
+    /// polls VLC's own HTTP interface, so a quit VLC is connection-refused,
+    /// which is unambiguous. `vlc_active` could never carry this — it is
+    /// byte-fetch freshness, and a VLC that buffers ahead goes quiet while
+    /// still playing, which is exactly why the Now-view was left to be dismissed
+    /// by hand. The remote reads this to tear the view down on its own.
+    pub gone: bool,
 }
 
 type SharedState = Arc<ServerState>;
@@ -436,6 +443,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/vlc/{id}/ready", get(handle_vlc_ready))
         .route("/vlc/{id}/open.m3u", get(handle_vlc_playlist))
         .route("/vlc/{id}/sub.srt", get(handle_vlc_sub))
+        .route("/vlc/gone", post(handle_vlc_gone))
         .route("/vlc/control", post(handle_vlc_control))
         .route("/vlc/pending", get(handle_vlc_pending))
         .route("/vlc/enqueue-next", post(handle_vlc_enqueue_next))
@@ -4411,6 +4419,8 @@ async fn cast_health_monitor(
                                 // Chromecast path: cast_health_monitor owns liveness
                                 // here, so there is no VLC stall to report.
                                 stalled: false,
+                                // A fresh position report means VLC is alive.
+                                gone: false,
                             });
                         }
                     }
@@ -5376,6 +5386,8 @@ async fn handle_position(
             abs_secs: req.seconds,
             dur: req.duration.unwrap_or(0.0),
             stalled: req.stalled,
+            // A position report IS liveness; only POST /vlc/gone sets this.
+            gone: false,
         });
     }
     Json(json!({ "ok": changed, "key": key }))
@@ -5560,6 +5572,7 @@ async fn handle_seek(
                 dur: 0.0,
                 // A just-issued seek is by definition not a stall.
                 stalled: false,
+                gone: false,
             });
             tracing::info!(
                 "Seek: '{}' on '{}' to absolute {:.0}s (stream {:.0}s, ss_offset={:.0}s)",
@@ -8558,6 +8571,70 @@ async fn handle_vlc_pending(State(state): State<SharedState>) -> Json<Value> {
 /// can't accumulate into an EMFILE (the FD-exhaustion leak the 524288 limit only
 /// papered over). Keeps the downloaded data on disk (`delete_files=false`) for
 /// Local-Bypass reuse; stops are spawned fire-and-forget so serving isn't blocked.
+/// `POST /vlc/gone` — the Mac-side bridge reporting that VLC has QUIT.
+///
+/// The bridge polls VLC's own HTTP interface every second, so a quit VLC is
+/// connection-refused: unambiguous, and a wholly different signal from
+/// `vlc_active`, which is only byte-fetch freshness and goes quiet whenever VLC
+/// buffers ahead. That ambiguity is why the Now-view used to wait for a human
+/// to press Stop on a player that had already exited.
+///
+/// Two things happen. The live cell is flagged so the remote can tear its
+/// Now-view down by itself, and the torrent this watch started is STOPPED —
+/// until now nothing reaped it, because `reap_previous_vlc_torrents` only fires
+/// on the NEXT play, so a finished episode left a torrent running indefinitely.
+async fn handle_vlc_gone(State(state): State<SharedState>, Json(body): Json<Value>) -> Json<Value> {
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut flagged = false;
+    {
+        let mut g = lock_recover(&state.live_position);
+        if let Some(lp) = g.as_mut() {
+            // Title-guarded so a stale report cannot tear down a DIFFERENT stream
+            // that started in the meantime.
+            if title.is_empty() || lp.title == title {
+                lp.gone = true;
+                flagged = true;
+            }
+        }
+    }
+    *lock_recover(&state.vlc_activity) = None;
+    let stopped = reap_all_vlc_torrents(&state);
+    tracing::info!(
+        "VLC gone (title={:?}) — now-view flagged={}, {} torrent(s) stopped",
+        title,
+        flagged,
+        stopped
+    );
+    Json(json!({ "ok": true, "flagged": flagged, "torrents_stopped": stopped }))
+}
+
+/// Stop every torrent started for the VLC path. Unlike
+/// `reap_previous_vlc_torrents` this keeps none — the player is gone, so there
+/// is nothing left for any of them to feed.
+fn reap_all_vlc_torrents(state: &SharedState) -> usize {
+    let to_stop: Vec<u32> = {
+        let mut g = lock_recover(&state.vlc_torrents);
+        let all: Vec<u32> = g.iter().copied().collect();
+        g.clear();
+        all
+    };
+    let n = to_stop.len();
+    for tid in to_stop {
+        let st = state.clone();
+        tokio::spawn(async move {
+            match st.torrent_engine.stop(tid, false).await {
+                Ok(()) => tracing::info!("vlc-torrent reap: stopped {} (VLC quit)", tid),
+                Err(e) => tracing::warn!("vlc-torrent reap: stop {} failed: {}", tid, e),
+            }
+        });
+    }
+    n
+}
+
 fn reap_previous_vlc_torrents(state: &SharedState, keep: u32) {
     let to_stop: Vec<u32> = {
         let mut g = lock_recover(&state.vlc_torrents);
@@ -9609,6 +9686,15 @@ async fn handle_get_position(
             .map(|lp| lp.stalled)
             .unwrap_or(false)
     };
+    // VLC quit. The remote tears its Now-view down on this rather than waiting
+    // for a human to press Stop on a player that is already gone.
+    let gone = {
+        let g = lock_recover(&state.live_position);
+        g.as_ref()
+            .filter(|lp| Some(lp.title.as_str()) == query.title.as_deref())
+            .map(|lp| lp.gone)
+            .unwrap_or(false)
+    };
     let pos = match live {
         Some(p) => p,
         None => AppState::load(&state.state_dir).get_position(query.imdb_id.clone(), query.title),
@@ -9619,7 +9705,7 @@ async fn handle_get_position(
     // absent for a Chromecast stream or a complete local file, where it means nothing.
     let runway = active_vlc_runway_secs(&state, pos, dur);
     Json(json!({
-        "imdb_id": query.imdb_id, "t": pos, "dur": dur,
+        "imdb_id": query.imdb_id, "t": pos, "dur": dur, "gone": gone,
         "runway_secs": runway,
         "stalled": stalled,
     }))
@@ -10360,6 +10446,7 @@ mod tests {
             abs_secs: 1375.0,
             dur: 0.0,
             stalled: false,
+            gone: false,
         };
         // Backward seek to 1375 on the SAME stream → live wins (would snap to
         // the 1575 HWM without this).

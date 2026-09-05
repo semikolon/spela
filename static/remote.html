@@ -1159,7 +1159,7 @@ async function openInVlc(id,title,poster){
   S.now.lastSync=Date.now(); S.now.vlcTitle="";
   S.now.data={title:title||"VLC",poster_url:poster||"",quality:"",target:":VLC",imdb_id:"",ss_offset:0};
   stopPolling();   // the Chromecast /status poll must NOT run for a VLC stream
-  location.hash="#/now"; renderNowFull(); startVlcPoll();
+  goNowView(); renderNowFull(); startVlcPoll();
   toast("Opening in VLC…");
   // Fire the PLAYLIST url (…/open.m3u), NOT the bare stream url. VLC opening the .m3u
   // is what makes its #EXTVLCOPT lines apply — the subtitle input-slave, resume
@@ -1196,7 +1196,7 @@ async function openLibraryInVlc(spec){
   S.now.lastSync=Date.now(); S.now.vlcTitle="";
   S.now.data={title:title,poster_url:poster,quality:"",target:":VLC",imdb_id:"",ss_offset:0};
   stopPolling();
-  location.hash="#/now"; renderNowFull(); startVlcPoll();
+  goNowView(); renderNowFull(); startVlcPoll();
   toast("Opening in VLC…");
   // Scheme only — no page-navigation fallback (see openInVlc: the blur-timeout fallback
   // double-opened in browser + VLC on a multi-monitor setup where VLC doesn't blur Chrome).
@@ -2383,7 +2383,7 @@ async function castViaPlay(spec, retry){
   if(r&&r.error){ showPlayError(spec.label,spec.poster,r.error,retry); return; }
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   S.now.data={title:spec.label,poster_url:spec.poster||"",quality:"",target:":"+(S.target&&S.target.name||"")};
-  location.hash="#/now"; renderNowFull(); pollNow(true);   // playing → the full now-view (loading stayed in the panel)
+  goNowView(); renderNowFull(); pollNow(true);   // playing → the full now-view (loading stayed in the panel)
 }
 
 /* Fast-play: search a title + play its best source directly (the ▶ on Continue /
@@ -2427,7 +2427,7 @@ async function doShannonPlay(opts,cardForSources){
   if(r&&r.error){ showPlayError(opts.title||"Shannon TV",opts.poster_url,r.error,()=>doShannonPlay(opts,cardForSources)); return; }
   toast("Dispatched — Shannon will fetch + play in ~10s");
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
-  location.hash="#/now"; pollNow(true);
+  goNowView(); pollNow(true);
 }
 
 /* ---------- Phone-direct playback (Phase 6 / US-5 / T-14,15) ----------
@@ -2459,7 +2459,7 @@ async function doPhoneDirect(opts,cardForSources,label){
   S.now.frontier=0; S.now.endlist=false;
   S.now.data={title:label||"Playing",quality:"",poster_url:opts.poster_url||"",
               ss_offset:(r&&r.ss_offset)||0};
-  location.hash="#/now"; renderNowFull();                       // playing → now-view builds the <video> + buffering overlay
+  goNowView(); renderNowFull();                       // playing → now-view builds the <video> + buffering overlay
   pollNow(true);
   startPhoneFrontierPoll();
 }
@@ -2775,6 +2775,20 @@ function stopPolling(){ clearInterval(S.pollTimer); S.pollTimer=null; }
    quiet VLC would look "ended". The user stops via the Stop button. */
 function startVlcPoll(){ if(S.vlcTimer)return; pollVlc(); S.vlcTimer=setInterval(pollVlc,3000); }
 function stopVlcPoll(){ clearInterval(S.vlcTimer); S.vlcTimer=null; }
+/* VLC exited — dismantle the Now-view without anyone pressing Stop.
+   Mirrors the manual-stop teardown, minus the stop command: there is no player
+   left to tell. The brief toast matches the "Stopped" one, so a screen that
+   changes by itself still says why. */
+function vlcEnded(title){
+  stopVlcPoll();
+  S.now.vlc=false; S.now.data=null; S.now.playing=false; S.now.stopping=false;
+  S.now.vlcTitle=null; S.now.posAbs=0; S.now.dur=0; S.now.stalled=false; S.now.runway=null;
+  $("#nowbar").classList.remove("on");
+  toast(title ? "Finished · "+title : "Playback ended");
+  leaveNowViewAfterStop();
+  renderNowFull();
+}
+
 async function pollVlc(){
   if(!S.now.vlc){ stopVlcPoll(); return; }
   let s={}; try{ s=await api("/status"); }catch{}
@@ -2788,7 +2802,13 @@ async function pollVlc(){
              // actually moving. VLC reports "playing" while starved, so the clock is the
              // only honest signal and the bridge derives it there.
              S.now.runway = (p.runway_secs!=null) ? p.runway_secs : null;
-             S.now.stalled = !!p.stalled; } }catch{}
+             S.now.stalled = !!p.stalled;
+             // VLC QUIT. The bridge probes VLC's own http interface, so this is
+             // a refused connection rather than "no bytes lately" — the
+             // ambiguity that made auto-clearing unsafe before. Nothing is
+             // playing, so the Now-view is a lie whether or not the episode was
+             // finished; tear it down and go back where the play came from.
+             if(p.gone){ vlcEnded(title); return; } } }catch{}
   }
   $("#nowbar").classList.add("on"); updateNowBar();
   if(currentView()==="now" && !S.now.seekDrag) renderNowFull();
@@ -3090,8 +3110,25 @@ async function transport(path){ await api(path,{method:"POST"}).catch(()=>toast(
 // Guarded on ACTUALLY being on the Now view: a stop triggered from anywhere else must not
 // yank the user off the page they are on. Uses the hash, so `route()` does the render and
 // this stays one line rather than a second rendering path.
+/* Enter the Now-view FROM somewhere, remembering where.
+   A play takes over the screen; when the stream ends the user should land back
+   where they were, not on a fixed page. `leaveNowView()` reads this. Home is
+   only the fallback for when there is genuinely no previous view — the remote
+   opened cold on #/now, or reloaded there.
+   Deliberately NOT set when the user navigates to Now himself (nav tab, the
+   now-bar): he chose Now as a destination, so there is nothing to return from,
+   and those handlers clear it. */
+function goNowView(){
+  const from = currentView();
+  S.now.returnTo = (from && from !== "now") ? from : null;
+  location.hash = "#/now";
+}
+
 function leaveNowViewAfterStop(){
-  if((location.hash||"").startsWith("#/now")) location.hash = "#/home";
+  if(!(location.hash||"").startsWith("#/now")) return;
+  const back = S.now.returnTo;
+  S.now.returnTo = null;
+  location.hash = back ? "#/"+back : "#/home";
 }
 
 async function stopPlayback(){
@@ -3141,11 +3178,11 @@ async function restart(){
 }
 $("#nbRestart").onclick=restart;
 $("#nbPlay").onclick=()=>{ if(!S.now.cold) togglePlay(); };
-$("#nbExpand").onclick=()=>location.hash="#/now";
+$("#nbExpand").onclick=()=>{ S.now.returnTo=null; location.hash="#/now"; };
 // Tap anywhere on the now-bar (poster/title) opens the full player;
 // taps on its buttons keep their own action (closest() walks up from
 // the inner SVG icon to the button, so this guard is icon-safe).
-$("#nowbar").addEventListener("click",e=>{ if(e.target.closest("button")) return; location.hash="#/now"; });
+$("#nowbar").addEventListener("click",e=>{ if(e.target.closest("button")) return; S.now.returnTo=null; location.hash="#/now"; });
 
 /* tick the now-bar/full view between polls so interpolation stays smooth */
 setInterval(()=>{ if(S.now.data&&!S.now.cold&&!S.now.seekDrag){
