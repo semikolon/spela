@@ -2278,6 +2278,37 @@ fn pixels_for_res_tier(tier: u32) -> Option<f64> {
     })
 }
 
+/// May a race substitute `candidate` for the source the viewer chose?
+///
+/// A race is a DELIVERY test, and it may only compare candidates that are
+/// INTERCHANGEABLE. Two different resolutions are not: whichever one wins, the
+/// viewer ends up watching a picture they did not pick. Racing predates the
+/// quality tiers and took every lower-ranked source as a candidate, so a smaller
+/// file with a fuller swarm won essentially every time — which is the shape of a
+/// race, not a fault in it.
+///
+/// Anchor 2026-09-06, The Diplomat S03E07: the 5-seed 5.64 GB 2160p was tapped
+/// explicitly, racing fired four seconds later because 5 < the 100-seed race
+/// threshold, and the 2.41 GB 1080p "won". The journal reads `race (vlc): result
+/// #2 won, switching from #1`, and the episode played at 1080p / 6.65 Mbps. The
+/// seed bar had been removed that morning precisely so a thin 4K could be
+/// reached; the racer then took it away again, one layer down.
+///
+/// So the rescue may go sideways or up, never down. An unknown resolution is not
+/// a substitute for a known one — it cannot be shown to be equivalent, and a race
+/// that cannot prove equivalence must not switch.
+pub fn race_candidate_is_not_a_downgrade(candidate_title: &str, chosen_title: &str) -> bool {
+    let chosen_px = pixels_for_res_tier(resolution_tier(chosen_title));
+    let cand_px = pixels_for_res_tier(resolution_tier(candidate_title));
+    match (chosen_px, cand_px) {
+        // Nothing to protect: the chosen source's resolution is unreadable, so any
+        // candidate is as good a guess as it was.
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(chosen), Some(cand)) => cand >= chosen,
+    }
+}
+
 /// Bytes per pixel for a release: size divided by the pixels its resolution
 /// implies. Runtime cancels out because every candidate in one search is the same
 /// minutes, so this is a clean proxy for bits-per-pixel-per-frame — which is what
@@ -4961,6 +4992,51 @@ mod tests {
             "1080p H.264 with 513 seeds should outrank 720p H.264 with 734 seeds. Got: {:?}",
             results[0].title
         );
+    }
+
+    /// The Diplomat S03E07, 2026-09-06, copied from `last_search.json` on the live
+    /// server the evening it happened. Fredrik tapped #1 (the 4K) and watched #2.
+    #[test]
+    fn test_a_race_may_not_substitute_a_1080p_for_the_4k_that_was_chosen() {
+        let four_k = "The Diplomat S03E07 PNG 2160p NF WEB-DL DDP5 1 Atmos H 265-XEBEC.mkv";
+        let hd = "The.Diplomat.S03E07.PNG.1080p.NF.WEB-DL.H.264-EniaHD.mkv";
+        let other_4k = "The.Diplomat.S03E07.2160p.WEB-DL.H.265-Other.mkv";
+        let sd = "The.Diplomat.S03E07.480p.x264-mSD.mkv";
+
+        assert!(
+            !race_candidate_is_not_a_downgrade(hd, four_k),
+            "the 1080p that actually won this race must no longer be a candidate"
+        );
+        assert!(
+            race_candidate_is_not_a_downgrade(other_4k, four_k),
+            "another 4K is a legitimate rescue — same picture, different swarm"
+        );
+        assert!(!race_candidate_is_not_a_downgrade(sd, four_k));
+
+        // Sideways and upward are both fine, in every direction that is not down.
+        assert!(
+            race_candidate_is_not_a_downgrade(four_k, hd),
+            "up is allowed"
+        );
+        assert!(
+            race_candidate_is_not_a_downgrade(hd, hd),
+            "equal is allowed"
+        );
+        assert!(!race_candidate_is_not_a_downgrade(sd, hd));
+    }
+
+    #[test]
+    fn test_an_unreadable_resolution_may_not_stand_in_for_a_known_one() {
+        let known = "Show.S01E01.2160p.WEB.x265-Grp.mkv";
+        let unknown = "Show.S01E01.WEB-Grp.mkv";
+        assert!(
+            !race_candidate_is_not_a_downgrade(unknown, known),
+            "a race that cannot prove equivalence must not switch"
+        );
+        // The mirror: when the CHOSEN source's resolution is unreadable there is
+        // nothing to protect, so racing behaves exactly as it did before.
+        assert!(race_candidate_is_not_a_downgrade(known, unknown));
+        assert!(race_candidate_is_not_a_downgrade(unknown, unknown));
     }
 
     #[test]

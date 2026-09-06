@@ -2943,6 +2943,33 @@ async function pollNow(force){
   if(S.now.warming) return;   // 2026-07-04: the warmup poll owns the screen until /play resolves
   if(document.visibilityState!=="visible"&&!force) return;
   let s; try{ s=await api("/status"); }catch{ return; }
+  // REHYDRATE a VLC now-view after a page reload (2026-09-06). `S.now.vlc` is
+  // client state, set only by the play flow, so a refresh or a cold open on
+  // #/now loses it — and a VLC play creates no `CurrentStream`, so `!s.current`
+  // sent us straight to "Nothing playing" over an episode that was visibly
+  // running on the monitor. The server knew the whole time: `vlc_stream_title`
+  // is set when the stream is served and cleared only by `/vlc/gone`, so it is
+  // the durable identity (unlike `vlc_active`, which is a 30s byte-fetch stamp
+  // and goes quiet while VLC buffers ahead). Teardown still comes from `gone`
+  // via pollVlc, so this cannot strand a stale view.
+  if(s && s.vlc_stream_title && !S.now.phone){
+    const t=s.vlc_stream_title, imdb=s.vlc_stream_imdb||"";
+    S.now.vlc=true; S.now.phone=false; S.now.cold=false; S.now.playing=true;
+    S.now.error=null; S.now.endlist=true; S.now.frontier=0;
+    S.now.vlcTitle=t; S.now.lastSync=Date.now();
+    // Same shape openInVlc builds — renderNowFull reads S.now.data and shows
+    // "Nothing playing" without it. The poster is unknown on a cold reload
+    // (there is no search on the page), so it is fetched from the identity the
+    // server just handed us rather than left blank.
+    S.now.data={title:t,poster_url:"",quality:"",target:":VLC",imdb_id:imdb,ss_offset:0};
+    stopPolling(); startVlcPoll();
+    if(imdb){ api(`/title-meta?imdb_id=${encodeURIComponent(imdb)}&media_type=auto`)
+      .then(m=>{ if(m&&m.poster_url&&S.now.data&&!S.now.data.poster_url){
+        S.now.data.poster_url=m.poster_url;
+        if(currentView()==="now"&&!S.now.seekDrag) renderNowFull(); updateNowBar(); } })
+      .catch(()=>{}); }
+    return;
+  }
   if(!s||s.status==="idle"||!s.current){
     S.now.data=null; S.now.playing=false; S.now.phone=false; stopPolling();
     $("#nowbar").classList.remove("on"); renderNowFull(); return;

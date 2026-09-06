@@ -1408,10 +1408,18 @@ async fn maybe_race_sources(
         .iter()
         .find(|r| r.id == rid)
         .map(|r| r.seeds)?;
+    // Same non-downgrade rule as the VLC racer: a rescue may go sideways or up,
+    // never down. See `race_candidate_is_not_a_downgrade`.
+    let chosen_title = search
+        .results
+        .iter()
+        .find(|r| r.id == rid)
+        .map(|r| r.title.clone())?;
     let candidates: Vec<(String, Option<u32>)> = search
         .results
         .iter()
         .filter(|r| r.id >= rid && !r.magnet.is_empty())
+        .filter(|r| crate::search::race_candidate_is_not_a_downgrade(&r.title, &chosen_title))
         .take(state.config.race_max_sources)
         .map(|r| (r.magnet.clone(), r.file_index))
         .collect();
@@ -1506,10 +1514,20 @@ async fn maybe_race_sources_for_vlc(state: &SharedState, rid: usize) -> Option<u
         .iter()
         .find(|r| r.id == rid)
         .map(|r| r.seeds)?;
+    // Only sources that are NOT a picture downgrade may be raced — see
+    // `race_candidate_is_not_a_downgrade`. Without this the race silently undoes
+    // the ranker's quality decision, because a smaller file with a fuller swarm
+    // wins a delivery test almost every time.
+    let chosen_title = search
+        .results
+        .iter()
+        .find(|r| r.id == rid)
+        .map(|r| r.title.clone())?;
     let candidates: Vec<(String, Option<u32>)> = search
         .results
         .iter()
         .filter(|r| r.id >= rid && !r.magnet.is_empty())
+        .filter(|r| crate::search::race_candidate_is_not_a_downgrade(&r.title, &chosen_title))
         .take(state.config.race_max_sources)
         .map(|r| (r.magnet.clone(), r.file_index))
         .collect();
