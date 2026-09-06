@@ -1581,17 +1581,46 @@ pub(crate) fn effective_res_tier_forced(
     best_1080p_bpp: Option<f64>,
     force_4k: bool,
 ) -> u32 {
+    effective_res_tier_full(r, transcoding, transcoding, best_1080p_bpp, force_4k)
+}
+
+/// Resolution tier with the two decisions the `transcoding` flag used to conflate
+/// pulled apart (2026-09-06).
+///
+/// `hd_first` picks the ORDERING — 2160p last, for a 1080p panel or a capped
+/// preference. `strict_seeds` picks the VIABILITY BAR — 50 for the Chromecast
+/// path, where a slow start is the cost, against 20 for native decode.
+///
+/// They were one flag, so asking to cap at 1080p silently imported the Chromecast
+/// seed bar as well: on The Diplomat S03E07 that excluded a 46-seed 1.95 GB and a
+/// 21-seed 479 MB release, leaving one candidate, and both capped modes returned
+/// the same file whether the viewer had asked for the fattest 1080p or the
+/// smallest. Caught by the tests for those two modes disagreeing with each other.
+pub(crate) fn effective_res_tier_full(
+    r: &TorrentResult,
+    hd_first: bool,
+    strict_seeds: bool,
+    best_1080p_bpp: Option<f64>,
+    force_4k: bool,
+) -> u32 {
+    let transcoding = hd_first;
     // Retained but never set true in production since 2026-09-05: the force-4K
     // override it served was replaced by frugal mode (see `RankOpts::frugal`)
     // once the pack-penalty removal made a good 4K rank first on its own. Kept
     // because the shape is right if a force-a-resolution override is ever wanted
     // again, and because deleting it would take the reasoning with it.
+    // An explicit ask for 4K skips BOTH guards — the seed-viability bar and the
+    // bits-per-pixel floor. They exist to stop the ranker CHOOSING a doubtful 4K on
+    // its own; when the viewer chooses it, the question they answer has already
+    // been answered. Anchor 2026-09-06: a 15-seed 10.6 Mbps 2160p of The Diplomat
+    // S03E07 was under both, correctly by their own logic, and was still the thing
+    // he wanted.
     if force_4k && resolution_tier(&r.title) == 3 {
         return 0;
     }
     let base = resolution_tier(&r.title);
     let viable = r.seeds
-        >= if transcoding {
+        >= if strict_seeds {
             MIN_SEEDS_TRANSCODING
         } else {
             MIN_SEEDS_NATIVE
@@ -1645,6 +1674,48 @@ pub fn rank_results_mut(results: &mut [TorrentResult]) {
 /// well-seeded HEVC (e.g. 253-seed x265) beats a starved H.264 (18-seed). The
 /// original H.264 preference (v3.0.0) predates non-Chromecast targets; scoping it
 /// to Chromecast is the correct refinement now that VLC/browser handle HEVC.
+/// What the viewer asked the ranker for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum QualityPref {
+    /// The ranker's own judgement, guards and all.
+    #[default]
+    Auto,
+    /// Give me 4K if any exists, whatever the guards think. Both guards that would
+    /// otherwise demote it are skipped: the seed-viability bar and the
+    /// bits-per-pixel starvation test. Among the 4Ks the later tiers still sort by
+    /// language, size and seeds, so this yields the best of them and not an
+    /// arbitrary one.
+    ForceUhd,
+    /// Cap at 1080p, but otherwise rank normally — the fattest 1080p, not the
+    /// smallest. For a screen that cannot use the pixels on a connection that can
+    /// afford the bytes.
+    CapHd,
+    /// Bandwidth costs money: cap at 1080p AND take the SMALLEST encode. Roughly
+    /// 12 GB to 1 GB for the same episode.
+    Saver,
+}
+
+impl QualityPref {
+    /// Parse the wire form. Anything unrecognised is Auto, so a stale client or a
+    /// hand-typed URL degrades to the ranker's judgement rather than to an error.
+    pub fn from_param(s: Option<&str>) -> Self {
+        match s.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+            "uhd" | "4k" | "2160" => Self::ForceUhd,
+            "hd" | "1080" => Self::CapHd,
+            "saver" | "frugal" | "1" => Self::Saver,
+            _ => Self::Auto,
+        }
+    }
+    pub fn is_saver(self) -> bool {
+        self == Self::Saver
+    }
+    /// Both capped modes hand the resolution tier the transcoding mapping, which
+    /// already sorts 2160p last — the same ordering for a different reason.
+    pub fn caps_to_hd(self) -> bool {
+        matches!(self, Self::CapHd | Self::Saver)
+    }
+}
+
 /// What the ranker is ranking FOR. Introduced 2026-09-05 when a third knob
 /// arrived: three positional arguments, two of them bare bools, is the shape
 /// where a caller silently swaps them and nothing complains.
@@ -1657,23 +1728,19 @@ pub struct RankOpts<'a> {
     pub transcoding: bool,
     /// The show's TMDB `original_language`, for judging language fit.
     pub original_language: Option<&'a str>,
-    /// FRUGAL mode — shift-click, for when bandwidth costs money.
+    /// What the viewer asked for, when they asked for anything.
     ///
-    /// Started life as a force-4K override, which the pack-penalty removal made
-    /// pointless the same evening: with that gone a good 2160p ranks first
-    /// unaided, so an override could only ever force one the ranker had
-    /// deliberately declined. Inverted instead, into the case that does need a
-    /// manual escape: a phone on mobile data, or MERIAN on a hotspot, where the
-    /// monthly quota is the scarce thing rather than the pixels.
+    /// Auto is the ranker's own judgement and is right most of the time. The other
+    /// two exist because it is judgement, not fact, and both directions of being
+    /// wrong are ones only he can see: a 4K his guards declined (2026-09-06, a
+    /// 15-seed 10.6 Mbps 2160p sat below a 6.6 Mbps 1080p — under the viability bar
+    /// AND under the bits-per-pixel floor, both correct in general and both wrong
+    /// for someone who wants 4K and will wait), and the reverse when bandwidth is
+    /// the scarce thing rather than pixels.
     ///
-    /// Two changes, both pointing the same way. Resolution follows the
-    /// TRANSCODING mapping, so 2160p sorts last — 11.85 GB against about 5 GB for
-    /// the same episode at 1080p. And the bitrate tier INVERTS, so the smallest
-    /// encode wins instead of the largest: that is the half that actually saves
-    /// the quota, taking the same episode from roughly 5 GB to 1 GB. Nothing is
-    /// lost by it on a phone screen — the compression this ranker learned to
-    /// avoid is only visible on a 4K monitor at close range.
-    pub frugal: bool,
+    /// Replaces re-tuning thresholds every time a case comes out unwanted. A
+    /// threshold moved to satisfy one episode is a threshold wrong for the next.
+    pub pref: QualityPref,
 }
 
 pub fn rank_results_mut_prefer(
@@ -1686,7 +1753,7 @@ pub fn rank_results_mut_prefer(
         RankOpts {
             transcoding: prefer_h264,
             original_language,
-            frugal: false,
+            pref: QualityPref::Auto,
         },
     );
 }
@@ -1744,9 +1811,12 @@ pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) 
         // Frugal borrows the transcoding resolution mapping, which already sorts
         // 2160p last — the same ordering, for a different reason: there because
         // the panel cannot show the pixels, here because the pixels cost money.
-        let res_transcoding = prefer_h264 || opts.frugal;
-        let a_eff = effective_res_tier_forced(a, res_transcoding, best_1080p_bpp, false);
-        let b_eff = effective_res_tier_forced(b, res_transcoding, best_1080p_bpp, false);
+        let res_transcoding = prefer_h264 || opts.pref.caps_to_hd();
+        let force = opts.pref == QualityPref::ForceUhd;
+        // Ordering follows the preference; the seed bar follows the TARGET. Capping
+        // at 1080p on a native target must not also import the Chromecast bar.
+        let a_eff = effective_res_tier_full(a, res_transcoding, prefer_h264, best_1080p_bpp, force);
+        let b_eff = effective_res_tier_full(b, res_transcoding, prefer_h264, best_1080p_bpp, force);
         if a_eff != b_eff {
             return a_eff.cmp(&b_eff);
         }
@@ -1824,7 +1894,7 @@ pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) 
         let a_size = size_tier(a);
         let b_size = size_tier(b);
         if a_size != b_size {
-            return if opts.frugal {
+            return if opts.pref.is_saver() {
                 b_size.cmp(&a_size) // smallest wins — the quota is the scarce thing
             } else {
                 a_size.cmp(&b_size)
@@ -3866,7 +3936,7 @@ mod tests {
             RankOpts {
                 transcoding: false, // still VLC — frugal is about bytes, not decoding
                 original_language: Some("en"),
-                frugal: true,
+                pref: QualityPref::Saver,
             },
         );
         assert!(
@@ -3900,6 +3970,151 @@ mod tests {
         });
         rank_results_mut_prefer(&mut normal, false, Some("en"));
         assert!(normal[0].title.contains("2160p"));
+    }
+
+    /// The Diplomat S03E07, copied verbatim from the live server 2026-09-06 — the
+    /// case that produced the quality control. Both 2160p sources are under the
+    /// 20-seed viability bar, and the larger-seeded one is also under the
+    /// bits-per-pixel floor (10.6 Mbps against the best 1080p's 6.6, a ratio of
+    /// 0.40 where the floor cuts at 0.50). Both guards are right in general and
+    /// both were wrong for someone who wants 4K and will wait for it.
+    fn diplomat_s03e07_live_candidates() -> Vec<TorrentResult> {
+        vec![
+            make_sized(
+                1,
+                "The.Diplomat.US.S03E07.1080p.WEB.h264-GRACE[EZTVx.to].mkv",
+                46,
+                "1.95 GB",
+            ),
+            make_sized(
+                2,
+                "The Diplomat (2023) - S03E07 - PNG (1080p NF WEB-DL x265 Silence).mkv",
+                106,
+                "1.74 GB",
+            ),
+            make_sized(
+                3,
+                "The.Diplomat.US.S03E07.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                21,
+                "479.11 MB",
+            ),
+            make_sized(
+                4,
+                "The.Diplomat.US.S03E07.480p.x264-mSD[EZTVx.to].mkv",
+                53,
+                "358.47 MB",
+            ),
+            make_sized(
+                23,
+                "The Diplomat S03E07 PNG 2160p NF WEB-DL DDP5 1 Atmos H 265-XEBEC.mkv",
+                5,
+                "5.64 GB",
+            ),
+            make_sized(
+                24,
+                "The.Diplomat.S03E07.PNG.2160p.10bit.NF.WEB-DL.DDP5.1.HEVC-Vyndros.mkv",
+                15,
+                "3.14 GB",
+            ),
+        ]
+    }
+
+    /// Auto keeps both guards, so the thin 4K stays down. This is the behaviour
+    /// that prompted the question, and it is correct on its own terms.
+    #[test]
+    fn test_auto_leaves_a_thin_4k_below_the_1080p() {
+        let mut r = diplomat_s03e07_live_candidates();
+        rank_results_mut_prefer(&mut r, false, Some("en"));
+        assert!(!r[0].title.contains("2160p"), "got {:?}", r[0].title);
+    }
+
+    /// Asking for 4K skips BOTH guards, and yields the BEST of the 4Ks rather than
+    /// an arbitrary one: 5.64 GB beats 3.14 GB on the bitrate tier.
+    #[test]
+    fn test_asking_for_4k_overrides_both_guards() {
+        let mut r = diplomat_s03e07_live_candidates();
+        rank_results_mut_opts(
+            &mut r,
+            RankOpts {
+                transcoding: false,
+                original_language: Some("en"),
+                pref: QualityPref::ForceUhd,
+            },
+        );
+        assert!(r[0].title.contains("2160p"), "got {:?}", r[0].title);
+        assert!(
+            r[0].size.contains("5.64"),
+            "the fatter 4K wins; got {:?}",
+            r[0].size
+        );
+        assert!(
+            r[1].title.contains("2160p"),
+            "both 4Ks rise; got {:?}",
+            r[1].title
+        );
+    }
+
+    /// Capping at 1080p is NOT the same as saver: it wants the fattest 1080p, not
+    /// the smallest. A screen that cannot use the pixels on a connection that can
+    /// afford the bytes.
+    #[test]
+    fn test_capping_to_hd_still_wants_the_fattest_1080p() {
+        let mut r = diplomat_s03e07_live_candidates();
+        rank_results_mut_opts(
+            &mut r,
+            RankOpts {
+                transcoding: false,
+                original_language: Some("en"),
+                pref: QualityPref::CapHd,
+            },
+        );
+        assert!(!r[0].title.contains("2160p"));
+        assert!(r[0].size.contains("1.95"), "got {:?}", r[0].size);
+    }
+
+    /// Saver caps AND inverts: the smallest watchable file, roughly a tenth of the
+    /// bytes of the 4K.
+    #[test]
+    fn test_saver_takes_the_smallest() {
+        let mut r = diplomat_s03e07_live_candidates();
+        rank_results_mut_opts(
+            &mut r,
+            RankOpts {
+                transcoding: false,
+                original_language: Some("en"),
+                pref: QualityPref::Saver,
+            },
+        );
+        assert!(!r[0].title.contains("2160p"));
+        assert!(
+            r[0].size.contains("479"),
+            "smallest 1080p; got {:?}",
+            r[0].size
+        );
+    }
+
+    /// The wire form is forgiving: a stale client or a hand-typed URL degrades to
+    /// the ranker's own judgement rather than erroring.
+    #[test]
+    fn test_quality_pref_parsing() {
+        use QualityPref::*;
+        assert_eq!(QualityPref::from_param(Some("uhd")), ForceUhd);
+        assert_eq!(QualityPref::from_param(Some("4K")), ForceUhd);
+        assert_eq!(QualityPref::from_param(Some("hd")), CapHd);
+        assert_eq!(QualityPref::from_param(Some("saver")), Saver);
+        assert_eq!(
+            QualityPref::from_param(Some("frugal")),
+            Saver,
+            "older spelling"
+        );
+        assert_eq!(
+            QualityPref::from_param(Some("1")),
+            Saver,
+            "frugal=1 wire form"
+        );
+        assert_eq!(QualityPref::from_param(Some("nonsense")), Auto);
+        assert_eq!(QualityPref::from_param(None), Auto);
+        assert_eq!(QualityPref::from_param(Some("  UHD  ")), ForceUhd);
     }
 
     /// The 4K in this list has ONE seed. Preferring 2160p must not mean

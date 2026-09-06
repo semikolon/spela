@@ -173,6 +173,143 @@ fn cached_media_quality(state: &SharedState, rid: usize) -> Option<crate::transc
     lock_recover(&state.media_probe).get(&key).cloned()
 }
 
+/// How close a buffering torrent is to being OPENABLE, as 0..100.
+///
+/// NOT the fraction of the file downloaded, which is what the loading bar drew
+/// until 2026-09-06 and which reads as far more remaining than there is: VLC opens
+/// at 15% AND 64 MB AND both ends present, so a bar showing 12%-of-file was in fact
+/// four-fifths of the way there and looked like it had eight times as long to go.
+///
+/// The two fractional gates each contribute their own completion and the BINDING
+/// one decides, because a torrent can be past 15% while short of 64 MB or the
+/// reverse. The ends gate is boolean and usually last, so it owns the final tenth:
+/// the bar physically cannot fill until the tail lands, which is the thing that
+/// actually holds up a play that looks finished (Silo S03E04, 2026-08-03).
+pub(crate) fn open_progress_pct(
+    frac: f64,
+    bytes: u64,
+    min_frac: f64,
+    min_bytes: u64,
+    ends_ok: bool,
+    finished: bool,
+) -> u32 {
+    if finished {
+        return 100;
+    }
+    let gate_frac = if min_frac > 0.0 {
+        (frac / min_frac).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let gate_bytes = if min_bytes > 0 {
+        (bytes as f64 / min_bytes as f64).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let gates = gate_frac.min(gate_bytes);
+    if gates >= 1.0 && ends_ok {
+        return 100;
+    }
+    ((gates * 90.0) + if ends_ok { 10.0 } else { 0.0 }) as u32
+}
+
+/// Is this client reaching spela from OUTSIDE the home LAN, and therefore possibly
+/// paying by the megabyte?
+///
+/// spela is LAN-only, so WireGuard is the only way in from mobile data or a
+/// hotspot — which makes the source address a better signal than anything the
+/// browser can tell us. `navigator.connection.effectiveType` measures SPEED, not
+/// cost (fast 5G is indistinguishable from wifi), and its Safari support is
+/// unconfirmed, which matters because the phone is the main case.
+///
+/// KNOWN IMPRECISION, accepted 2026-09-06: off-LAN is a SUPERSET of metered — a
+/// laptop on a café's wifi also arrives over WireGuard and gets capped needlessly.
+/// Erring frugal costs picture quality, erring the other way costs money, and the
+/// UI toggle covers the difference.
+///
+/// An address in neither range is treated as ON-LAN. A LAN-only service reached
+/// from an unrecognised address is far more likely to be a home device than a
+/// metered one, and the failure direction there is a needless quality cut.
+pub(crate) fn client_is_off_lan(addr: std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // The fleet's WireGuard subnet. Home LAN is 192.168.4.x and loopback is
+            // spela talking to itself; both are unmetered by construction.
+            o[0] == 10
+        }
+        // No IPv6 is in play on this network; treating it as on-LAN keeps the
+        // failure direction on the harmless side.
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
+/// The client address to judge, given the socket peer and any `X-Forwarded-For`.
+///
+/// The web remote is reached through kamal-proxy at `spela.home`, so the socket
+/// peer is the PROXY and the real client only appears in the header. The header is
+/// trusted ONLY when the direct peer is itself local — loopback or the LAN gateway
+/// — because anything else could set it freely, and this decides how much bandwidth
+/// to spend rather than anything security-bearing.
+pub(crate) fn effective_client_ip(
+    peer: std::net::IpAddr,
+    forwarded_for: Option<&str>,
+) -> std::net::IpAddr {
+    let peer_is_local = match peer {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback() || (o[0] == 192 && o[1] == 168)
+        }
+        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+    };
+    if !peer_is_local {
+        return peer;
+    }
+    forwarded_for
+        .and_then(|h| h.split(',').next())
+        .map(str::trim)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(peer)
+}
+
+/// Probed quality for an explicitly known path — the torrent's own file, which the
+/// readiness handler already resolves. Preferred over the result-id form there:
+/// a fresh torrent has no title-matched file on disk yet, so the bypass resolver
+/// finds nothing and the loading panel showed no label at all for exactly the case
+/// a label is most wanted (observed 2026-09-06).
+fn cached_media_quality_at(
+    state: &SharedState,
+    path: Option<&std::path::Path>,
+) -> Option<crate::transcode::MediaQuality> {
+    let p = path?;
+    let key = p.to_string_lossy().to_string();
+    if lock_recover(&state.media_probe).get(&key).is_none() {
+        spawn_media_probe_at(state, p.to_path_buf());
+        return None;
+    }
+    lock_recover(&state.media_probe).get(&key).cloned()
+}
+
+/// Probe one known path, once. Same bounded-and-cached shape as the result-id form.
+fn spawn_media_probe_at(state: &SharedState, path: std::path::PathBuf) {
+    let key = path.to_string_lossy().to_string();
+    {
+        let mut m = lock_recover(&state.media_probe);
+        if m.contains_key(&key) {
+            return;
+        }
+        // Reserve nothing: a failed probe simply retries on a later poll, which is
+        // correct while a torrent is still writing its header.
+        let _ = &mut *m;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Some(q) = crate::transcode::probe_media_quality(&path).await {
+            lock_recover(&state.media_probe).insert(key, q);
+        }
+    });
+}
+
 /// Probe the file a result resolves to, once. Lifetime: one bounded ffprobe that
 /// completes on its own; the cache entry is what stops the ~1.5s readiness poll
 /// from spawning another every tick.
@@ -1449,6 +1586,10 @@ struct SearchParams {
     /// / shannon). Only "chromecast" keeps the tier-4 H.264 preference; native-HEVC
     /// targets re-rank by seed count so a well-seeded HEVC isn't demoted.
     target: Option<String>,
+    /// `pref=auto|uhd|hd|saver` — what the viewer asked for, from the quality
+    /// control in the remote. Absent means Auto, EXCEPT off-LAN where it means
+    /// Saver. Supersedes `frugal=1`, which is still accepted.
+    pref: Option<String>,
     /// `frugal=1` — bandwidth costs money right now (a phone on mobile data, a
     /// laptop on a hotspot). Caps at 1080p and picks the SMALLEST encode rather
     /// than the largest, taking an episode from roughly 12 GB to roughly 1 GB.
@@ -1507,8 +1648,17 @@ struct CastInfoRequest {
 
 async fn handle_search(
     State(state): State<SharedState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> Json<Value> {
+    // Where is this client, and might it be paying by the megabyte? See
+    // `client_is_off_lan` for why the source address beats anything the browser
+    // can tell us, and for the imprecision that is deliberately accepted.
+    let off_lan = client_is_off_lan(effective_client_ip(
+        peer.ip(),
+        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+    ));
     let q = match params.q {
         Some(q) if !q.is_empty() => q,
         _ => return Json(json!({"error": "Missing q parameter"})),
@@ -1527,10 +1677,26 @@ async fn handle_search(
             // (Re-ranking reassigns result ids, so it must precede the partial-download
             // enrichment + save_last_search below.) Axis = needs-H.264-transcode, not
             // the literal "chromecast".
-            let frugal = params.frugal.as_deref() == Some("1");
-            // Frugal re-ranks whatever the target is: a Chromecast on a hotspot
-            // costs exactly as much per gigabyte as a phone does.
-            if frugal
+            // What the viewer asked for, if anything. `frugal=1` stays accepted as
+            // the older spelling. When nothing is asked and the client reached us
+            // from OUTSIDE the home LAN, the default becomes Saver: spela is
+            // LAN-only, so WireGuard is the only way in from mobile data or a
+            // hotspot, and a wrong guess there costs money rather than pixels.
+            let asked = params.pref.as_deref().or(params.frugal.as_deref().map(|f| {
+                if f == "1" {
+                    "saver"
+                } else {
+                    "auto"
+                }
+            }));
+            let pref = match asked {
+                Some(a) => crate::search::QualityPref::from_param(Some(a)),
+                None if off_lan => crate::search::QualityPref::Saver,
+                None => crate::search::QualityPref::Auto,
+            };
+            // A non-Auto preference re-ranks whatever the target is: a Chromecast on
+            // a hotspot costs exactly as much per gigabyte as a phone does.
+            if pref != crate::search::QualityPref::Auto
                 && !params
                     .target
                     .as_deref()
@@ -1545,7 +1711,7 @@ async fn handle_search(
                     crate::search::RankOpts {
                         transcoding: true,
                         original_language: orig_lang.as_deref(),
-                        frugal: true,
+                        pref,
                     },
                 );
             }
@@ -1563,7 +1729,7 @@ async fn handle_search(
                     crate::search::RankOpts {
                         transcoding: false,
                         original_language: orig_lang.as_deref(),
-                        frugal,
+                        pref,
                     },
                 );
             }
@@ -9198,17 +9364,37 @@ async fn handle_vlc_ready(
         0.0
     };
     const MIN_BUFFER: u64 = 64 * 1024 * 1024;
+    const MIN_FRAC: f64 = 0.15;
     // Byte-fraction is necessary but NOT sufficient: VLC probes the head + the MKV
     // tail (Cues) before playback, and a torrent can hit 15%+64MB with the tail
     // still missing → VLC opens and hangs probing hundreds of MB deep (Silo S03E04,
     // Aug 3). Only declare ready once both ends are actually downloaded.
-    let ready = finished
-        || (frac >= 0.15
-            && bytes >= MIN_BUFFER
-            && state
+    // The two fractional gates, each as its own 0..1 completion. The BINDING one is
+    // the minimum: a torrent can be past 15% and still short of 64 MB, or the
+    // reverse, and the bar must follow whichever is actually holding it up.
+    let gate_frac = (frac / MIN_FRAC).min(1.0);
+    let gate_bytes = (bytes as f64 / MIN_BUFFER as f64).min(1.0);
+    let gates = gate_frac.min(gate_bytes);
+    // The ends gate is BOOLEAN and usually last, so it cannot be a fraction — it
+    // gets the final tenth of the bar. Evaluated only once the fractional gates
+    // are met, as before: it costs a head+tail read, and this runs on a ~1.5s poll.
+    let ends_ok = if finished || gates >= 1.0 {
+        finished
+            || state
                 .torrent_engine
                 .ends_present(tid, file_index.unwrap_or(0) as usize)
-                .await);
+                .await
+    } else {
+        false
+    };
+    let ready = finished || (gates >= 1.0 && ends_ok);
+    // Progress toward OPENING, which is not progress toward 100% downloaded and was
+    // being drawn as though it were. VLC opens at 15% + 64 MB + both ends present,
+    // so a bar reading 12% of the file was in fact four-fifths of the way there and
+    // looked like it had eight times as long to go. The last tenth is the ends gate,
+    // so the bar physically cannot fill until the tail lands — which is the thing
+    // that actually holds up a play that looks finished (Silo S03E04, Aug 3).
+    let open_pct = open_progress_pct(frac, bytes, MIN_FRAC, MIN_BUFFER, ends_ok, finished);
     // RUNWAY, not percent. Percent-downloaded is the number that told Fredrik "32%" while
     // he had seven minutes of watchable video, and playback stalled exactly at the seven.
     // The contiguous run from the playhead is what he can actually act on.
@@ -9265,9 +9451,23 @@ async fn handle_vlc_ready(
     Json(json!({
         "ready": ready,
         "pct": (frac * 100.0) as u32,
+        // Progress toward being OPENABLE. `pct` stays as the raw
+        // fraction-of-file for anything that wants it, but this is the honest
+        // one to draw a waiting bar with.
+        "open_pct": open_pct,
         "bytes": bytes,
         "total": total,
+        // Liveness and swarm health, for the panel to show without words: motion
+        // maps to speed, and a dot per peer says whether anyone is feeding it.
+        // Both were computed here already and simply never left the server.
+        "speed_bps": speed,
+        "peers": peers,
+        // Playtime CLEARED, and the episode's length to measure it against. This is
+        // the honest unit for a waiting bar: bytes-downloaded answers a question
+        // nobody asked, while "how many minutes can I watch" is the actual one.
         "runway_secs": runway,
+        "dur_secs": dur,
+        "quality": cached_media_quality_at(&state, file_path.as_deref()),
         "phase": if finished { "complete" } else if ready { "buffered" } else { "buffering" },
     }))
 }
@@ -13693,5 +13893,162 @@ mod bypass_downgrade_floor_tests {
             (want as f64 * 0.74) as u64,
             want
         ));
+    }
+}
+
+#[cfg(test)]
+mod loading_progress_tests {
+    use super::open_progress_pct;
+
+    const MIN_FRAC: f64 = 0.15;
+    const MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// The bug this replaced: the bar drew fraction-of-FILE, so a torrent that was
+    /// four-fifths of the way to openable showed 12% and read as eight times the
+    /// remaining wait. 2026-09-06.
+    #[test]
+    fn twelve_percent_of_the_file_is_most_of_the_way_to_opening() {
+        let bytes = (0.12 * 3_000_000_000.0) as u64; // 360 MB, well past the 64 MB gate
+        let p = open_progress_pct(0.12, bytes, MIN_FRAC, MIN_BYTES, false, false);
+        assert!(
+            p >= 65,
+            "0.12/0.15 is four-fifths of the byte-fraction gate; got {p}"
+        );
+        assert!(p <= 90, "the ends gate owns the last tenth; got {p}");
+    }
+
+    /// The BINDING gate decides. A tiny file can be past 15% while nowhere near
+    /// 64 MB, and the bar must follow whichever is actually holding it up.
+    #[test]
+    fn the_binding_gate_decides_not_the_generous_one() {
+        // 50% of a 100 MB file: byte-fraction gate long satisfied, absolute gate not.
+        let p = open_progress_pct(0.50, 50 * 1024 * 1024, MIN_FRAC, MIN_BYTES, false, false);
+        assert!(
+            p < 90,
+            "50 MB of the 64 MB minimum is not nearly ready; got {p}"
+        );
+        // The reverse: plenty of bytes, barely any of the file.
+        let q = open_progress_pct(0.02, 500 * 1024 * 1024, MIN_FRAC, MIN_BYTES, false, false);
+        assert!(q < 20, "2% of a large file is barely started; got {q}");
+    }
+
+    /// The ends gate is boolean and usually last, so it owns the final tenth: the
+    /// bar cannot fill while the tail is missing, which is exactly the state that
+    /// looks finished and does not play (Silo S03E04, 2026-08-03).
+    #[test]
+    fn the_bar_cannot_fill_until_the_tail_lands() {
+        let full = open_progress_pct(0.99, 2_000_000_000, MIN_FRAC, MIN_BYTES, false, false);
+        assert_eq!(full, 90, "both fractional gates met, tail missing");
+        let done = open_progress_pct(0.99, 2_000_000_000, MIN_FRAC, MIN_BYTES, true, false);
+        assert_eq!(done, 100);
+    }
+
+    #[test]
+    fn a_finished_torrent_is_a_hundred_regardless() {
+        assert_eq!(
+            open_progress_pct(0.0, 0, MIN_FRAC, MIN_BYTES, false, true),
+            100
+        );
+    }
+
+    #[test]
+    fn nothing_downloaded_is_zero_and_never_negative() {
+        assert_eq!(
+            open_progress_pct(0.0, 0, MIN_FRAC, MIN_BYTES, false, false),
+            0
+        );
+    }
+
+    /// Monotonic: more bytes can never move the bar backwards, which is what makes
+    /// it readable as progress at all.
+    #[test]
+    fn progress_never_goes_backwards() {
+        let total = 3_000_000_000u64;
+        let mut prev = 0;
+        for step in 0..=40 {
+            let bytes = total / 40 * step;
+            let p = open_progress_pct(
+                bytes as f64 / total as f64,
+                bytes,
+                MIN_FRAC,
+                MIN_BYTES,
+                false,
+                false,
+            );
+            assert!(p >= prev, "went backwards at step {step}: {prev} -> {p}");
+            prev = p;
+        }
+    }
+}
+
+#[cfg(test)]
+mod client_location_tests {
+    use super::{client_is_off_lan, effective_client_ip};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// spela is LAN-only, so WireGuard is the only way in from mobile data or a
+    /// hotspot. MERIAN's tunnel address is the real one.
+    #[test]
+    fn the_wireguard_subnet_is_off_lan() {
+        assert!(client_is_off_lan(ip("10.0.0.3")));
+        assert!(client_is_off_lan(ip("10.0.0.7")));
+    }
+
+    #[test]
+    fn the_home_lan_and_loopback_are_not() {
+        assert!(!client_is_off_lan(ip("192.168.4.1")));
+        assert!(!client_is_off_lan(ip("192.168.4.126")));
+        assert!(!client_is_off_lan(ip("127.0.0.1")));
+    }
+
+    /// An unrecognised address is treated as ON-lan. A LAN-only service reached
+    /// from an unknown address is far likelier to be a home device than a metered
+    /// one, and the failure direction there is a needless quality cut.
+    #[test]
+    fn an_unknown_address_does_not_trigger_a_quality_cut() {
+        assert!(!client_is_off_lan(ip("172.16.0.9")));
+        assert!(!client_is_off_lan(ip("::1")));
+    }
+
+    /// The remote is reached through kamal-proxy, so the socket peer is the PROXY
+    /// and the real client is only in the header.
+    #[test]
+    fn the_forwarded_header_is_used_when_the_peer_is_the_local_proxy() {
+        assert_eq!(
+            effective_client_ip(ip("127.0.0.1"), Some("10.0.0.3")),
+            ip("10.0.0.3")
+        );
+        assert_eq!(
+            effective_client_ip(ip("192.168.4.1"), Some("10.0.0.3, 172.16.0.1")),
+            ip("10.0.0.3"),
+            "the first entry is the originating client"
+        );
+    }
+
+    /// …and ignored otherwise, since anything non-local could set it freely.
+    #[test]
+    fn the_forwarded_header_is_ignored_from_a_non_local_peer() {
+        assert_eq!(
+            effective_client_ip(ip("10.0.0.3"), Some("192.168.4.50")),
+            ip("10.0.0.3"),
+            "a remote client cannot claim to be on the LAN"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_junk_header_falls_back_to_the_peer() {
+        assert_eq!(effective_client_ip(ip("127.0.0.1"), None), ip("127.0.0.1"));
+        assert_eq!(
+            effective_client_ip(ip("127.0.0.1"), Some("not-an-ip")),
+            ip("127.0.0.1")
+        );
+        assert_eq!(
+            effective_client_ip(ip("127.0.0.1"), Some("")),
+            ip("127.0.0.1")
+        );
     }
 }
