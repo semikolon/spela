@@ -1341,6 +1341,20 @@ function stopTrailers(){
   // Put the facade back so the card is not left with an empty black box.
   document.querySelectorAll(".trwrap").forEach(w=>{ if(!w.children.length) w.remove(); });
 }
+/* The search query lives in the URL, so a reload lands back on the same result
+   instead of an empty search page (2026-09-06). Everything else about the page is
+   already restorable — the view from the hash, the Movies/TV toggle and the play
+   target from sessionStorage — and the query was the one piece that evaporated,
+   which is what made the page feel ephemeral. Written with replaceState while
+   typing so a search does not push a history entry per keystroke. */
+function searchQueryFromHash(){
+  const m=location.hash.match(/[?&]q=([^&]*)/);
+  try{ return m ? decodeURIComponent(m[1]) : ""; }catch{ return ""; }
+}
+function rememberSearchInUrl(q){
+  const want = q ? "#/search?q="+encodeURIComponent(q) : "#/search";
+  if(location.hash!==want) history.replaceState(null,"",want);
+}
 function route(){
   stopTrailers();
   const v=(location.hash.replace(/^#\//,"")||"home").split("?")[0];
@@ -1351,7 +1365,13 @@ function route(){
   if(known==="home") loadHome();
   if(known==="now") renderNowFull();
   if(known==="library") renderLibrary();
-  if(known==="search" && !S.search.q){ loadRecent(); }
+  if(known==="search"){
+    // A query in the URL that the page has not run yet — a reload, a pasted link,
+    // or the back button. Restore the box and run it.
+    const hq=searchQueryFromHash();
+    if(hq && hq!==S.search.q){ $("#q").value=hq; S.search.q=hq; runSearch(hq); }
+    else if(!S.search.q){ loadRecent(); }
+  }
   if(known==="towatch") renderToWatch();
   if(known==="rewatch") renderRewatch();
 }
@@ -1371,7 +1391,7 @@ async function renderToWatch(){
     // written `note` was inconsistent + jargon-y, replaced by real genres).
     if(x.rt!=null) r.appendChild(el("span",{className:"s "+(x.rt>=88?"":"low"),textContent:"🍅 "+x.rt}));
     r.onclick=()=>{ setMode(isTV?"tv":"movie"); const q=searchQueryFor(x);
-      $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
+      $("#q").value=q; S.search.q=q; location.hash="#/search?q="+encodeURIComponent(q); runSearch(q); };
     enrichWhenVisible(r,()=>enrichToWatchRow(r,x,isTV));
     return r;
   });
@@ -1464,7 +1484,7 @@ async function renderRewatch(){
     const r=el("button",{className:"src"});
     r.appendChild(el("span",{className:"q",textContent:x.title}));
     r.onclick=()=>{ setMode(x.resolvedTV?"tv":"movie"); const q=searchQueryFor(x);
-      $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
+      $("#q").value=q; S.search.q=q; location.hash="#/search?q="+encodeURIComponent(q); runSearch(q); };
     // Two toggles: loved and not-for-me. Neither pressed = unrated, which is the
     // honest default; pressing one clears the other, since they are exclusive.
     const rate=el("div",{className:"rate"});
@@ -1802,7 +1822,7 @@ async function loadRecent(){
     const c=el("button",{className:"chip"});
     c.innerHTML=esc(it.label)+(it.season?`<span class="ep">S${String(it.season).padStart(2,"0")}E${String(it.episode||0).padStart(2,"0")}</span>`:"");
     c.onclick=()=>{ setMode(it.season?"tv":"movie");
-      $("#q").value=it.query; S.search.q=it.query; runSearch(it.query); };
+      $("#q").value=it.query; S.search.q=it.query; rememberSearchInUrl(it.query); runSearch(it.query); };
     chips.appendChild(c);
   });
   row.appendChild(chips); row.classList.add("on");
@@ -1858,7 +1878,7 @@ function followingItem(s, onMarked){
     +`<span class="fometa"><b>${s.new_count} new</b>${nu?` · ${esc(nu)}`:""}${epName}</span>`
     +(line2?`<span class="fosub">${line2}</span>`:"")
     +(s.partway!=null?`<span class="fosub partway">▸ ${s.partway}% into ${esc(nu||"this episode")}</span><span class="cprog"><span class="cprogfill" style="width:${s.partway}%"></span></span>`:"");
-  tap.onclick=()=>{ setMode("tv"); const q=s.title+(nu?" "+nu:""); $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
+  tap.onclick=()=>{ setMode("tv"); const q=s.title+(nu?" "+nu:""); $("#q").value=q; S.search.q=q; location.hash="#/search?q="+encodeURIComponent(q); runSearch(q); };
   // Poster as a half-faded background — same treatment as the To-Watch rows.
   // Prefer the landscape backdrop (crisp in the wide row); fall back to the
   // portrait poster (which `cover` upscales ~3-4x → fuzzy). 2026-08-06.
@@ -1972,7 +1992,7 @@ function upcomingItem(s){
   // (which defaults to S01E01). TV mode sends no movie param, so the show resolves right;
   // spela parses the SxxExx and lands on that episode (0 sources until it releases).
   tap.onclick=()=>{ setMode("tv"); const q=s.title+(s.next_air&&s.next_air.se?" "+s.next_air.se:"");
-    $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
+    $("#q").value=q; S.search.q=q; location.hash="#/search?q="+encodeURIComponent(q); runSearch(q); };
   // Prefer the landscape backdrop (crisp in the wide row); fall back to the
   // portrait poster (which `cover` upscales ~3-4x → fuzzy). 2026-08-06.
   const bg=s.backdrop_url||s.poster_url;
@@ -2053,7 +2073,7 @@ function continueItem(it){
     +(it.pct!=null?`<span class="cprog"><span class="cprogfill" style="width:${it.pct}%"></span></span>`:"");
   tap.onclick=()=>{ setMode(isTV?"tv":"movie");
     const q=(name+(se?" "+se:"")).trim(); $("#q").value=q; S.search.q=q;
-    location.hash="#/search"; runSearch(q); };
+    location.hash="#/search?q="+encodeURIComponent(q); runSearch(q); };
   paintPoster(tap,it.poster_url); lazyBackdrop(tap, name, isTV);
   item.appendChild(tap);
   // Fast-play ▶ — resume the best source directly (skips the search step).
@@ -2093,7 +2113,7 @@ function recItem(it){
     +`<span class="fometa">${isTV?"Series":"Movie"}<span class="rrt">${rtInit}</span></span>`;
   tap.onclick=()=>{ setMode(isTV?"tv":"movie");
     const q=searchQueryFor(it);
-    $("#q").value=q; S.search.q=q; location.hash="#/search"; runSearch(q); };
+    $("#q").value=q; S.search.q=q; location.hash="#/search?q="+encodeURIComponent(q); runSearch(q); };
   if(it.poster_url) paintPoster(tap,it.poster_url);
   enrichWhenVisible(tap,()=>enrichRec(tap,it));
   item.appendChild(tap);
@@ -2185,7 +2205,7 @@ async function resolvePending(key,watched,card){
 
 let dT;
 $("#q").addEventListener("input",e=>{ const q=e.target.value.trim();
-  clearTimeout(dT); dT=setTimeout(()=>{ S.search.q=q;
+  clearTimeout(dT); dT=setTimeout(()=>{ S.search.q=q; rememberSearchInUrl(q);
     if(q){ runSearch(q); } else { $("#searchOut").innerHTML=""; loadRecent(); loadPending(); loadFollowing(); } },300); });
 
 // Mark the shown movie/series watched (search detail button). Show-level for a
