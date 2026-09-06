@@ -1561,11 +1561,14 @@ impl SearchEngine {
 /// 2.5x the bitrate of what the ranker had been picking — was still visibly
 /// compressed at close distance on the 4K monitor.
 ///
-/// Viability is baked into the value in BOTH mappings, which is what keeps this
-/// a strict total order (see the history note above) and what stops an
-/// unreachable 4K from winning: a 2160p release under
-/// the viability bar drops below every viable lower resolution, so 4K is
-/// preferred only when it can actually be delivered.
+/// The value is a per-result BUCKET rather than a pairwise comparison, which is
+/// what keeps this a strict total order (see the history note above).
+///
+/// It no longer encodes anything about the swarm. Until 2026-09-06 a seed-viability
+/// bar was baked in here, so a thin-swarm 2160p dropped below every better-seeded
+/// lower resolution; that was a prediction about delivery, and spela measures
+/// delivery instead (racing, the stall gate, source rotation). The only thing that
+/// can still push a 4K down is `is_starved_4k`, which is a judgement about PICTURE.
 #[cfg_attr(not(test), allow(dead_code))] // test entry point; production calls the _forced form
 pub(crate) fn effective_res_tier(
     r: &TorrentResult,
@@ -1599,7 +1602,7 @@ pub(crate) fn effective_res_tier_forced(
 pub(crate) fn effective_res_tier_full(
     r: &TorrentResult,
     hd_first: bool,
-    strict_seeds: bool,
+    _strict_seeds: bool,
     best_1080p_bpp: Option<f64>,
     force_4k: bool,
 ) -> u32 {
@@ -1609,9 +1612,10 @@ pub(crate) fn effective_res_tier_full(
     // once the pack-penalty removal made a good 4K rank first on its own. Kept
     // because the shape is right if a force-a-resolution override is ever wanted
     // again, and because deleting it would take the reasoning with it.
-    // An explicit ask for 4K skips BOTH guards — the seed-viability bar and the
-    // bits-per-pixel floor. They exist to stop the ranker CHOOSING a doubtful 4K on
-    // its own; when the viewer chooses it, the question they answer has already
+    // An explicit ask for 4K skips the remaining guard, the bits-per-pixel floor.
+    // (It skipped the seed-viability bar too, until that bar was removed outright
+    // on 2026-09-06.) The floor exists to stop the ranker CHOOSING a doubtful 4K on
+    // its own; when the viewer chooses it, the question it answers has already
     // been answered. Anchor 2026-09-06: a 15-seed 10.6 Mbps 2160p of The Diplomat
     // S03E07 was under both, correctly by their own logic, and was still the thing
     // he wanted.
@@ -1619,42 +1623,52 @@ pub(crate) fn effective_res_tier_full(
         return 0;
     }
     let base = resolution_tier(&r.title);
-    let viable = r.seeds
-        >= if strict_seeds {
-            MIN_SEEDS_TRANSCODING
-        } else {
-            MIN_SEEDS_NATIVE
-        };
+    // NO SEED-VIABILITY BAR since 2026-09-06. It used to demote any resolution
+    // whose swarm looked thin, below every viable lower one — an EXCLUSION dressed
+    // as an ordering.
+    //
+    // It was a PREDICTION about delivery in a system that MEASURES delivery.
+    // Racing already fires whenever the pick is under `race_seed_threshold` and
+    // tries the alternatives for real; the stall gate condemns a source that sends
+    // nothing; the remote rotates past up to three dead ones. Seed count is a
+    // tracker-scrape CLAIM, not deliverable capacity — this project has a measured
+    // case of a "344-seed" release connecting three real peers at 0 B/s — so the
+    // bar was excluding real candidates on a number that does not mean what it
+    // says, to answer a question the machinery downstream answers empirically.
+    // That is `Observe, don't predict` almost verbatim: when a cheap oracle exists,
+    // search and evaluate rather than filter on a heuristic.
+    //
+    // Cost of being wrong is now bounded and VISIBLE: a dead pick costs the stall
+    // gate plus a rotation, and the waiting bar's stripes stop moving while it
+    // happens. Cost of the bar was invisible and permanent — it silently withheld
+    // 4K that would have played (The Diplomat S03E07: a 5-seed 19 Mbps and a
+    // 15-seed 10.6 Mbps 2160p both excluded on Auto).
+    //
+    // Seeds still PREFER, they no longer EXCLUDE: they remain the final tiebreak,
+    // so between otherwise-equal sources the better-seeded one still wins.
+    //
+    // The bits-per-pixel floor STAYS. It is a different kind of thing: a judgement
+    // about picture quality, which no downstream measurement replaces, and it is
+    // what stops a thin 3 GB "4K" beating a fat 5 GB 1080p. Reachable deliberately
+    // through the 4K preference.
     if transcoding {
-        match (base, viable) {
-            (0, true) => 0,  // 1080p viable
-            (1, true) => 1,  // 720p viable
-            (2, true) => 2,  // 480p viable
-            (0, false) => 3, // 1080p unviable → demoted
-            (1, false) => 4, // 720p unviable
-            (2, false) => 5, // 480p unviable
-            (3, _) => 6,     // 2160p — always demoted for a 1080p-capped screen
-            _ => 7,          // unknown / unclassified
+        match base {
+            0 => 0, // 1080p — the target for a 1080p panel
+            1 => 1, // 720p
+            2 => 2, // 480p
+            3 => 3, // 2160p — demoted: the panel cannot show it and NVENC pays 3x
+            _ => 4, // unknown / unclassified
         }
     } else {
         // A 4K is only 4K if its bitrate backs the pixels.
         let starved = is_starved_4k(r, best_1080p_bpp);
-        match (base, viable, starved) {
-            (3, true, false) => 0, // 2160p viable, and the bitrate backs it
-            (0, true, _) => 1,     // 1080p viable
-            (3, true, true) => 2,  // 2160p viable but STARVED → below good 1080p
-            (1, true, _) => 3,     // 720p viable
-            (2, true, _) => 4,     // 480p viable
-            // Below the viability bar the binding constraint is delivery, not
-            // pixels, so the order INVERTS here: 2160p needs roughly five times
-            // the sustained bitrate of 1080p, which makes a dead 4K the least
-            // likely of all of these to ever play. A 1-seed 11 GB 2160p must not
-            // outrank a 47-seed 1080p just for being 4K.
-            (0, false, _) => 5, // 1080p unviable
-            (1, false, _) => 6, // 720p unviable
-            (2, false, _) => 7, // 480p unviable
-            (3, false, _) => 8, // 2160p unviable → last; hungriest and deadest
-            _ => 9,             // unknown / unclassified
+        match (base, starved) {
+            (3, false) => 0, // 2160p, and the bitrate backs it
+            (0, _) => 1,     // 1080p
+            (3, true) => 2,  // 2160p but STARVED → below a good 1080p
+            (1, _) => 3,     // 720p
+            (2, _) => 4,     // 480p
+            _ => 5,          // unknown / unclassified
         }
     }
 }
@@ -1680,11 +1694,12 @@ pub enum QualityPref {
     /// The ranker's own judgement, guards and all.
     #[default]
     Auto,
-    /// Give me 4K if any exists, whatever the guards think. Both guards that would
-    /// otherwise demote it are skipped: the seed-viability bar and the
-    /// bits-per-pixel starvation test. Among the 4Ks the later tiers still sort by
-    /// language, size and seeds, so this yields the best of them and not an
-    /// arbitrary one.
+    /// Give me 4K if any exists, whatever the guards think. Since the
+    /// seed-viability bar was removed (2026-09-06) there is only one guard left to
+    /// skip: the bits-per-pixel starvation test, so this reaches even a 4K whose
+    /// bitrate says it will look worse than the 1080p beside it. Among the 4Ks the
+    /// later tiers still sort by language, size and seeds, so this yields the best
+    /// of them and not an arbitrary one.
     ForceUhd,
     /// Cap at 1080p, but otherwise rank normally — the fattest 1080p, not the
     /// smallest. For a screen that cannot use the pixels on a connection that can
@@ -1733,10 +1748,14 @@ pub struct RankOpts<'a> {
     /// Auto is the ranker's own judgement and is right most of the time. The other
     /// two exist because it is judgement, not fact, and both directions of being
     /// wrong are ones only he can see: a 4K his guards declined (2026-09-06, a
-    /// 15-seed 10.6 Mbps 2160p sat below a 6.6 Mbps 1080p — under the viability bar
-    /// AND under the bits-per-pixel floor, both correct in general and both wrong
-    /// for someone who wants 4K and will wait), and the reverse when bandwidth is
-    /// the scarce thing rather than pixels.
+    /// 15-seed 10.6 Mbps 2160p sat below a 6.6 Mbps 1080p — under the seed bar of
+    /// the day AND under the bits-per-pixel floor, both correct in general and both
+    /// wrong for someone who wants 4K and will wait), and the reverse when
+    /// bandwidth is the scarce thing rather than pixels.
+    ///
+    /// The seed half of that has since been settled at the source: the bar was
+    /// removed the same day, so Auto now reaches a thin-swarm 4K by itself and
+    /// ForceUhd is left overriding the bits-per-pixel floor alone.
     ///
     /// Replaces re-tuning thresholds every time a case comes out unwanted. A
     /// threshold moved to satisfy one episode is a threshold wrong for the next.
@@ -1758,194 +1777,232 @@ pub fn rank_results_mut_prefer(
     );
 }
 
-pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) {
-    let prefer_h264 = opts.transcoding;
-    let original_language = opts.original_language;
+/// The context a comparison is made in. The bits-per-pixel yardstick a 2160p
+/// release is judged against is a property of the whole candidate SET, not of
+/// any pair, so it is computed once and passed in; comparing two results in
+/// isolation would measure them against a different yardstick than the real
+/// sort uses, which is why this is a struct rather than four loose arguments.
+struct RankCtx<'a> {
+    prefer_h264: bool,
+    original_language: Option<&'a str>,
+    pref: QualityPref,
+    best_1080p_bpp: Option<f64>,
+}
+
+/// The ranking comparator, extracted from the `sort_by` closure so a test can
+/// assert directly that it is a STRICT TOTAL ORDER over a candidate set.
+/// `sort_by` requires that and gives no diagnostic when it does not hold — a
+/// non-transitive comparator surfaces as a ranking that changes with the input
+/// ORDER, which reads like a scoring bug and is not one. This project has been
+/// bitten by exactly that (see `effective_res_tier`), so the property is now
+/// tested rather than argued.
+fn rank_cmp(a: &TorrentResult, b: &TorrentResult, ctx: &RankCtx<'_>) -> std::cmp::Ordering {
     const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
     // May 13, 2026 v3.4.0: when the HEVC alternative has ≥SEED_DISPARITY_OVERRIDE×
     // the seeds of the H.264 tier-4 winner, override the codec preference. See
     // tier 4 body below for the full rationale + Apr/May 2026 anchoring incident.
     const SEED_DISPARITY_OVERRIDE: u32 = 30;
 
+    // Tier 1: non-DV > DV — a HARD gate, but ONLY for the transcoding target.
+    //
+    // The reason it exists is specific to one piece of hardware: Darwin's GTX
+    // 1650 NVENC cannot parse a Dolby Vision profile 5/7 RPU, so a DV release
+    // cast to a Chromecast produces no output at all. That is a genuine
+    // capability wall and stays absolute.
+    //
+    // It is NOT a wall for the M2 decoding natively in VLC, and leaving it in
+    // place there had a cost that only became visible once 4K was wanted:
+    // essentially every 2160p WEB-DL of a streaming title ships with DV, so a
+    // gate written about a GPU was quietly excluding the entire 4K catalogue
+    // from a 4K monitor. For Star City S01E08 the single well-seeded 2160p was
+    // a DV release sitting at position 37 of 39.
+    //
+    // So for native targets DV is demoted to a PREFERENCE (tier 6 below) rather
+    // than a gate: a 4K DV release still beats a 1080p non-DV one, because
+    // resolution is decided first, while between two otherwise-equal releases
+    // the non-DV one still wins. Fredrik's own testimony is the evidence for
+    // the lift — he has played DV before without noticing wrong colour — and
+    // the failure mode if that is ever wrong is washed-out picture, visible in
+    // the first second and revertible by moving this tier back up.
+    let a_dv = has_dolby_vision_in_title(&a.title);
+    let b_dv = has_dolby_vision_in_title(&b.title);
+    if ctx.prefer_h264 && a_dv != b_dv {
+        return if a_dv {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Less
+        };
+    }
+
+    // Tier 2 (v3.4.1): composite `effective_res_tier` value that bakes
+    // seed-viability into the resolution bucket. See `effective_res_tier`
+    // doc for the full mapping + the non-transitive-comparator history
+    // that motivated the redesign. Direct `cmp` on the bucket guarantees
+    // total ordering; tier 4 only fires within the same bucket.
+    // Frugal borrows the transcoding resolution mapping, which already sorts
+    // 2160p last — the same ordering, for a different reason: there because
+    // the panel cannot show the pixels, here because the pixels cost money.
+    let res_transcoding = ctx.prefer_h264 || ctx.pref.caps_to_hd();
+    let force = ctx.pref == QualityPref::ForceUhd;
+    // Ordering follows the preference; the seed bar follows the TARGET. Capping
+    // at 1080p on a native target must not also import the Chromecast bar.
+    let a_eff = effective_res_tier_full(
+        a,
+        res_transcoding,
+        ctx.prefer_h264,
+        ctx.best_1080p_bpp,
+        force,
+    );
+    let b_eff = effective_res_tier_full(
+        b,
+        res_transcoding,
+        ctx.prefer_h264,
+        ctx.best_1080p_bpp,
+        force,
+    );
+    if a_eff != b_eff {
+        return a_eff.cmp(&b_eff);
+    }
+
+    // Tier 3 (2026-09-05): language fit, WITHIN an equal resolution+viability
+    // bucket. Star City S01E06 is the anchor — all three top candidates were
+    // well-seeded 1080p, so they tied on every existing tier and seed count
+    // alone decided: a Polish AI-dub (903) and a French MULTI (174) outranked
+    // the plain English release (166), and it played with six French subtitle
+    // tracks and no English one. Sits below resolution so a dead clean swarm
+    // can't win; see `effective_lang_tier` for why it carries no seed term.
+    let a_lang = effective_lang_tier(a, ctx.original_language);
+    let b_lang = effective_lang_tier(b, ctx.original_language);
+    if a_lang != b_lang {
+        return a_lang.cmp(&b_lang);
+    }
+
+    // Tier 4: H.264 > HEVC within same resolution + DV status (insta-play tiebreak).
+    // May 13, 2026 v3.4.0 amendment — seed-disparity override:
+    // when the HEVC alternative has ≥30× the seeds of the H.264 winner,
+    // promote the HEVC. Rationale: well-seeded swarms (MeGusta-class,
+    // 1000+ seeds) start streaming within seconds, while starved swarms
+    // (Cinecalidad 99-seed Apr/May 2026 case) blocked librqbit's
+    // first-piece fetch past ffmpeg's reconnect budget — 0 segments,
+    // 75 s blue-cast icon, manual recovery. HEVC→H.264 NVENC transcode
+    // on Darwin's GTX 1650 adds 5-10 s of cold-start cost, strictly
+    // cheaper than waiting for a starved swarm or failing entirely. The
+    // 30× threshold is "user-tuned conservative" — at 30× the H.264
+    // winner is unambiguously inferior; below 30× the codec-cost
+    // tradeoff isn't worth flipping. Per-resolution + DV gates still
+    // fire first (tier 3 / tier 2), so this override only ever swaps
+    // codec WITHIN the same resolution + DV bucket.
+    let a_hevc = is_hevc_from_title(&a.title);
+    let b_hevc = is_hevc_from_title(&b.title);
+    // Tier 4 fires ONLY for the Chromecast target (ctx.prefer_h264). Native-HEVC
+    // targets (VLC / browser / phone) fall through to Tier 6 (seed count), so a
+    // well-seeded HEVC wins instead of being demoted below a starved H.264.
+    if ctx.prefer_h264 && a_hevc != b_hevc {
+        let (h264_seeds, hevc_seeds, h264_is_a) = if a_hevc {
+            (b.seeds, a.seeds, false)
+        } else {
+            (a.seeds, b.seeds, true)
+        };
+        // `max(1)` guards h264_seeds = 0 so the multiplier stays meaningful
+        // (without it, saturating_mul yields 0 and any positive HEVC count
+        // trivially satisfies the inequality — semantically fine but
+        // makes the threshold a no-op for that edge case).
+        let h264_seeds_safe = h264_seeds.max(1);
+        if hevc_seeds >= h264_seeds_safe.saturating_mul(SEED_DISPARITY_OVERRIDE) {
+            return if h264_is_a {
+                std::cmp::Ordering::Greater // H.264 (a) loses to HEVC (b)
+            } else {
+                std::cmp::Ordering::Less // H.264 (b) loses to HEVC (a)
+            };
+        }
+        // No qualifying disparity — apply the existing H.264 preference
+        // if the H.264 winner has viable seeds (≥5).
+        let preferred = if a_hevc { b } else { a }; // the H.264 one
+        if preferred.seeds >= MIN_SEEDS_FOR_CODEC_PREF {
+            return if a_hevc {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
+        }
+    }
+
+    // Tier 5 (2026-09-05): bitrate, via file size. Everything above this has
+    // tied — same resolution bucket, same viability, same language, same
+    // codec — so these are genuinely alternative encodes of the same minutes,
+    // and the bigger one is the less compressed one. This sits ABOVE seeds
+    // deliberately: seed count was the de-facto quality decision and it
+    // consistently picked the smallest file, because the tiny x265 rips are
+    // the ones everybody seeds.
+    let a_size = size_tier(a);
+    let b_size = size_tier(b);
+    if a_size != b_size {
+        return if ctx.pref.is_saver() {
+            b_size.cmp(&a_size) // smallest wins — the quota is the scarce thing
+        } else {
+            a_size.cmp(&b_size)
+        };
+    }
+
+    // NO PACK PENALTY. It was tier 1 until 2026-09-05 — ahead of resolution,
+    // language, codec and bitrate together — so a single episode taken from a
+    // season pack lost to every standalone release however much better it was.
+    // That is how the only well-seeded 2160p of Star City S01E08 (48 seeds,
+    // 11.85 GB, about 24 Mbps) came to sit at position 16 behind a 1.00 GB
+    // rip: it is `file_index: 7`, an episode inside a pack, as were all three
+    // good 4Ks for that episode. The one that ranked HIGHER had a single seed.
+    //
+    // It was first moved below the quality tiers, then removed outright the
+    // same evening, both on Fredrik's call. The reasoning: a pack costs
+    // nothing extra to fetch. spela selects the single file (`only_files`),
+    // Torrentio reports THAT file's size rather than the pack's, and the
+    // pruner bounds the disk either way. The tier carried a one-line comment
+    // and no recorded reason, so there was no intent to reconcile against.
+    //
+    // The one signal on the other side, recorded because it is the thing that
+    // would bring this back: the Silence season pack is the source that died
+    // nine seconds into playback on 2026-09-05. Being a pack was never shown
+    // to be WHY — the vanish was `--play-and-exit`, and the stumble underneath
+    // it was not diagnosed. If packs do turn out to stall more often, that is
+    // the evidence to look for, and a penalty belongs below the quality tiers
+    // rather than above them.
+
+    // Tier 7 (2026-09-05): non-DV > DV for NATIVE targets, as a last preference
+    // rather than the tier-2 gate. Everything else has tied, so this only ever
+    // separates two releases that are otherwise the same pick — which is the
+    // one place a mild uncertainty about VLC's Dolby Vision handling should be
+    // allowed to decide anything.
+    if !ctx.prefer_h264 && a_dv != b_dv {
+        return if a_dv {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Less
+        };
+    }
+
+    // Tier 8: more seeds > fewer seeds
+    b.seeds.cmp(&a.seeds)
+}
+
+pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) {
     // Pre-pass: the 1080p yardstick a 2160p release is judged against. Computed
     // once, outside the comparator, so every tier stays a per-result value.
-    let best_1080p_bpp = best_1080p_bytes_per_pixel(results);
-
-    results.sort_by(|a, b| {
-        // Tier 1: non-DV > DV — a HARD gate, but ONLY for the transcoding target.
-        //
-        // The reason it exists is specific to one piece of hardware: Darwin's GTX
-        // 1650 NVENC cannot parse a Dolby Vision profile 5/7 RPU, so a DV release
-        // cast to a Chromecast produces no output at all. That is a genuine
-        // capability wall and stays absolute.
-        //
-        // It is NOT a wall for the M2 decoding natively in VLC, and leaving it in
-        // place there had a cost that only became visible once 4K was wanted:
-        // essentially every 2160p WEB-DL of a streaming title ships with DV, so a
-        // gate written about a GPU was quietly excluding the entire 4K catalogue
-        // from a 4K monitor. For Star City S01E08 the single well-seeded 2160p was
-        // a DV release sitting at position 37 of 39.
-        //
-        // So for native targets DV is demoted to a PREFERENCE (tier 6 below) rather
-        // than a gate: a 4K DV release still beats a 1080p non-DV one, because
-        // resolution is decided first, while between two otherwise-equal releases
-        // the non-DV one still wins. Fredrik's own testimony is the evidence for
-        // the lift — he has played DV before without noticing wrong colour — and
-        // the failure mode if that is ever wrong is washed-out picture, visible in
-        // the first second and revertible by moving this tier back up.
-        let a_dv = has_dolby_vision_in_title(&a.title);
-        let b_dv = has_dolby_vision_in_title(&b.title);
-        if prefer_h264 && a_dv != b_dv {
-            return if a_dv {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Less
-            };
-        }
-
-        // Tier 2 (v3.4.1): composite `effective_res_tier` value that bakes
-        // seed-viability into the resolution bucket. See `effective_res_tier`
-        // doc for the full mapping + the non-transitive-comparator history
-        // that motivated the redesign. Direct `cmp` on the bucket guarantees
-        // total ordering; tier 4 only fires within the same bucket.
-        // Frugal borrows the transcoding resolution mapping, which already sorts
-        // 2160p last — the same ordering, for a different reason: there because
-        // the panel cannot show the pixels, here because the pixels cost money.
-        let res_transcoding = prefer_h264 || opts.pref.caps_to_hd();
-        let force = opts.pref == QualityPref::ForceUhd;
-        // Ordering follows the preference; the seed bar follows the TARGET. Capping
-        // at 1080p on a native target must not also import the Chromecast bar.
-        let a_eff = effective_res_tier_full(a, res_transcoding, prefer_h264, best_1080p_bpp, force);
-        let b_eff = effective_res_tier_full(b, res_transcoding, prefer_h264, best_1080p_bpp, force);
-        if a_eff != b_eff {
-            return a_eff.cmp(&b_eff);
-        }
-
-        // Tier 3 (2026-09-05): language fit, WITHIN an equal resolution+viability
-        // bucket. Star City S01E06 is the anchor — all three top candidates were
-        // well-seeded 1080p, so they tied on every existing tier and seed count
-        // alone decided: a Polish AI-dub (903) and a French MULTI (174) outranked
-        // the plain English release (166), and it played with six French subtitle
-        // tracks and no English one. Sits below resolution so a dead clean swarm
-        // can't win; see `effective_lang_tier` for why it carries no seed term.
-        let a_lang = effective_lang_tier(a, original_language);
-        let b_lang = effective_lang_tier(b, original_language);
-        if a_lang != b_lang {
-            return a_lang.cmp(&b_lang);
-        }
-
-        // Tier 4: H.264 > HEVC within same resolution + DV status (insta-play tiebreak).
-        // May 13, 2026 v3.4.0 amendment — seed-disparity override:
-        // when the HEVC alternative has ≥30× the seeds of the H.264 winner,
-        // promote the HEVC. Rationale: well-seeded swarms (MeGusta-class,
-        // 1000+ seeds) start streaming within seconds, while starved swarms
-        // (Cinecalidad 99-seed Apr/May 2026 case) blocked librqbit's
-        // first-piece fetch past ffmpeg's reconnect budget — 0 segments,
-        // 75 s blue-cast icon, manual recovery. HEVC→H.264 NVENC transcode
-        // on Darwin's GTX 1650 adds 5-10 s of cold-start cost, strictly
-        // cheaper than waiting for a starved swarm or failing entirely. The
-        // 30× threshold is "user-tuned conservative" — at 30× the H.264
-        // winner is unambiguously inferior; below 30× the codec-cost
-        // tradeoff isn't worth flipping. Per-resolution + DV gates still
-        // fire first (tier 3 / tier 2), so this override only ever swaps
-        // codec WITHIN the same resolution + DV bucket.
-        let a_hevc = is_hevc_from_title(&a.title);
-        let b_hevc = is_hevc_from_title(&b.title);
-        // Tier 4 fires ONLY for the Chromecast target (prefer_h264). Native-HEVC
-        // targets (VLC / browser / phone) fall through to Tier 6 (seed count), so a
-        // well-seeded HEVC wins instead of being demoted below a starved H.264.
-        if prefer_h264 && a_hevc != b_hevc {
-            let (h264_seeds, hevc_seeds, h264_is_a) = if a_hevc {
-                (b.seeds, a.seeds, false)
-            } else {
-                (a.seeds, b.seeds, true)
-            };
-            // `max(1)` guards h264_seeds = 0 so the multiplier stays meaningful
-            // (without it, saturating_mul yields 0 and any positive HEVC count
-            // trivially satisfies the inequality — semantically fine but
-            // makes the threshold a no-op for that edge case).
-            let h264_seeds_safe = h264_seeds.max(1);
-            if hevc_seeds >= h264_seeds_safe.saturating_mul(SEED_DISPARITY_OVERRIDE) {
-                return if h264_is_a {
-                    std::cmp::Ordering::Greater // H.264 (a) loses to HEVC (b)
-                } else {
-                    std::cmp::Ordering::Less // H.264 (b) loses to HEVC (a)
-                };
-            }
-            // No qualifying disparity — apply the existing H.264 preference
-            // if the H.264 winner has viable seeds (≥5).
-            let preferred = if a_hevc { b } else { a }; // the H.264 one
-            if preferred.seeds >= MIN_SEEDS_FOR_CODEC_PREF {
-                return if a_hevc {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Less
-                };
-            }
-        }
-
-        // Tier 5 (2026-09-05): bitrate, via file size. Everything above this has
-        // tied — same resolution bucket, same viability, same language, same
-        // codec — so these are genuinely alternative encodes of the same minutes,
-        // and the bigger one is the less compressed one. This sits ABOVE seeds
-        // deliberately: seed count was the de-facto quality decision and it
-        // consistently picked the smallest file, because the tiny x265 rips are
-        // the ones everybody seeds.
-        let a_size = size_tier(a);
-        let b_size = size_tier(b);
-        if a_size != b_size {
-            return if opts.pref.is_saver() {
-                b_size.cmp(&a_size) // smallest wins — the quota is the scarce thing
-            } else {
-                a_size.cmp(&b_size)
-            };
-        }
-
-        // NO PACK PENALTY. It was tier 1 until 2026-09-05 — ahead of resolution,
-        // language, codec and bitrate together — so a single episode taken from a
-        // season pack lost to every standalone release however much better it was.
-        // That is how the only well-seeded 2160p of Star City S01E08 (48 seeds,
-        // 11.85 GB, about 24 Mbps) came to sit at position 16 behind a 1.00 GB
-        // rip: it is `file_index: 7`, an episode inside a pack, as were all three
-        // good 4Ks for that episode. The one that ranked HIGHER had a single seed.
-        //
-        // It was first moved below the quality tiers, then removed outright the
-        // same evening, both on Fredrik's call. The reasoning: a pack costs
-        // nothing extra to fetch. spela selects the single file (`only_files`),
-        // Torrentio reports THAT file's size rather than the pack's, and the
-        // pruner bounds the disk either way. The tier carried a one-line comment
-        // and no recorded reason, so there was no intent to reconcile against.
-        //
-        // The one signal on the other side, recorded because it is the thing that
-        // would bring this back: the Silence season pack is the source that died
-        // nine seconds into playback on 2026-09-05. Being a pack was never shown
-        // to be WHY — the vanish was `--play-and-exit`, and the stumble underneath
-        // it was not diagnosed. If packs do turn out to stall more often, that is
-        // the evidence to look for, and a penalty belongs below the quality tiers
-        // rather than above them.
-
-        // Tier 7 (2026-09-05): non-DV > DV for NATIVE targets, as a last preference
-        // rather than the tier-2 gate. Everything else has tied, so this only ever
-        // separates two releases that are otherwise the same pick — which is the
-        // one place a mild uncertainty about VLC's Dolby Vision handling should be
-        // allowed to decide anything.
-        if !prefer_h264 && a_dv != b_dv {
-            return if a_dv {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Less
-            };
-        }
-
-        // Tier 8: more seeds > fewer seeds
-        b.seeds.cmp(&a.seeds)
-    });
+    let ctx = RankCtx {
+        prefer_h264: opts.transcoding,
+        original_language: opts.original_language,
+        pref: opts.pref,
+        best_1080p_bpp: best_1080p_bytes_per_pixel(results),
+    };
+    results.sort_by(|a, b| rank_cmp(a, b, &ctx));
 
     // 2026-07-04: dead swarms are NOT dropped — the web remote marks them red
     // (mirrors the green "on disk" style) so the user SEES which sources are
     // slow/dead and can avoid them, rather than having them silently hidden.
-    // The ranker still orders them low (effective_res_tier's ≥50-seed
-    // viability demotes them), so they surface at the BOTTOM, marked red.
+    //
+    // AMENDED 2026-09-06: they are no longer ordered low either. The seed bar
+    // that used to demote them was removed, so seeds are the final TIEBREAK and
+    // nothing more; a thin swarm can now lead the list, wearing its red marker,
+    // and whether it delivers is settled by racing and the stall gate.
     for (i, r) in results.iter_mut().enumerate() {
         r.id = i + 1;
     }
@@ -2275,22 +2332,20 @@ fn is_starved_4k(r: &TorrentResult, best_1080p_bpp: Option<f64>) -> bool {
     bpp < reference * STARVED_4K_FRACTION
 }
 
-/// How many seeds a release needs before its resolution counts as "real", so an
-/// unreachable 4K cannot outrank a well-seeded 1080p just by being 4K.
-///
-/// Target-scoped since 2026-09-05. 50 is the long-standing transcoding-target
-/// number, tuned when the goal was purely "start fast on a 1080p TV". Native
-/// targets get 20, because 4K swarms are structurally thinner than 1080p ones
-/// and 50 was excluding them wholesale — the best 2160p for Star City S01E08 had
-/// **48** seeds, two short, and was demoted to the bottom of the list while the
-/// monitor sat there wanting it. The looser bar is safe here rather than
-/// reckless: a source that cannot deliver is caught downstream by the readiness
-/// gate, the 12s/30s stall gate, source racing and dead-source rotation, all of
-/// which surface a bad pick in seconds. Seed count is a poor delivery predictor
-/// anyway (a "344-seed" release once connected 3 real peers at 0 B/s), so this
-/// bar was never the real protection.
-const MIN_SEEDS_TRANSCODING: u32 = 50;
-const MIN_SEEDS_NATIVE: u32 = 20;
+// REMOVED 2026-09-06 — the seed-viability bar that used to demote a thin-swarm
+// resolution below every viable lower one. Kept as a note rather than deleted
+// silently, because it looks like an obvious thing to add back.
+//
+// It was 50 for the transcoding target and 20 for native, and it was a PREDICTION
+// about delivery in a system that MEASURES delivery: racing fires below
+// `race_seed_threshold` and tries the alternatives for real, the stall gate
+// condemns a source that sends nothing, and the remote rotates past three dead
+// ones. Seed count is a tracker-scrape claim rather than deliverable capacity —
+// a "344-seed" release once connected three real peers at 0 B/s — so the bar
+// excluded real candidates on a number that does not mean what it says.
+//
+// Seeds still decide the final tiebreak. They prefer; they no longer exclude.
+// See `effective_res_tier_full` for the full reasoning.
 
 /// Bitrate preference, expressed through FILE SIZE.
 ///
@@ -3699,15 +3754,27 @@ mod tests {
     /// term of its own — `effective_res_tier` runs first and demotes the 3-seed
     /// clean release below the well-seeded MULTI, so the guard is structural.
     #[test]
-    fn test_language_tier_yields_to_a_dead_clean_swarm() {
+    fn test_language_still_outranks_a_better_seeded_multi() {
+        // SUPERSEDED 2026-09-06. This asserted that a 3-seed clean release loses to
+        // a 400-seed MULTI, which held only because the seed-viability bar demoted
+        // the clean one. With the bar gone, language decides as it should: a
+        // release whose subtitles are all in the wrong language is unwatchable,
+        // which is a different kind of problem from one that downloads slowly, and
+        // only the second of those is something the stall gate can rescue.
         let mut results = vec![
-            make_result(1, "Show.S01E01.1080p.WEB.x264-Clean.mkv", 3, None),
-            make_result(2, "Show S01E01 MULTI 1080p WEB H264-Group.mkv", 400, None),
+            make_result(1, "Show.S01E01.1080p.WEB.x264-Clean.mkv", 3, Some(0)),
+            make_result(
+                2,
+                "Show S01E01 MULTI 1080p WEB H264-Group.mkv",
+                400,
+                Some(0),
+            ),
         ];
-        rank_results_mut_prefer(&mut results, true, Some("en"));
+        rank_results_mut_prefer(&mut results, false, Some("en"));
         assert!(
-            results[0].title.contains("MULTI"),
-            "a 3-seed clean release is not playable; the well-seeded MULTI must win"
+            !results[0].title.contains("MULTI"),
+            "language outranks seeds; got {:?}",
+            results[0].title
         );
     }
 
@@ -3842,15 +3909,28 @@ mod tests {
         let mut results = star_city_s01e08_live_candidates();
         rank_results_mut_prefer(&mut results, false, Some("en")); // vlc — native decode
 
-        // The fattest usable 1080p wins: 5.09 GB, about 10.6 Mbps, at 21 seeds.
-        // Two changes had to land for that: the native 20-seed viability bar (the
-        // old 50 excluded it outright) and treating an explicitly dual-language
-        // release as clean, since `ITA.ENG` documents the original audio as
-        // present and the audio picker takes English by `original_language`.
+        // AMENDED 2026-09-06 when the seed-viability bar was removed. The 11.28 GB
+        // 2160p leads now: at 0.55 of the best 1080p's bytes-per-pixel it clears
+        // the starvation floor, and its ONE seed no longer demotes it — whether
+        // one seed can deliver is measured downstream, not predicted here.
         assert!(
-            results[0].title.contains("I.lupi"),
-            "expected the 5.09 GB dual-language WEB-DL; got {:?}",
+            results[0].title.contains("2160p"),
+            "the un-starved 4K leads; got {:?}",
             results[0].title
+        );
+        // The original point of this test stands underneath it: the fattest
+        // usable 1080p is the 5.09 GB dual-language WEB-DL at 21 seeds, ahead of
+        // the 274-seed 1.00 GB rip. `ITA.ENG` documents the original audio as
+        // present, so the release is clean and the audio picker takes English by
+        // `original_language`.
+        let top_1080p = results
+            .iter()
+            .find(|r| r.title.contains("1080p"))
+            .expect("a 1080p in the list");
+        assert!(
+            top_1080p.title.contains("I.lupi"),
+            "expected the 5.09 GB dual-language WEB-DL; got {:?}",
+            top_1080p.title
         );
         // Order below it is by SIZE, not by seeds, which is the whole point: the
         // 274-seed 1.00 GB used to be first and now sits behind every fatter
@@ -3973,11 +4053,12 @@ mod tests {
     }
 
     /// The Diplomat S03E07, copied verbatim from the live server 2026-09-06 — the
-    /// case that produced the quality control. Both 2160p sources are under the
-    /// 20-seed viability bar, and the larger-seeded one is also under the
+    /// case that produced the quality control. At the time both 2160p sources sat
+    /// under the 20-seed viability bar, and the larger-seeded one is also under the
     /// bits-per-pixel floor (10.6 Mbps against the best 1080p's 6.6, a ratio of
-    /// 0.40 where the floor cuts at 0.50). Both guards are right in general and
-    /// both were wrong for someone who wants 4K and will wait for it.
+    /// 0.40 where the floor cuts at 0.50). The bar was removed later the same day,
+    /// so on Auto the fixture now yields the 5.64 GB 2160p; the starved 3.14 GB one
+    /// still ranks below the good 1080p, which is the floor doing its job.
     fn diplomat_s03e07_live_candidates() -> Vec<TorrentResult> {
         vec![
             make_sized(
@@ -4022,10 +4103,27 @@ mod tests {
     /// Auto keeps both guards, so the thin 4K stays down. This is the behaviour
     /// that prompted the question, and it is correct on its own terms.
     #[test]
-    fn test_auto_leaves_a_thin_4k_below_the_1080p() {
+    fn test_auto_now_reaches_the_4k_the_seed_bar_used_to_hide() {
+        // SUPERSEDED 2026-09-06. This asserted that Auto leaves a thin-swarm 4K
+        // below the 1080p, which was true while the seed-viability bar existed and
+        // was exactly the complaint: the 19 Mbps 2160p of this episode was withheld
+        // on a 5-seed tracker claim. With the bar gone, Auto reaches it, and
+        // whether it can actually be delivered is settled by racing and the stall
+        // gate rather than predicted.
         let mut r = diplomat_s03e07_live_candidates();
         rank_results_mut_prefer(&mut r, false, Some("en"));
-        assert!(!r[0].title.contains("2160p"), "got {:?}", r[0].title);
+        assert!(r[0].title.contains("2160p"), "got {:?}", r[0].title);
+        assert!(
+            r[0].size.contains("5.64"),
+            "the un-starved 4K, not the thin one; got {:?}",
+            r[0].size
+        );
+        // The 3.14 GB 2160p is still held back — by the bits-per-pixel floor, which
+        // is a judgement about PICTURE and stays. 10.6 Mbps over four times the
+        // pixels is 0.40 of the best 1080p's bytes-per-pixel, under the 0.50 floor.
+        let thin = r.iter().position(|x| x.size.contains("3.14")).unwrap();
+        let hd = r.iter().position(|x| x.size.contains("1.95")).unwrap();
+        assert!(thin > hd, "a starved 4K still ranks below a good 1080p");
     }
 
     /// Asking for 4K skips BOTH guards, and yields the BEST of the 4Ks rather than
@@ -4120,16 +4218,37 @@ mod tests {
     /// The 4K in this list has ONE seed. Preferring 2160p must not mean
     /// preferring a spinner, so it has to lose to every viable 1080p here.
     #[test]
-    fn test_ranking_does_not_pick_the_one_seed_4k() {
+    fn test_a_thinly_seeded_4k_is_now_reachable_and_measured_not_predicted() {
+        // SUPERSEDED 2026-09-06. This asserted that a 1-seed 11 GB 2160p must not
+        // rank near the top — true while the seed bar existed, and the reason the
+        // bar was defensible. It is now reachable, deliberately: seed count is a
+        // tracker-scrape claim rather than deliverable capacity, and this system
+        // MEASURES delivery (racing below the race threshold, the stall gate, and
+        // rotation past three dead sources) rather than guessing at it.
+        //
+        // The cost of being wrong moved from invisible-and-permanent (4K silently
+        // withheld) to bounded-and-visible (a stall gate, a rotation, and a waiting
+        // bar whose stripes stop moving).
         let mut results = star_city_s01e08_live_candidates();
         rank_results_mut_prefer(&mut results, false, Some("en"));
         let four_k = results
             .iter()
             .position(|r| r.title.contains("2160p"))
             .unwrap();
-        assert!(
-            four_k > 2,
-            "a 1-seed 11 GB 2160p must not rank near the top; got position {four_k}"
+        assert_eq!(
+            four_k, 0,
+            "an un-starved 4K leads regardless of its seed count"
+        );
+        // Seeds still PREFER even though they no longer EXCLUDE: they remain the
+        // final tiebreak between otherwise-equal sources.
+        let mut tie = vec![
+            make_sized(1, "Show.S01E01.1080p.WEB.x264-Grp.mkv", 5, "3 GB"),
+            make_sized(2, "Show.S01E01.1080p.WEB.x264-Grp.mkv", 500, "3 GB"),
+        ];
+        rank_results_mut_prefer(&mut tie, false, Some("en"));
+        assert_eq!(
+            tie[0].seeds, 500,
+            "equal in every other way, the fuller swarm wins"
         );
     }
 
@@ -4240,7 +4359,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// SUPERSEDED 2026-09-05: this pinned "single file wins despite fewer seeds",
     /// which was tier 1 for the ranker's whole life. The penalty is gone — see the
     /// NO PACK PENALTY note in the comparator — so the same fixture must now rank
@@ -4492,17 +4610,22 @@ mod tests {
 
     #[test]
     fn test_ranking_no_cycle_on_may13_s02e05_fixture() {
-        // The exact 3-way comparator cycle from the May 13 PM
-        // Night Manager S02E05 incident. After v3.4.1, the sort must
-        // produce a TRANSITIVE ordering — A > B > C is the deterministic
-        // total-order result because C (17 seeds at 1080p) demotes below
-        // viable 720p (B) via `effective_res_tier`.
+        // The exact 3-way comparator cycle from the May 13 Night Manager S02E05
+        // incident. What this test is FOR is transitivity: Rust's sort_by requires
+        // a total order, and non-transitive input produces undefined output.
+        //
+        // 2026-09-06: it used to assert one specific ordering (A > B > C), which
+        // was a CONSEQUENCE of the seed-viability floor demoting C. That floor is
+        // gone, so the ordering moved — and the ordering was never the point. It
+        // now asserts the property directly: every permutation of the same three
+        // inputs must produce the SAME result. That survives the next tier change,
+        // which the hard-coded ordering did not.
         let a = make_result(0, "NM.S02E05.1080p.HEVC.10bit.mkv", 65, Some(0));
         let b = make_result(0, "NM.S02E05.720p.H.264.mkv", 51, Some(0));
         let c = make_result(0, "NM.S02E05.1080p.H.264.mkv", 17, Some(0));
 
-        // Validate pairwise consistency: if X > Y and Y > Z, then X > Z.
-        for (perm_a, perm_b, perm_c) in [
+        let mut canonical: Option<Vec<String>> = None;
+        for (x, y, z) in [
             (a.clone(), b.clone(), c.clone()),
             (a.clone(), c.clone(), b.clone()),
             (b.clone(), a.clone(), c.clone()),
@@ -4510,61 +4633,55 @@ mod tests {
             (c.clone(), a.clone(), b.clone()),
             (c.clone(), b.clone(), a.clone()),
         ] {
-            let mut results = vec![perm_a, perm_b, perm_c];
+            let mut results = vec![x, y, z];
             rank_results_mut(&mut results);
-            // The deterministic transitive result must be A first (1080p HEVC,
-            // viable seeds), B second (720p H.264, viable), C last (1080p H.264
-            // demoted because 17 seeds < 50 viability floor).
-            assert!(
-                results[0].title.contains("HEVC.10bit"),
-                "Expected A (1080p HEVC viable) first; got {:?}",
-                results[0].title
-            );
-            assert!(
-                results[1].title.contains("720p"),
-                "Expected B (720p viable) second; got {:?}",
-                results[1].title
-            );
-            assert!(
-                results[2].title.contains("1080p.H.264"),
-                "Expected C (1080p H.264 unviable) last; got {:?}",
-                results[2].title
-            );
+            let order: Vec<String> = results.iter().map(|r| r.title.clone()).collect();
+            match &canonical {
+                None => canonical = Some(order),
+                Some(first) => assert_eq!(
+                    &order, first,
+                    "input order changed the result — the comparator is not a total order"
+                ),
+            }
         }
+        // And pin what that stable answer currently is, so a behaviour change is
+        // visible rather than silent: both 1080p entries now share a resolution
+        // band, and the codec tier picks the H.264 one for a transcoding target.
+        let order = canonical.unwrap();
+        assert!(
+            order[0].contains("1080p"),
+            "a 1080p leads; got {:?}",
+            order[0]
+        );
+        assert!(order[2].contains("720p"), "720p last; got {:?}", order[2]);
     }
 
     #[test]
     fn test_effective_res_tier_classification_transcoding_target() {
-        // Pin the TRANSCODING mapping (chromecast / shannon — 1080p screens fed by
-        // Darwin's NVENC). Lower = ranked higher.
-        // 0..=2: 1080p/720p/480p with ≥50 seeds (target-resolution viable)
-        // 3..=5: 1080p/720p/480p with <50 seeds (demoted below viable 480p)
-        // 6: 2160p / 4K / UHD (always deprioritized — the panel is 1080p)
-        // 7: unknown / not classified
-        let r1080_viable = make_result(0, "X.1080p.x264.mkv", 50, Some(0));
-        let r1080_unviable = make_result(0, "X.1080p.x264.mkv", 49, Some(0));
-        let r720_viable = make_result(0, "X.720p.x264.mkv", 100, Some(0));
-        let r720_unviable = make_result(0, "X.720p.x264.mkv", 5, Some(0));
-        let r480_viable = make_result(0, "X.480p.x264.mkv", 50, Some(0));
+        // The TRANSCODING mapping (chromecast / shannon — 1080p panels fed by
+        // NVENC). Pure resolution ordering since 2026-09-06; the seed-viability
+        // term that used to interleave here is gone, so seed count no longer
+        // changes which bucket a release lands in.
+        let r1080 = make_result(0, "X.1080p.x264.mkv", 50, Some(0));
+        let r1080_thin = make_result(0, "X.1080p.x264.mkv", 2, Some(0));
+        let r720 = make_result(0, "X.720p.x264.mkv", 100, Some(0));
+        let r480 = make_result(0, "X.480p.x264.mkv", 50, Some(0));
         let r2160 = make_result(0, "X.2160p.x265.mkv", 500, Some(0));
         let r_unknown = make_result(0, "X.no.resolution.tag.mkv", 1000, Some(0));
 
-        assert_eq!(effective_res_tier(&r1080_viable, true, None), 0);
-        assert_eq!(effective_res_tier(&r720_viable, true, None), 1);
-        assert_eq!(effective_res_tier(&r480_viable, true, None), 2);
-        assert_eq!(effective_res_tier(&r1080_unviable, true, None), 3);
-        assert_eq!(effective_res_tier(&r720_unviable, true, None), 4);
-        assert_eq!(effective_res_tier(&r2160, true, None), 6);
-        assert_eq!(effective_res_tier(&r_unknown, true, None), 7);
-
-        // Critical invariant: viable lower resolution beats unviable higher.
-        assert!(
-            effective_res_tier(&r720_viable, true, None)
-                < effective_res_tier(&r1080_unviable, true, None)
+        assert_eq!(effective_res_tier(&r1080, true, None), 0);
+        assert_eq!(effective_res_tier(&r720, true, None), 1);
+        assert_eq!(effective_res_tier(&r480, true, None), 2);
+        assert_eq!(
+            effective_res_tier(&r2160, true, None),
+            3,
+            "4K last for a 1080p panel"
         );
-        // 2160p with great seeds STILL ranks below any viable 1080p/720p/480p.
-        assert!(
-            effective_res_tier(&r2160, true, None) > effective_res_tier(&r480_viable, true, None)
+        assert_eq!(effective_res_tier(&r_unknown, true, None), 4);
+        assert_eq!(
+            effective_res_tier(&r1080_thin, true, None),
+            effective_res_tier(&r1080, true, None),
+            "a thin swarm no longer changes the resolution bucket"
         );
     }
 
@@ -4574,49 +4691,26 @@ mod tests {
     /// however high its bitrate is.
     #[test]
     fn test_effective_res_tier_classification_native_target() {
-        let r2160_viable = make_result(0, "X.2160p.x265.mkv", 60, Some(0));
-        let r2160_unviable = make_result(0, "X.2160p.x265.mkv", 3, Some(0));
-        let r1080_viable = make_result(0, "X.1080p.x264.mkv", 900, Some(0));
-        let r720_viable = make_result(0, "X.720p.x264.mkv", 900, Some(0));
+        // The NATIVE mapping (vlc / phone — the 4K monitor). 2160p first, and since
+        // 2026-09-06 the only thing that can push it down is the bits-per-pixel
+        // floor, which is about PICTURE. Seed count no longer participates: whether
+        // a swarm can deliver is measured downstream, not predicted here.
+        let r2160 = make_result(0, "X.2160p.x265.mkv", 60, Some(0));
+        let r2160_thin = make_result(0, "X.2160p.x265.mkv", 3, Some(0));
+        let r1080 = make_result(0, "X.1080p.x264.mkv", 900, Some(0));
+        let r720 = make_result(0, "X.720p.x264.mkv", 900, Some(0));
 
-        assert_eq!(effective_res_tier(&r2160_viable, false, None), 0);
-        assert_eq!(effective_res_tier(&r1080_viable, false, None), 1);
-        // 2 is reserved for a viable-but-STARVED 2160p, so 720p sits at 3.
-        assert_eq!(effective_res_tier(&r720_viable, false, None), 3);
-
-        // A 4K nobody is seeding is worse than a 1080p that plays. This is the
-        // guard that keeps "prefer 4K" from meaning "prefer a spinner".
-        assert!(
-            effective_res_tier(&r2160_unviable, false, None)
-                > effective_res_tier(&r1080_viable, false, None)
+        assert_eq!(effective_res_tier(&r2160, false, None), 0);
+        assert_eq!(effective_res_tier(&r1080, false, None), 1);
+        assert_eq!(effective_res_tier(&r720, false, None), 3);
+        assert_eq!(
+            effective_res_tier(&r2160_thin, false, None),
+            effective_res_tier(&r2160, false, None),
+            "three seeds and sixty seeds land in the same bucket now"
         );
-        assert!(
-            effective_res_tier(&r2160_unviable, false, None)
-                > effective_res_tier(&r720_viable, false, None)
-        );
-        // And it loses to every OTHER dead source too: below the bar the question
-        // is what can be delivered, and 4K is the hungriest thing on the list.
-        let r1080_unviable = make_result(0, "X.1080p.x264.mkv", 47, Some(0));
-        let r480_unviable = make_result(0, "X.480p.x264.mkv", 4, Some(0));
-        assert!(
-            effective_res_tier(&r2160_unviable, false, None)
-                > effective_res_tier(&r1080_unviable, false, None)
-        );
-        assert!(
-            effective_res_tier(&r2160_unviable, false, None)
-                > effective_res_tier(&r480_unviable, false, None)
-        );
-
-        // And the two targets genuinely disagree — the same 4K release ranks
-        // first on the monitor and last on the Chromecast.
-        assert!(
-            effective_res_tier(&r2160_viable, false, None)
-                < effective_res_tier(&r1080_viable, false, None)
-        );
-        assert!(
-            effective_res_tier(&r2160_viable, true, None)
-                > effective_res_tier(&r1080_viable, true, None)
-        );
+        // The two targets still genuinely disagree about 4K.
+        assert!(effective_res_tier(&r2160, false, None) < effective_res_tier(&r1080, false, None));
+        assert!(effective_res_tier(&r2160, true, None) > effective_res_tier(&r1080, true, None));
     }
 
     #[test]
@@ -4870,20 +4964,181 @@ mod tests {
     }
 
     #[test]
-    fn test_ranking_falls_back_to_720p_when_1080p_has_insufficient_seeds() {
-        // Threshold is 50 seeds for resolution preference. A dead 1080p
-        // (10 seeds) must LOSE to a well-seeded 720p (500 seeds) because
-        // the dead 1080p would stall mid-download.
+    fn test_comparator_is_a_strict_total_order_across_the_whole_seed_range() {
+        // Removing a term from a multi-tier comparator is exactly where a
+        // non-transitive ordering gets introduced, and `sort_by` gives no
+        // diagnostic when the property breaks — the symptom is a ranking that
+        // changes with the INPUT ORDER, which reads as a scoring bug and is not
+        // one. So: a grid varying every axis the ranker reads, seed counts from 1
+        // to 5000 included, checked exhaustively against the three laws.
+        let mut grid = Vec::new();
+        let mut id = 0u32;
+        for res in ["2160p", "1080p", "720p", "480p"] {
+            for codec in ["x264", "x265"] {
+                for (seeds, size) in [(1u32, "9 GB"), (40, "4 GB"), (5000, "1.2 GB")] {
+                    id += 1;
+                    grid.push(make_sized(
+                        id as usize,
+                        &format!("Show.S01E01.{res}.WEB.{codec}-Grp.mkv"),
+                        seeds,
+                        size,
+                    ));
+                }
+            }
+        }
+        assert_eq!(grid.len(), 24);
+
+        // The yardstick comes from the whole SET, so the context is built once —
+        // comparing a pair in isolation would judge it against a different
+        // best-1080p than the real sort does.
+        let ctx = RankCtx {
+            prefer_h264: false,
+            original_language: Some("en"),
+            pref: QualityPref::Auto,
+            best_1080p_bpp: best_1080p_bytes_per_pixel(&grid),
+        };
+
+        for a in &grid {
+            assert_eq!(rank_cmp(a, a, &ctx), std::cmp::Ordering::Equal, "reflexive");
+            for b in &grid {
+                assert_eq!(
+                    rank_cmp(a, b, &ctx),
+                    rank_cmp(b, a, &ctx).reverse(),
+                    "antisymmetry broke between {:?} and {:?}",
+                    a.title,
+                    b.title
+                );
+                for c in &grid {
+                    if rank_cmp(a, b, &ctx).is_lt() && rank_cmp(b, c, &ctx).is_lt() {
+                        assert!(
+                            rank_cmp(a, c, &ctx).is_lt(),
+                            "transitivity broke: {:?} < {:?} < {:?}",
+                            a.title,
+                            b.title,
+                            c.title
+                        );
+                    }
+                    // Equality must be transitive too, or ties become order-dependent.
+                    if rank_cmp(a, b, &ctx).is_eq() && rank_cmp(b, c, &ctx).is_eq() {
+                        assert!(
+                            rank_cmp(a, c, &ctx).is_eq(),
+                            "equality is not transitive: {:?}, {:?}, {:?}",
+                            a.title,
+                            b.title,
+                            c.title
+                        );
+                    }
+                }
+            }
+        }
+
+        // And the sort is order-independent in fact, not only in theory. Equality
+        // is the subtlety: two releases the ranker cannot separate stay in input
+        // order under a stable sort, so reversing the input legitimately swaps
+        // them. The property that must hold is that position i of one sort is
+        // EQUIVALENT to position i of the other, not identical to it.
+        let mut forward = grid.clone();
+        rank_results_mut_prefer(&mut forward, false, Some("en"));
+        let mut backward = grid.clone();
+        backward.reverse();
+        rank_results_mut_prefer(&mut backward, false, Some("en"));
+        for (f, b) in forward.iter().zip(backward.iter()) {
+            assert!(
+                rank_cmp(f, b, &ctx).is_eq(),
+                "reversing the input moved {:?} past {:?}",
+                f.title,
+                b.title
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolution_ordering_is_identical_at_every_seed_count() {
+        // The property the seed bar's removal is FOR: a resolution's rank must not
+        // depend on how full its swarm looks. Same four releases, six swarm sizes
+        // spanning a dead source to a blockbuster; the order must never move.
+        for seeds in [1u32, 3, 19, 20, 49, 50, 900] {
+            let mut r = vec![
+                make_sized(1, "Show.S01E01.480p.WEB.x264-Grp.mkv", seeds, "2 GB"),
+                make_sized(2, "Show.S01E01.720p.WEB.x264-Grp.mkv", seeds, "2 GB"),
+                make_sized(3, "Show.S01E01.1080p.WEB.x264-Grp.mkv", seeds, "2 GB"),
+                make_sized(4, "Show.S01E01.2160p.WEB.x265-Grp.mkv", seeds, "12 GB"),
+            ];
+            rank_results_mut_prefer(&mut r, false, Some("en"));
+            // NOT by `id` — the ranker rewrites that field to the rank position,
+            // so an id assertion passes trivially and proves nothing.
+            let order: Vec<&str> = r
+                .iter()
+                .map(|x| {
+                    ["2160p", "1080p", "720p", "480p"]
+                        .into_iter()
+                        .find(|res| x.title.contains(res))
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(
+                order,
+                vec!["2160p", "1080p", "720p", "480p"],
+                "seed count {seeds} changed the resolution order"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_starvation_floor_survives_the_seed_bar_removal() {
+        // The one thing that may still push a 4K down is bytes-per-pixel, because
+        // that is a judgement about PICTURE rather than a guess about delivery.
+        // A 5000-seed starved 4K still loses to a fat 1080p; a 1-seed healthy 4K
+        // still wins. Seeds move neither verdict.
+        let fat_1080p = make_sized(1, "Show.S01E01.1080p.WEB.x264-Grp.mkv", 40, "5.09 GB");
+        let starved_4k = make_sized(2, "Show.S01E01.2160p.WEB.x265-Grp.mkv", 5000, "8 GB");
+        let healthy_4k = make_sized(3, "Show.S01E01.2160p.WEB.x265-Grp.mkv", 1, "24 GB");
+
+        let mut a = vec![fat_1080p.clone(), starved_4k];
+        rank_results_mut_prefer(&mut a, false, Some("en"));
+        assert!(
+            a[0].title.contains("1080p"),
+            "a starved 4K loses however full its swarm is; got {:?}",
+            a[0].title
+        );
+
+        let mut b = vec![fat_1080p, healthy_4k];
+        rank_results_mut_prefer(&mut b, false, Some("en"));
+        assert!(
+            b[0].title.contains("2160p"),
+            "a healthy 4K wins however empty its swarm is; got {:?}",
+            b[0].title
+        );
+    }
+
+    #[test]
+    fn test_seeds_no_longer_demote_a_resolution_but_still_break_a_tie() {
+        // SUPERSEDED 2026-09-06. This asserted that a 10-seed 1080p must lose to
+        // a 500-seed 720p, on the reasoning that "the dead 1080p would stall
+        // mid-download". That is a PREDICTION about delivery, and spela measures
+        // delivery: it races candidates below the race threshold, gates on a
+        // stalled start, and rotates past three dead sources. A thin swarm is now
+        // allowed to prove itself, and the cost of it failing is bounded and
+        // visible rather than a resolution silently withheld.
         let mut results = vec![
             make_result(1, "Movie.720p.H264.FLUX.mkv", 500, Some(0)),
             make_result(2, "Movie.1080p.H264.FLUX.mkv", 10, Some(0)),
         ];
         rank_results_mut(&mut results);
         assert!(
-            results[0].title.contains("720p"),
-            "720p with 500 seeds must beat 1080p with 10 seeds. Got: {:?}",
+            results[0].title.contains("1080p"),
+            "resolution decides; ten seeds is not an exclusion. Got: {:?}",
             results[0].title
         );
+
+        // Seeds still PREFER. Equal on resolution, codec, size and language, the
+        // fuller swarm wins — which is the half of the old behaviour worth keeping.
+        let mut tie = vec![
+            make_result(1, "Movie.1080p.H264.FLUX.mkv", 10, Some(0)),
+            make_result(2, "Movie.1080p.H264.FLUX.mkv", 500, Some(0)),
+        ];
+        rank_results_mut(&mut tie);
+        assert_eq!(tie[0].seeds, 500, "seeds are the final tiebreak");
     }
 
     #[test]
