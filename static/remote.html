@@ -2855,6 +2855,8 @@ async function pollVlc(){
              // which is the honest state rather than a guess from the filename.
              if(p.video_resolution) S.now.vres = p.video_resolution;
              if(p.video_codec) S.now.vcodec = p.video_codec;
+             // ffprobe of the bytes actually being served — the authoritative one.
+             if(p.quality) S.now.q = p.quality;
              // VLC QUIT. The bridge probes VLC's own http interface, so this is
              // a refused connection rather than "no bytes lately" — the
              // ambiguity that made auto-clearing unsafe before. Nothing is
@@ -3070,13 +3072,31 @@ function resLabel(r){
   if(w>0) return "480p";
   return "";
 }
+/* Three sources, in descending order of how much they know:
+     1. the ffprobe of the file being SERVED — resolution, codec and file bitrate,
+        works on every target, and follows a Local Bypass substitution;
+     2. VLC's own decoder report — resolution and codec, VLC path only;
+     3. the ranked release's quality string — a claim, used only until something
+        better arrives.
+   Bitrate is FILE bitrate (size ÷ duration), which is what causes the artefacts
+   and what a gigabyte of mobile data buys. VLC's stats.demuxbitrate is the
+   instantaneous demux rate: it moves with buffering and describes the network,
+   not the encode. */
+function mbps(bps){
+  if(!bps||bps<=0) return "";
+  const m=bps/1e6;
+  return (m>=10?Math.round(m):Math.round(m*10)/10)+" Mbps";
+}
 function qualityLabel(c){
+  const q=S.now.q;
   const parts=[];
-  const fromDecoder=resLabel(S.now.vres);
-  if(fromDecoder) parts.push(fromDecoder);
+  const res = (q&&q.width) ? resLabel(q.width+"x"+q.height) : resLabel(S.now.vres);
+  if(res) parts.push(res);
   else if(c&&c.quality) parts.push(c.quality);
-  const cod=shortCodec(S.now.vcodec);
+  const cod = shortCodec((q&&q.codec)||S.now.vcodec);
   if(cod) parts.push(cod);
+  const br = mbps(q&&q.bitrate_bps);
+  if(br) parts.push(br);
   return parts.join(" · ");
 }
 

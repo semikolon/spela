@@ -73,6 +73,18 @@ pub struct ServerState {
     /// (`SUB_MISSING_TTL`) because OpenSubtitles gains files for a fresh episode over
     /// the following days.
     pub sub_missing: Mutex<HashMap<String, Instant>>,
+    /// 2026-09-06: ffprobe results per file path, for the quality label. The
+    /// answer never changes for a given file, and probing costs 100-300 ms, so
+    /// it is read once and kept. Keyed by path rather than by result id because
+    /// the file is the thing being described — Local Bypass can serve a
+    /// different release than the one ranked, and the label must follow the
+    /// bytes rather than the intent.
+    pub media_probe: Mutex<HashMap<String, crate::transcode::MediaQuality>>,
+    /// Path of the file currently being served to VLC. The quality label follows
+    /// the BYTES, and this is where the bytes are named — `/api/position` is
+    /// addressed by title and has no result id to resolve from. Set when the
+    /// stream is served, cleared by `/vlc/gone`.
+    pub serving_path: Mutex<Option<String>>,
     /// 2026-09-05: subtitle cache keys already warmed (or warming) in the background.
     /// `/vlc/{id}/ready` is polled ~1.5s and the warm can take tens of seconds when
     /// alass aligns against a complete 5GB file, so without this guard every tick
@@ -150,6 +162,45 @@ pub struct LivePosition {
 }
 
 type SharedState = Arc<ServerState>;
+
+/// The probed quality of whatever file a result currently resolves to, if it has
+/// been probed. Never probes inline: a readiness poll must not block on ffprobe,
+/// so `spawn_media_probe` fills the cache in the background and this reads it.
+fn cached_media_quality(state: &SharedState, rid: usize) -> Option<crate::transcode::MediaQuality> {
+    let (path, _) = resolve_local_file_for_result(state, rid)
+        .or_else(|| resolve_local_file_lenient(state, rid))?;
+    let key = path.to_string_lossy().to_string();
+    lock_recover(&state.media_probe).get(&key).cloned()
+}
+
+/// Probe the file a result resolves to, once. Lifetime: one bounded ffprobe that
+/// completes on its own; the cache entry is what stops the ~1.5s readiness poll
+/// from spawning another every tick.
+fn spawn_media_probe(state: &SharedState, rid: usize) {
+    let Some((path, _)) = resolve_local_file_for_result(state, rid)
+        .or_else(|| resolve_local_file_lenient(state, rid))
+    else {
+        return;
+    };
+    let key = path.to_string_lossy().to_string();
+    if lock_recover(&state.media_probe).contains_key(&key) {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Some(q) = crate::transcode::probe_media_quality(&path).await {
+            tracing::info!(
+                "probed {:?}: {}x{} {} {:.1} Mbps",
+                path,
+                q.width,
+                q.height,
+                q.codec,
+                q.bitrate_bps as f64 / 1_000_000.0
+            );
+            lock_recover(&state.media_probe).insert(key, q);
+        }
+    });
+}
 
 /// The decoder-reported label currently on record for `title`, if any.
 ///
@@ -326,6 +377,8 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         vlc_raced: Mutex::new(HashSet::new()),
         sub_warmed: Mutex::new(HashSet::new()),
         sub_missing: Mutex::new(HashMap::new()),
+        media_probe: Mutex::new(HashMap::new()),
+        serving_path: Mutex::new(None),
         live_position: Mutex::new(None),
         vlc_activity: Mutex::new(None),
         vlc_commands: Mutex::new(Vec::new()),
@@ -8791,6 +8844,7 @@ async fn handle_vlc_gone(State(state): State<SharedState>, Json(body): Json<Valu
         }
     }
     *lock_recover(&state.vlc_activity) = None;
+    *lock_recover(&state.serving_path) = None;
     let stopped = reap_all_vlc_torrents(&state);
     tracing::info!(
         "VLC gone (title={:?}) — now-view flagged={}, {} torrent(s) stopped",
@@ -8866,6 +8920,15 @@ async fn handle_vlc_stream(
             .and_then(|sh| sh.imdb_id);
         *lock_recover(&state.vlc_activity) = Some((Instant::now(), name, imdb));
     }
+    // Name the bytes, and probe them. Both are cheap and idempotent: the probe
+    // returns early if this path is already cached, so a per-Range-request serve
+    // costs one map lookup.
+    if let Some((path, _)) =
+        resolve_local_file_for_result(&state, id).or_else(|| resolve_local_file_lenient(&state, id))
+    {
+        *lock_recover(&state.serving_path) = Some(path.to_string_lossy().to_string());
+    }
+    spawn_media_probe(&state, id);
     // 1. Complete file on disk (strict match) → serve directly (fully seekable).
     if let Some((path, _)) = resolve_local_file_for_result(&state, id) {
         tracing::info!(
@@ -9014,15 +9077,23 @@ async fn handle_vlc_ready(
         .into_iter()
         .chain(resolve_local_file_lenient(&state, id))
         .find(|(path, _)| is_physically_full(path, 0));
+    let probed = cached_media_quality(&state, id);
     if complete.is_some() {
         // Warm the external English subtitle before VLC asks for it. On a complete
         // file this is the SLOW case (alass aligns over the whole file, 38.9s measured
         // on Star City S01E06) and VLC blocks on its `--input-slave`, so doing it here
         // — during the poll the SPA already runs — is what keeps the open instant.
         spawn_vlc_subtitle_warm(&state, id);
-        return Json(json!({ "ready": true, "pct": 100, "phase": "on disk" }));
+        spawn_media_probe(&state, id);
+        return Json(json!({
+            "ready": true, "pct": 100, "phase": "on disk", "quality": probed,
+        }));
     }
     spawn_vlc_subtitle_warm(&state, id);
+    // Safe on a partial torrent: a sparse file reports its full logical size and
+    // the duration sits in the container header, so the probe describes the
+    // finished encode from the first moments of the download.
+    spawn_media_probe(&state, id);
     let Some((magnet, file_index, _, _, _)) = resolve_result_for_vlc(&state, id) else {
         return Json(json!({ "ready": false, "error": "Result not found — search again." }));
     };
@@ -10024,9 +10095,18 @@ async fn handle_get_position(
             .map(|lp| (lp.video_resolution.clone(), lp.video_codec.clone()))
             .unwrap_or((None, None))
     };
+    // What the file IS, probed with ffprobe from the bytes actually being served.
+    // This is the number the label shows: file bitrate, which is what produces
+    // compression artefacts and what a gigabyte of mobile quota buys — not VLC's
+    // instantaneous demux rate, which moves with buffering and says nothing about
+    // the encode.
+    let quality = {
+        let path = lock_recover(&state.serving_path).clone();
+        path.and_then(|p| lock_recover(&state.media_probe).get(&p).cloned())
+    };
     Json(json!({
         "imdb_id": query.imdb_id, "t": pos, "dur": dur, "gone": gone,
-        "video_resolution": vres, "video_codec": vcodec,
+        "video_resolution": vres, "video_codec": vcodec, "quality": quality,
         "runway_secs": runway,
         "stalled": stalled,
     }))

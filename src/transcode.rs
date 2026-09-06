@@ -340,6 +340,96 @@ fn lang_tag_matches(track_lang: &str, want: &str) -> bool {
 /// `preferred_lang` (ISO 639-1, from the title's TMDB `original_language`)
 /// wins when present — so foreign films play in their ORIGINAL language, not
 /// the English dub — then English, then Danish, then the first track.
+/// What a media file actually is, read from the file rather than from its name.
+///
+/// 2026-09-06. The label under the episode title is built from this. Every
+/// alternative was worse:
+///
+///   * The release NAME is a claim, and this project has two proofs it lies — a
+///     release titled `...H.264-MeM` played as HEVC, and Local Bypass could serve
+///     a 1.00 GB rip in place of the 5.09 GB release the ranker chose.
+///   * VLC's `stats.demuxbitrate` is the INSTANTANEOUS demux rate. It moves with
+///     buffering, says nothing about the encode, and its unit is undocumented in
+///     the response. The number worth showing is the FILE bitrate: that is what
+///     produces the compression artefacts, and what a gigabyte of mobile quota
+///     buys.
+///   * VLC's decoder report covers resolution and codec but exists only on the
+///     VLC path. ffprobe works for every target, including Chromecast and the
+///     browser.
+///
+/// Bitrate is size ÷ duration, TOTAL rather than video-only: MKV frequently
+/// carries no per-stream `bit_rate` tag, and total is the figure that matches
+/// both the file size and how release bitrates are normally quoted. It therefore
+/// includes audio, which on a 5.1 EAC3 track is a few hundred kbps.
+///
+/// Safe on a still-downloading torrent: a sparse file reports its FULL logical
+/// size, and the duration lives in the container header, so the answer is the
+/// finished file's bitrate from the first moments of the download.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MediaQuality {
+    pub width: u32,
+    pub height: u32,
+    pub codec: String,
+    pub duration_secs: f64,
+    pub bitrate_bps: u64,
+}
+
+/// Probe one file with ffprobe. ~100-300 ms, so callers cache by path — the
+/// answer never changes for a given file.
+pub async fn probe_media_quality(path: &std::path::Path) -> Option<MediaQuality> {
+    let out = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height",
+            "-show_entries",
+            "format=duration,size",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let st = v["streams"].as_array()?.first()?;
+    let width = st["width"].as_u64().unwrap_or(0) as u32;
+    let height = st["height"].as_u64().unwrap_or(0) as u32;
+    let codec = st["codec_name"].as_str().unwrap_or("").to_string();
+    let duration: f64 = v["format"]["duration"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    // ffprobe's `format.size` is the file's own size, which for a sparse torrent
+    // file is the LOGICAL size — exactly what is wanted, since the label should
+    // describe the finished encode rather than how much has arrived so far.
+    let size: u64 = v["format"]["size"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if width == 0 || duration <= 0.0 {
+        return None;
+    }
+    let bitrate_bps = if size > 0 {
+        ((size as f64 * 8.0) / duration) as u64
+    } else {
+        0
+    };
+    Some(MediaQuality {
+        width,
+        height,
+        codec,
+        duration_secs: duration,
+        bitrate_bps,
+    })
+}
+
 pub async fn detect_codecs(url: &str, preferred_lang: Option<&str>) -> Result<CodecInfo> {
     let output = Command::new("ffprobe")
         .args([
