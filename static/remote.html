@@ -1244,6 +1244,25 @@ async function openInVlc(id,title,poster){
   catch(e){ showPlayError(title||"VLC",poster,"spela unreachable",()=>openInVlc(id,title,poster)); return; }
   const url=(m3u.split("\n").find(l=>l.startsWith("http"))||"").trim();
   if(!url){ showPlayError(title||"VLC",poster,"No stream URL.",()=>openInVlc(id,title,poster)); return; }
+  // Pre-flight the stream itself before handing it to VLC. Readiness and the
+  // serve are separate code paths — readiness can say yes while the serve fails,
+  // and when it does the failure surfaces as VLC's own modal ("VLC is unable to
+  // open the MRL…", seen 2026-09-06 on a source whose swarm had died), which
+  // tells the viewer nothing and leaves spela looking fine. One ranged byte is
+  // enough to know. FAIL-OPEN on a timeout or a network error: a slow torrent
+  // stream is not a broken one, and refusing to launch on a slow probe would be
+  // a worse bug than the one this prevents.
+  try{
+    const probe=await fetch(url,{headers:{Range:"bytes=0-1"},
+      signal:AbortSignal.timeout ? AbortSignal.timeout(6000) : undefined});
+    if(!probe.ok && probe.status!==206){
+      showPlayError(title||"VLC",poster,
+        "That source can’t be served right now (HTTP "+probe.status+").",
+        ()=>openInVlc(id,title,poster));
+      return;
+    }
+  }catch(e){ /* timeout / network — proceed, VLC has its own reconnect */ }
+  if(gen!==S.vlcGen) return;   // cancelled while probing
   endWarming();
   // 2026-08-04: VLC-on-this-Mac becomes a controllable now-view (parity with
   // Chromecast). The Mac-side spela-vlc-bridge relays pause/resume/seek from the
@@ -3146,8 +3165,19 @@ function renderWarmPanel(){
     </div>
   </div>`;
   const cb=$("#wCancel");
-  if(cb) cb.onclick=async()=>{ endWarming(); S.now.data=null;
-    await api("/stop",{method:"POST"}).catch(()=>{}); };
+  // Cancel has to SUPERSEDE the VLC readiness loop, not just hide the panel.
+  // 2026-09-06: it called endWarming() + /stop and nothing else, and /stop acts on
+  // the CurrentStream, which a VLC play does not have. So the poll loop in
+  // vlcWaitReady kept running, kept rotating past dead sources, and fired the
+  // vlc:// url minutes later — VLC opened by itself while Fredrik was typing about
+  // having cancelled. Bumping the generation token is the abort the loop already
+  // honours at both of its checkpoints.
+  if(cb) cb.onclick=async()=>{
+    S.vlcGen=(S.vlcGen||0)+1;
+    S.now.vlcNote=null; S.now.vlcErr=null;
+    endWarming(); S.now.data=null;
+    await api("/stop",{method:"POST"}).catch(()=>{});
+  };
 }
 /* Play-start failure, rendered into the same bottom panel (persistent, in place). */
 function renderErrPanel(){
