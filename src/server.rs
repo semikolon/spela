@@ -1440,6 +1440,41 @@ async fn maybe_race_sources(
     race_torrent_sources(state, &candidates, state.config.race_timeout_secs).await
 }
 
+/// How long a chosen source is given before a race may switch away from it.
+///
+/// Shorter than the stall gate (`vlc_stall_gate_secs`), so a race still gets to
+/// rescue a source before it is condemned outright, and long enough that an
+/// ordinary cold start is not mistaken for a failure.
+const RACE_GRACE_SECS: u64 = 8;
+
+/// May a race take the viewer OFF the source they chose?
+///
+/// The old condition was `bytes == 0`, evaluated on the first readiness poll about
+/// a second and a half in — at which point a perfectly healthy swarm has also
+/// delivered zero bytes, because a cold start routinely takes ten to fifteen
+/// seconds. So the race fired on essentially every thin-swarm pick and switched on
+/// whichever alternative happened to move first, which is a PREDICTION about
+/// delivery standing in for a measurement of it: the same mistake as the
+/// seed-viability bar, one layer down.
+///
+/// The condition is now the stall gate's, on a shorter clock: bytes AND peers AND
+/// speed all zero. Peers matter because day-one swarm poisoning fills connection
+/// slots with decoys that handshake and send nothing — such a source sits at zero
+/// bytes for a while and then breaks through, and it has PEERS throughout, so
+/// gating on bytes alone would race away from exactly what it should wait for.
+///
+/// Anchor 2026-09-06, The Diplomat S03E07: the chosen 5.64 GB 2160p was moving at
+/// a few kilobytes a second when the race fired at four seconds and handed the
+/// episode to a 2.41 GB 1080p.
+pub fn race_switch_is_warranted(
+    bytes: u64,
+    peers: usize,
+    speed_bps: u64,
+    elapsed_secs: u64,
+) -> bool {
+    elapsed_secs >= RACE_GRACE_SECS && bytes == 0 && peers == 0 && speed_bps == 0
+}
+
 /// Should the VLC path give up on a source that resolved but is delivering nothing?
 ///
 /// Pure so the POLICY can be tested without a live swarm. The condition mirrors
@@ -9363,11 +9398,10 @@ async fn handle_vlc_ready(
         }));
     }
 
-    // Race the top candidates when the pick's swarm looks weak — including when the seed
-    // count is UNKNOWN, which reads as 0 and is the common case whenever Torrentio omits
-    // seeders. Runs at most once per source; the winner is returned as a switch so the
-    // remote can move to it using the same rotation plumbing.
-    if bytes == 0 && !finished {
+    // Race the top candidates once the pick has been given a fair chance and is
+    // delivering NOTHING. Runs at most once per source; the winner is returned as a
+    // switch so the remote can move to it using the same rotation plumbing.
+    if !finished && race_switch_is_warranted(bytes, peers, speed, first.elapsed().as_secs()) {
         if let Some(winner) = maybe_race_sources_for_vlc(&state, id).await {
             if winner != id {
                 return Json(json!({
@@ -13665,7 +13699,7 @@ mod vlc_readiness_completeness_tests {
 
 #[cfg(test)]
 mod vlc_stall_gate_tests {
-    use super::{vlc_source_is_stalled, vlc_stall_gate_secs};
+    use super::{race_switch_is_warranted, vlc_source_is_stalled, vlc_stall_gate_secs};
 
     #[test]
     fn a_poisoned_swarm_survives_because_it_has_peers() {
@@ -13703,6 +13737,47 @@ mod vlc_stall_gate_tests {
         assert_eq!(vlc_stall_gate_secs(1_000_000_000), 12);
         assert!(!vlc_source_is_stalled(0, 0, 0, 20, 9_000_000_000, false));
         assert!(vlc_source_is_stalled(0, 0, 0, 30, 9_000_000_000, false));
+    }
+
+    #[test]
+    fn a_race_may_not_switch_away_from_a_source_that_is_still_starting() {
+        // A healthy swarm delivers zero bytes for the first ten to fifteen seconds,
+        // and the race used to fire on the first readiness poll about a second and a
+        // half in. Every one of these is a source that should be left alone.
+        assert!(
+            !race_switch_is_warranted(0, 0, 0, 2),
+            "first poll: far too early"
+        );
+        assert!(
+            !race_switch_is_warranted(0, 0, 0, 7),
+            "still inside the grace period"
+        );
+        // Any evidence of life exempts it, at any point.
+        assert!(
+            !race_switch_is_warranted(1, 0, 0, 600),
+            "one byte is delivery"
+        );
+        assert!(
+            !race_switch_is_warranted(0, 3, 0, 600),
+            "peers but no bytes yet is the poisoned-swarm case"
+        );
+        assert!(
+            !race_switch_is_warranted(0, 0, 2500, 600),
+            "moving, however slowly"
+        );
+    }
+
+    #[test]
+    fn a_race_may_switch_once_the_source_has_shown_nothing_at_all() {
+        assert!(
+            race_switch_is_warranted(0, 0, 0, 8),
+            "the grace boundary is inclusive"
+        );
+        assert!(race_switch_is_warranted(0, 0, 0, 30));
+        // And it fires BEFORE the stall gate condemns the source outright, which is
+        // the window in which a rescue is still worth attempting.
+        assert!(race_switch_is_warranted(0, 0, 0, 9));
+        assert!(!vlc_source_is_stalled(0, 0, 0, 9, 1_000_000_000, false));
     }
 
     #[test]
