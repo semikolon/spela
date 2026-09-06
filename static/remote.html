@@ -322,6 +322,12 @@
     background:rgba(21,21,28,.97);backdrop-filter:blur(10px);border-top:1px solid var(--line);
     padding:.55rem .7rem calc(.55rem + var(--safe-b));display:none;gap:.6rem;align-items:center}
   #nowbar.on{display:flex}
+  /* On the Now view the bar is a smaller copy of what fills the screen — same
+     title, same position, same three controls — so it is hidden there (2026-09-06).
+     Driven by a body class set in route() rather than :has(), so it does not
+     depend on selector support, and placed here where specificity (1,1,1) beats
+     #nowbar.on (1,1,0) whichever of the four places toggles `on` last. */
+  body.on-now #nowbar{display:none}
   #nowbar .mp{width:42px;height:42px;border-radius:8px;object-fit:cover;background:var(--bg3);flex:none}
   #nowbar .nt{flex:1;min-width:0}
   #nowbar .nt .a{font-weight:700;font-size:.88rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1271,6 +1277,7 @@ function route(){
   const v=(location.hash.replace(/^#\//,"")||"home").split("?")[0];
   const known=["home","search","library","now","towatch","rewatch"].includes(v)?v:"home";
   $$(".view").forEach(s=>s.classList.toggle("on",s.id==="v-"+known));
+  document.body.classList.toggle("on-now", known==="now");
   $$("nav a").forEach(a=>a.classList.toggle("on",a.dataset.v===known));
   if(known==="home") loadHome();
   if(known==="now") renderNowFull();
@@ -2843,6 +2850,11 @@ async function pollVlc(){
              // only honest signal and the bridge derives it there.
              S.now.runway = (p.runway_secs!=null) ? p.runway_secs : null;
              S.now.stalled = !!p.stalled;
+             // What the DECODER says, for the quality label. Absent until the
+             // bridge has reported once; the label then simply does not show,
+             // which is the honest state rather than a guess from the filename.
+             if(p.video_resolution) S.now.vres = p.video_resolution;
+             if(p.video_codec) S.now.vcodec = p.video_codec;
              // VLC QUIT. The bridge probes VLC's own http interface, so this is
              // a refused connection rather than "no bytes lately" — the
              // ambiguity that made auto-clearing unsafe before. Nothing is
@@ -3029,6 +3041,45 @@ function renderErrPanel(){
   const rb=$("#errRetry"); if(rb) rb.onclick=()=>{ const fn=e.retry; S.now.error=null; hideWarmPanel(); if(fn) fn(); };
   $("#errBack").onclick=()=>{ S.now.error=null; hideWarmPanel(); };
 }
+/* QUALITY LABEL — what is actually on screen, not what the file is called.
+   Built from VLC's own decoder (`Video_resolution`, `Codec`, relayed by the
+   bridge) rather than from the release name, because a filename is a claim and
+   this project has two proofs it lies: a release titled `...H.264-MeM` played as
+   HEVC, and Local Bypass could substitute a different file for the same episode
+   — a 1.00 GB rip standing in for a 5.09 GB one, which is exactly the case a
+   label is wanted for. Falls back to the ranked result's own quality string when
+   the decoder has not reported yet (a Chromecast stream never will), and shows
+   nothing at all rather than guessing. */
+function shortCodec(c){
+  const t=(c||"").toLowerCase();
+  if(t.includes("hevc")||t.includes("h265")||t.includes("h.265")) return "HEVC";
+  if(t.includes("avc")||t.includes("h264")||t.includes("h.264")) return "H.264";
+  if(t.includes("av1")) return "AV1";
+  if(t.includes("vp9")) return "VP9";
+  return "";
+}
+function resLabel(r){
+  const m=/^(\d+)x(\d+)$/.exec((r||"").trim());
+  if(!m) return "";
+  const w=+m[1], h=+m[2];
+  // Height alone misreads a widescreen crop: this episode is 3840x1746, which is
+  // 4K at 2.20:1 and would read as "1080p" on height. Width is the honest axis.
+  if(w>=3000) return "4K";
+  if(w>=1800) return "1080p";
+  if(w>=1200) return "720p";
+  if(w>0) return "480p";
+  return "";
+}
+function qualityLabel(c){
+  const parts=[];
+  const fromDecoder=resLabel(S.now.vres);
+  if(fromDecoder) parts.push(fromDecoder);
+  else if(c&&c.quality) parts.push(c.quality);
+  const cod=shortCodec(S.now.vcodec);
+  if(cod) parts.push(cod);
+  return parts.join(" · ");
+}
+
 function renderNowFull(){
   const root=$("#nowFull");
   // 2026-08-04: loading + play-error now live in the lower-third #warmpanel, not
@@ -3084,7 +3135,7 @@ function renderNowFull(){
     <div class="nowmeta">
     <h2>${esc(c.title||"")}</h2>
     ${epLine()}
-    <div class="sub">${esc(c.quality||"")} · ${esc((c.target||"").split(":")[1]||"")}</div>
+    <div class="sub">${[qualityLabel(c), (c.target||"").split(":")[1]||""].filter(Boolean).map(esc).join(" · ")}</div>
     <div class="scrub">
       <div class="rail"><div class="frontier" style="width:${fpct}%"></div><div class="fill" id="fFill" style="width:${pct}%"></div></div>
       <input id="fSeek" type="range" min="0" max="${Math.max(1,Math.round(S.now.dur||max))}" value="${Math.round(pos)}">

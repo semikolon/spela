@@ -135,9 +135,35 @@ pub struct LivePosition {
     /// still playing, which is exactly why the Now-view was left to be dismissed
     /// by hand. The remote reads this to tear the view down on its own.
     pub gone: bool,
+    /// 2026-09-06: what the DECODER says it is playing — `"1920x872"`, `"hevc"` —
+    /// read from VLC's own status by the bridge.
+    ///
+    /// Deliberately NOT taken from the release name. A filename is a CLAIM, and
+    /// this project has two live proofs that the claim lies: a release titled
+    /// `...H.264-MeM` played as HEVC, and Local Bypass could silently substitute a
+    /// different file for the same episode (a 1.00 GB rip standing in for a
+    /// 5.09 GB one, 2026-09-05). A quality label built from the title would have
+    /// read "1080p" in both cases and been wrong about what reached the screen.
+    /// This reads the screen.
+    pub video_resolution: Option<String>,
+    pub video_codec: Option<String>,
 }
 
 type SharedState = Arc<ServerState>;
+
+/// The decoder-reported label currently on record for `title`, if any.
+///
+/// Read before REPLACING `live_position` from a path that does not know it — a
+/// Chromecast position tick, or a seek. Without this the label would blink out
+/// every time the user scrubbed, which reads as "the quality changed" when
+/// nothing did. Title-guarded so a different stream cannot inherit it.
+fn carry_quality_label(state: &SharedState, title: &str) -> (Option<String>, Option<String>) {
+    lock_recover(&state.live_position)
+        .as_ref()
+        .filter(|p| p.title == title)
+        .map(|p| (p.video_resolution.clone(), p.video_codec.clone()))
+        .unwrap_or((None, None))
+}
 
 /// 2026-07-04: snapshot of an in-progress stream setup, read by `/progress`.
 #[derive(Clone)]
@@ -4465,6 +4491,7 @@ async fn cast_health_monitor(
                         // unthrottled + HWM-independent — this is what makes a
                         // backward seek stick instead of snapping to the HWM.
                         if let Some(t) = &title_snapshot {
+                            let (carried_res, carried_codec) = carry_quality_label(&state, &t);
                             *lock_recover(&state.live_position) = Some(LivePosition {
                                 title: t.clone(),
                                 abs_secs: absolute,
@@ -4474,6 +4501,8 @@ async fn cast_health_monitor(
                                 stalled: false,
                                 // A fresh position report means VLC is alive.
                                 gone: false,
+                                video_resolution: carried_res.clone(),
+                                video_codec: carried_codec.clone(),
                             });
                         }
                     }
@@ -5389,6 +5418,12 @@ struct SetResumeRequest {
     /// this, so the bridge derives it from clock advancement and reports it here.
     #[serde(default)]
     stalled: bool,
+    /// What VLC's own decoder reports, e.g. `"1920x872"` and `"hevc"`. Optional so
+    /// an older bridge keeps working — it simply reports no label.
+    #[serde(default)]
+    video_resolution: Option<String>,
+    #[serde(default)]
+    video_codec: Option<String>,
 }
 
 /// `POST /position` {imdb_id, title, seconds, duration} — set the resume high-water
@@ -5441,6 +5476,8 @@ async fn handle_position(
             stalled: req.stalled,
             // A position report IS liveness; only POST /vlc/gone sets this.
             gone: false,
+            video_resolution: req.video_resolution.clone(),
+            video_codec: req.video_codec.clone(),
         });
     }
     Json(json!({ "ok": changed, "key": key }))
@@ -5619,6 +5656,7 @@ async fn handle_seek(
             // Update the scrubber's live position IMMEDIATELY (don't wait for
             // the monitor's next ≤5s poll) so the web remote's next /api/position
             // reflects the seek target instead of the stale pre-seek reading.
+            let (seek_res, seek_codec) = carry_quality_label(&state, &current.title);
             *lock_recover(&state.live_position) = Some(LivePosition {
                 title: current.title.clone(),
                 abs_secs: absolute_pos,
@@ -5626,6 +5664,8 @@ async fn handle_seek(
                 // A just-issued seek is by definition not a stall.
                 stalled: false,
                 gone: false,
+                video_resolution: seek_res.clone(),
+                video_codec: seek_codec.clone(),
             });
             tracing::info!(
                 "Seek: '{}' on '{}' to absolute {:.0}s (stream {:.0}s, ss_offset={:.0}s)",
@@ -9934,6 +9974,9 @@ async fn handle_get_position(
             .map(|lp| lp.gone)
             .unwrap_or(false)
     };
+    // Cloned before `query.title` is moved into get_position below — the quality
+    // label needs the same title guard every other field here uses.
+    let title_for_label = query.title.clone();
     let pos = match live {
         Some(p) => p,
         None => AppState::load(&state.state_dir).get_position(query.imdb_id.clone(), query.title),
@@ -9943,8 +9986,20 @@ async fn handle_get_position(
     // that is where the question "how much can I still watch" is asked from. Best-effort:
     // absent for a Chromecast stream or a complete local file, where it means nothing.
     let runway = active_vlc_runway_secs(&state, pos, dur);
+    // What the DECODER says it is playing, for the quality label. Absent until the
+    // bridge has reported once, and absent entirely on the Chromecast path — the
+    // remote simply shows no label rather than guessing from the release name,
+    // which is the thing that would be wrong exactly when it matters.
+    let (vres, vcodec) = {
+        let g = lock_recover(&state.live_position);
+        g.as_ref()
+            .filter(|lp| Some(lp.title.as_str()) == title_for_label.as_deref())
+            .map(|lp| (lp.video_resolution.clone(), lp.video_codec.clone()))
+            .unwrap_or((None, None))
+    };
     Json(json!({
         "imdb_id": query.imdb_id, "t": pos, "dur": dur, "gone": gone,
+        "video_resolution": vres, "video_codec": vcodec,
         "runway_secs": runway,
         "stalled": stalled,
     }))
@@ -10686,6 +10741,8 @@ mod tests {
             dur: 0.0,
             stalled: false,
             gone: false,
+            video_resolution: None,
+            video_codec: None,
         };
         // Backward seek to 1375 on the SAME stream → live wins (would snap to
         // the 1575 HWM without this).
