@@ -1126,6 +1126,9 @@ async function vlcWaitReady(id, gen){
   for(let i=0;i<600;i++){   // ~15 min cap at 1.5s/poll
     if(gen!=null && S.vlcGen!==gen) return "superseded";  // a newer VLC source took over — stop this loop silently
     let d; try{ d=await api("/vlc/"+id+"/ready"); }catch(e){ S.now.vlcErr="spela unreachable"; return false; }
+    // The ffprobe of the file lands here first, while the loading panel is still
+    // up — so what you are about to watch is stated BEFORE the wait, not after it.
+    if(d && d.quality) S.now.q = d.quality;
     if(gen!=null && S.vlcGen!==gen) return "superseded";  // re-check after the await
     if(d && d.error){ S.now.vlcErr=d.error; return false; }
     if(d && d.ready) return true;
@@ -2987,11 +2990,15 @@ function renderWarmPanel(){
   const title=w.title||wd.title||"Loading…", poster=wd.poster||"";
   const phase=w.phase||"connecting", t=w.torrent;
   let label, barPct=null, sub="";
+  // What the file actually IS, as soon as it is known — the point of a loading
+  // panel is to answer "is this the one I wanted" before the wait, not after.
+  const ql=qualityLabel(null);
   if(w.vlc){
     label="Buffering for VLC…"; barPct=(w.pct!=null)?w.pct:null;
     sub = (w.runway!=null && w.runway>0)
       ? fmtRunway(w.runway)+" ready · opens automatically"
       : "opens automatically when ready";
+    if(ql) sub = ql + " · " + sub;
     // Say it out loud when a dead source is skipped. A play that silently switches
     // source is indistinguishable from one that ignored what you picked.
     if(S.now.vlcNote){ label="Switching source…"; sub=S.now.vlcNote; barPct=null; }
@@ -2999,6 +3006,7 @@ function renderWarmPanel(){
     label="Downloading…";
     barPct=Math.max(0,Math.min(100,t.percent||0));
     sub=`${fmtSpeed(t.speed_bps)} · ${t.peers||0} peer${t.peers===1?"":"s"}`;
+    if(ql) sub = ql + " · " + sub;
   }else if(phase==="transcoding"){
     label="Preparing video…";
     const segs=w.segments||0;
