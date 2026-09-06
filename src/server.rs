@@ -4491,7 +4491,7 @@ async fn cast_health_monitor(
                         // unthrottled + HWM-independent — this is what makes a
                         // backward seek stick instead of snapping to the HWM.
                         if let Some(t) = &title_snapshot {
-                            let (carried_res, carried_codec) = carry_quality_label(&state, &t);
+                            let (carried_res, carried_codec) = carry_quality_label(&state, t);
                             *lock_recover(&state.live_position) = Some(LivePosition {
                                 title: t.clone(),
                                 abs_secs: absolute,
