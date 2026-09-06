@@ -4886,13 +4886,40 @@ async fn handle_status(State(state): State<SharedState>) -> Json<Value> {
             .filter(|(at, _, _)| at.elapsed() < std::time::Duration::from_secs(30))
             .map(|(_, t, i)| (t.clone(), i.clone()))
     };
+    // 2026-09-06: the identity of the VLC stream spela STARTED, with no freshness
+    // filter. `vlc_active` above answers "is VLC pulling bytes right now"; this
+    // answers "what did we start", and conflating the two cost a whole episode.
+    //
+    // The bridge could only ever INHERIT identity: it captured it while
+    // `vlc_active` was true and held it. A bridge started mid-episode — by the
+    // 03:00 nightly, by a crash, by a manual restart — therefore had no way to
+    // learn what was playing, because VLC buffers ahead and the 30s stamp had long
+    // gone stale, leaving `/status` reporting a flat `idle` over a playing film.
+    // Observed 2026-09-06: a restart at 11:05 mid-episode, then 35 minutes of
+    // silence, no completion, and VLC left open at the end.
+    //
+    // The cell was already durable — set when the stream is served, cleared only
+    // by `/vlc/gone`. Only the READ was throwing the identity away. Kept as
+    // ADDITIVE fields so nothing that reads `status` or `vlc_active` changes
+    // meaning.
+    let vlc_known: Option<(String, Option<String>)> = {
+        let g = lock_recover(&state.vlc_activity);
+        g.as_ref().map(|(_, t, i)| (t.clone(), i.clone()))
+    };
     match &app_state.current {
         None => match &vlc {
             Some((title, imdb)) => Json(json!({
                 "status": "streaming", "target": "vlc",
                 "vlc_active": true, "title": title, "imdb_id": imdb,
+                "vlc_stream_title": title, "vlc_stream_imdb": imdb,
             })),
-            None => Json(json!({"status": "idle"})),
+            None => match &vlc_known {
+                Some((title, imdb)) => Json(json!({
+                    "status": "idle",
+                    "vlc_stream_title": title, "vlc_stream_imdb": imdb,
+                })),
+                None => Json(json!({"status": "idle"})),
+            },
         },
         Some(current) => {
             // Liveness ground truth: ffmpeg is producing HLS segments
