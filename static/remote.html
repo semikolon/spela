@@ -349,8 +349,24 @@
      phone-direct buffering overlay (#phbuf) over the <video> until first frame. */
   .phwrap{position:relative;width:min(94vw,640px);align-self:center}
   .phbuf{position:absolute;inset:0;justify-content:center;background:rgba(11,11,15,.78);border-radius:14px}
-  .wbar{width:min(360px,80%);height:10px;border-radius:6px;background:var(--bg3);overflow:hidden;margin:.1rem 0}
-  .wfill{height:100%;background:var(--warn);border-radius:6px;transition:width .45s ease}
+  .wbar{width:min(360px,80%);height:10px;border-radius:6px;background:var(--bg3);overflow:hidden;margin:.1rem 0;position:relative}
+  .wfill{height:100%;background:var(--warn);border-radius:6px;transition:width .45s ease;position:relative;z-index:2}
+  /* Cleared runway, behind the fill: how much of the EPISODE is already watchable.
+     Dimmer on purpose — it is context, not the thing being waited for. */
+  .wrun{position:absolute;inset:0 auto 0 0;height:100%;border-radius:6px;
+        background:color-mix(in srgb,var(--warn) 26%,transparent);
+        transition:width .6s ease;z-index:1}
+  /* Motion IS the throughput reading. Stripes drift at --wspeed, set from bytes
+     per second; a stalled swarm stops moving, which no static bar can say.
+     Pointer-only and off under reduced-motion — this is information, but not at
+     the cost of someone who cannot take the animation. */
+  @media (prefers-reduced-motion:no-preference){
+    .wfill.moving::after{content:"";position:absolute;inset:0;border-radius:6px;
+      background:repeating-linear-gradient(115deg,
+        rgba(255,255,255,.20) 0 8px, rgba(255,255,255,0) 8px 18px);
+      animation:wdrift var(--wspeed,3s) linear infinite}
+  }
+  @keyframes wdrift{ from{background-position:0 0} to{background-position:36px 0} }
   .nowfull h2{margin:.2rem 0 0;font-size:1.3rem;text-align:center}
   .nowfull .sub{color:var(--dim);font-size:.85rem;margin-top:-.4rem}
   .nowfull .epline{color:var(--fg);font-size:1rem;font-weight:600;margin-top:.15rem;opacity:.92}
@@ -749,6 +765,12 @@
     .tgt,.tbtn,.topt,.newbadge,nav a,.seg button,.toast button,.banner button,
     .markw,.followbtn,.rtlink{
       position:relative;overflow:hidden;transition:box-shadow .25s ease}
+  /* The quality segment sits beside Movies/TV and must read as secondary to it:
+     the primary choice is what to watch. Smaller type, dimmer until chosen. */
+  .qseg{margin-left:.5rem}
+  .qseg button{font-size:.78rem;padding:.42rem .6rem;opacity:.72}
+  .qseg button.on{opacity:1}
+  @media (max-width:560px){ .qseg{margin-left:0;margin-top:.4rem} }
     /* FRUGAL HINT — hold Shift and the play buttons say what they will do.
        Uses ::before because ::after belongs to the hover gleam, and sits behind
        @media (hover:hover) for the same reason the gleam does: iOS strands
@@ -872,6 +894,16 @@
         <button data-m="movie" class="on" data-ic="film">Movies</button>
         <button data-m="tv" data-ic="tv">TV</button>
       </div>
+      <!-- QUALITY. Deliberately NOT in the top nav (Fredrik, 2026-09-06): that row
+           is already six tabs plus brand, badge and target chip, and wraps under
+           560px as it stands. It belongs here instead, beside the other choice you
+           make before searching — what to play, and how. -->
+      <div class="seg qseg" id="qualSeg" role="group" aria-label="Quality">
+        <button class="qopt on" data-p="auto" title="Let spela choose">Auto</button>
+        <button class="qopt" data-p="uhd" title="4K even when the swarm looks thin">4K</button>
+        <button class="qopt" data-p="hd" title="Best 1080p, never 4K">1080p</button>
+        <button class="qopt" data-p="saver" title="Smallest file — for mobile data">Saver</button>
+      </div>
     </div>
     <div id="recentRow" class="recent"></div>
     <div id="searchOut"></div>
@@ -917,7 +949,7 @@ const fmt=s=>{ s=Math.max(0,Math.round(s||0)); const h=s/3600|0,m=(s%3600)/60|0,
   return (h?h+":"+String(m).padStart(2,"0"):m)+":"+String(x).padStart(2,"0"); };
 
 /* ---------- state ---------- */
-const TKEY="spela_target", MKEY="spela_mode";
+const TKEY="spela_target", MKEY="spela_mode", PKEY="spela_pref";
 /* Default target is DEVICE-AWARE (2026-08-31). It used to be a flat {kind:"vlc"}
    for everyone, which is right at the desk — the Mac monitor is the main watch
    surface — and wrong in the hand: opening the remote on the phone silently
@@ -953,8 +985,8 @@ function defaultTarget(){
    that never unmounts, so that is the whole of it and there is nothing to tear
    down — but `blur` DOES matter: alt-tabbing away while Shift is held would
    otherwise leave the label stuck on. */
-addEventListener("click", e=>{ S.frugal = !!e.shiftKey; }, true);
-addEventListener("keydown", e=>{ if(e.key==="Enter"||e.key===" ") S.frugal = !!e.shiftKey; }, true);
+addEventListener("click", e=>{ if(e.shiftKey) S.pref="saver"; }, true);
+addEventListener("keydown", e=>{ if((e.key==="Enter"||e.key===" ")&&e.shiftKey) S.pref="saver"; }, true);
 addEventListener("keydown", e=>{ if(e.key==="Shift") document.body.classList.add("frugalhint"); });
 addEventListener("keyup",   e=>{ if(e.key==="Shift") document.body.classList.remove("frugalhint"); });
 addEventListener("blur",    ()=> document.body.classList.remove("frugalhint"));
@@ -962,6 +994,11 @@ addEventListener("blur",    ()=> document.body.classList.remove("frugalhint"));
 const S={
   target:JSON.parse(sessionStorage.getItem(TKEY)||"null")||defaultTarget(),   // {kind:'chromecast'|'phone'|'vlc'|'shannon', name}; the pick lasts the session.
   mode:sessionStorage.getItem(MKEY)||"movie",                 // 'movie' | 'tv'
+  // 'auto' | 'uhd' | 'hd' | 'saver'. Session-scoped like the target, because it
+  // answers a question about THIS sitting — which screen, which connection —
+  // rather than a standing preference. Off-LAN the SERVER defaults to saver when
+  // nothing is asked, so leaving this on auto is not the same as asking for auto.
+  pref:sessionStorage.getItem(PKEY)||"auto",
   search:{q:"",abort:null,data:null},
   library:{data:null,loading:false},
   now:{data:null,posAbs:0,dur:0,frontier:0,endlist:false,playing:false,lastSync:0,
@@ -1129,6 +1166,16 @@ async function vlcWaitReady(id, gen){
     // The ffprobe of the file lands here first, while the loading panel is still
     // up — so what you are about to watch is stated BEFORE the wait, not after it.
     if(d && d.quality) S.now.q = d.quality;
+    // Everything the readiness poll now knows, for the loading bar: how close to
+    // OPENABLE (not fraction-of-file), how much playtime is cleared, how long the
+    // episode is, whether bytes are flowing, and whether anyone is feeding it.
+    if(d){
+      if(d.open_pct!=null) S.now.openPct = d.open_pct;
+      if(d.runway_secs!=null) S.now.runway = d.runway_secs;
+      if(d.dur_secs) S.now.warmDur = d.dur_secs;
+      if(d.speed_bps!=null) S.now.speed = d.speed_bps;
+      if(d.peers!=null) S.now.peers = d.peers;
+    }
     if(gen!=null && S.vlcGen!==gen) return "superseded";  // re-check after the await
     if(d && d.error){ S.now.vlcErr=d.error; return false; }
     if(d && d.ready) return true;
@@ -1703,6 +1750,22 @@ seg.onclick=e=>{ const b=e.target.closest("button"); if(!b)return;
   S.mode=b.dataset.m; sessionStorage.setItem(MKEY,S.mode);
   [...seg.children].forEach(x=>x.classList.toggle("on",x===b));
   if(S.search.q) runSearch(S.search.q); };
+// Quality control. Same delegation shape as the mode segment beside it.
+$("#qualSeg")?.addEventListener("click", e=>{
+  const b=e.target.closest(".qopt"); if(!b) return;
+  setPref(b.dataset.p);
+});
+
+function syncPrefButtons(){
+  $$(".qopt").forEach(b=>b.classList.toggle("on", b.dataset.p===S.pref));
+}
+function setPref(p){
+  S.pref=p; sessionStorage.setItem(PKEY,p);
+  $$(".qopt").forEach(b=>b.classList.toggle("on", b.dataset.p===p));
+  // Re-run the current search so the change is visible at once rather than at the
+  // next play. Seeing what it does IS the control.
+  if(S.search.q) runSearch(S.search.q);
+}
 function setMode(m){ S.mode=m; sessionStorage.setItem(MKEY,S.mode);
   [...seg.children].forEach(x=>x.classList.toggle("on",x.dataset.m===m)); }
 
@@ -2216,7 +2279,7 @@ async function runSearch(q){
   // Pass the selected target so the server ranks for it: native-HEVC targets
   // (vlc/phone) rank by seeds; NVENC targets (chromecast/shannon) prefer H.264.
   if(S.target&&S.target.kind) qs+="&target="+encodeURIComponent(S.target.kind);
-  if(S.frugal) qs+="&frugal=1";
+  if(S.pref&&S.pref!=="auto") qs+="&pref="+encodeURIComponent(S.pref);
   let d;
   try{ d=await api("/search?"+qs,{signal:ac.signal}); }
   catch(e){ if(e.name==="AbortError")return;
@@ -2451,7 +2514,7 @@ async function fastPlay(query, isTV, poster){
   // HEVC -- 3.3x the peers and 1.7x fewer bytes to move. S.target is guaranteed set
   // by the guard above, so there is nothing to fall back to.
   const tq = (S.target && S.target.kind) ? "&target="+encodeURIComponent(S.target.kind) : "";
-  const fq = S.frugal ? "&frugal=1" : "";
+  const fq = (S.pref&&S.pref!=="auto") ? "&pref="+encodeURIComponent(S.pref) : "";
   let d; try{ d=await api("/search?q="+encodeURIComponent(query)+(isTV?"&tv=1":"&movie=1")+tq+fq); }
   catch{ showPlayError(query,poster,"spela unreachable",()=>fastPlay(query,isTV,poster)); return; }
   S.search.data=d;
@@ -2983,6 +3046,31 @@ function epLine(){ return S.now.epLabel? `<div class="sub epline">${esc(S.now.ep
    phase label + progress bar + second-by-second stats (download %/speed/peers
    OR transcode segments OR VLC buffer), fed by GET /progress (and vlcWaitReady
    for the VLC path). Compact horizontal layout: poster thumb + body. */
+/* THE WAITING BAR — three questions, no words.
+     how far?   the fill, which is progress toward OPENABLE rather than
+                fraction-of-file, so it does not understate by eight times;
+     how much of the episode is already watchable?
+                a second, dimmer layer showing cleared runway against the
+                episode's length — the thing actually worth knowing while waiting;
+     is it moving, and how fast?
+                the fill's stripes drift, faster with the download. Stopped
+                stripes are a stalled swarm, which a static bar cannot say and
+                which is the question you actually ask while staring at one.
+   Peers need no element: no peers means no bytes means no motion. */
+function warmBar(pct){
+  const dur=S.now.warmDur||0, run=S.now.runway||0;
+  const runPct = (dur>0) ? Math.max(0,Math.min(100, run/dur*100)) : 0;
+  const bps=S.now.speed||0;
+  // Slow enough to read as motion, fast enough to feel like throughput. Clamped
+  // so a 40 MB/s burst does not become a strobe.
+  const secs = bps>0 ? Math.max(0.5, Math.min(8, 4e6/bps)) : 0;
+  const moving = secs>0 ? `--wspeed:${secs.toFixed(2)}s` : "--wspeed:0s";
+  return `<div class="wbar" style="${moving}">
+    <div class="wrun" style="width:${runPct}%"></div>
+    <div class="wfill${bps>0?" moving":""}" style="width:${pct}%"></div>
+  </div>`;
+}
+
 function renderWarmPanel(){
   const root=$("#warmpanel"); if(!root) return;
   root.classList.remove("wperr");
@@ -2994,7 +3082,10 @@ function renderWarmPanel(){
   // panel is to answer "is this the one I wanted" before the wait, not after.
   const ql=qualityLabel(null);
   if(w.vlc){
-    label="Buffering for VLC…"; barPct=(w.pct!=null)?w.pct:null;
+    // Progress toward OPENING, not fraction of the file. See open_progress_pct on
+    // the server: a torrent four-fifths of the way to openable used to draw 12%.
+    label="Buffering for VLC…";
+    barPct=(S.now.openPct!=null)?S.now.openPct:((w.pct!=null)?w.pct:null);
     sub = (w.runway!=null && w.runway>0)
       ? fmtRunway(w.runway)+" ready · opens automatically"
       : "opens automatically when ready";
@@ -3022,7 +3113,7 @@ function renderWarmPanel(){
     <div class="wpbody">
       <div class="wptitle">${esc(title)}</div>
       <div class="wpphase"><div class="spin"></div>${esc(label)}</div>
-      ${barPct!=null?`<div class="wbar"><div class="wfill" style="width:${barPct}%"></div></div>`:""}
+      ${barPct!=null?warmBar(barPct):""}
       <div class="wpsub">${esc(sub)}${el}</div>
       <div class="wpact"><button class="srcbtn" id="wCancel">${ic("stop")}Cancel</button></div>
     </div>
@@ -3315,7 +3406,7 @@ $(".brand")?.addEventListener("click",()=>{ $("#q").value=""; S.search.q="";
   $("#searchOut").innerHTML=""; if(currentView()==="search"){ loadRecent(); loadPending(); loadFollowing(); } });
 
 /* ---------- boot ---------- */
-iconizeStatic(); route(); pollNow(true);
+iconizeStatic(); syncPrefButtons(); route(); pollNow(true);
 </script>
 </body>
 </html>
