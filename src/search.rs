@@ -1581,10 +1581,11 @@ pub(crate) fn effective_res_tier_forced(
     best_1080p_bpp: Option<f64>,
     force_4k: bool,
 ) -> u32 {
-    // An explicit ask for 4K puts every 2160p at the top, ahead of the two
-    // guards that exist to stop the ranker CHOOSING a bad one on its own. He is
-    // choosing; among the 4Ks the later tiers still sort by language, size and
-    // seeds, so he gets the best of them rather than an arbitrary one.
+    // Retained but never set true in production since 2026-09-05: the force-4K
+    // override it served was replaced by frugal mode (see `RankOpts::frugal`)
+    // once the pack-penalty removal made a good 4K rank first on its own. Kept
+    // because the shape is right if a force-a-resolution override is ever wanted
+    // again, and because deleting it would take the reasoning with it.
     if force_4k && resolution_tier(&r.title) == 3 {
         return 0;
     }
@@ -1656,14 +1657,23 @@ pub struct RankOpts<'a> {
     pub transcoding: bool,
     /// The show's TMDB `original_language`, for judging language fit.
     pub original_language: Option<&'a str>,
-    /// The user asked for 4K explicitly (shift-click), overriding the ranker's
-    /// own judgement about whether a 2160p release is worth it here. Skips both
-    /// guards that would otherwise demote it: the seed-viability bar and the
-    /// bits-per-pixel starvation test. Deliberately an OVERRIDE and not a
-    /// preference — the ranker already prefers a good 4K on a native target, so
-    /// this only ever fires for a 4K it decided against, and the point is to let
-    /// him decide anyway.
-    pub force_4k: bool,
+    /// FRUGAL mode — shift-click, for when bandwidth costs money.
+    ///
+    /// Started life as a force-4K override, which the pack-penalty removal made
+    /// pointless the same evening: with that gone a good 2160p ranks first
+    /// unaided, so an override could only ever force one the ranker had
+    /// deliberately declined. Inverted instead, into the case that does need a
+    /// manual escape: a phone on mobile data, or MERIAN on a hotspot, where the
+    /// monthly quota is the scarce thing rather than the pixels.
+    ///
+    /// Two changes, both pointing the same way. Resolution follows the
+    /// TRANSCODING mapping, so 2160p sorts last — 11.85 GB against about 5 GB for
+    /// the same episode at 1080p. And the bitrate tier INVERTS, so the smallest
+    /// encode wins instead of the largest: that is the half that actually saves
+    /// the quota, taking the same episode from roughly 5 GB to 1 GB. Nothing is
+    /// lost by it on a phone screen — the compression this ranker learned to
+    /// avoid is only visible on a 4K monitor at close range.
+    pub frugal: bool,
 }
 
 pub fn rank_results_mut_prefer(
@@ -1676,7 +1686,7 @@ pub fn rank_results_mut_prefer(
         RankOpts {
             transcoding: prefer_h264,
             original_language,
-            force_4k: false,
+            frugal: false,
         },
     );
 }
@@ -1731,8 +1741,12 @@ pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) 
         // doc for the full mapping + the non-transitive-comparator history
         // that motivated the redesign. Direct `cmp` on the bucket guarantees
         // total ordering; tier 4 only fires within the same bucket.
-        let a_eff = effective_res_tier_forced(a, prefer_h264, best_1080p_bpp, opts.force_4k);
-        let b_eff = effective_res_tier_forced(b, prefer_h264, best_1080p_bpp, opts.force_4k);
+        // Frugal borrows the transcoding resolution mapping, which already sorts
+        // 2160p last — the same ordering, for a different reason: there because
+        // the panel cannot show the pixels, here because the pixels cost money.
+        let res_transcoding = prefer_h264 || opts.frugal;
+        let a_eff = effective_res_tier_forced(a, res_transcoding, best_1080p_bpp, false);
+        let b_eff = effective_res_tier_forced(b, res_transcoding, best_1080p_bpp, false);
         if a_eff != b_eff {
             return a_eff.cmp(&b_eff);
         }
@@ -1810,7 +1824,11 @@ pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) 
         let a_size = size_tier(a);
         let b_size = size_tier(b);
         if a_size != b_size {
-            return a_size.cmp(&b_size);
+            return if opts.frugal {
+                b_size.cmp(&a_size) // smallest wins — the quota is the scarce thing
+            } else {
+                a_size.cmp(&b_size)
+            };
         }
 
         // NO PACK PENALTY. It was tier 1 until 2026-09-05 — ahead of resolution,
@@ -3824,6 +3842,64 @@ mod tests {
             pair[0].seeds, 100,
             "seeds decide; being inside a pack costs nothing"
         );
+    }
+
+    /// FRUGAL mode, on the real Star City S01E08 list: on a phone paying by the
+    /// megabyte the right answer is the smallest watchable file, not the best.
+    /// The same list that gives a 11.85 GB 2160p on the monitor should give about
+    /// a gigabyte here — the difference between an episode and a monthly quota.
+    #[test]
+    fn test_frugal_mode_picks_the_smallest_encode() {
+        let mut results = star_city_s01e08_live_candidates();
+        results.push({
+            let mut r = make_sized(
+                16,
+                "Star.City.S01E08.2160p.ATVP.WEB-DL.DV.HDR.H.265.RGzsRutracker.mkv",
+                48,
+                "11.85 GB",
+            );
+            r.file_index = Some(7);
+            r
+        });
+        rank_results_mut_opts(
+            &mut results,
+            RankOpts {
+                transcoding: false, // still VLC — frugal is about bytes, not decoding
+                original_language: Some("en"),
+                frugal: true,
+            },
+        );
+        assert!(
+            results[0].size.contains("1001.27 MB"),
+            "frugal should pick the 1.00 GB x265; got {:?} at {:?}",
+            results[0].size,
+            results[0].title
+        );
+        // 2160p sorts last in frugal, whatever its seeds: it is the single most
+        // expensive thing on the list.
+        let four_k = results
+            .iter()
+            .position(|r| r.title.contains("2160p"))
+            .unwrap();
+        assert!(
+            four_k >= results.len() - 2,
+            "4K must sink in frugal mode; got {four_k}"
+        );
+
+        // …and the SAME list, not frugal, still puts the 4K first.
+        let mut normal = star_city_s01e08_live_candidates();
+        normal.push({
+            let mut r = make_sized(
+                16,
+                "Star.City.S01E08.2160p.ATVP.WEB-DL.DV.HDR.H.265.RGzsRutracker.mkv",
+                48,
+                "11.85 GB",
+            );
+            r.file_index = Some(7);
+            r
+        });
+        rank_results_mut_prefer(&mut normal, false, Some("en"));
+        assert!(normal[0].title.contains("2160p"));
     }
 
     /// The 4K in this list has ONE seed. Preferring 2160p must not mean

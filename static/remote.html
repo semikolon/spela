@@ -743,6 +743,20 @@
     .tgt,.tbtn,.topt,.newbadge,nav a,.seg button,.toast button,.banner button,
     .markw,.followbtn,.rtlink{
       position:relative;overflow:hidden;transition:box-shadow .25s ease}
+    /* FRUGAL HINT — hold Shift and the play buttons say what they will do.
+       Uses ::before because ::after belongs to the hover gleam, and sits behind
+       @media (hover:hover) for the same reason the gleam does: iOS strands
+       :hover after a tap, and there is no Shift key on a phone anyway. */
+    @media (hover:hover){
+      body.frugalhint .playicon:hover::before,
+      body.frugalhint .foplay:hover::before{
+        content:"1080"; position:absolute; inset:0; z-index:3;
+        display:grid; place-items:center;
+        background:#1f1f29; color:#9fe7b6;
+        font-weight:800; font-size:.68rem; letter-spacing:.04em;
+        border-radius:inherit;
+      }
+    }
     .fotap::after,.src::after,.card::after,
     .foplay::after,.fomark::after,.founfollow::after,.foseasonbtn::after,
     .unmark::after,.playicon::after,.srcbtn::after,
@@ -915,6 +929,30 @@ function defaultTarget(){
     && window.matchMedia("(hover: none) and (pointer: coarse)").matches;
   return handheld ? {kind:"phone",name:"This device"} : {kind:"vlc",name:"VLC"};
 }
+/* ---------- FRUGAL MODE — shift-click a play button for the small file ----------
+   Bandwidth costs money on a hotspot or on mobile data, and the ranker is tuned
+   the other way: it will happily pick an 11.85 GB 2160p, which is most of a
+   monthly quota for one episode. Shift caps the search at 1080p and asks for the
+   SMALLEST encode instead of the largest, which lands the same episode around a
+   gigabyte. Nothing is lost on a phone screen; the compression this ranker learned
+   to avoid is only visible on a 4K monitor at close range.
+
+   The modifier is read in a CAPTURE-phase listener rather than threaded through
+   the six call sites that start a play. Every click sets it, so it always
+   reflects the click that is happening rather than some earlier one, and it
+   cannot go stale. Enter/Space are read too, since the library cards are
+   keyboard-operable and would otherwise miss it.
+
+   LIFETIME: both listeners live as long as the page. This is a single-page app
+   that never unmounts, so that is the whole of it and there is nothing to tear
+   down — but `blur` DOES matter: alt-tabbing away while Shift is held would
+   otherwise leave the label stuck on. */
+addEventListener("click", e=>{ S.frugal = !!e.shiftKey; }, true);
+addEventListener("keydown", e=>{ if(e.key==="Enter"||e.key===" ") S.frugal = !!e.shiftKey; }, true);
+addEventListener("keydown", e=>{ if(e.key==="Shift") document.body.classList.add("frugalhint"); });
+addEventListener("keyup",   e=>{ if(e.key==="Shift") document.body.classList.remove("frugalhint"); });
+addEventListener("blur",    ()=> document.body.classList.remove("frugalhint"));
+
 const S={
   target:JSON.parse(sessionStorage.getItem(TKEY)||"null")||defaultTarget(),   // {kind:'chromecast'|'phone'|'vlc'|'shannon', name}; the pick lasts the session.
   mode:sessionStorage.getItem(MKEY)||"movie",                 // 'movie' | 'tv'
@@ -2168,6 +2206,7 @@ async function runSearch(q){
   // Pass the selected target so the server ranks for it: native-HEVC targets
   // (vlc/phone) rank by seeds; NVENC targets (chromecast/shannon) prefer H.264.
   if(S.target&&S.target.kind) qs+="&target="+encodeURIComponent(S.target.kind);
+  if(S.frugal) qs+="&frugal=1";
   let d;
   try{ d=await api("/search?"+qs,{signal:ac.signal}); }
   catch(e){ if(e.name==="AbortError")return;
@@ -2402,7 +2441,8 @@ async function fastPlay(query, isTV, poster){
   // HEVC -- 3.3x the peers and 1.7x fewer bytes to move. S.target is guaranteed set
   // by the guard above, so there is nothing to fall back to.
   const tq = (S.target && S.target.kind) ? "&target="+encodeURIComponent(S.target.kind) : "";
-  let d; try{ d=await api("/search?q="+encodeURIComponent(query)+(isTV?"&tv=1":"&movie=1")+tq); }
+  const fq = S.frugal ? "&frugal=1" : "";
+  let d; try{ d=await api("/search?q="+encodeURIComponent(query)+(isTV?"&tv=1":"&movie=1")+tq+fq); }
   catch{ showPlayError(query,poster,"spela unreachable",()=>fastPlay(query,isTV,poster)); return; }
   S.search.data=d;
   const first=(d&&d.results&&d.results[0]);

@@ -1370,6 +1370,11 @@ struct SearchParams {
     /// / shannon). Only "chromecast" keeps the tier-4 H.264 preference; native-HEVC
     /// targets re-rank by seed count so a well-seeded HEVC isn't demoted.
     target: Option<String>,
+    /// `frugal=1` — bandwidth costs money right now (a phone on mobile data, a
+    /// laptop on a hotspot). Caps at 1080p and picks the SMALLEST encode rather
+    /// than the largest, taking an episode from roughly 12 GB to roughly 1 GB.
+    /// Set by shift-clicking a play button. See `RankOpts::frugal`.
+    frugal: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1443,6 +1448,28 @@ async fn handle_search(
             // (Re-ranking reassigns result ids, so it must precede the partial-download
             // enrichment + save_last_search below.) Axis = needs-H.264-transcode, not
             // the literal "chromecast".
+            let frugal = params.frugal.as_deref() == Some("1");
+            // Frugal re-ranks whatever the target is: a Chromecast on a hotspot
+            // costs exactly as much per gigabyte as a phone does.
+            if frugal
+                && !params
+                    .target
+                    .as_deref()
+                    .is_some_and(|t| matches!(t, "vlc" | "phone"))
+            {
+                let orig_lang = result
+                    .show
+                    .as_ref()
+                    .and_then(|sh| sh.original_language.clone());
+                crate::search::rank_results_mut_opts(
+                    &mut result.results,
+                    crate::search::RankOpts {
+                        transcoding: true,
+                        original_language: orig_lang.as_deref(),
+                        frugal: true,
+                    },
+                );
+            }
             if params
                 .target
                 .as_deref()
@@ -1452,10 +1479,13 @@ async fn handle_search(
                     .show
                     .as_ref()
                     .and_then(|sh| sh.original_language.clone());
-                crate::search::rank_results_mut_prefer(
+                crate::search::rank_results_mut_opts(
                     &mut result.results,
-                    false,
-                    orig_lang.as_deref(),
+                    crate::search::RankOpts {
+                        transcoding: false,
+                        original_language: orig_lang.as_deref(),
+                        frugal,
+                    },
                 );
             }
             // 2026-06-30: enrich each result with its on-disk partial-download
