@@ -237,41 +237,85 @@ impl TorrentEngine {
             dead_magnets: Mutex::new(HashMap::new()),
             media_dir: media_dir.to_path_buf(),
         });
-        engine.forget_orphans().await;
+        engine.settle_restored_torrents().await;
         Ok(engine)
     }
 
-    /// Drop remembered torrents whose files the pruner has since deleted.
+    /// Physical bytes a set of files actually holds. Sparse placeholders read as 0.
     ///
-    /// The pairing the persistence store needs: something now CREATES durable
-    /// records, so something must remove them, or the store grows without bound and
-    /// every restart pays a validation pass for torrents whose bytes are long gone.
-    /// The pruner deletes files directly and knows nothing about librqbit, so this
-    /// reconciles at the one moment the whole set is in hand.
+    /// `len()` is a LIE for a torrent file: librqbit creates every selected file at its
+    /// full logical size immediately, so a placeholder holding nothing reports gigabytes.
+    /// Only the block count says what is really there.
+    fn physical_bytes(paths: impl Iterator<Item = PathBuf>) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        paths
+            .filter_map(|p| std::fs::metadata(&p).ok())
+            .map(|m| m.blocks() * 512)
+            .sum()
+    }
+
+    /// Put the session in a safe state after a restart.
     ///
-    /// Deletes the RECORD only, never files — by definition there are none left.
-    async fn forget_orphans(&self) {
+    /// Two things are owed here, and both exist because persistence is now on.
+    ///
+    /// PAUSE EVERYTHING. Nothing is playing at boot. A torrent restored from the store
+    /// comes back in whatever state it was persisted in, and the normal end of a live
+    /// stream is `TimeoutStopSec` followed by SIGKILL — no chance to pause — so a
+    /// torrent that was downloading when spela was killed comes back downloading. It
+    /// would then quietly pull gigabytes nobody asked for, competing for the same disk
+    /// the pruner is trying to free. A play un-pauses exactly what it needs.
+    ///
+    /// FORGET THE EMPTY ONES. The pruner deletes files and knows nothing about
+    /// librqbit, so its evictions leave records behind; librqbit recreates those files
+    /// as placeholders when it restores the torrent. That is why the test is PHYSICAL
+    /// BYTES rather than "does the file exist" — by the time this runs the file always
+    /// exists, at full logical size, holding nothing. Exactly zero blocks across every
+    /// file is the only condition that deletes, so there is nothing to lose when it does.
+    async fn settle_restored_torrents(&self) {
         let root = self.media_dir.clone();
-        let stale: Vec<usize> = self.session.with_torrents(|it| {
-            it.filter_map(|(id, t)| {
-                let meta = t.metadata.load_full()?;
-                let any_present = meta
-                    .file_infos
-                    .iter()
-                    .any(|fi| root.join(&fi.relative_filename).exists());
-                // Metadata not yet resolved returns above: no evidence either way,
-                // so the record stays. Only a torrent whose files are ALL gone is
-                // provably an orphan.
-                (!any_present).then_some(id)
-            })
-            .collect()
-        });
-        for id in stale {
-            match self.session.delete(TorrentIdOrHash::Id(id), false).await {
-                Ok(()) => {
-                    tracing::info!("librqbit: forgot torrent {} — its files are gone", id)
+        let (empty, live): (Vec<usize>, Vec<usize>) = self.session.with_torrents(|it| {
+            let mut empty = Vec::new();
+            let mut live = Vec::new();
+            for (id, t) in it {
+                let Some(meta) = t.metadata.load_full() else {
+                    // Metadata unresolved: no evidence either way, so leave it entirely
+                    // alone rather than guess.
+                    continue;
+                };
+                let bytes = Self::physical_bytes(
+                    meta.file_infos
+                        .iter()
+                        .map(|fi| root.join(&fi.relative_filename)),
+                );
+                if bytes == 0 {
+                    empty.push(id);
+                } else if !t.is_paused() {
+                    live.push(id);
                 }
+            }
+            (empty, live)
+        });
+        for id in empty {
+            match self.session.delete(TorrentIdOrHash::Id(id), true).await {
+                Ok(()) => tracing::info!(
+                    "librqbit: forgot torrent {} — it holds no bytes at all (pruned)",
+                    id
+                ),
                 Err(e) => tracing::warn!("librqbit: could not forget torrent {}: {}", id, e),
+            }
+        }
+        for id in live {
+            let Some(handle) = self.session.get(TorrentIdOrHash::Id(id)) else {
+                continue;
+            };
+            match self.session.pause(&handle).await {
+                Ok(()) => tracing::info!(
+                    "librqbit: paused restored torrent {} — nothing is playing yet",
+                    id
+                ),
+                Err(e) => {
+                    tracing::warn!("librqbit: could not pause restored torrent {}: {}", id, e)
+                }
             }
         }
     }
@@ -800,6 +844,60 @@ fn stats_to_progress(stats: &TorrentStats) -> TorrentProgress {
         speed_bps,
         finished: stats.finished,
         state,
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::TorrentEngine;
+    use std::io::Write;
+
+    /// The distinction the boot-time cleanup turns on, and the one that is easy to get
+    /// wrong: a torrent file is created at its FULL logical size the moment it is
+    /// selected, so `len()` reports gigabytes for a file holding nothing. Deleting on
+    /// `len() == 0` would never fire; deleting on "the file exists" would fire on
+    /// everything. Only the block count separates a placeholder from real data.
+    #[test]
+    fn a_sparse_placeholder_holds_no_physical_bytes_however_large_it_claims_to_be() {
+        let dir = std::env::temp_dir().join(format!("spela_phys_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let placeholder = dir.join("placeholder.mkv");
+        let f = std::fs::File::create(&placeholder).unwrap();
+        f.set_len(3_373_117_433).unwrap(); // the real Vyndros episode size
+        drop(f);
+        assert_eq!(
+            std::fs::metadata(&placeholder).unwrap().len(),
+            3_373_117_433,
+            "it claims to be 3.14 GB"
+        );
+        assert_eq!(
+            TorrentEngine::physical_bytes(std::iter::once(placeholder.clone())),
+            0,
+            "...and holds nothing, which is what decides"
+        );
+
+        let real = dir.join("real.mkv");
+        let mut g = std::fs::File::create(&real).unwrap();
+        g.write_all(&vec![7u8; 256 * 1024]).unwrap();
+        drop(g);
+        assert!(
+            TorrentEngine::physical_bytes(std::iter::once(real.clone())) > 0,
+            "a file with data must never be mistaken for a placeholder"
+        );
+
+        // Mixed: one real file among placeholders is enough to keep the whole torrent.
+        assert!(
+            TorrentEngine::physical_bytes(vec![placeholder, real].into_iter()) > 0,
+            "a season pack with one downloaded episode is not empty"
+        );
+
+        // A path that does not exist contributes nothing and must not panic.
+        assert_eq!(
+            TorrentEngine::physical_bytes(std::iter::once(dir.join("absent.mkv"))),
+            0
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
