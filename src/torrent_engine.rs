@@ -44,7 +44,7 @@ pub const NO_PEERS_ERROR: &str = "no peers — this source appears dead";
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Magnet, ManagedTorrent,
-    PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStats,
+    PeerConnectionOptions, Session, SessionOptions, TorrentStats,
 };
 
 // `librqbit::torrent_state::FileStream` and `ManagedTorrentHandle` (the
@@ -127,7 +127,14 @@ impl TorrentEngine {
     /// `stream_port` is baked into the loopback URLs returned from `start`.
     /// Asynchronous because `Session::new` performs DHT bootstrap setup +
     /// listener binding.
-    pub async fn new(media_dir: &Path, state_dir: &Path, stream_port: u16) -> Result<Arc<Self>> {
+    pub async fn new(
+        media_dir: &Path,
+        // Kept in the signature: it is where the librqbit persistence store lives, and
+        // the parameter existing is the cheapest reminder that turning persistence back
+        // on is a two-line change once the socket-growth question is answered.
+        _state_dir: &Path,
+        stream_port: u16,
+    ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(media_dir).context("creating media_dir for torrent engine")?;
         // Apr 30, 2026 (L1 hardening — partial): librqbit 8.1.1 doesn't
         // expose a peer-count cap in SessionOptions / PeerConnectionOptions
@@ -221,10 +228,29 @@ impl TorrentEngine {
             //
             // The store lives in the STATE dir, never the media dir: the pruner owns the
             // media dir and would eventually delete its own bookkeeping.
-            persistence: Some(SessionPersistenceConfig::Json {
-                folder: Some(state_dir.join("librqbit")),
-            }),
-            fastresume: true,
+            // ⚠ PERSISTENCE IS OFF AGAIN (2026-09-09, within the hour). Turning it on
+            // did everything it promised — data survived a restart, no re-hash, instant
+            // resume — and then leaked file descriptors without bound. MEASURED on the
+            // live router: 614 peer sockets, then 2545, then 3872, growing about 900 a
+            // minute with every torrent PAUSED and Send-Q zero across all of them. So it
+            // was not seeding; it was accepting inbound peers for retained torrents and
+            // never letting go. That is the documented `EMFILE` class this project
+            // already suffered once, and the box is the house router.
+            //
+            // The cause is not yet established, which is exactly why this is off rather
+            // than tuned: a guess at a peer cap would be treating a symptom. What is
+            // known is that the growth appeared with retention and that deleting a
+            // torrent at teardown has always kept the count near zero.
+            //
+            // To re-enable, the question to answer FIRST is why a paused torrent
+            // continues to attract and hold inbound connections — the session listener
+            // accepts before it consults the torrent, so a paused torrent may be
+            // accepting sockets it will never use. Detail: CLAUDE.md Hard-Won.
+            //
+            // persistence: Some(SessionPersistenceConfig::Json {
+            //     folder: Some(state_dir.join("librqbit")),
+            // }),
+            // fastresume: true,
             ..Default::default()
         };
         let session = Session::new_with_opts(media_dir.to_path_buf(), opts)
@@ -640,26 +666,16 @@ impl TorrentEngine {
         let Some(librqbit_id) = unshift_librqbit_id(id) else {
             return Ok(());
         };
-        if delete_files {
-            return self
-                .session
-                .delete(TorrentIdOrHash::Id(librqbit_id), true)
-                .await
-                .context("session.delete failed");
-        }
-        match self.session.get(TorrentIdOrHash::Id(librqbit_id)) {
-            Some(handle) => {
-                if handle.is_paused() {
-                    return Ok(());
-                }
-                self.session
-                    .pause(&handle)
-                    .await
-                    .context("session.pause failed")
-            }
-            // Already gone. Nothing to keep and nothing to stop.
-            None => Ok(()),
-        }
+        // ⚠ Back to DELETE for both cases (2026-09-09, same hour it changed). Pausing
+        // kept the torrent in the session, and a retained torrent accumulated inbound
+        // peer sockets without bound — see the persistence note in `new`. The files are
+        // still kept when `delete_files` is false, so Local Bypass reuses them exactly
+        // as before; what is lost is only librqbit's piece record, which costs a
+        // re-hash on the next play of the same release.
+        self.session
+            .delete(TorrentIdOrHash::Id(librqbit_id), delete_files)
+            .await
+            .context("session.delete failed")
     }
 
     /// Number of torrents started across this engine's lifetime. Diagnostic
