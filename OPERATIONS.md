@@ -24,15 +24,21 @@ over verbatim to ffmpeg workers and any future torrent backend.
 - Emergency worker cleanup must terminate ffmpeg transcode workers (and any
   orphan pre-v3.3.0 webtorrent-cli processes) only; it must not delete
   media, mark files verified, or rewrite playback history. The librqbit
-  session is in-process, so its analog is `session.delete(TorrentIdOrHash::Id(...))`
-  — called via `TorrentEngine::stop(id, delete_files=false)` to drop the
-  torrent from the active set while leaving bytes on disk for Local Bypass.
+  session is in-process, so its analog is `TorrentEngine::stop(id, delete_files=false)`,
+  which since 2026-09-09 PAUSES the torrent rather than deleting it: the bytes
+  stay on disk for Local Bypass as before, and librqbit's record of which pieces
+  are already good stays too, so the next play of that release resumes instead of
+  re-reading the whole file. `delete_files = true` is still a real delete, and is
+  only for a failed start whose sparse placeholder is worth nothing.
 - User-facing playback cleanup may delete temporary transcode files, but that
   must stay explicit and separate from worker-only cleanup.
 - `.spela_done` completion markers require a known expected byte size and a
   physical byte check. Never derive completion from playback duration alone.
 - Every active torrent should be traceable to current playback state via
-  `app_state.current.pid`. spela's `pid != 0` invariant uniquely identifies a
+  `app_state.current.pid` — on the Chromecast path. The VLC and browser paths
+  deliberately create no `CurrentStream`, so their torrents are traced through
+  `vlc_activity` and the readiness / serve endpoints instead, and
+  `reap_previous_vlc_torrents` bounds them to the current stream. spela's `pid != 0` invariant uniquely identifies a
   librqbit-managed torrent — the `+1` shift over librqbit's `TorrentId`
   (which starts at 0) keeps `pid == 0` as the Local Bypass sentinel
   (`shift_librqbit_id` / `unshift_librqbit_id` in `torrent_engine.rs`).
@@ -62,7 +68,12 @@ over verbatim to ffmpeg workers and any future torrent backend.
 - Disk safety has two independent layers: spela's own media-dir cap
   (`MAX_MEDIA_MB`) protects spela from itself, and the host-filesystem
   free-space floor (`MIN_FS_FREE_MB`) protects the rest of the host from
-  spela. Both checks must pass before a new download starts. The host floor
+  spela. Both checks must pass before a new download starts, and since
+  2026-08-23 both run on EVERY path that can start one — `start_torrent_for_play`
+  is the shared choke point for `do_play` and both Open-in-VLC endpoints — plus a
+  background sweep as the path-agnostic net. Before that only `do_play` pruned, so
+  the default play target downloaded uncapped and grew the cache to roughly five
+  times its ceiling. The host floor
   is best-effort — `None` on `df` failure proceeds rather than blocks, so
   a parser regression can never make spela unusable on its own.
 - `stream_host` must be resolvable BY THE CHROMECAST, not just by spela.
@@ -138,6 +149,18 @@ over verbatim to ffmpeg workers and any future torrent backend.
    spela restarts, so there is no librqbit-side stale-state class to
    reconcile.
 
+   **SUPERSEDED 2026-09-09: torrents ARE persisted now**, along with the record
+   of which pieces are already good, so a stale-state class exists and is
+   reconciled at boot by `TorrentEngine::settle_restored_torrents`. It does two
+   things. It PAUSES everything, because nothing is playing at boot and the
+   normal end of a live stream is `TimeoutStopSec` then SIGKILL, which gives no
+   chance to pause — so a torrent that was downloading when spela was killed
+   would otherwise come back downloading, competing for the same disk the pruner
+   is trying to free. And it forgets records whose files hold zero physical
+   bytes, which is what the pruner's evictions leave behind. It **never deletes
+   files**: the pruner owns the media directory, and a boot-time reconciler has
+   no business removing media.
+
 6. Documentation and tests:
    Keep regression tests around worker-only cleanup and stale PID handling.
    Keep this operations note linked from `README.md`, `CLAUDE.md`, and
@@ -156,8 +179,9 @@ over verbatim to ffmpeg workers and any future torrent backend.
    the post-playback reaper is spawned. The paths in scope: the `Ok(Err(_))`
    and `Err(_)` branches around `cast::cast_url`, AND (since v3.4.0, May 13)
    the stream-start fail-fast trigger inside the HLS pre-buffer loop —
-   `should_fail_fast_stream_start(elapsed, segments)` returns true at 20 s
-   with 0 segments produced; the error is returned to `handle_play` which
+   `should_fail_fast_with_deadline(...)`, which supersedes the older
+   `should_fail_fast_stream_start` (now unreferenced) and scales the deadline
+   with the source size; the error is returned to `handle_play`, which
    auto-fallbacks to the next search result. Without these explicit cleanup
    paths an unreachable Chromecast or a panic inside the spawn_blocking task
    leaves the just-started torrent + ffmpeg as orphans until the next play /
@@ -207,6 +231,44 @@ over verbatim to ffmpeg workers and any future torrent backend.
    failure-to-recover-from-real-wedge (rare; user-pause is common).
    `should_attempt_recast` gains a fourth `paused_in_session: bool`
    parameter as a HARD GATE — see its doc for the full guard ordering.
+
+## Bandwidth and Sharing
+
+- **Upload is capped at 100 Mbit/s** (`MAX_UPLOAD_BYTES_PER_SEC` in
+  `torrent_engine.rs`). The host is also the house router in this deployment, so a
+  saturated uplink costs every device on the LAN its latency, not just the download.
+  librqbit's field is named `upload_bps` but the quota is spent in BYTES — the caller
+  passes a chunk length — so the constant is bits over eight.
+- **A finished download keeps seeding until it has been watched**, then stops; the
+  pruner ends the rest by taking the files. Sharing back is the default; sharing
+  forever, for things nobody will watch, is not. The join from a release name to a
+  ledger entry is deliberately fuzzy, because both ways of getting it wrong are cheap:
+  stop sharing a little early, or keep sharing under the ceiling until the file is
+  cleaned up.
+- **Inbound peer connections are capped at the ROUTER**, not in the application: 300
+  concurrent globally and 4 per peer, on the torrent port only, in the firewall rules.
+  Deliberately a layer below spela — one service must never be able to exhaust a
+  router's connection-tracking table whatever its bugs. A rate limit was considered and
+  rejected: it slows growth rather than bounding it.
+
+## Restarts
+
+`spela.socket` holds both listeners across a `spela.service` restart and spela inherits
+them through `listenfd`, so the port stays bound and clients reconnect rather than fail.
+A LIVE stream is an effectively infinite connection that cannot drain, so a mid-watch
+restart waits out `TimeoutStopSec` and is then SIGKILLed — expected, and the journal's
+`stop-sigterm timed out, Killing` line is normal. Reconnection, not draining, is what
+carries a stream across the gap.
+
+## Build Note
+
+spela builds against a **fork of librqbit**, pinned by commit in `Cargo.toml`, for one
+upstream fix: the incoming-connection listener matched only the success shape of a
+finished handshake check, and a failed check is the common case here — a peer asking for
+an infohash spela has already dropped. Each failure stopped the loop draining while new
+connections kept arriving, so accepted sockets accumulated unread until the process ran
+out of descriptors (measured: about 990 a minute, reaching 13,638). Upstream PR:
+ikatson/rqbit#663. Move back to the crates.io release once it merges.
 
 ## Systemd Drop-In
 

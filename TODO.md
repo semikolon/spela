@@ -1,11 +1,28 @@
 # Spela TODOs 🎬🍿
 
-### 🔓 OPEN — verify the VLC-quit teardown by actually quitting VLC
-Shipped + deployed 2026-09-05 (server, remote, bridge, all live on Darwin; bridge
-restarted on macmini AND merian). **Not once exercised by a real quit** — the
-endpoint answers and `/api/position` carries `gone`, but nobody has watched the
-Now-view clear and land back on the previous page. Needs a human at a machine
-with VLC: play something, quit VLC, watch the remote.
+### ✅ RESOLVED 2026-09-09 — the VLC-quit teardown is exercised by real quits
+It has fired **24 times in seven days**, most recently `VLC gone (title="Star City
+S01E06") — now-view flagged=true, 1 torrent(s) stopped`. Both halves work on real
+quits: the Now-view clears and the torrent is stopped, which nothing did before.
+
+### 🔓 OPEN — a 1.2 GB partial download vanished across a restart (2026-09-09)
+Star City S01E03 reached 1.2 GB and `open_pct 100`; after a `systemctl restart` it
+was absent from the persistence store, its directory was gone, and a re-tap started
+from 27 MB. **The pruner is exonerated by its own silence** (no eviction line) and
+the boot reconciler by its own log (it recorded forgetting only a different,
+genuinely empty torrent). Not ruled out: `race_torrent_sources` losing-candidate
+cleanup, and `stop_torrent(.., delete_files = true)` on a failed start. The
+reconciler was made incapable of deleting files the same evening — not because it
+was proven guilty, but because removing the capability is cheaper than defending it.
+**Next action**: instrument every remaining path that can delete a media file with a
+log line naming what it deletes and why, then wait for a recurrence. Cost of being
+wrong is bounded (a re-downloadable partial, never the curated library), which is
+why persistence stays on.
+
+### 🔓 OPEN — unpin the librqbit fork when the upstream PR merges
+`Cargo.toml` points at `semikolon/rqbit` by commit for one fix: the incoming-listener
+starvation (ikatson/rqbit#663). **Next action**: watch that PR; when it lands in a
+release, move back to crates.io and delete the fork note in `OPERATIONS.md`.
 
 ### ✅ RESOLVED 2026-09-05 — MERIAN no longer rebuilds a spela it never uses
 `install-extra-binaries` has no `watch`, so it provisioned the fleet's dev tools
@@ -321,7 +338,7 @@ hit-side + ENABLED at 12 GiB.
 
 ### v3.4.1 — Ranker root-fix: transitivity-safe `effective_res_tier` (SHIPPED May 13, 2026 PM) ✅
 
-Fixed a non-transitive `sort_by` comparator in v3.4.0's `rank_results_mut` exposed by the May 13 Night Manager S02E05 search — three results formed a 3-way cycle through asymmetric seed-viability gating at tier 3. New `effective_res_tier(&TorrentResult) -> u32` helper bakes seed-viability into the resolution bucket itself, so tier 3 does direct `cmp` on a single per-operand value and total ordering is structurally guaranteed. Generic lesson encoded in the helper's docstring: **pairwise threshold-fallthrough rules are a classic source of non-transitive comparators; bake all per-operand attributes into a SINGLE per-operand value, then compare values directly.** Tests: +2 (cycle replay across all 6 permutations of the fixture; bucket classification pin). 339 total tests green; commit `c3b41a0`. Full case study: [CLAUDE.md](CLAUDE.md) § "v3.4.1 — ranker root-fix".
+Fixed a non-transitive `sort_by` comparator in v3.4.0's `rank_results_mut` exposed by the May 13 Night Manager S02E05 search — three results formed a 3-way cycle through asymmetric seed-viability gating at tier 3. New `effective_res_tier(&TorrentResult) -> u32` helper baked seed-viability into the resolution bucket itself, so tier 3 does direct `cmp` on a single per-operand value and total ordering is structurally guaranteed. **The seed term was removed 2026-09-06** — it predicted delivery in a system that measures it — but the shape it was introduced for is unchanged and is the durable lesson: the tier is still a SINGLE per-operand value, and the comparator is still a strict total order, now asserted exhaustively rather than argued. Generic lesson encoded in the helper's docstring: **pairwise threshold-fallthrough rules are a classic source of non-transitive comparators; bake all per-operand attributes into a SINGLE per-operand value, then compare values directly.** Tests: +2 (cycle replay across all 6 permutations of the fixture; bucket classification pin). 339 total tests green; commit `c3b41a0`. Full case study: [CLAUDE.md](CLAUDE.md) § "v3.4.1 — ranker root-fix".
 
 ### v3.4.0 — Bad-source resilience trio (SHIPPED May 13, 2026) ✅
 
