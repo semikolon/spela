@@ -370,42 +370,45 @@ impl TorrentEngine {
         }
     }
 
-    /// Pause every torrent that has finished downloading.
+    /// Finished torrents that are still uploading, with the name of their content.
     ///
-    /// spela has never been a seeder, and it must not become one by accident. Before
-    /// persistence it could not: teardown deleted the torrent outright, so a completed
-    /// download simply ceased to exist. Keeping torrents changed that — a finished one
-    /// stays in the session and uploads indefinitely, which is somebody's home
-    /// connection being spent on a decision nobody made. Observed within minutes of the
-    /// persistence change going live: 614 established peer connections on the torrent
-    /// port for an episode that had finished downloading and that nobody was watching.
+    /// The caller decides which to stop, because that decision needs the watch ledger
+    /// and the engine has no business knowing about it. Fredrik's rule (2026-09-09): a
+    /// finished download KEEPS SEEDING until he has watched it, or until the pruner
+    /// takes the files. Sharing back is the decent default; what was never decided was
+    /// seeding things nobody is going to watch, forever.
     ///
-    /// Pausing a finished torrent costs nothing on the read side, because a fully
-    /// downloaded file is served STATICALLY rather than through librqbit (see
-    /// `handle_vlc_stream`), so playback never needs it live.
-    ///
-    /// Why this runs on a timer rather than at completion: the state is reached
-    /// asynchronously inside librqbit, and the boot-time settle races that same
-    /// initialization and loses. A periodic sweep cannot lose a race it does not enter.
-    pub async fn pause_finished(&self) {
-        let finished: Vec<usize> = self.session.with_torrents(|it| {
-            it.filter_map(|(id, t)| (!t.is_paused() && t.stats().finished).then_some(id))
-                .collect()
-        });
-        for id in finished {
-            let Some(handle) = self.session.get(TorrentIdOrHash::Id(id)) else {
-                continue;
-            };
-            match self.session.pause(&handle).await {
-                Ok(()) => tracing::info!(
-                    "librqbit: paused torrent {} — finished downloading, not seeding it",
-                    id
-                ),
-                Err(e) => {
-                    tracing::debug!("librqbit: could not pause finished torrent {}: {}", id, e)
+    /// Why a caller-driven sweep rather than a hook at completion: the finished state is
+    /// reached asynchronously inside librqbit, so a check at completion, or at boot,
+    /// races that and loses. A periodic sweep cannot lose a race it does not enter.
+    pub fn finished_and_seeding(&self) -> Vec<(u32, String)> {
+        self.session.with_torrents(|it| {
+            it.filter_map(|(id, t)| {
+                if t.is_paused() || !t.stats().finished {
+                    return None;
                 }
-            }
+                let name = t.name().unwrap_or_default();
+                shift_librqbit_id(id).ok().map(|sid| (sid, name))
+            })
+            .collect()
+        })
+    }
+
+    /// Stop a torrent uploading, keeping it and its files exactly where they are.
+    pub async fn pause_seeding(&self, id: u32) -> Result<()> {
+        let Some(librqbit_id) = unshift_librqbit_id(id) else {
+            return Ok(());
+        };
+        let Some(handle) = self.session.get(TorrentIdOrHash::Id(librqbit_id)) else {
+            return Ok(());
+        };
+        if handle.is_paused() {
+            return Ok(());
         }
+        self.session
+            .pause(&handle)
+            .await
+            .context("session.pause failed")
     }
 
     /// Which torrent owns this file on disk, and which file it is inside it.
@@ -491,6 +494,10 @@ impl TorrentEngine {
         let hash = m.as_id20()?;
         self.session.get(TorrentIdOrHash::Hash(hash))
     }
+
+    /// Upload ceiling in BYTES per second — 100 Mbit/s, Fredrik's number (2026-09-09).
+    /// Darwin is the house router, so its uplink is shared with every device here.
+    const MAX_UPLOAD_BYTES_PER_SEC: u32 = 100_000_000 / 8;
 
     /// Start a torrent from a magnet URI with optional file selection (BEP-53).
     /// Returns immediately after librqbit accepts the magnet — the actual

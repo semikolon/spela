@@ -555,21 +555,29 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         });
     }
 
-    // NEVER SEED (2026-09-09). Its own timer rather than a ride on the 5-minute disk
-    // sweep, because five minutes of unasked-for uploading is not a guarantee, and this
-    // check is an in-memory scan costing nothing. See `TorrentEngine::pause_finished`
-    // for why it is a timer at all: the finished state arrives asynchronously inside
-    // librqbit, so a check at completion or at boot races it and loses.
+    // SEED UNTIL WATCHED (2026-09-09, Fredrik's rule). A finished download keeps
+    // sharing — that is the decent default and it is what keeps thin swarms alive for
+    // everyone else. What was never decided was seeding, forever, things nobody is
+    // going to watch. So a finished torrent stops when its episode reaches the watch
+    // ledger, and the pruner ends the rest by taking the files.
+    //
+    // Bounded regardless by the 100 Mbit/s upload ceiling in the engine, so even a
+    // mis-derived title costs bandwidth we have rather than the whole uplink.
+    //
+    // Its own timer rather than a ride on the 5-minute disk sweep: the check is an
+    // in-memory scan plus one ledger read. A timer at all because the finished state
+    // arrives asynchronously inside librqbit, so a hook at completion races it and
+    // loses.
     //
     // Lifetime: permanent by design, like the disk sweep above — it ends with the
     // process, and its purpose is stated here.
     {
         let seed_guard_state = state.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                seed_guard_state.torrent_engine.pause_finished().await;
+                stop_seeding_what_has_been_watched(&seed_guard_state).await;
             }
         });
     }
@@ -9216,6 +9224,86 @@ fn begin_or_poll_start(state: &SharedState, magnet: &str, file_index: Option<u32
     StartState::InFlight
 }
 
+/// Stop seeding the episodes Fredrik has already watched.
+///
+/// Sharing back is the decent default and it is what keeps thin swarms alive, so a
+/// finished download goes on seeding. It stops at the point the sharing stops being
+/// something he would choose: once he has watched it. Everything else ends when the
+/// pruner takes the files.
+///
+/// The join is the torrent's own name through the same cleaner the search box uses, then
+/// the watch ledger. Both directions of a mis-match are harmless, which is why a fuzzy
+/// join is acceptable here: guess "watched" wrongly and we merely stop sharing early;
+/// guess "unwatched" wrongly and it keeps sharing under a 100 Mbit/s ceiling until the
+/// pruner removes it.
+/// A release name as the watch ledger would have recorded it.
+///
+/// The scene name carries the resolution, source, codec and group; the ledger carries
+/// "Show SxxExx". `clean_title_for_tmdb` truncates at the first scene stop-token, which
+/// is what strips all of that, and `parse_episode_markers` supplies the episode.
+fn ledger_title_for_release(release_name: &str) -> String {
+    let (_, season, episode) = crate::search::parse_episode_markers(release_name);
+    if let (Some(s), Some(e)) = (season, episode) {
+        // Cut at the MARKER, not at the scene tokens. `parse_episode_markers` removes
+        // only the `SxxExx` and `clean_title_for_tmdb` truncates at the first scene
+        // token, so composing them leaves whatever sits between the two — the episode
+        // NAME. `The.Diplomat.S03E07.PNG.2160p…` came out as "The Diplomat PNG", which
+        // matches nothing in a ledger holding "The Diplomat S03E07". This is the same
+        // trap recorded for next-episode enqueue, arrived at from the other direction.
+        let upper = release_name.to_ascii_uppercase();
+        let marker = format!("S{s:02}E{e:02}");
+        if let Some(at) = upper.find(&marker) {
+            let show = crate::search::clean_title_for_tmdb(&release_name[..at]);
+            // A trailing year goes too. Scene folder names carry it ("Star City (2026)
+            // - S01E08 - …") and the ledger never does, because it records what the
+            // search box resolved. Safe to strip HERE and nowhere else: this branch runs
+            // only when an episode marker was found, so the subject is a TV episode,
+            // where a year is decoration. For a film it is identity, and the fallback
+            // below leaves it alone.
+            let show = show.trim();
+            let show = show
+                .strip_suffix(')')
+                .and_then(|t| t.rfind('(').map(|i| &t[..i]))
+                .filter(|head| {
+                    show[head.len() + 1..show.len() - 1]
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                })
+                .unwrap_or(show)
+                .trim_end_matches(['-', ' '])
+                .trim();
+            if !show.is_empty() {
+                return format!("{show} S{s:02}E{e:02}");
+            }
+        }
+    }
+    crate::search::clean_title_for_tmdb(release_name)
+        .trim()
+        .to_string()
+}
+
+async fn stop_seeding_what_has_been_watched(state: &SharedState) {
+    let seeding = state.torrent_engine.finished_and_seeding();
+    if seeding.is_empty() {
+        return;
+    }
+    let app = AppState::load(&state.state_dir);
+    for (id, name) in seeding {
+        let title = ledger_title_for_release(&name);
+        if title.is_empty() || !app.has_seen(None, &title) {
+            continue;
+        }
+        match state.torrent_engine.pause_seeding(id).await {
+            Ok(()) => tracing::info!(
+                "librqbit: stopped seeding torrent {} ({}) — already watched",
+                id,
+                title
+            ),
+            Err(e) => tracing::debug!("librqbit: could not stop seeding torrent {}: {}", id, e),
+        }
+    }
+}
+
 /// A partial file for this result that ANOTHER torrent is already fetching.
 ///
 /// Returns the torrent to stream from and the file's index inside it, having
@@ -13859,8 +13947,8 @@ mod vlc_readiness_completeness_tests {
 #[cfg(test)]
 mod vlc_stall_gate_tests {
     use super::{
-        decide_start, race_switch_is_warranted, vlc_source_is_stalled, vlc_stall_gate_secs,
-        StartState, START_FAILURE_MEMORY,
+        decide_start, ledger_title_for_release, race_switch_is_warranted, vlc_source_is_stalled,
+        vlc_stall_gate_secs, StartState, START_FAILURE_MEMORY,
     };
     use std::time::Duration;
 
@@ -13900,6 +13988,44 @@ mod vlc_stall_gate_tests {
         assert_eq!(vlc_stall_gate_secs(1_000_000_000), 12);
         assert!(!vlc_source_is_stalled(0, 0, 0, 20, 9_000_000_000, false));
         assert!(vlc_source_is_stalled(0, 0, 0, 30, 9_000_000_000, false));
+    }
+
+    #[test]
+    fn a_release_name_resolves_to_the_title_the_ledger_holds() {
+        // Real names from this project's own journal and fixtures. The ledger records
+        // "Show SxxExx"; everything after the episode marker is scene noise.
+        for (release, want) in [
+            (
+                "The.Diplomat.S03E07.PNG.2160p.10bit.NF.WEB-DL.DDP5.1.HEVC-Vyndros.mkv",
+                "The Diplomat S03E07",
+            ),
+            (
+                "Star.City.S01E08.1080p.HEVC.x265-MeGusta[EZTVx.to].mkv",
+                "Star City S01E08",
+            ),
+            (
+                "The.Diplomat.US.S03E07.1080p.WEB.h264-GRACE[EZTVx.to].mkv",
+                "The Diplomat US S03E07",
+            ),
+            (
+                "Star City (2026) - S01E08 - The Wolves (1080p ATV WEB-DL x265 Silence)",
+                "Star City S01E08",
+            ),
+        ] {
+            assert_eq!(ledger_title_for_release(release), want, "from {release:?}");
+        }
+    }
+
+    #[test]
+    fn a_release_with_no_episode_keeps_its_bare_title() {
+        // A film, and a season pack: neither yields an episode, so neither can be
+        // matched against a per-episode ledger row and both keep seeding until the
+        // pruner takes them. That is the safe direction — see the doc comment.
+        assert_eq!(
+            ledger_title_for_release("From.Russia.with.Love.1963.UHD.BluRay.2160p.mkv"),
+            "From Russia with Love"
+        );
+        assert!(!ledger_title_for_release("Star.City.S01.1080p.ATVP.WEB-DL.H.264").contains("E0"));
     }
 
     #[test]
