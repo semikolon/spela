@@ -122,6 +122,16 @@ pub enum TorrentState {
     Error,
 }
 
+/// Upload ceiling in BYTES per second — 100 Mbit/s, Fredrik's number (2026-09-09).
+///
+/// Darwin is the house ROUTER, so its uplink is shared with every device here and
+/// saturating it costs everyone their latency, not just this download.
+///
+/// ⚠ librqbit's field is named `upload_bps` but the quota is spent in BYTES: the caller
+/// is `prepare_for_upload(NonZeroU32::new(ci.size))` and `ci.size` is a chunk length in
+/// bytes. Hence bits over eight.
+const MAX_UPLOAD_BYTES_PER_SEC: u32 = 100_000_000 / 8;
+
 impl TorrentEngine {
     /// Construct an engine with a freshly-created `Session` rooted at `media_dir`.
     /// `stream_port` is baked into the loopback URLs returned from `start`.
@@ -199,6 +209,10 @@ impl TorrentEngine {
                 .iter()
                 .filter_map(|s| s.parse().ok())
                 .collect(),
+            ratelimits: librqbit::limits::LimitsConfig {
+                upload_bps: std::num::NonZeroU32::new(MAX_UPLOAD_BYTES_PER_SEC),
+                download_bps: None,
+            },
             listen_port_range: Some(torrent_port..torrent_port + 1),
             enable_upnp_port_forwarding: false,
             blocklist_url,
@@ -494,10 +508,6 @@ impl TorrentEngine {
         let hash = m.as_id20()?;
         self.session.get(TorrentIdOrHash::Hash(hash))
     }
-
-    /// Upload ceiling in BYTES per second — 100 Mbit/s, Fredrik's number (2026-09-09).
-    /// Darwin is the house router, so its uplink is shared with every device here.
-    const MAX_UPLOAD_BYTES_PER_SEC: u32 = 100_000_000 / 8;
 
     /// Start a torrent from a magnet URI with optional file selection (BEP-53).
     /// Returns immediately after librqbit accepts the magnet — the actual
@@ -993,6 +1003,20 @@ mod settle_tests {
             0
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The upload ceiling is a NUMBER in a config struct, which is exactly the kind of
+    /// thing that can be defined, documented, and never actually wired — it happened
+    /// once already in this file, where the constant existed and nothing referenced it,
+    /// so the cap was reported as live while librqbit ran unlimited.
+    #[test]
+    fn the_upload_ceiling_is_a_hundred_megabit_expressed_in_bytes() {
+        assert_eq!(super::MAX_UPLOAD_BYTES_PER_SEC, 12_500_000);
+        assert_eq!(
+            super::MAX_UPLOAD_BYTES_PER_SEC as u64 * 8,
+            100_000_000,
+            "librqbit spends this quota in BYTES despite the `_bps` name"
+        );
     }
 }
 
