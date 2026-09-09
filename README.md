@@ -48,7 +48,12 @@ assistant should be able to play something when you ask nicely.
   as default.
 - **Local files first.** If a copy is already on disk it is served straight from there,
   fully seekable, with no torrent involved — including files a separate library daemon
-  serves from an external drive.
+  serves from an external drive, and a season pack opens an episode chooser rather than
+  guessing.
+- **Repeat plays start instantly.** A completed Chromecast transcode is kept in a
+  size-capped cache, so watching the same thing again skips the transcode entirely.
+- **The next episode is lined up inside the running VLC** as you approach the end, so it
+  continues with no relaunch and no gap.
 
 **Keeping track**
 
@@ -58,6 +63,14 @@ assistant should be able to play something when you ask nicely.
   loved / not-for-me ratings and a Rewatch shelf that reads it from the other side.
 - **Air dates from TVmaze**, falling back to TMDB, because TMDB lags the real platform
   drop by about a day.
+- **Enough to decide with**: a Rotten Tomatoes score, a click-to-load trailer, and for a
+  series a status badge (returning, undecided, ended, cancelled) merged from two sources
+  that disagree usefully — one of them has a word for "aired but undecided" and the other
+  distinguishes cancelled from finished.
+- **A dated intel note** under that badge, written by an assistant through `POST
+  /show-notes` rather than fetched: reception, renewal talk, and why a thing was
+  cancelled. It is pull rather than push, so a note is only as current as its last
+  refresh, and the interface says so once it goes stale.
 
 **Behaving itself**
 
@@ -72,6 +85,12 @@ assistant should be able to play something when you ask nicely.
 - **It gives up on dead sources instead of spinning.** A source delivering nothing after
   a grace period is raced against alternatives of the same or better picture quality, and
   the remote rotates past dead ones out loud rather than silently.
+- **Thin swarms get help**: twenty public trackers injected session-wide, an inbound peer
+  listener so other peers can reach you, the head and tail of a file fetched first so a
+  player's container probe does not block, and a blocklist that bans the decoy ranges
+  which fill connection slots without ever sending bytes.
+- **Redeploys do not drop the port.** The listening sockets are held by systemd across a
+  restart, so a browser or VLC reconnects rather than failing.
 
 ## How sources are ranked
 
@@ -176,6 +195,8 @@ server = "media.local:7890"
 default_device = "Living Room TV"
 subtitles = "en"
 tmdb_api_key = "your-key-here"
+mdblist_api_key = "optional-key"   # Rotten Tomatoes scores; omit and they are simply absent
+hls_cache_cap_mb = 12288           # completed Chromecast transcodes, least-recently-used
 stream_host = "media.local"      # what a Chromecast can fetch from; never localhost
 media_dir = "~/media"
 port = 7890
@@ -221,13 +242,14 @@ The CLI and the remote are both clients of the same HTTP API. Grouped, not exhau
 
 | Group | Endpoints |
 |---|---|
-| Playback | `/search` `/play` `/stop` `/pause` `/resume` `/seek` `/seek-retranscode` `/volume` `/next` `/prev` `/status` `/progress` |
+| Playback | `/search` `/play` `/stop` `/pause` `/resume` `/seek` `/seek-retranscode` `/volume` `/next` `/prev` `/status` `/progress` `/position` |
 | Web remote | `/remote` `/home` `/recent` `/title-meta` `/poster/{size}/{file}` |
 | VLC | `/vlc/{id}/ready` `/vlc/{id}/open.m3u` `/vlc/{id}/stream` `/vlc/{id}/sub.srt` `/vlc/control` `/vlc/pending` `/vlc/gone` `/vlc/enqueue-next` |
-| Streaming | `/hls/master.m3u8` `/hls/playlist.m3u8` `/hls/{segment}` `/hls/init.mp4` `/hls_cache/{key}/{file}` |
+| Streaming | `/hls/master.m3u8` `/hls/playlist.m3u8` `/hls/{segment}` `/hls/init.mp4` `/hls_cache/{key}/{file}` `/stream/transcode` `/torrent/{id}/stream/{file_idx}` (loopback only) |
 | Library | `/library` `/library/files` `/library/vlc.m3u` |
-| Watch tracking | `/watched` `/watched-add` `/watched-remove` `/watched-rate` `/following` `/following/add` `/following/mark` `/following/remove` `/continue/remove` `/pending-watched` |
-| Chromecast | `/targets` `/cast-info` `/api/cast-config` `/api/position` `/api/retry` `/api/seek-restart` |
+| Watch tracking | `/watched` `/watched-add` `/watched-remove` `/watched-rate` `/watched-backfill-ids` `/following` `/following/add` `/following/mark` `/following/remove` `/following/seen-seasons` `/continue/remove` `/pending-watched` `/pending-watched/resolve` |
+| Queue and picks | `/watchlist` `/recommendations` `/show-notes` `/queue` |
+| Chromecast | `/targets` `/cast-info` `/api/cast-config` `/api/position` `/api/position/reset` `/api/retry` `/api/seek-restart` `/cast-receiver.html` |
 | Other | `/history` `/config` |
 
 ## Tests
