@@ -34,7 +34,16 @@ listenfd = "1"
 # (rqbit issue #578) and edition-2024 Rust requirement. The streaming API
 # (`ManagedTorrent::stream` -> `FileStream: AsyncRead + AsyncSeek`) is stable
 # across 8.1 -> 9.0-beta.2, so the eventual upgrade is non-breaking.
-librqbit = { version = "8.1", default-features = false, features = ["rust-tls"] }
+# 2026-09-09: our own fork, pinned to a commit, for ONE upstream fix — the incoming
+# listener starved itself. `task_tcp_listener` matched `Some(Ok(..)) = futs.next()`, a
+# refutable pattern, and a failed handshake check is the COMMON case here (a peer asking
+# for an infohash we deleted at teardown). Every failure disabled the drain branch for
+# the rest of that select! call while accept() kept adding, so accepted sockets piled up
+# unread until the process ran out of descriptors — measured ~990/min, reaching 13,600.
+# Fix matches on `Some(res)` with an explicit Err arm, the shape the persistence loop in
+# the same file already uses, and selects `biased` so checks in hand finish first.
+# Branch: semikolon/rqbit fix-incoming-listener-starvation. PR upstream pending.
+librqbit = { git = "https://github.com/semikolon/rqbit", rev = "1a354e6c7e51f097aafe8c73a9b2bb4da16010c3", default-features = false, features = ["rust-tls"] }
 
 # Apr 30, 2026: rustls 0.23+ requires an explicit `CryptoProvider::install_default()`
 # call before any TLS use when multiple provider crates can coexist transitively.
