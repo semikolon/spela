@@ -338,6 +338,44 @@ impl TorrentEngine {
         }
     }
 
+    /// Pause every torrent that has finished downloading.
+    ///
+    /// spela has never been a seeder, and it must not become one by accident. Before
+    /// persistence it could not: teardown deleted the torrent outright, so a completed
+    /// download simply ceased to exist. Keeping torrents changed that — a finished one
+    /// stays in the session and uploads indefinitely, which is somebody's home
+    /// connection being spent on a decision nobody made. Observed within minutes of the
+    /// persistence change going live: 614 established peer connections on the torrent
+    /// port for an episode that had finished downloading and that nobody was watching.
+    ///
+    /// Pausing a finished torrent costs nothing on the read side, because a fully
+    /// downloaded file is served STATICALLY rather than through librqbit (see
+    /// `handle_vlc_stream`), so playback never needs it live.
+    ///
+    /// Why this runs on a timer rather than at completion: the state is reached
+    /// asynchronously inside librqbit, and the boot-time settle races that same
+    /// initialization and loses. A periodic sweep cannot lose a race it does not enter.
+    pub async fn pause_finished(&self) {
+        let finished: Vec<usize> = self.session.with_torrents(|it| {
+            it.filter_map(|(id, t)| (!t.is_paused() && t.stats().finished).then_some(id))
+                .collect()
+        });
+        for id in finished {
+            let Some(handle) = self.session.get(TorrentIdOrHash::Id(id)) else {
+                continue;
+            };
+            match self.session.pause(&handle).await {
+                Ok(()) => tracing::info!(
+                    "librqbit: paused torrent {} — finished downloading, not seeding it",
+                    id
+                ),
+                Err(e) => {
+                    tracing::debug!("librqbit: could not pause finished torrent {}: {}", id, e)
+                }
+            }
+        }
+    }
+
     /// Which torrent owns this file on disk, and which file it is inside it.
     ///
     /// The season-pack case, 2026-09-06: an episode showed "57% downloaded" and would

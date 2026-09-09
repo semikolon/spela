@@ -555,6 +555,25 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         });
     }
 
+    // NEVER SEED (2026-09-09). Its own timer rather than a ride on the 5-minute disk
+    // sweep, because five minutes of unasked-for uploading is not a guarantee, and this
+    // check is an in-memory scan costing nothing. See `TorrentEngine::pause_finished`
+    // for why it is a timer at all: the finished state arrives asynchronously inside
+    // librqbit, so a check at completion or at boot races it and loses.
+    //
+    // Lifetime: permanent by design, like the disk sweep above — it ends with the
+    // process, and its purpose is stated here.
+    {
+        let seed_guard_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                seed_guard_state.torrent_engine.pause_finished().await;
+            }
+        });
+    }
+
     // 2026-07-13 (slice 5): background watch tracker — polls house Chromecasts,
     // stages near-complete non-spela sessions for Fredrik to confirm on load.
     spawn_chromecast_tracker(state.clone());
