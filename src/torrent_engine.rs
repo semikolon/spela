@@ -273,7 +273,7 @@ impl TorrentEngine {
     /// file is the only condition that deletes, so there is nothing to lose when it does.
     async fn settle_restored_torrents(&self) {
         let root = self.media_dir.clone();
-        let (empty, live): (Vec<usize>, Vec<usize>) = self.session.with_torrents(|it| {
+        let (empty, live): (Vec<(usize, u64)>, Vec<usize>) = self.session.with_torrents(|it| {
             let mut empty = Vec::new();
             let mut live = Vec::new();
             for (id, t) in it {
@@ -288,18 +288,23 @@ impl TorrentEngine {
                         .map(|fi| root.join(&fi.relative_filename)),
                 );
                 if bytes == 0 {
-                    empty.push(id);
+                    empty.push((id, bytes));
                 } else if !t.is_paused() {
                     live.push(id);
                 }
             }
             (empty, live)
         });
-        for id in empty {
+        for (id, bytes) in empty {
+            // The measurement goes in the log with the verdict. This deletes files, and
+            // a deletion justified by a number nobody can see afterwards is a deletion
+            // nobody can audit — librqbit's own `Initial check results: have N` line
+            // sits a few lines above in the same journal, so the two can be compared.
             match self.session.delete(TorrentIdOrHash::Id(id), true).await {
                 Ok(()) => tracing::info!(
-                    "librqbit: forgot torrent {} — it holds no bytes at all (pruned)",
-                    id
+                    "librqbit: forgot torrent {} — {} physical bytes on disk (pruned away)",
+                    id,
+                    bytes
                 ),
                 Err(e) => tracing::warn!("librqbit: could not forget torrent {}: {}", id, e),
             }
