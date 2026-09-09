@@ -273,13 +273,42 @@ impl TorrentEngine {
     /// file is the only condition that deletes, so there is nothing to lose when it does.
     async fn settle_restored_torrents(&self) {
         let root = self.media_dir.clone();
-        let (empty, live): (Vec<(usize, u64)>, Vec<usize>) = self.session.with_torrents(|it| {
+        // PAUSE FIRST, and pause everything — including torrents whose metadata has not
+        // resolved yet. Pausing needs no knowledge of the files; measuring does. Gating
+        // the pause on metadata therefore left a race in which a torrent restored
+        // mid-resolution kept downloading, which is exactly what happened on the first
+        // live restart after this shipped: the pause line never appeared. Order matters
+        // more than tidiness here, because a pause is free and reversible and the whole
+        // point is that nothing fetches anything until a play asks for it.
+        let all: Vec<usize> = self
+            .session
+            .with_torrents(|it| it.map(|(id, _)| id).collect());
+        for id in all {
+            let Some(handle) = self.session.get(TorrentIdOrHash::Id(id)) else {
+                continue;
+            };
+            if handle.is_paused() {
+                continue;
+            }
+            match self.session.pause(&handle).await {
+                Ok(()) => tracing::info!(
+                    "librqbit: paused restored torrent {} — nothing is playing yet",
+                    id
+                ),
+                // An initializing torrent can refuse, and the next boot catches it.
+                // Never fatal: an engine that will not start is far worse than a torrent
+                // that downloads when it should not.
+                Err(e) => {
+                    tracing::debug!("librqbit: could not pause restored torrent {}: {}", id, e)
+                }
+            }
+        }
+        let empty: Vec<(usize, u64)> = self.session.with_torrents(|it| {
             let mut empty = Vec::new();
-            let mut live = Vec::new();
             for (id, t) in it {
                 let Some(meta) = t.metadata.load_full() else {
-                    // Metadata unresolved: no evidence either way, so leave it entirely
-                    // alone rather than guess.
+                    // Metadata unresolved: no evidence about what is on disk, so leave
+                    // it. It is paused above, which is the half that matters.
                     continue;
                 };
                 let bytes = Self::physical_bytes(
@@ -289,11 +318,9 @@ impl TorrentEngine {
                 );
                 if bytes == 0 {
                     empty.push((id, bytes));
-                } else if !t.is_paused() {
-                    live.push(id);
                 }
             }
-            (empty, live)
+            empty
         });
         for (id, bytes) in empty {
             // The measurement goes in the log with the verdict. This deletes files, and
@@ -307,20 +334,6 @@ impl TorrentEngine {
                     bytes
                 ),
                 Err(e) => tracing::warn!("librqbit: could not forget torrent {}: {}", id, e),
-            }
-        }
-        for id in live {
-            let Some(handle) = self.session.get(TorrentIdOrHash::Id(id)) else {
-                continue;
-            };
-            match self.session.pause(&handle).await {
-                Ok(()) => tracing::info!(
-                    "librqbit: paused restored torrent {} — nothing is playing yet",
-                    id
-                ),
-                Err(e) => {
-                    tracing::warn!("librqbit: could not pause restored torrent {}: {}", id, e)
-                }
             }
         }
     }
