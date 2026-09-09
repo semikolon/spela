@@ -43,8 +43,8 @@ pub const NO_PEERS_ERROR: &str = "no peers — this source appears dead";
 
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, PeerConnectionOptions,
-    Session, SessionOptions, TorrentStats,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Magnet, ManagedTorrent,
+    PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStats,
 };
 
 // `librqbit::torrent_state::FileStream` and `ManagedTorrentHandle` (the
@@ -72,6 +72,10 @@ pub struct TorrentEngine {
     /// Magnets proven to have no reachable peers, with when that was proven. Bounds the
     /// cost of a dead source to ONE timeout rather than one per readiness poll.
     dead_magnets: Mutex<HashMap<String, Instant>>,
+    /// Where librqbit writes files. Held because `ManagedTorrentShared::options` is
+    /// private in 8.1.x, so a torrent cannot be asked where its own files live —
+    /// `file_relative_path` returns a RELATIVE path for exactly this reason.
+    media_dir: PathBuf,
 }
 
 /// Information returned to the caller of `start()`. Replaces the
@@ -123,7 +127,7 @@ impl TorrentEngine {
     /// `stream_port` is baked into the loopback URLs returned from `start`.
     /// Asynchronous because `Session::new` performs DHT bootstrap setup +
     /// listener binding.
-    pub async fn new(media_dir: &Path, stream_port: u16) -> Result<Arc<Self>> {
+    pub async fn new(media_dir: &Path, state_dir: &Path, stream_port: u16) -> Result<Arc<Self>> {
         std::fs::create_dir_all(media_dir).context("creating media_dir for torrent engine")?;
         // Apr 30, 2026 (L1 hardening — partial): librqbit 8.1.1 doesn't
         // expose a peer-count cap in SessionOptions / PeerConnectionOptions
@@ -198,17 +202,162 @@ impl TorrentEngine {
             listen_port_range: Some(torrent_port..torrent_port + 1),
             enable_upnp_port_forwarding: false,
             blocklist_url,
+            // 2026-09-09: REMEMBER torrents across a restart, and remember which
+            // pieces are already good.
+            //
+            // Without this every play began from nothing: a magnet fetch against the
+            // swarm, then `Doing initial checksum validation` re-reading whatever was
+            // already on disk (measured 22s for 1.8 GiB of a season pack on the HDD).
+            // We threw the knowledge away at teardown and then paid to rebuild it.
+            //
+            // The two settings are bundled ONE way only, and the direction matters:
+            // `persistence_factory` hands back `NonPersistentBitVFactory` whenever
+            // `persistence` is None, so fastresume REQUIRES persistence (the piece
+            // record lives in the same store). The half that sounds alarming —
+            // "everything resumes downloading on restart" — is not bundled at all: the
+            // saved record carries `is_paused` and `into_add_torrent` restores it, so a
+            // torrent paused at teardown comes back PAUSED. Known, indexed, silent, and
+            // no argument with the 100 GB pruner.
+            //
+            // The store lives in the STATE dir, never the media dir: the pruner owns the
+            // media dir and would eventually delete its own bookkeeping.
+            persistence: Some(SessionPersistenceConfig::Json {
+                folder: Some(state_dir.join("librqbit")),
+            }),
+            fastresume: true,
             ..Default::default()
         };
         let session = Session::new_with_opts(media_dir.to_path_buf(), opts)
             .await
             .context("librqbit::Session::new_with_opts failed during engine bootstrap")?;
-        Ok(Arc::new(Self {
+        let engine = Arc::new(Self {
             session,
             stream_port,
             started_count: AtomicU32::new(0),
             dead_magnets: Mutex::new(HashMap::new()),
-        }))
+            media_dir: media_dir.to_path_buf(),
+        });
+        engine.forget_orphans().await;
+        Ok(engine)
+    }
+
+    /// Drop remembered torrents whose files the pruner has since deleted.
+    ///
+    /// The pairing the persistence store needs: something now CREATES durable
+    /// records, so something must remove them, or the store grows without bound and
+    /// every restart pays a validation pass for torrents whose bytes are long gone.
+    /// The pruner deletes files directly and knows nothing about librqbit, so this
+    /// reconciles at the one moment the whole set is in hand.
+    ///
+    /// Deletes the RECORD only, never files — by definition there are none left.
+    async fn forget_orphans(&self) {
+        let root = self.media_dir.clone();
+        let stale: Vec<usize> = self.session.with_torrents(|it| {
+            it.filter_map(|(id, t)| {
+                let meta = t.metadata.load_full()?;
+                let any_present = meta
+                    .file_infos
+                    .iter()
+                    .any(|fi| root.join(&fi.relative_filename).exists());
+                // Metadata not yet resolved returns above: no evidence either way,
+                // so the record stays. Only a torrent whose files are ALL gone is
+                // provably an orphan.
+                (!any_present).then_some(id)
+            })
+            .collect()
+        });
+        for id in stale {
+            match self.session.delete(TorrentIdOrHash::Id(id), false).await {
+                Ok(()) => {
+                    tracing::info!("librqbit: forgot torrent {} — its files are gone", id)
+                }
+                Err(e) => tracing::warn!("librqbit: could not forget torrent {}: {}", id, e),
+            }
+        }
+    }
+
+    /// Which torrent owns this file on disk, and which file it is inside it.
+    ///
+    /// The season-pack case, 2026-09-06: an episode showed "57% downloaded" and would
+    /// not play. Both halves of that were honest. The bytes really were on disk and
+    /// really did belong to that release — but they belonged to a DIFFERENT torrent,
+    /// the season pack, while the row clicked was the standalone whose swarm has no
+    /// peers at all. Local Bypass found the file and refused it for being full of
+    /// holes, which was correct, and then nobody asked the next question: is something
+    /// already fetching this? It was.
+    ///
+    /// Answering it turns that click into an instant play with the holes filling as it
+    /// goes, which is what streaming from a partial torrent does anyway.
+    pub fn owner_of(&self, path: &Path) -> Option<(u32, usize)> {
+        let target = std::fs::canonicalize(path).ok()?;
+        let root = self.media_dir.clone();
+        self.session.with_torrents(|it| {
+            for (id, t) in it {
+                let Some(meta) = t.metadata.load_full() else {
+                    continue;
+                };
+                for (idx, fi) in meta.file_infos.iter().enumerate() {
+                    let candidate = root.join(&fi.relative_filename);
+                    if std::fs::canonicalize(&candidate).ok().as_deref() == Some(target.as_path()) {
+                        return shift_librqbit_id(id).ok().map(|sid| (sid, idx));
+                    }
+                }
+            }
+            None
+        })
+    }
+
+    /// Un-pause a torrent we are about to stream from, and make sure the file we want
+    /// is one it is actually fetching. A paused torrent serves whatever is already on
+    /// disk and never fills the gaps, which reads as a stall rather than as a pause.
+    pub async fn resume_for(&self, id: u32, file_idx: usize) -> Result<()> {
+        let Some(librqbit_id) = unshift_librqbit_id(id) else {
+            return Ok(());
+        };
+        let Some(handle) = self.session.get(TorrentIdOrHash::Id(librqbit_id)) else {
+            return Ok(());
+        };
+        if handle
+            .only_files()
+            .as_ref()
+            .is_some_and(|f| !f.contains(&file_idx))
+        {
+            let mut want: std::collections::HashSet<usize> = handle
+                .only_files()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            want.insert(file_idx);
+            if let Err(e) = self.session.update_only_files(&handle, &want).await {
+                tracing::warn!("librqbit: could not widen file selection: {}", e);
+            }
+        }
+        if handle.is_paused() {
+            self.session
+                .unpause(&handle)
+                .await
+                .context("session.unpause failed")?;
+            tracing::info!(
+                "librqbit: resumed torrent {} to fill in file {}",
+                id,
+                file_idx
+            );
+        }
+        Ok(())
+    }
+
+    /// The torrent we already hold for this magnet, if any — WITHOUT touching the swarm.
+    ///
+    /// This is the line the whole persistence change exists for. librqbit's own
+    /// "already managed" check lives in `add_torrent_internal` and runs AFTER
+    /// `resolve_magnet`, so handing `add_torrent` a magnet we already hold still pays
+    /// the full metadata fetch: instant on a live swarm, `METADATA_TIMEOUT` on a dead
+    /// one. The infohash is right there in the magnet, and the session is a map, so the
+    /// answer costs a lookup.
+    fn already_managed(&self, magnet: &str) -> Option<Arc<ManagedTorrent>> {
+        let m = Magnet::parse(magnet).ok()?;
+        let hash = m.as_id20()?;
+        self.session.get(TorrentIdOrHash::Hash(hash))
     }
 
     /// Start a torrent from a magnet URI with optional file selection (BEP-53).
@@ -231,6 +380,55 @@ impl TorrentEngine {
             overwrite: true,
             ..Default::default()
         };
+
+        // Already ours? Then say so now, and never speak to the swarm.
+        //
+        // This is the line the persistence change exists for. librqbit HAS an
+        // already-managed check, but it sits in `add_torrent_internal` AFTER
+        // `resolve_magnet`, so handing it a magnet we already hold still pays the full
+        // metadata fetch — instant on a live swarm, `METADATA_TIMEOUT` on a dead one.
+        // Since teardown now pauses rather than deletes, a source played before is
+        // still here with its piece record intact, and this turns a 20-second wait into
+        // a map lookup. A dead swarm stops mattering for anything already downloaded.
+        if let Some(handle) = self.already_managed(magnet) {
+            // The file wanted may not be the file selected. A season pack added for
+            // episode 6 must widen its selection before it will fetch episode 7,
+            // otherwise the stream waits on pieces nobody asked for.
+            if let Some(idx) = file_index {
+                let idx = idx as usize;
+                let selected = handle.only_files();
+                let needs_widening = selected.as_ref().is_some_and(|f| !f.contains(&idx));
+                if needs_widening {
+                    let mut want: std::collections::HashSet<usize> =
+                        selected.unwrap_or_default().into_iter().collect();
+                    want.insert(idx);
+                    if let Err(e) = self.session.update_only_files(&handle, &want).await {
+                        tracing::warn!("librqbit: could not widen file selection: {}", e);
+                    }
+                }
+            }
+            if handle.is_paused() {
+                self.session
+                    .unpause(&handle)
+                    .await
+                    .context("unpausing an already-managed torrent")?;
+                tracing::info!(
+                    "librqbit: resumed torrent {} (already on disk)",
+                    handle.id()
+                );
+            }
+            let id_u32 = shift_librqbit_id(handle.id())?;
+            return Ok(TorrentStartInfo {
+                id: id_u32,
+                file_index: file_index.unwrap_or(0) as usize,
+                url: format!(
+                    "http://127.0.0.1:{}/torrent/{}/stream/{}",
+                    self.stream_port,
+                    id_u32,
+                    file_index.unwrap_or(0)
+                ),
+            });
+        }
 
         // A magnet carries no metadata — librqbit must fetch it from the swarm before it
         // can report a single byte. With NO reachable peers that await never returns, and
@@ -326,14 +524,42 @@ impl TorrentEngine {
     /// sentinel id (0) is a no-op (caller already checks `pid != 0` but defense
     /// in depth — would otherwise mistarget librqbit's TorrentId 0 if not for
     /// the +1 shift).
+    /// End a torrent's activity.
+    ///
+    /// `delete_files: true` throws everything away — the files and the record — and is
+    /// for a failed start, whose sparse placeholder is worth nothing.
+    ///
+    /// `delete_files: false` means "stop downloading but KEEP the bytes", and since
+    /// 2026-09-09 that is a PAUSE rather than a delete. Deleting also erased librqbit's
+    /// record of the torrent, including which pieces were already good, so the next play
+    /// of the same release started from nothing: a fresh magnet fetch against the swarm
+    /// and a full re-read of the file to work out what we already had. We discarded the
+    /// knowledge and then paid to rebuild it. A paused torrent keeps its record, resumes
+    /// instantly, and downloads nothing meanwhile, so the pruner still owns the disk.
     pub async fn stop(&self, id: u32, delete_files: bool) -> Result<()> {
         let Some(librqbit_id) = unshift_librqbit_id(id) else {
             return Ok(());
         };
-        self.session
-            .delete(TorrentIdOrHash::Id(librqbit_id), delete_files)
-            .await
-            .context("session.delete failed")
+        if delete_files {
+            return self
+                .session
+                .delete(TorrentIdOrHash::Id(librqbit_id), true)
+                .await
+                .context("session.delete failed");
+        }
+        match self.session.get(TorrentIdOrHash::Id(librqbit_id)) {
+            Some(handle) => {
+                if handle.is_paused() {
+                    return Ok(());
+                }
+                self.session
+                    .pause(&handle)
+                    .await
+                    .context("session.pause failed")
+            }
+            // Already gone. Nothing to keep and nothing to stop.
+            None => Ok(()),
+        }
     }
 
     /// Number of torrents started across this engine's lifetime. Diagnostic

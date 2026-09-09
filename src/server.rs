@@ -66,6 +66,8 @@ pub struct ServerState {
     /// Result ids whose source race has already been run, so a ~1.5s poll cannot start a
     /// fresh race on every tick.
     pub vlc_raced: Mutex<HashSet<usize>>,
+    /// In-flight torrent starts, keyed by magnet. See `begin_or_poll_start`.
+    pub starts: Mutex<HashMap<String, StartRecord>>,
     /// 2026-09-05: episode keys with no English subtitle anywhere, and when that was
     /// established. VLC re-requests a failing `--input-slave` about four times before
     /// giving up (measured), and a cold miss can cost tens of seconds, so without this
@@ -467,7 +469,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     // validated peer attach + end-to-end cast). Init is fail-fast: if the
     // Session can't bootstrap, surface the error and abort startup.
     tracing::info!("Initializing librqbit torrent engine");
-    let torrent_engine = TorrentEngine::new(&media_dir, config.port)
+    let torrent_engine = TorrentEngine::new(&media_dir, &state_dir, config.port)
         .await
         .context("librqbit engine bootstrap failed")?;
     tracing::info!(
@@ -512,6 +514,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         media_dur: Mutex::new(HashMap::new()),
         vlc_first_poll: Mutex::new(HashMap::new()),
         vlc_raced: Mutex::new(HashSet::new()),
+        starts: Mutex::new(HashMap::new()),
         sub_warmed: Mutex::new(HashSet::new()),
         sub_missing: Mutex::new(HashMap::new()),
         media_probe: Mutex::new(HashMap::new()),
@@ -9124,6 +9127,109 @@ struct VlcPinQuery {
     ih: Option<String>,
 }
 
+/// One remembered start: the cell the spawned task writes into, and when it began.
+/// The instant is what lets a failure expire so a recovered swarm can be retried.
+pub type StartRecord = (Arc<Mutex<StartState>>, Instant);
+
+/// Where a torrent start has got to, without anybody having to wait for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartState {
+    /// Being resolved right now. The caller reports progress instead of blocking.
+    InFlight,
+    Ready(u32),
+    Failed(String),
+}
+
+/// How long a failed start is remembered before it may be retried. Shorter than the
+/// engine's own dead-magnet memory, which answers instantly anyway, so a retry after
+/// this costs nothing while a swarm that has come back to life is still reachable.
+const START_FAILURE_MEMORY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Start a torrent WITHOUT making the caller wait for it.
+///
+/// The readiness endpoint used to `await` the start, so the HTTP request itself froze
+/// until librqbit either resolved the swarm or gave up — twenty seconds on a dead
+/// magnet, and however long a resume's validation pass took on a live one. Nothing else
+/// was wrong with it; the whole freeze was that single await. Cancel could not work
+/// during it either, because there was nothing listening.
+///
+/// So the start moves into a task and this reports where it has got to. A source seen
+/// before now resolves in a map lookup (see `TorrentEngine::already_managed`), so
+/// `InFlight` is usually a single poll; a genuinely new one shows progress instead of a
+/// frozen screen, and a dead one still answers `Failed` and lets the remote rotate.
+/// Report what is already recorded, or `None` meaning "go and start one".
+///
+/// Pure, so the POLICY can be tested without a torrent session. The readiness endpoint
+/// asks this every ~1.5 s, and getting it wrong means either re-serving a 20-second
+/// timeout on every poll or never retrying a swarm that has come back to life.
+fn decide_start(existing: Option<(&StartState, std::time::Duration)>) -> Option<StartState> {
+    match existing {
+        None => None,
+        Some((StartState::Failed(_), age)) if age > START_FAILURE_MEMORY => None,
+        Some((cur, _)) => Some(cur.clone()),
+    }
+}
+
+fn begin_or_poll_start(state: &SharedState, magnet: &str, file_index: Option<u32>) -> StartState {
+    let mut map = lock_recover(&state.starts);
+    let recorded = map
+        .get(magnet)
+        .map(|(cell, at)| (lock_recover(cell).clone(), at.elapsed()));
+    if let Some(answer) = decide_start(recorded.as_ref().map(|(st, age)| (st, *age))) {
+        return answer;
+    }
+    map.remove(magnet);
+    let cell = Arc::new(Mutex::new(StartState::InFlight));
+    map.insert(magnet.to_string(), (cell.clone(), Instant::now()));
+    drop(map);
+
+    let st = state.clone();
+    let m = magnet.to_string();
+    // Lifetime: bounded by the start itself, which is bounded by METADATA_TIMEOUT.
+    // It writes one cell and exits; nothing polls, nothing loops.
+    tokio::spawn(async move {
+        let outcome = match start_torrent_for_play(&st, &m, file_index).await {
+            Ok((tid, _)) => StartState::Ready(tid),
+            Err(e) => StartState::Failed(e.to_string()),
+        };
+        *lock_recover(&cell) = outcome;
+    });
+    StartState::InFlight
+}
+
+/// A partial file for this result that ANOTHER torrent is already fetching.
+///
+/// Returns the torrent to stream from and the file's index inside it, having
+/// un-paused it so the holes actually fill.
+///
+/// The identity guard is the Bypass matcher itself, unchanged: `resolve_local_file_*`
+/// matches a release by inner-file name and size, so adopting these bytes cannot hand
+/// over a different copy of the episode than the one clicked — the failure this project
+/// has now hit three times in one week, from Local Bypass, from the ranker's racer, and
+/// nearly from here.
+///
+/// Only for INCOMPLETE files. A complete one is served statically by the caller's first
+/// branch, which is both faster and fully seekable.
+async fn adopt_owning_torrent(state: &SharedState, id: usize) -> Option<(u32, Option<u32>)> {
+    let (path, _) = resolve_local_file_lenient(state, id)?;
+    if is_physically_full(&path, 0) {
+        return None;
+    }
+    let (tid, file_idx) = state.torrent_engine.owner_of(&path)?;
+    if let Err(e) = state.torrent_engine.resume_for(tid, file_idx).await {
+        tracing::warn!("VLC: could not resume owning torrent {}: {}", tid, e);
+        return None;
+    }
+    tracing::info!(
+        "VLC: result #{} → torrent {} already holds {:?} (file {}) — streaming from it",
+        id,
+        tid,
+        path,
+        file_idx
+    );
+    Some((tid, Some(file_idx as u32)))
+}
+
 async fn handle_vlc_stream(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
@@ -9158,30 +9264,39 @@ async fn handle_vlc_stream(
         );
         return serve_static_with_range(path, "video/x-matroska", &headers).await;
     }
+    // 1.5. An INCOMPLETE file for this release that another torrent already holds —
+    // the season-pack case. Adopting it skips the swarm entirely, which is the whole
+    // point when the clicked release's own swarm is dead.
+    let adopted = adopt_owning_torrent(&state, id).await;
     // 2/3. Partial or fresh → start/resume the torrent + serve its FileStream.
-    let Some((magnet, file_index, _, _, _)) = resolve_result_for_vlc(&state, id) else {
-        return (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(json!({"error": "Result not found — search again."})),
-        )
-            .into_response();
-    };
-    if magnet.is_empty() {
-        return (
-            axum::http::StatusCode::CONFLICT,
-            Json(json!({"error": "No magnet for this source."})),
-        )
-            .into_response();
-    }
-    let tid = match start_torrent_for_play(&state, &magnet, file_index).await {
-        Ok((tid, _url)) => tid,
-        Err(e) => {
-            tracing::warn!("VLC: torrent start failed for #{}: {}", id, e);
-            return (
-                axum::http::StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("Couldn't start torrent: {}", e)})),
-            )
-                .into_response();
+    let (tid, file_index) = match adopted {
+        Some(pair) => pair,
+        None => {
+            let Some((magnet, file_index, _, _, _)) = resolve_result_for_vlc(&state, id) else {
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(json!({"error": "Result not found — search again."})),
+                )
+                    .into_response();
+            };
+            if magnet.is_empty() {
+                return (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(json!({"error": "No magnet for this source."})),
+                )
+                    .into_response();
+            }
+            match start_torrent_for_play(&state, &magnet, file_index).await {
+                Ok((tid, _url)) => (tid, file_index),
+                Err(e) => {
+                    tracing::warn!("VLC: torrent start failed for #{}: {}", id, e);
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": format!("Couldn't start torrent: {}", e)})),
+                    )
+                        .into_response();
+                }
+            }
         }
     };
     reap_previous_vlc_torrents(&state, tid);
@@ -9313,31 +9428,56 @@ async fn handle_vlc_ready(
     // the duration sits in the container header, so the probe describes the
     // finished encode from the first moments of the download.
     spawn_media_probe(&state, id);
-    let Some((magnet, file_index, _, _, _)) = resolve_result_for_vlc(&state, id) else {
-        return Json(json!({ "ready": false, "error": "Result not found — search again." }));
-    };
-    if magnet.is_empty() {
-        return Json(json!({ "ready": false, "error": "No magnet for this source." }));
-    }
-    // Ensure the torrent is running + its head/tail (Cues) are being prioritized.
-    let tid = match start_torrent_for_play(&state, &magnet, file_index).await {
-        Ok((tid, _)) => tid,
-        Err(e) => {
-            // A magnet whose swarm has no reachable peers never resolves its metadata, so
-            // this used to hang forever and the readiness poll simply stopped answering.
-            // Report it as DEAD and distinctly, so the caller can rotate to the next
-            // ranked source — which is exactly what handle_play's auto-retry loop already
-            // does on the Chromecast path. Until now the VLC path had no equivalent, and
-            // the ▶ button always picks result #1, so one dead top pick meant a spinner
-            // that never resolved (The Diplomat S03E01, 2026-08-27).
-            let dead = e
-                .to_string()
-                .contains(crate::torrent_engine::NO_PEERS_ERROR);
-            return Json(json!({
-                "ready": false, "pct": 0, "dead": dead,
-                "phase": if dead { "no peers" } else { "starting" },
-            }));
+    // The same adoption the serve does, so readiness and the serve cannot disagree
+    // about which torrent is behind this result. They are separate code paths, and
+    // when they diverge the failure surfaces as VLC's own "unable to open the MRL".
+    let adopted = adopt_owning_torrent(&state, id).await;
+    let (magnet, file_index) = match &adopted {
+        Some((_, idx)) => (String::new(), *idx),
+        None => {
+            let Some((magnet, file_index, _, _, _)) = resolve_result_for_vlc(&state, id) else {
+                return Json(
+                    json!({ "ready": false, "error": "Result not found — search again." }),
+                );
+            };
+            if magnet.is_empty() {
+                return Json(json!({ "ready": false, "error": "No magnet for this source." }));
+            }
+            (magnet, file_index)
         }
+    };
+    // Ensure the torrent is running + its head/tail (Cues) are being prioritized.
+    let tid = match &adopted {
+        Some((tid, _)) => *tid,
+        None => match begin_or_poll_start(&state, &magnet, file_index) {
+            StartState::Ready(tid) => tid,
+            // Being found right now. Say so and let the next poll ask again — the
+            // request must never sit on this, which is what froze the screen and made
+            // Cancel inert.
+            StartState::InFlight => {
+                return Json(json!({
+                    "ready": false, "pct": 0, "open_pct": 0,
+                    "phase": "finding the source", "quality": probed,
+                }));
+            }
+            // A magnet whose swarm has no reachable peers never resolves its
+            // metadata, so this used to hang forever and the readiness poll simply
+            // stopped answering. Report it as DEAD and distinctly, so the caller can
+            // rotate to the next ranked source — exactly what handle_play's auto-retry
+            // loop already does on the Chromecast path. The VLC path had no
+            // equivalent, and the ▶ button always picks result #1, so one dead top
+            // pick meant a spinner that never resolved (The Diplomat S03E01,
+            // 2026-08-27).
+            StartState::Failed(e) => {
+                let dead = e.contains(crate::torrent_engine::NO_PEERS_ERROR);
+                tracing::warn!("VLC: torrent start failed for #{}: {}", id, e);
+                return Json(json!({
+                    "ready": false, "pct": 0, "dead": dead,
+                    "error": if dead { None } else { Some(format!("Couldn't start torrent: {}", e)) },
+                    "phase": if dead { "no seeds" } else { "couldn't start" },
+                }));
+            }
+        },
     };
     // Do NOT reap here. /vlc/ready is POLLED (~1s) and can run CONCURRENTLY for
     // several tapped sources; a reap keyed to THIS poll's tid stops the OTHER sources'
@@ -13699,7 +13839,11 @@ mod vlc_readiness_completeness_tests {
 
 #[cfg(test)]
 mod vlc_stall_gate_tests {
-    use super::{race_switch_is_warranted, vlc_source_is_stalled, vlc_stall_gate_secs};
+    use super::{
+        decide_start, race_switch_is_warranted, vlc_source_is_stalled, vlc_stall_gate_secs,
+        StartState, START_FAILURE_MEMORY,
+    };
+    use std::time::Duration;
 
     #[test]
     fn a_poisoned_swarm_survives_because_it_has_peers() {
@@ -13737,6 +13881,55 @@ mod vlc_stall_gate_tests {
         assert_eq!(vlc_stall_gate_secs(1_000_000_000), 12);
         assert!(!vlc_source_is_stalled(0, 0, 0, 20, 9_000_000_000, false));
         assert!(vlc_source_is_stalled(0, 0, 0, 30, 9_000_000_000, false));
+    }
+
+    #[test]
+    fn a_start_in_flight_is_reported_never_restarted() {
+        // The readiness endpoint asks every ~1.5 s. A start already running must be
+        // reported as running, not launched a second time.
+        assert_eq!(
+            decide_start(Some((&StartState::InFlight, Duration::from_secs(0)))),
+            Some(StartState::InFlight)
+        );
+        assert_eq!(
+            decide_start(Some((&StartState::InFlight, Duration::from_secs(600)))),
+            Some(StartState::InFlight),
+            "an unusually slow start is still that start, not a reason to pile on another"
+        );
+        assert_eq!(
+            decide_start(Some((&StartState::Ready(7), Duration::from_secs(600)))),
+            Some(StartState::Ready(7))
+        );
+    }
+
+    #[test]
+    fn nothing_recorded_means_go_and_start_one() {
+        assert_eq!(decide_start(None), None);
+    }
+
+    #[test]
+    fn a_failed_start_is_remembered_then_allowed_to_retry() {
+        let failed = StartState::Failed("no peers".into());
+        // Inside the window the answer is instant and unchanged — a poll every 1.5 s
+        // must never re-serve the 20-second metadata timeout.
+        assert_eq!(
+            decide_start(Some((&failed, Duration::from_secs(0)))),
+            Some(failed.clone())
+        );
+        assert_eq!(
+            decide_start(Some((&failed, START_FAILURE_MEMORY))),
+            Some(failed.clone()),
+            "the boundary itself still answers from memory"
+        );
+        // Past it, try again. Swarms come back, and a permanent refusal would be the
+        // seed bar's mistake wearing another costume.
+        assert_eq!(
+            decide_start(Some((
+                &failed,
+                START_FAILURE_MEMORY + Duration::from_secs(1)
+            ))),
+            None
+        );
     }
 
     #[test]
