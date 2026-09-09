@@ -345,13 +345,23 @@ impl TorrentEngine {
             empty
         });
         for (id, bytes) in empty {
-            // The measurement goes in the log with the verdict. This deletes files, and
-            // a deletion justified by a number nobody can see afterwards is a deletion
-            // nobody can audit — librqbit's own `Initial check results: have N` line
-            // sits a few lines above in the same journal, so the two can be compared.
-            match self.session.delete(TorrentIdOrHash::Id(id), true).await {
+            // NEVER DELETES FILES (2026-09-09, tightened the same evening it shipped).
+            // It forgets the RECORD only. The measurement said zero blocks, so the
+            // placeholders it leaves behind cost nothing, and the pruner owns the media
+            // directory anyway — a boot-time reconciler has no business removing media.
+            //
+            // The tightening was not prompted by a proven fault in this function: a
+            // partial download went missing across a restart the same evening and this
+            // was ONE of the few things that could delete a file, so the capability was
+            // removed rather than defended. Cheap, and it takes this code out of the
+            // suspect list for good.
+            //
+            // The measurement still goes in the log beside the verdict, so it can be
+            // compared against librqbit's own `Initial check results: have N` a few
+            // lines above in the same journal.
+            match self.session.delete(TorrentIdOrHash::Id(id), false).await {
                 Ok(()) => tracing::info!(
-                    "librqbit: forgot torrent {} — {} physical bytes on disk (pruned away)",
+                    "librqbit: forgot torrent {} — {} physical bytes on disk (files left alone)",
                     id,
                     bytes
                 ),
