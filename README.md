@@ -18,6 +18,8 @@ and what is worth watching next.
 
 No media library to maintain. No fifteen-app Docker stack. No Node subprocess.
 
+![The home queue: what you are part-way through, what is new in shows you follow, and what airs next](docs/screenshots/home-queue.png)
+
 ## Why?
 
 Because "I want to watch a movie" shouldn't require Sonarr + Radarr + Prowlarr +
@@ -72,6 +74,8 @@ assistant should be able to play something when you ask nicely.
   cancelled. It is pull rather than push, so a note is only as current as its last
   refresh, and the interface says so once it goes stale.
 
+![The to-watch list: recommendations with a one-line reason each, then the series shelf with scores and years](docs/screenshots/to-watch.png)
+
 **Behaving itself**
 
 - **Bounded disk.** A 100 GB cache cap with least-recently-used eviction, plus a
@@ -91,6 +95,8 @@ assistant should be able to play something when you ask nicely.
   which fill connection slots without ever sending bytes.
 - **Redeploys do not drop the port.** The listening sockets are held by systemd across a
   restart, so a browser or VLC reconnects rather than failing.
+
+![The search card: a quality control beside the Movies/TV toggle, a status badge, a Rotten Tomatoes score, and a trailer that loads only when clicked](docs/screenshots/search-card.png)
 
 ## How sources are ranked
 
@@ -119,6 +125,8 @@ outright, which is a prediction about delivery in a system that measures deliver
 racing, a stall gate, and rotation past dead sources all observe what actually arrives.
 **Being one episode inside a season pack costs nothing** either: spela selects the single
 file, so a pack is not a larger download.
+
+![The library view: everything already on disk, as a poster grid](docs/screenshots/library.png)
 
 ## Architecture
 
