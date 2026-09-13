@@ -6863,6 +6863,13 @@ async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
         .unwrap_or_default();
     // Cache keys are "<kind>:<id-or-title:year>"; index by the title segment so a
     // ledger title can be looked up without knowing which kind it was cached under.
+    // ALSO index by imdb id (2026-09-13). Every ledger row carries one since the
+    // backfill, and `title_meta` caches under `i<imdb>` whenever it resolved by id —
+    // which is the common case for anything reached from a row rather than typed into
+    // the search box. Indexing only by title therefore missed those entries and left
+    // the type unknown, so the row started in "Not yet identified" and jumped sections
+    // the moment it scrolled into view.
+    let mut by_imdb: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut by_title: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (k, v) in meta.iter() {
         let Some(mt) = v
@@ -6873,8 +6880,19 @@ async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
             continue;
         };
         if let Some(rest) = k.split_once(':').map(|x| x.1) {
+            // An imdb-keyed entry is `i<imdb>` with no further colon. Match the SHAPE
+            // rather than the first letter: the old test skipped anything beginning
+            // with `t` or `i`, which is a real-title prefix as often as a key prefix
+            // and only ever worked because titles happen to be capitalised.
+            if let Some(imdb) = rest.strip_prefix('i').filter(|r| r.starts_with("tt")) {
+                by_imdb.insert(imdb.to_string(), mt.to_string());
+                continue;
+            }
+            if rest.starts_with('t') && !rest.contains(':') {
+                continue; // `t<tmdb-id>`, no title to index
+            }
             let title = rest.rsplit_once(':').map(|x| x.0).unwrap_or(rest);
-            if !title.is_empty() && !title.starts_with('t') && !title.starts_with('i') {
+            if !title.is_empty() {
                 by_title.insert(title.to_string(), mt.to_string());
             }
         }
@@ -6885,9 +6903,17 @@ async fn handle_watched(State(state): State<SharedState>) -> Json<Value> {
         .take(400)
         .map(|w| {
             let mut v = serde_json::to_value(w).unwrap_or_else(|_| json!({}));
+            // imdb id first: it is an identity, where a cleaned title is a guess that
+            // two different works can share.
             let key = crate::search::clean_title_for_tmdb(w.show.as_deref().unwrap_or(&w.title))
                 .to_lowercase();
-            if let Some(mt) = by_title.get(&key) {
+            let mt = w
+                .imdb_id
+                .as_deref()
+                .filter(|i| !i.is_empty())
+                .and_then(|i| by_imdb.get(i))
+                .or_else(|| by_title.get(&key));
+            if let Some(mt) = mt {
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("media_type".into(), json!(mt));
                 }

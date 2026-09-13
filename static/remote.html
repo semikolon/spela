@@ -1507,11 +1507,19 @@ async function renderRewatch(){
     };
     rate.append(mkBtn("love","♥",1,"Loved"), mkBtn("nope","✕",-1,"Not for me"));
     holder.append(r,rate);
-    enrichWhenVisible(r,async()=>{
-      await enrichToWatchRow(r,x,x.knownTV);
-      const dest = x.resolvedTV ? seriesBox : filmBox;
-      if(holder.parentElement!==dest){ dest.appendChild(holder); bump(); }
-    });
+    // Enrichment fills a row IN PLACE and never relocates it (2026-09-13). Rows used
+    // to migrate to their section as they scrolled into view, so the list re-sorted
+    // under the reader's eyes for as long as they kept scrolling — with 71 of 98
+    // titles unresolved at paint, that was most of the page, most of the time.
+    //
+    // Pre-resolving them all instead would mean ~70 requests at once, which is exactly
+    // the storm the viewport gating exists to prevent (measured: 143 requests, ~1.3s
+    // to settle, cut to 11 and ~0.9s). So the section a row lands in is decided once,
+    // from the evidence available at paint, and the list holds still. The types this
+    // enrichment discovers are cached SERVER-side, so the next visit paints them in
+    // their real section — the shelf converges across visits rather than during a
+    // scroll.
+    enrichWhenVisible(r,()=>enrichToWatchRow(r,x,x.knownTV));
     holder.__item=x;
     return holder;
   };
