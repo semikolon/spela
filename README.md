@@ -103,10 +103,15 @@ assistant should be able to play something when you ask nicely.
 Lower is better, and each tier is a value computed per result — never a pairwise
 threshold, which is how you get an ordering that changes depending on the input order.
 
-1. **Non-Dolby-Vision first**, and this one is a hard gate for the Chromecast: consumer
+1. **A release spela can address first.** The tracker names which file inside a torrent
+   is the video; when it cannot, spela has to fetch every file — fine for a single-file
+   release, ruinous for a Blu-ray disc folder where the feature is one file among dozens
+   of menus and extras. Those sink to the bottom of the list, marked, rather than
+   disappearing from it.
+2. **Non-Dolby-Vision first**, and this one is a hard gate for the Chromecast: consumer
    NVENC cannot parse a DV profile 5/7 RPU, so those releases produce no output at all.
    For native decoding it is a preference rather than a gate. Plain HDR10 is unaffected.
-2. **Resolution, scoped to the target.** A Chromecast is a 1080p screen fed by a
+3. **Resolution, scoped to the target.** A Chromecast is a 1080p screen fed by a
    transcoder, so `1080p > 720p > 480p > 2160p`. A 4K monitor decoding natively is the
    other way round, `2160p > 1080p > 720p > 480p`, because a 1080p source upscaled twice
    reads as soft at close distance whatever its bitrate. The one thing that can still
@@ -114,19 +119,27 @@ threshold, which is how you get an ordering that changes depending on the input 
    per pixel will look worse than the 1080p it would displace. That comparison is
    weighted by codec, since HEVC gets substantially more picture out of the same byte
    than H.264 does, and ignoring that refused legitimate 4K releases by a hair.
-3. **Language fit** against the show's original language: a clean release, then a
+4. **Language fit** against the show's original language: a clean release, then a
    multi-market or dual-language one, then a foreign dub.
-4. **H.264 over HEVC**, but only for targets that re-encode through NVENC, where H.264
+5. **H.264 over HEVC**, but only for targets that re-encode through NVENC, where H.264
    plays instantly. Skipped entirely for native decoding.
-5. **Bitrate, via file size.** Every candidate in one search is the same minutes, so size
-   *is* bitrate, in logarithmic bands.
-6. **More seeds**, as the final tiebreak.
+6. **Bitrate, via file size.** Every candidate in one search is the same minutes, so size
+   *is* bitrate, in logarithmic bands. That holds only while the size is one file, which
+   is what the first tier is there to guarantee.
+7. **More seeds**, as the final tiebreak.
 
 **Seeds prefer; they do not exclude.** A viability bar used to demote thin swarms
-outright, which is a prediction about delivery in a system that measures delivery —
-racing, a stall gate, and rotation past dead sources all observe what actually arrives.
-**Being one episode inside a season pack costs nothing** either: spela selects the single
-file, so a pack is not a larger download.
+outright, which is a prediction about delivery in a system that measures delivery: a
+slow pick is raced against one alternative, a stall gate condemns a source sending
+nothing, and the remote rotates past up to three dead ones — all of which observe what
+actually arrives instead of guessing from a tracker's count. The race is deliberately
+narrow, and it will only switch to a same-or-better release after several seconds of a
+source delivering nothing at all, so it cannot quietly trade your picture quality for a
+faster start.
+**Being one episode inside a season pack costs nothing** either: the tracker names the
+episode file, spela fetches only that one, and a pack is not a larger download. That is
+the same naming the first tier depends on — where it is missing, there is no single file
+to fetch.
 
 ![The library view: everything already on disk, as a poster grid](docs/screenshots/library.png)
 
