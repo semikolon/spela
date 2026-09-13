@@ -124,6 +124,11 @@
   .src .s.dead{color:var(--bad)}
   .src .s.fresh{color:var(--accent)}  /* just-aired: swarm forming, count unreliable */
   .src.dead{border-color:var(--bad);background:linear-gradient(90deg,rgba(224,86,74,.13),var(--bg3))}
+  /* 2026-09-13: a release Torrentio could not name a video file inside — spela
+     must fetch EVERY file, so a disc image downloads menus and extras while the
+     feature waits. Ranked last (tier 0) rather than hidden, and marked here so
+     the bottom of the list says WHY it is at the bottom. */
+  .src .disc{color:var(--warn);font-weight:700;white-space:nowrap}
   /* 2026-06-30: a source already (part-)downloaded on disk — tapping it resumes
      (librqbit overwrite:true) instead of re-fetching that fraction. */
   .src.partial{border-color:var(--good);background:linear-gradient(90deg,rgba(55,200,122,.16),var(--bg3))}
@@ -1774,6 +1779,12 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
       row.appendChild(el("span",{className:"x",textContent:codec(r.title)}));
       row.appendChild(el("span",{className:"x",textContent:r.size||""}));
       row.appendChild(el("span",{className:"x",textContent:r.source||""}));
+      // No fileIdx = spela cannot select a file and fetches the whole torrent.
+      // Harmless for a single-file release, ruinous for a Blu-ray disc folder.
+      // Tier 0 already sank it; this says why, so a deliberate tap is informed.
+      if(r.file_index==null) row.appendChild(el("span",{className:"disc",
+        title:"no single video file — playing this downloads the whole torrent (menus and extras included)",
+        textContent:"⚠ whole disc"}));
       row.appendChild(el("span",{className:"s "+health,
         title:fresh?"just aired — seed counts unreliable for a day or so; tap to try (spela verifies real delivery)":"",
         textContent:fresh?"🌱 new":(health==="dead"?"⚠ ":"")+sc+"🌱"}));

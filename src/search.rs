@@ -1803,6 +1803,42 @@ fn rank_cmp(a: &TorrentResult, b: &TorrentResult, ctx: &RankCtx<'_>) -> std::cmp
     // tier 4 body below for the full rationale + Apr/May 2026 anchoring incident.
     const SEED_DISPARITY_OVERRIDE: u32 = 30;
 
+    // Tier 0: a release spela can ADDRESS beats one it cannot.
+    //
+    // Torrentio reports which file inside a torrent is the video (`fileIdx`).
+    // When it cannot name one, `file_index` is None and `AddTorrentOptions`
+    // gets `only_files: None`, which tells librqbit to fetch EVERY file. For a
+    // single-file torrent that is harmless — all of it IS the film. For a
+    // Blu-ray disc image it is the whole 35 GB of menus, extras and lossless
+    // audio, and the feature is one file among dozens rather than the one being
+    // prioritised, so the stream can sit at zero while gigabytes arrive.
+    //
+    // Anchor 2026-09-13, Terminator 3: `...1080p.CEE.BluRay.AVC.TrueHD.5.1-FGT`
+    // is a BDMV folder, 35.47 GB with no fileIdx. It ranked FIRST because
+    // `size_tier` reads size as bitrate — true when the size IS one file, and
+    // wrong for a disc image, which wins the fattest-file test by not being a
+    // file. Two hours in, 2.1 GB had landed: three complete menu/extra streams,
+    // and ZERO bytes of the 31.11 GB feature.
+    //
+    // DEMOTED, never dropped. The same argument that removed the seed-viability
+    // bar applies: an exclusion is invisible and permanent, and a title where
+    // every release lacks a fileIdx would return an empty list. At the bottom it
+    // is still reachable by hand, and the search card marks it.
+    //
+    // Rare in practice — measured across four live searches: 2 of 37 for this
+    // title (the disc image and a Rifftrax multi-audio release), 0 of 16 and
+    // 0 of 40 for the others. The 22.2 GB FraMeSToR REMUX carries `fileIdx: 0`
+    // and is untouched, which is the case that proves this is not a size rule.
+    let a_addressable = a.file_index.is_some();
+    let b_addressable = b.file_index.is_some();
+    if a_addressable != b_addressable {
+        return if a_addressable {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        };
+    }
+
     // Tier 1: non-DV > DV — a HARD gate, but ONLY for the transcoding target.
     //
     // The reason it exists is specific to one piece of hardware: Darwin's GTX
@@ -3833,6 +3869,83 @@ mod tests {
         );
     }
 
+    /// 2026-09-13 anchor, Terminator 3. Titles, seed counts and size strings
+    /// copied VERBATIM from the live `/search` response; `file_index` is the
+    /// real `fileIdx` Torrentio returned for each.
+    ///
+    /// The disc image won on every quality tier — biggest file, so the fattest
+    /// bitrate by `size_tier`, and 1080p like the rest — and spela could not
+    /// address a file inside it, so playing it fetched menus and extras while
+    /// the 31 GB feature stayed at zero bytes.
+    #[test]
+    fn test_unaddressable_disc_image_ranks_below_every_addressable_release() {
+        let mut results = vec![
+            make_full(
+                1,
+                "Terminator.3.Rise.of.the.Machines.2003.1080p.CEE.BluRay.AVC.TrueHD.5.1-FGT",
+                10,
+                "35.47 GB",
+                None,
+            ),
+            make_full(
+                2,
+                "Terminator.3.Rise.of.the.Machines.2003.BluRay.1080p.TrueHD.5.1.AVC.REMUX-FraMeSToR.mkv",
+                47,
+                "22.2 GB",
+                Some(0),
+            ),
+            make_full(
+                3,
+                "Terminator 3 Rise of the Machines 2003 1080p AMZN CORE WEB-DL DDP 5 1 H 264-PiRaTeS.mkv",
+                21,
+                "7.5 GB",
+                Some(0),
+            ),
+        ];
+        rank_results_mut_prefer(&mut results, false, Some("en"));
+
+        assert_eq!(
+            results.last().unwrap().title,
+            "Terminator.3.Rise.of.the.Machines.2003.1080p.CEE.BluRay.AVC.TrueHD.5.1-FGT",
+            "the release with no fileIdx must sink to the bottom"
+        );
+        // Demoted, NOT dropped — the seed-bar argument: an exclusion is
+        // invisible and permanent, and a title where every release lacks a
+        // fileIdx would otherwise return nothing at all.
+        assert_eq!(results.len(), 3, "demoted, never removed");
+        // A 22.2 GB single-file REMUX carries fileIdx 0 and is untouched. This
+        // is the assertion that proves tier 0 is about ADDRESSABILITY and not a
+        // size rule wearing a different name.
+        assert!(results[0].title.contains("REMUX-FraMeSToR"));
+    }
+
+    /// Tier 0 must be silent between two releases that both carry a fileIdx —
+    /// otherwise it would be reordering on a property it does not distinguish.
+    #[test]
+    fn test_addressability_does_not_reorder_two_addressable_releases() {
+        let a = make_full(1, "Show.S01E01.1080p.WEB.x264-Grp.mkv", 40, "4 GB", Some(0));
+        let b = make_full(2, "Show.S01E01.1080p.WEB.x264-Grp.mkv", 40, "4 GB", Some(7));
+        let ctx = RankCtx {
+            prefer_h264: false,
+            original_language: Some("en"),
+            pref: QualityPref::Auto,
+            best_1080p_bpp: None,
+        };
+        assert_eq!(rank_cmp(&a, &b, &ctx), std::cmp::Ordering::Equal);
+    }
+
+    fn make_full(
+        id: usize,
+        title: &str,
+        seeds: u32,
+        size: &str,
+        file_index: Option<u32>,
+    ) -> TorrentResult {
+        let mut r = make_sized(id, title, seeds, size);
+        r.file_index = file_index;
+        r
+    }
+
     fn make_sized(id: usize, title: &str, seeds: u32, size: &str) -> TorrentResult {
         let mut r = make_result(id, title, seeds, Some(0));
         r.size = size.into();
@@ -5111,17 +5224,26 @@ mod tests {
         for res in ["2160p", "1080p", "720p", "480p"] {
             for codec in ["x264", "x265"] {
                 for (seeds, size) in [(1u32, "9 GB"), (40, "4 GB"), (5000, "1.2 GB")] {
-                    id += 1;
-                    grid.push(make_sized(
-                        id as usize,
-                        &format!("Show.S01E01.{res}.WEB.{codec}-Grp.mkv"),
-                        seeds,
-                        size,
-                    ));
+                    // Addressability (tier 0) is an axis the comparator reads, so
+                    // it belongs in the grid — the test's whole claim is that
+                    // EVERY axis is covered, and a tier added without widening
+                    // this would be asserted over by a fixture that never
+                    // exercises it.
+                    for file_index in [Some(0u32), None] {
+                        id += 1;
+                        let mut r = make_sized(
+                            id as usize,
+                            &format!("Show.S01E01.{res}.WEB.{codec}-Grp.mkv"),
+                            seeds,
+                            size,
+                        );
+                        r.file_index = file_index;
+                        grid.push(r);
+                    }
                 }
             }
         }
-        assert_eq!(grid.len(), 24);
+        assert_eq!(grid.len(), 48);
 
         // The yardstick comes from the whole SET, so the context is built once —
         // comparing a pair in isolation would judge it against a different
