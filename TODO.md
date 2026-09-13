@@ -5,6 +5,17 @@ It has fired **24 times in seven days**, most recently `VLC gone (title="Star Ci
 S01E06") — now-view flagged=true, 1 torrent(s) stopped`. Both halves work on real
 quits: the Now-view clears and the torrent is stopped, which nothing did before.
 
+### ✅ RESOLVED 2026-09-13 — Stop no longer closes a VLC spela did not start
+Was an open decision ("quitting kills every VLC, including one you opened by hand").
+It stopped being hypothetical when a Stop queued for one film killed the next one
+seconds after it opened. Stop is now a no-op unless a spela stream is playing, and
+queued commands carry the stream they were issued for. **Residual edge, knowingly
+left**: VLC's http interface belongs to whichever process grabbed the port first, so
+a hand-opened VLC that got there ahead of spela's is the one the bridge talks to
+throughout. Closing that means tracking the pid the `vlc://` handler launches, which
+is the URL-handler script's to give. Detail: CLAUDE.md Hard-Won "A queued command
+must carry the stream it was issued for".
+
 ### 🔓 OPEN — a 1.2 GB partial download vanished across a restart (2026-09-09)
 Star City S01E03 reached 1.2 GB and `open_pct 100`; after a `systemctl restart` it
 was absent from the persistence store, its directory was gone, and a re-tap started

@@ -111,7 +111,9 @@ threshold, which is how you get an ordering that changes depending on the input 
    other way round, `2160p > 1080p > 720p > 480p`, because a 1080p source upscaled twice
    reads as soft at close distance whatever its bitrate. The one thing that can still
    push a 4K down is bits-per-pixel: a 2160p carrying under half the best 1080p's data
-   per pixel will look worse than the 1080p it would displace.
+   per pixel will look worse than the 1080p it would displace. That comparison is
+   weighted by codec, since HEVC gets substantially more picture out of the same byte
+   than H.264 does, and ignoring that refused legitimate 4K releases by a hair.
 3. **Language fit** against the show's original language: a clean release, then a
    multi-market or dual-language one, then a foreign dub.
 4. **H.264 over HEVC**, but only for targets that re-encode through NVENC, where H.264
