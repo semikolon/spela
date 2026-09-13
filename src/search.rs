@@ -2313,10 +2313,34 @@ pub fn race_candidate_is_not_a_downgrade(candidate_title: &str, chosen_title: &s
 /// implies. Runtime cancels out because every candidate in one search is the same
 /// minutes, so this is a clean proxy for bits-per-pixel-per-frame — which is what
 /// compression artefacts are made of.
+/// How much more picture HEVC gets from the same bytes, against H.264.
+///
+/// Published comparisons put the saving between 35% and 52% for equal perceptual
+/// quality, so 1.7x is the conservative end of that range rather than the flattering
+/// one — this number decides whether a 4K is allowed through, and being generous with
+/// it would wave through genuinely starved releases.
+const HEVC_EFFICIENCY_OVER_H264: f64 = 1.7;
+
+/// Bytes per pixel, **weighted by what the codec does with a byte**.
+///
+/// The unweighted form compares a 4K HEVC against a 1080p H.264 as though a byte meant
+/// the same thing in both, and it does not. Deadloch S01E01, 2026-09-13: the two 2160p
+/// sources measured 0.47 and 0.49 against a 0.50 floor and were both refused, so Auto
+/// picked a 3.28 GB 1080p H.264 over a 6.22 GB 2160p HDR WEB-DL from Amazon. Losing by
+/// 3% and 1% was the tell — the comparison, not the releases, was wrong: at 1.7x
+/// efficiency that 4K carries the equivalent of 0.80, comfortably clear.
+///
+/// The weight is applied where the bytes are counted rather than at the floor, so every
+/// reader of this value gets the corrected comparison and the floor stays one number.
 fn bytes_per_pixel(r: &TorrentResult) -> Option<f64> {
     let px = pixels_for_res_tier(resolution_tier(&r.title))?;
     let bytes = crate::server::parse_size_to_bytes(&r.size)?;
-    (bytes > 0).then(|| bytes as f64 / px)
+    let weight = if is_hevc_from_title(&r.title) {
+        HEVC_EFFICIENCY_OVER_H264
+    } else {
+        1.0
+    };
+    (bytes > 0).then(|| bytes as f64 * weight / px)
 }
 
 /// The best bytes-per-pixel any 1080p candidate in this search reaches — the
@@ -4996,6 +5020,41 @@ mod tests {
 
     /// The Diplomat S03E07, 2026-09-06, copied from `last_search.json` on the live
     /// server the evening it happened. Fredrik tapped #1 (the 4K) and watched #2.
+    /// Deadloch S01E01, copied from the live server 2026-09-13 — the case that showed
+    /// the floor was comparing codecs as though a byte meant the same in both.
+    #[test]
+    fn a_4k_hevc_is_not_starved_just_because_a_fat_h264_1080p_exists() {
+        let mut r = vec![
+            make_sized(1, "Deadloch.S01E01.1080p.WEB.H264-GGWP.mkv", 40, "3.28 GB"),
+            make_sized(
+                2,
+                "Deadloch.S01E01.2160p.AMZN.WEB-DL.DDP5.1.HDR.HEVC-CMRG.mkv",
+                12,
+                "6.22 GB",
+            ),
+        ];
+        let bpp = best_1080p_bytes_per_pixel(&r);
+        assert!(
+            !is_starved_4k(&r[1], bpp),
+            "unweighted this measured 0.47 against a 0.50 floor and was refused; \
+             HEVC gets more picture from a byte, so it is not starved"
+        );
+        rank_results_mut_prefer(&mut r, false, Some("en"));
+        assert!(r[0].title.contains("2160p"), "got {:?}", r[0].title);
+    }
+
+    #[test]
+    fn the_starvation_floor_still_catches_a_genuinely_thin_4k() {
+        // The weight must not become a free pass. A 2160p HEVC has to carry real data,
+        // not merely be HEVC: against the same 3.28 GB 1080p, 2 GB is 0.26 weighted.
+        let r = vec![
+            make_sized(1, "Show.S01E01.1080p.WEB.H264-Grp.mkv", 40, "3.28 GB"),
+            make_sized(2, "Show.S01E01.2160p.WEB.HEVC-Grp.mkv", 40, "2 GB"),
+        ];
+        let bpp = best_1080p_bytes_per_pixel(&r);
+        assert!(is_starved_4k(&r[1], bpp));
+    }
+
     #[test]
     fn test_a_race_may_not_substitute_a_1080p_for_the_4k_that_was_chosen() {
         let four_k = "The Diplomat S03E07 PNG 2160p NF WEB-DL DDP5 1 Atmos H 265-XEBEC.mkv";
@@ -5166,8 +5225,12 @@ mod tests {
         // that is a judgement about PICTURE rather than a guess about delivery.
         // A 5000-seed starved 4K still loses to a fat 1080p; a 1-seed healthy 4K
         // still wins. Seeds move neither verdict.
+        // Sizes updated 2026-09-13 when the floor learned about codec efficiency: at
+        // 1.7x, 8 GB of HEVC is no longer starved against a 5.09 GB H.264 1080p, and it
+        // should not be. The test is about SEEDS not moving the verdict, so the fixture
+        // moves to sizes that still straddle the floor under the corrected comparison.
         let fat_1080p = make_sized(1, "Show.S01E01.1080p.WEB.x264-Grp.mkv", 40, "5.09 GB");
-        let starved_4k = make_sized(2, "Show.S01E01.2160p.WEB.x265-Grp.mkv", 5000, "8 GB");
+        let starved_4k = make_sized(2, "Show.S01E01.2160p.WEB.x265-Grp.mkv", 5000, "4 GB");
         let healthy_4k = make_sized(3, "Show.S01E01.2160p.WEB.x265-Grp.mkv", 1, "24 GB");
 
         let mut a = vec![fat_1080p.clone(), starved_4k];

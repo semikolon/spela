@@ -8902,6 +8902,28 @@ async fn handle_vlc_control(
             }
         }
     }
+    // STAMP THE COMMAND WITH THE STREAM IT IS FOR (2026-09-13).
+    //
+    // The queue held bare commands, so one had no way of saying which playback it
+    // belonged to. A `stop` issued for Vesper sat in the queue, the bridge drained it
+    // after Deadloch's VLC had already launched, and quitting kills every VLC — so the
+    // wrong film's Stop killed the next one, seconds after it opened.
+    //
+    // The title travels with the command and the bridge drops anything that does not
+    // match what it is currently tracking. Belt to the braces of clearing the queue on
+    // `/vlc/gone`: either alone would have prevented this, and a command that outlives
+    // its stream is worth refusing twice.
+    let mut cmd = cmd;
+    if let Some(obj) = cmd.as_object_mut() {
+        if !obj.contains_key("title") {
+            if let Some(t) = lock_recover(&state.live_position)
+                .as_ref()
+                .map(|p| p.title.clone())
+            {
+                obj.insert("title".into(), Value::String(t));
+            }
+        }
+    }
     let mut q = lock_recover(&state.vlc_commands);
     // Cap the queue so a watcher that isn't running (VLC closed) can't let
     // commands accumulate unbounded.
@@ -9089,6 +9111,16 @@ async fn handle_vlc_gone(State(state): State<SharedState>, Json(body): Json<Valu
             if title.is_empty() || lp.title == title {
                 lp.gone = true;
                 flagged = true;
+                // The stream is over, so anything still queued for it is stale and must
+                // never reach whatever plays next. See the stamping note in
+                // `handle_vlc_control` for what a stale command cost.
+                let dropped = std::mem::take(&mut *lock_recover(&state.vlc_commands)).len();
+                if dropped > 0 {
+                    tracing::info!(
+                        "vlc: dropped {} queued command(s) for the stream that just ended",
+                        dropped
+                    );
+                }
             }
         }
     }
