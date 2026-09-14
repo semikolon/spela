@@ -1,21 +1,5 @@
 # Spela TODOs 🎬🍿
 
-### ✅ RESOLVED 2026-09-09 — the VLC-quit teardown is exercised by real quits
-It has fired **24 times in seven days**, most recently `VLC gone (title="Star City
-S01E06") — now-view flagged=true, 1 torrent(s) stopped`. Both halves work on real
-quits: the Now-view clears and the torrent is stopped, which nothing did before.
-
-### ✅ RESOLVED 2026-09-13 — Stop no longer closes a VLC spela did not start
-Was an open decision ("quitting kills every VLC, including one you opened by hand").
-It stopped being hypothetical when a Stop queued for one film killed the next one
-seconds after it opened. Stop is now a no-op unless a spela stream is playing, and
-queued commands carry the stream they were issued for. **Residual edge, knowingly
-left**: VLC's http interface belongs to whichever process grabbed the port first, so
-a hand-opened VLC that got there ahead of spela's is the one the bridge talks to
-throughout. Closing that means tracking the pid the `vlc://` handler launches, which
-is the URL-handler script's to give. Detail: CLAUDE.md Hard-Won "A queued command
-must carry the stream it was issued for".
-
 ### 🔓 OPEN — a 1.2 GB partial download vanished across a restart (2026-09-09)
 Star City S01E03 reached 1.2 GB and `open_pct 100`; after a `systemctl restart` it
 was absent from the persistence store, its directory was gone, and a re-tap started
@@ -35,17 +19,6 @@ why persistence stays on.
 starvation (ikatson/rqbit#663). **Next action**: watch that PR; when it lands in a
 release, move back to crates.io and delete the fork note in `OPERATIONS.md`.
 
-### ✅ RESOLVED 2026-09-05 — MERIAN no longer rebuilds a spela it never uses
-`install-extra-binaries` has no `watch`, so it provisioned the fleet's dev tools
-on EVERY apply — meaning a machine that only reaches spela over HTTP still built
-the Rust binary from source. On MERIAN that drove load to 44 and made the fans
-audible across a room. Fixed with an explicit per-machine `skip_builds` list in
-`fleet.toml`, reusing rebuild-nit.sh's reader shape; explicit rather than derived
-from the "laptop" role, per the principle `[machines.turing]` already records.
-**The Mac Mini is deliberately NOT in the list** — it runs `spela serve-library`
-as a launchd agent and Ruby drives the CLI by local subprocess. Verified live:
-MERIAN's sync ran the installer and spela stayed absent.
-
 ### 📌 NOTE — one MERIAN sync printed no trigger lines; not reproducing
 The 2026-09-05 09:24 sync deployed 27 templates and reported `ok` with no
 `nit: trigger '…' succeeded` lines at all. The 11:2x sync printed three,
@@ -55,102 +28,21 @@ for a recurrence rather than chasing it — a bridge change that appears not to
 take effect is the symptom, and the manual fallback is
 `bash ~/dotfiles/scripts/darwin/42-restart-spela-vlc-bridge.sh`.
 
-### Rewatch shelf + trailers + list performance — SHIPPED + live-verified 2026-08-27 ✅
-**`#/rewatch`** (sixth nav view): the ledger read as a shelf, Films/Series split on first paint, films as `2h 16m` and series as episode/season counts. **Media-type resolution was the hard part** — `title_meta`'s ladder is `tmdb_id → imdb_id (corrects kind) → typed title-search locked to the caller's guess`, and the Rewatch view has neither id and cannot infer type (a show marked at SHOW level carries no `SxxExx`), so the typed search defaulted to `movie` and returned a DIFFERENT title (Station Eleven → an unrelated 2013 film). Fixed by following the 2026-08-22 history (`efba21e`/`12e1ff0`) rather than a parallel mechanism: a media-type-UNKNOWN rung resolves via the shared scorer and the resolved kind SHADOWS the caller's assumption. **Trailer on the search card** as a click-to-load facade, torn down at `route()` (an eager iframe kept playing audio across every page). **Lists got ~13× cheaper**: To-Watch fired 143 `/title-meta` calls at once (~1.3 s); viewport-gated enrichment cut it to 11 (~0.9 s) — and the three view API calls were never the cost (100 ms measured), so MEASURE before optimising here. Detail: CLAUDE.md § Rewatch tab / § Trailer / § payload-versioned cache.
+### 🔓 OPEN — see a next-episode hand-off end to end
 
-### Completion is an event, not a condition — SHIPPED + tested 2026-08-27 ✅
-`save_position_smart`'s completion branch was re-evaluated on EVERY position report, and
-`HWM_CLEAR_TAIL_SECS = 300` meant it fired for the whole last five minutes. Observed live
-on The Diplomat S03E01: "completion detected … clearing resume point" every ~17 s from
-2200 s of 2487 s. The log spam was the symptom; the damage was that each firing called
-`reset_position`, deleting the resume point AND the Continue row, and the branch returns
-before the in-progress upsert — **so pausing four minutes before the end erased where you
-were.**
-
-**Shipped**: (1) the ledger write is LATCHED, once per playback (`completion_latched`,
-in-memory + serde-skipped, self-healing — a report below half the runtime re-arms it, so
-a rewatch records again with no play path having to remember). (2) The thresholds are
-SPLIT: "effectively seen this" stays generous at `HWM_CLEAR_FRACTION`/`HWM_CLEAR_TAIL_SECS`,
-while discarding the place needs `PLACE_CLEAR_FRACTION` 0.995 or the last 30 s. This moves
-in the SAME direction as the Send Help incident that set 0.96 as a LOWER bound — it
-discards later, never earlier — and `HWM_CLEAR_FRACTION` itself is untouched because
-natural-EOF, the cast health monitor and auto-next-episode all depend on its meaning.
-Three tests encoded the old fused policy and were superseded in place with the reason
-recorded at each.
-
-**CORRECTION to this entry's earlier claim.** It said VLC "gives no reliable teardown
-signal". Too strong: pressing Stop DOES reach spela (`handle_vlc_control` receives it and
-was relaying it to VLC while ignoring it) — it is simply not present on every watch, since
-the stream can end or VLC can be closed. So the thresholds must stand on their own, but
-when the signal is there it is the most reliable statement of intent available, and an
-explicit stop past the watched mark now clears the place. Detail: CLAUDE.md Hard-Won
-"Completion is an EVENT".
-
-### Next-episode enqueue into the running VLC — SHIPPED 2026-08-28, ONE live step left ✅
-Supersedes "port the Chromecast queue": Fredrik's idea is better. VLC's `in_enqueue`
-appends to its own playlist, so the next episode continues with NO relaunch and no gap.
-Verified against a headless VLC (advances by itself at EOF), and the serving half verified
-live (206 + Range by title; traversal attempt → 404). Auto-fires off the completion latch;
-`vlc_autoqueue_next` disables it.
-
-**The one thing not yet seen end-to-end**: an actual hand-off between two episodes, because
-it is LOCAL-ONLY and Star City S01E02 is a sparse placeholder from a season pack, not
-downloaded. Download E02 first, then play E01 to the watched mark and watch it roll. Detail:
-CLAUDE.md Hard-Won "Next-episode ENQUEUE".
-
-### CLOSED — "streaming plays need sequential piece priority" was WRONG (2026-08-28)
-Filed and withdrawn the same evening. Kept because the wrong turn is worth not repeating.
-
-**The claim**: a 4K stall showed 3.14 GB present (32%) across 289 extents with only 1.12 GB
-contiguous, so spela should ask librqbit for sequential piece priority.
-
-**Why it was wrong, from the source rather than the summary** — `file_info.rs`:
-`first.chain(last).chain(mid)`, with its own test asserting `it(0..3) == [0, 2, 1]`. That is
-piece 0, then the last piece (for the container index), then **every remaining piece in
-ascending order**. The queue is already beginning-first. `docs/librqbit_streaming_faststart_research_2026_07_05.md`
-§1 said so in July and rated the idea "Nothing to build"; it was indexed in CLAUDE.md hours
-earlier and not opened.
-
-**What the 289 extents actually were**: pieces IN FLIGHT. Requested in ascending order,
-completing out of order across peers of differing speed, so there are always gaps behind the
-frontier mid-download. They fill — the finished file measured 9.91 GB with ZERO holes.
-
-**What was actually true**: starvation. 10 Mbps arriving against 21.4 Mbps consumed. No
-ordering change makes that playable; it only moves where the stall lands.
-
-**Two things worth keeping from the detour**: percent-downloaded is the wrong number to show
-a viewer mid-stream — contiguous runway in MINUTES is what they have — and the peer-supply
-levers the July research rated HIGH (session-level trackers, inbound TCP listener) are
-already implemented, verified in `torrent_engine.rs`.
-
-**Also corrected**: `prefetch_ends` reads 2 MB per end, 4 MB total, 0.04% of a 9.9 GB file.
-It was blamed for the scatter earlier the same evening and is not responsible.
+Next-episode enqueue into the running VLC is shipped and the serving half is
+verified; what has never been watched is an actual hand-off between two episodes,
+because it is LOCAL-ONLY and the obvious test episode was a sparse placeholder.
+**Next action**: download E02 first, then play E01 to the watched mark and watch it
+roll over. Detail: CLAUDE.md Hard-Won "Next-episode ENQUEUE".
 
 ### Open — recommender + ledger follow-ups (2026-08-27)
 - **Rating — SHIPPED 2026-08-27.** `WatchedEntry.rating: Option<i8>` (`1` loved / `0` fine / `-1` no; `None` = UNRATED and MUST stay distinguishable from "fine"). `POST /watched-rate`; rating a SHOW applies to all its episode rows and a re-mark carries the judgement across. Rewatch renders TWO toggles, never a cycle, plus a Loved-only filter.
 - **imdb_id backfill — DONE 2026-08-27.** `POST /watched-backfill-ids` resolves ONE id per distinct title via `title_meta` with `auto_kind`, applies it to every row, idempotent — re-run it whenever the ledger grows. Ran clean: 107/107 rows carry a well-formed id.
 - **`media_type=auto` is opt-in**; the To-Watch and rec rows still pass an explicit hint because they know it. Do not flip the default — OMITTING the hint has always meant "movie" and existing callers rely on it.
 
-### Ledger backfill from the taste profile — DONE 2026-08-26 ✅
-A reconciliation of `taste_profile.md` against the watched-ledger found **~15 genuinely-loved titles named in the profile that are absent from the ledger**, so `has_seen` cannot exclude them and the recommender may surface any of them: **Her · Ex Machina · Children of Men · Moon · Gattaca · Nightcrawler · Prisoners · The Banshees of Inisherin · Dark · Counterpart · The Bear · Beef · The Terror S1 · Poker Face · Pluribus** (Hell or High Water and Eternal Sunshine likely too — the extraction was regex-noisy). This is the exact drift the SSoT rule at the foot of `taste_profile.md` predicts: the profile is prose, the ledger is what the machine queries, and writing one without the other fails SILENTLY. **Done**: 36 titles written via `POST /watched-add` after Fredrik confirmed the sweep (he excluded `Smoke` by name). Ledger 31 → 66 distinct titles; junk `probe` entry removed; served recommendations fell to 83 as the read-time seen-filter took effect. The exclusions and WHY each was held back (queued titles, actor-filmography names, Patrik's loves, rewatch-curiosity) are recorded at the foot of `taste_profile.md` so a later session does not 'helpfully' add them.
-
 ### Netflix viewing-activity import — OPEN, blocked on Fredrik (2026-08-26)
 The structural cure for the lifetime-history gap (see § Watch tracker for why it matters — it produced five already-seen recommendations in one session). **Blocked**: the Bitwarden vault is logged OUT (`status: unauthenticated`, `lastSync: null`), so the Netflix credentials cannot be looked up. **Fredrik runs `bw login` then `bwu`** (master password + 2FA, human-only); then Claude searches the vault, pulls the PER-PROFILE CSV from `netflix.com/viewingactivity` (never the account-level GDPR export — it pulls every family profile), and builds the importer.
-
-### Watch-tracker seen-detection + undo — SHIPPED + live-verified 2026-08-26 ✅
-A series used to drop off the To-Watch list on ONE watched episode: `handle_watchlist` built its seen-set from each ledger entry's `show` NAME alone, so four minutes of `Search Party S01E01` hid a 96% series for weeks. Now `AppState::hidden_watched_shows` requires `SERIES_WATCHED_EPISODE_THRESHOLD` (3) DISTINCT episodes; films, explicit whole-show marks (the rec-row ✓ writes a bare title with no `SxxExx`) and migrated `seed` baselines still hide on one entry. Companion `POST /watched-remove {title}` + two UI affordances (rec-row ✓ raises a 9 s Undo toast that re-inserts the row at its ORIGINAL index; To-Watch grows a collapsed "Watched · N" section with a ✕ per row) — the ledger had been append-only, so a stray tap was unfixable and, worse, INVISIBLE. 9 tests. Detail: CLAUDE.md Hard-Won "To-Watch hides a SERIES only past 3 distinct watched episodes".
-
-### UI typography + hover gleam — SHIPPED + live-verified 2026-08-26 ✅
-**Manrope 16px/500 → base 17px**, shipped as a **base64 variable WOFF2 embedded in the SPA**, NOT merely named: Manrope is a Mac-only third-party install absent on iOS, so a bare `font-family` would fall back silently on the phone — the device the remote is actually used from. Nav tabs adopted the section-header voice (uppercase/800/`.09em`, `white-space:nowrap` — the tracking made TO WATCH wrap). **Hover gleam** ported from brf-auto's dashboard queue-card swoosh, re-scaled for dark chrome (`--gleam-peak`) and re-triggered on hover with a 15% inset settle that rises across the sweep; `#v-search .card` is exempt (one result = the card IS the page). Coverage was AUDITED, not assumed — walking every rendered control per view found four search-card buttons the selector list had missed. Detail: CLAUDE.md "Typography" + "Hover gleam".
-
-### Media cache moved to /mnt/hdd + cap enforced on ALL paths — SHIPPED + live-verified 2026-08-23 ✅
-Root cause of a 48 GB (~5× cap) `~/media` on the encrypted root: `prune_to_fit` + `check_space` ran ONLY in `do_play` (cast); both Open-in-VLC endpoints called `start_torrent_for_play` directly with no cap enforcement, so VLC-watching (the default target) downloaded uncapped. Fix: hoisted a debounced prune + check into the shared `start_torrent_for_play` (every download path) + a 5-min background sweep + raised `MAX_MEDIA_MB` 10→100 GB, and moved the cache to the dedicated fstab-persisted `/mnt/hdd/spela-media` (off cryptroot's shared-fate with Postgres/FalkorDB/router) via `SPELA_MEDIA_DIR` in the unit. Verified E07 downloads land on sdb; old 50 GB cleared (cryptroot 87%→66%). Detail: CLAUDE.md Hard-Won `src/disk.rs` note + Darwin § Media.
-
-### Episode-strict Local Bypass (season-pack aware) — SHIPPED + live-verified 2026-08-23 ✅
-Two bypass bugs fixed in `find_local_bypass_match` (`src/server.rs`): (1) a **bare show title with no structured episode** (`searching == None` — a `/home` "Coming soon"/New-Episodes tap searches `"Show S01E06"` as free text) matched ANY on-disk episode folder of the show, then applied that episode's resume HWM; (2) a **season-pack dir** (`Show.S01.WEBRip...`) was invisible because its NAME lacks `S01E06`, so packed episodes were never bypass-matched → needless re-download. Fix: new `bypass_match_title` recovers `SxxExx` from the result title (wired into all 4 title-build sites) so the match stays episode-strict; the matcher now matches a dir on episode-STRIPPED show tokens then episode-gates the INNER file (gate satisfied if the dir name names the episode — single-episode folder with a generic inner file — OR the inner file does — season pack). Top-level files + movies (no `SxxExx`) unchanged. 7 new tests (real Widow's Bay/Predestination release names), full server module 189/0 green. Live-verified: E07 bypass-matched its exact `S01E07` file. `54e4545`.
-
-### Accurate platform-release dates via TVmaze — SHIPPED + live-verified 2026-08-06 ✅
-Corrects TMDB's day-early air-date lag for ALL networks (Silo S03E06 now Aug 7 not Aug 6; Star Trek latest now S04E03 not the stale E02). `search.rs::tvmaze_episodes` (singlesearch + imdb cross-check; `/lookup` is unreliable), airstamp→Stockholm, 6h cache, falls back to TMDB on any miss. Wired into `search_tv` + `tv_status`. Full detail: CLAUDE.md Hard-Won "Air dates come from TVmaze". Companion SPA fix (same day): now-view/now-bar show the playing episode + search-card drops stale "Latest". **Residual (minor):** TVmaze is TV-only (movies use TMDB `release_date`, no lag problem); `is_future_date`/`compute_following_shows` "today" is now Stockholm — consistent.
 
 ### 4K / partial-torrent VLC "buffer then AUTO-play" (2026-08-03)
 **✅ MOSTLY SHIPPED (v3.21):** `TorrentEngine::prefetch_ends` (first+last-piece prefetch) + `GET /vlc/{id}/ready` + SPA `vlcWaitReady` (poll readiness, auto-fire `vlc://` when buffered, no re-click) are live. **Remaining refinements:** (a) ✅ SHIPPED (v3.22 `ends_present` — a short-timeout head+tail present-check, ANDed with the `≥15% + ≥64MB` proxy in `/vlc/ready`); (b) rate-vs-bitrate gate — for a slow 4K swarm (download < playback bitrate), wait for full/rate-safe download before auto-launch (needs the file's bitrate, ~size/duration once probed); (c) dedup `prefetch_ends` (currently fires per /ready poll — harmless pile-up of fire-and-forget tasks, but wasteful); (d) de-prioritise DV profile-5 4K for the VLC target (renders poorly). Design + why below:
@@ -210,14 +102,6 @@ Data + research: `docs/barrage_findings_2026_07_05.md`, `docs/slow_torrent_strat
 - **[DONE 2026-07-06 — local variant, LIVE on prod] Source racing (no debrid)** — weak-swarm-gated pre-selection stage in `do_play`'s torrent branch: when the top pick has `seeds < race_seed_threshold` (default 100), the top `race_max_sources` (default 2) releases are added to the shared librqbit session concurrently, the first to deliver real bytes wins, losers are stopped+deleted, winner continues via `AlreadyManaged`. Config-gated (`race_sources_enabled`, default on). **Validated on the test instance** (The Cremator 4-seed → result 2 delivered first, won in ~1.3s, downloaded at 843 KB/s). Two commits: `2857992` (feature) + `047bd75` (concurrent-start fix — `add_torrent` blocks on magnet metadata, so a dead candidate-1 hung the sequential version). Debrid leg parked (above). GPU use unchanged (race is download-only; only the winner transcodes).
 - **[good hygiene] deliberus-postgres binds `0.0.0.0:5432`** — WAN-blocked (INPUT drop + DOCKER-USER) so LAN-only, but should bind the LAN IP like the other DBs.
 
-### Cast UX + speed — SHIPPED (v3.13, 2026-07-04 evening, post-Bear-watch feedback)
-Fredrik watched The Bear, came back with rich feedback. Shipped + verified (Fredriks TV):
-- **Stop kills the cast** (`handle_stop` sends the Chromecast a STOP before backend teardown — was leaving the TV playing the buffered HLS). **Graceful optimistic stop** in the SPA (now-playing surface fades out = the confirmation, "Stopped" toast, per NN/g). **Crisp <100ms tap feedback** on transport buttons (scale + color `:active`).
-- **Start ~5× faster**: race-ahead lead 120s→12s (MIN_SPEED 1.5× is the real safety gate + the adaptivity — strong source starts early, weak waits) + wall-sample 8s→5s. alass alignment capped at 5s (the 19s subtitle bottleneck was a COLD-cache first-play cost — cached re-plays ~1s). Silo warm-cache start: **~13s** (was ~50s). Cold: ~17s.
-- **Rewind-to-0 works**: SPA seek BEFORE the transcode start (ss_offset) now re-transcodes instead of erroring "Cannot seek to 0s".
-- **kamal-proxy target-timeout 30s→300s** (the months-long root cause — proxy 504'd slow /play mid-cast; per-service, verified isolated).
-Full research: `docs/ux_principles_media_remote_2026_07_04.md`. Global UX principle (action-feedback thresholds) queued for global CLAUDE.md.
-
 ### NEXT — intro-warmup: instant TV wake + parallel handshake (Fredrik's idea, 2026-07-04)
 The ~8s Chromecast LOAD handshake (connect + launch receiver app + buffer) runs SERIALLY *after* race-ahead. Fredrik: cast the (currently-disabled) intro clip as a warm-up placeholder the instant the transcode starts → TV lights up in ~2-3s (huge perceived-perf win) + the receiver-app-launch overlaps the transcode buildup → then LOAD the real HLS on the warm receiver. Build defensively (best-effort; any failure falls through to the normal cast, no regression). Timing caveat: intro is 5s, real-ready is ~13s → a gap where the intro ends before real content; consider looping the intro or a longer placeholder. NEEDS live-Chromecast testing (the swap-glitch) — can't fully verify without a device.
 
@@ -227,28 +111,13 @@ Fredrik's insight (correct): Cast receivers render subtitles as a **layered text
 ### NEXT — cold-cache subtitle prefetch during search
 First-play subtitle cost is the cold alass audio-VAD (~15s, now capped at 5s → raw sub fallback). Prefetch + align subtitles in the BACKGROUND when the user views search results (before they tap play) → by play-time the aligned SRT is cached → fast first-play WITH aligned subs. Decouples subtitle latency from the play entirely (for the DMR-burn-in path; the custom receiver makes it moot).
 
-### Cast reliability — SHIPPED (v3.12, 2026-07-04)
-Fixed the recurring "won't play from web remote": (1) kamal-proxy `--target-timeout` 30s→300s (the primary root cause — proxy 504'd slow `/play` mid-cast → orphan ffmpeg, no cast; evaded diagnosis for months because direct-curl bypasses the proxy); (2) `do_cleanup` orphan-ffmpeg pkill + retry-past-death-race (stale segments were polluting the next play → Chromecast buffering); (3) race-ahead primary-variant segment count (was double-counting multi-variant → cast at half the real buffer). Verified Silo → Fredriks TV reaches Playing via both paths. See CLAUDE.md Status v3.12 + Hard-Won Lessons "kamal-proxy target-timeout".
-
 ### NEXT (architectural, deferred): decouple `/play` from the HTTP request lifecycle
 The proxy-timeout bump (300s) is the robust interim, but the *proper* fix is to make `/play` return fast (right after starting the transcode) and run the cast-gate + cast + monitor in a DETACHED tokio task that the HTTP request's cancellation can't kill. Then no proxy/browser timeout can ever orphan a cast, and `/play` is instant. The warmup UI already polls `/progress` + `/status`, so the frontend is ready — needs: (a) `/play` spawns the cast pipeline detached + returns `{status:"starting"}`; (b) background-task errors surface via a `/status` `last_error` field; (c) SPA keeps the warmup screen until `/status` shows streaming (don't `endWarming` on the fast `/play` return). Also consider lowering the race-ahead `MIN_LEAD_SECS` (120s → ~40s) for COMPLETE local files — a 3.5× transcode of a complete file never gets frontier-caught, so 120s of pre-buffer just adds ~30s to every start; a smaller lead would make Chromecast plays start in ~15-20s instead of ~50s.
-
-### Live warmup progress — SHIPPED (v3.11, 2026-07-04)
-`GET /progress` + RAII `Warmup` in ServerState (`begin_warmup` per source path, cleared on every do_play return); phase inferred, segment count mtime-filtered to fresh `.ts`. SPA: chromecast + phone-direct + library all navigate to a live progress screen immediately, poll `/progress` every 1s while `/play` awaits in the background. Verified: torrent path (live peers/speed/%), local path (fresh segs 1→6→11), RAII clears on success + dead-seed error. See CLAUDE.md Hard-Won Lessons "Live warmup progress". *Future: Shannon target has no warmup (server early-returns); torrent-audio-track alignment for remote-origin subs is out of scope.*
-
-### Subtitle-sync guarantee via alass — SHIPPED (v3.11, 2026-07-04)
-`subtitles.rs::align_srt_with_alass` — external OpenSubtitles SRTs aligned to the media (embedded-text-track reference else audio VAD) via `alass --no-split` before burn-in, on local `file://` sources. Embedded-first rung (rung 1) unchanged = primary synced path. Verified: +45s desync recovered exactly. Full research: `docs/subtitle_sync_research_2026_07_04.md`. *Future: remote serve-library HTTP streams can't align (no local file); a CONSTANT lag across titles is spela's own `ss_offset`/`shift_srt`/`start_time`, not the SRT — check that path if it recurs.*
-
-### Audio-pick — SHIPPED + SUPERSEDED (2026-07-04)
-Jun-4 `eng→dan→first` chain replaced by TMDB `original_language`-first picker (never a dub). See CLAUDE.md Hard-Won Lessons "Audio picker prefers the film's ORIGINAL language". The config-driven `preferred_audio_languages` idea is subsumed (TMDB knows the original language). Done.
 
 ### samklang — torrent-streamed music extension (SPEC SHIPPED 2026-06-02, NOT YET IMPLEMENTED) 🎵
 Three-file Kiro spec at `.claude/specs/samklang/{requirements,design,tasks}.md`. Music streaming for a small invited circle, built as `MediaType::Music` extension to spela (one binary; `/music/*` routes; new `/listen` tab in `static/remote.html`). Torrent-only streaming (BT primary v1, Soulseek + Internet Archive in phase-4 try-harder path), progressive in-time quality upgrade via Web Audio + MSE source-swap (mp3 → FLAC seamlessly), bearer-token multi-user, Postgres on Darwin :5433 for state. 5 phases ~5-6 weeks at AI-augmented velocity; **phase 1 weekend-shippable** (search + play + web /listen tab, single user, Jackett-on-Darwin-Docker as the indexer hub). Cross-cutting non-regression invariant: existing video paths (`MediaType::{Movie, TvShow}`) bit-identical throughout. Companion: dotfiles (B3) Shannon BT-audio side-quest must resolve before T-3.11 Marshall-via-Shannon target can land — Chromecast cast (T-3.7) ships first.
 
 ---
-
-### Web remote — Phases 1-6 SHIPPED · v1 FEATURE-COMPLETE (v3.7, deployed Darwin) ✅
-Dark single-asset SPA at `/remote`, portless via a LAN reverse proxy (host-private infra). Full Kiro spec: `.claude/specs/web-remote/{requirements,design,tasks}.md`. **Done (all 6 phases):** `/remote`+`/library`+`/library/list`, shell/grid/API-client, search/hybrid-play/target-picker/now-playing/scrubber, My-Library view (distinct unreachable/offline/empty states), bare-`/`→307, the now-playing pause/resume state-machine fix, **phone-direct in-browser playback** ("This phone" live; `target:"vlc"` no-cast HLS → native `<video>`/hls.js). **Status (2026-05-18):** (1) T-4 poster enrichment **✅ shipped+deployed: 54/57 (95%)** best-effort (pipeline: clean-title → token-similarity → year-param → `/search/multi` → relaxed first-word/drop-last tiers; 3 honest-ceiling misses — fansub-prefix/double-feature/obscure-TV-doc); (2) My-Library list+posters **✅ LIVE** (stale-`/library/list`-binary fix; 57 films + posters e2e) — but **tap-to-play was structurally broken, fixed v3.7.1** (deploy to Darwin to land): (a) `do_play` magnet gate ran *before* the local/remote bridge → "Missing magnet" on every library tap; (b) SPA target-picker abandoned the play on first tap (no pending-replay) → silent no-op. "end-to-end" had only meant list/posters (*Built≠Verified*); (3) `spela.home` → systemic HTTPS **✅ DONE** (`https://spela.fredrikbranstrom.se` live; xref `~/dotfiles/docs/lan_https_dns01_wildcard_spec_2026_05_18.md`); (4) real-device e2e (T-16) is yours via normal use. **Open:** (a) "TCC durability hardening" below (serve-library grant code-signature-keyed → Mac-rebuild revokes; stable-codesign fix); (b) Phase-7 thin-client remaining layers — see next block. Supersedes the "A. web remote" path in `PHONE_APP_PROJECT.md`; native iOS app remains the separate deferred track (now informed by real phone-direct use).
 
 ### Phase-7 spela-thin-client (Shannon bedroom, kiosk Option A) — architectural keystone LIVE · HW-decode regressed since 2026-05-21 · Watch UI is the next UX rank-1
 Architecture: Shannon plays Darwin's no-cast HLS via a local renderer; Darwin's NVENC does all transcoding (research § 6-compliant H.264 8-bit). Two entry points to the same plumbing:
@@ -298,101 +167,38 @@ Architecture: Shannon plays Darwin's no-cast HLS via a local renderer; Darwin's 
 
 **Chromecast retirement is PARTIAL** per research § 6 — spela + direct-URL YouTube only; Netflix/HBO/DRM apps keep the Chromecast (irreducible aarch64-Widevine gap).
 
-### v3.6.0 Local Library Streaming + v3.6.1 race-ahead + v3.6.2 tier-3 (SHIPPED May 16, 2026; ONE user step pending) 🔧
+### 🔓 OPEN — fleet-track the two Mac-side pieces serve-library depends on
 
-Stream pre-existing LAN files instead of re-torrenting. Commits `cf11848`
-(serve-library origin + multi-root + remote-origin bridge), `c0eeadf`
-(race-ahead fast-cast — local files cast in ~20 s, not a 15-min full
-pre-transcode; math proof in `race_ahead_safe`), `ece4d56` (tier-3
-directory health — serve-library was DOA for directory-style films).
-Deployed: Darwin (server, ece4d56, `remote_origins → 192.168.4.2:7891`),
-Mac (release build, `~/.local/bin/spela` symlink, BOHR `library_dirs`,
-launchd `com.fredrikbranstrom.spela-library` running). Full design:
-`docs/LOCAL_LIBRARY_STREAMING_PLAN.md`. serve-library verified working
-(Inception/Possession/Drive/Black-Mirror → handles, Range 206, traversal
-→ 410) when run in a TCC-granted context; Darwin↔Mac network path
-verified (HTTP 410, 3 ms).
+Local library streaming is live (design: `docs/LOCAL_LIBRARY_STREAMING_PLAN.md`).
+Two pieces work on the Mac Mini but are not reconstructible from a fresh provision.
 
-- [x] ✅ **serve-library FDA/Removable-Volumes — RESOLVED (2026-05-18).** My-Library is LIVE end-to-end (54/57 posters, verified). The real fix was rebuilding the Mac serve-library binary with `/library/list` (it was stale); the user granted the Removable-Volumes "Allow" this session so `read_dir(BOHR)` works. **Recurring durability gotcha (not a blocker):** TCC keys the grant to the binary's code signature → any Mac `spela` rebuild silently revokes it → serve-library `read_dir` hangs again until re-Allow. Durable fix = ad-hoc-codesign with a stable identifier post-build (see "TCC durability hardening" below). Until then: re-grant after any Mac spela rebuild — `System Settings → Privacy & Security → Full Disk Access → + → ⌘⇧G → /Users/fredrikbranstrom/Projects/spela/target/release/spela → ON`, then `launchctl kickstart -k gui/$(id -u)/com.fredrikbranstrom.spela-library`.
-- [x] ✅ **TCC durability hardening (SHIPPED May 20, 2026).** `bin/build-mac.sh` wrapper does `cargo build --release` + ad-hoc codesign with stable identifier `com.fredrikbranstrom.spela`. Documented in CLAUDE.md § Build & Deploy. **One-time re-grant required at next bounce** — Mac Mini's currently running daemon (PID 5384) is still on the old hash-based signature (in-memory); next `launchctl kickstart -k` or reboot picks up the new stable-identifier binary, FDA will need re-granting via System Settings ONCE. From then on, every rebuild via `bin/build-mac.sh` preserves the stable identifier — empirical verification pending across the next few rebuilds. (Ref: CLAUDE.md global "TCC code signature gotcha".)
-- [ ] **Fleet-track the launchd agent (Track-everything-automatable).** `~/Library/` is gitignored by nit (correctly — fleet templates plists). Templatize → `dotfiles/templates/Library/LaunchAgents/com.fredrikbranstrom.spela-library.plist.tmpl` with `{{ home_dir }}`, wired to the `30-reload-launchagents` trigger. Deployed+functional+reboot-surviving on Mac Mini now (plist now tightened, see below); just not yet nit-reproducible. **Drive-missing-on-MERIAN concern dissolved by v3.8.0 (`245bef0`)**: the daemon now enters `Waiting` calmly instead of crash-looping when configured drives are absent. **Plist defense-in-depth ALREADY APPLIED on Mac Mini's deployed copy** (May 20, 2026): `KeepAlive { Crashed: true, SuccessfulExit: false }` (was `true`) + `ThrottleInterval=60` (was unset / 10s default). Templates should mirror these exact values when fleet-tracking lands. Remaining MERIAN concern is empty `library_dirs` (still bails — `SuccessfulExit: false` would respawn at 1-per-minute instead of 1-per-10s, still loud) — Mac-Mini-scoping via a `[[ -n library_dirs ]]` template gate is the right deploy filter. *Consult-before-shared-infra* — propose before implementing.
-- [ ] **Track `~/.local/bin/nightly-sweep` (Track-everything-automatable).** Currently a plain executable file on Mac Mini, NOT nit-tracked. Its Phase 4 was extended May 20, 2026 to rotate `spela-library.{out,err}.log` (10 MB cap → last 1000 lines, in-place truncation to preserve launchd's open FD inode — `cat tmp > file` form replaces the older `mv tmp file` orphan-the-inode pattern across ALL Phase 4 entries). Should be nit-tracked + deployed across fleet machines that have a launchd-managed daemon producing logs (currently just Mac Mini; would extend to any future fleet member). When this lands, capture the in-place rotation form as the canonical pattern.
+- [ ] **The launchd agent plist.** `~/Library/` is gitignored by nit, so
+  `com.fredrikbranstrom.spela-library.plist` is deployed and reboot-surviving but not
+  tracked. Templatize to `dotfiles/templates/Library/LaunchAgents/…plist.tmpl` with
+  `{{ home_dir }}`, wired to the `30-reload-launchagents` trigger, mirroring the
+  values already applied live: `KeepAlive { Crashed: true, SuccessfulExit: false }`
+  and `ThrottleInterval=60`. MERIAN needs a `[[ -n library_dirs ]]` template gate,
+  since an empty `library_dirs` still bails. *Consult-before-shared-infra* — propose
+  before implementing.
+- [ ] **`~/.local/bin/nightly-sweep`.** A plain executable on the Mac Mini, not
+  nit-tracked. Its Phase 4 rotates `spela-library.{out,err}.log` in place (`cat tmp >
+  file`, which preserves launchd's open FD inode — the older `mv tmp file` form
+  orphans it). Track it, and capture the in-place rotation as the canonical pattern.
 
-### v3.4.3 — `spela seek` absolute-episode-position semantics + no-arg HWM resume (SHIPPED May 14, 2026) ✅
+### 🔓 OPEN — HLS cache, two sizing decisions left
 
-Live UX fix triggered by user noticing `spela seek 0` didn't jump to episode start on a resumed play. Pre-v3.4.3: `seek N` was stream-relative (leaked ffmpeg's `-ss` offset into the user-facing API). v3.4.3: `seek N` is absolute episode position; `seek` (no arg) resumes from saved HWM. Errors include actionable hint pointing at `spela play --seek N` for the BeforeStreamStart re-transcode case. +12 tests on `compute_cast_seek_target`. Pure helper at `src/server.rs::compute_cast_seek_target`. CLI signature: `Seek { seconds: f64 }` → `Seek { position: Option<f64> }`. Response JSON adds `absolute_target_secs` / `stream_target_secs` / `ss_offset` for observability. Hard-won lesson in [CLAUDE.md](CLAUDE.md). Commit `e3960aa`.
+The cache is complete and live at 12 GiB (`Config.hls_cache_cap_mb`).
 
-### v3.4.2 — Pause-gated auto-recast (SHIPPED May 13, 2026 evening) ✅
-
-Live incident: NM S02E05 user pause at 15:19 + CrKey 1.56 Default Media Receiver unloading after 16 min of pause + cast_health_monitor's 3-poll IDLE-failure threshold + Apr 25 auto-recast logic = stream resumed playing without user consent while they were AFK. Verbatim user preference: *"I never want that to happen."* Fix: `paused_in_session: bool` HARD GATE on `should_attempt_recast`. cast_health_monitor maintains sticky `paused_seen_in_session` local — once user pauses in a session, recast is disabled for the rest of that session. Stream replacement clears the flag. +3 tests. Hard-won lesson in [CLAUDE.md](CLAUDE.md). Commit `e0e81bf`.
-
-### v3.5.0 — HLS cache foundation (SHIPPED May 13, 2026 PM, OPT-IN) ✅
-### v3.7.9 — HLS cache complete (SHIPPED May 19-20, 2026) ✅
-
-Cache fully-transcoded HLS sets across plays so resumes/replays skip the
-~150-200 s "Chromecast reliability mode" pre-buffer wait. Foundation +
-hit-side + ENABLED at 12 GiB.
-
-- [x] **Module** (`src/hls_cache.rs`, RGR-tested): cache key builder, on-disk layout, complete-marker semantics, sparse-aware size accounting, LRU age ordering, prune-to-fit eviction.
-- [x] **Config**: `Config.hls_cache_cap_mb: u64` (default `12288` since v3.7.9 — was 0 / opt-in pre-v3.7.9).
-- [x] **State**: `CurrentStream.cache_key: Option<String>` set early in `do_play` from request-intent (subs_intent + intro_intent), used by BOTH cache-fill and cache-hit so they provably agree.
-- [x] **Cache-fill on `do_cleanup`**: `try_promote_to_hls_cache` atomic-renames `transcoded_hls/` → `<media_dir>/hls_cache/<key>/` when all guards hold.
-- [x] **Cache-HIT short-circuit in `do_play`** (v3.7.9, `1fe0842`): `is_cache_hit` check early; if cached, sets `is_local=true` + skips the entire detect_codecs + transcode pipeline; final_url → `/hls_cache/<key>/master.m3u8`. The v3.5.1 synthetic-vs-multivariant-master blocker was resolved by tonight's v3.7.3 finding: ffmpeg writes a real multi-variant master; cache stores it verbatim; new dedicated `/hls_cache/{key}/{file}` route serves it unchanged (Option (a) from the prior blocker analysis).
-- [x] **Startup LRU pass** (v3.7.9): one-shot `prune_cache_to_fit` in `run_server` startup, defends against cap-shrink edge cases.
-- [x] **Library title-hash cache key** (v3.7.8, `4597e3c`): FNV-1a 64-bit hash of cleaned title for library plays without an IMDb ID. `resolve_cache_key` is the single source of truth (imdb else title-hash).
-- [ ] **Default bump to 20480** (open, low-priority): could raise from 12288 → 20480 (20 GB ≈ 60 episodes) once movie-night usage shows we need the extra room. 12288 was chosen conservatively per Darwin disk-pressure sensitivity; live-validate before flipping.
-- [ ] **Background transcode-ahead** (deferred): when user stops at minute 5, finish transcoding the rest in the background to populate the cache. Adds an ffmpeg subprocess + GPU contention concerns — deferred per scope.
+- [ ] **Raise the cap to 20480** (20 GB ≈ 60 episodes) once movie-night usage shows
+  the extra room is wanted. 12288 was chosen conservatively for Darwin disk pressure;
+  live-validate before flipping.
+- [ ] **Background transcode-ahead** (deferred): when a watch stops at minute 5,
+  finish transcoding the rest in the background to populate the cache. Adds an ffmpeg
+  subprocess plus GPU contention, which is why it was deferred rather than built.
 
 ### Custom Cast Receiver scaffolds — NOT dead code (leave them)
 
 `handle_seek_restart` (server.rs:5407) + `handle_retry` (server.rs:5536) look like dead stubs by their bodies (handle_retry just returns `{"status":"retry_requested"}` with a TODO). They are **NOT webtorrent-era cruft** — git blame shows BOTH shipped in `a9637a6 "feat: Custom Cast Receiver — intro, seeking, subs, resume, overlay"`. The receiver HTML at `static/cast-receiver.html` actively fetches both endpoints (lines 240 + 398). Deleting either would break the Custom Cast Receiver scaffolding. **They're awaiting wiring as part of the $5-Google-registration Custom Cast Receiver landing** (see "Still Open" → Custom Cast Receiver below). When that work lands, both handlers should be implemented properly: `handle_seek_restart` → call `do_play(seek_to=req.t)` (the same path v3.7.7's `/seek-retranscode` uses); `handle_retry` → call the existing `handle_play` auto-retry path.
-
-### v3.4.1 — Ranker root-fix: transitivity-safe `effective_res_tier` (SHIPPED May 13, 2026 PM) ✅
-
-Fixed a non-transitive `sort_by` comparator in v3.4.0's `rank_results_mut` exposed by the May 13 Night Manager S02E05 search — three results formed a 3-way cycle through asymmetric seed-viability gating at tier 3. New `effective_res_tier(&TorrentResult) -> u32` helper baked seed-viability into the resolution bucket itself, so tier 3 does direct `cmp` on a single per-operand value and total ordering is structurally guaranteed. **The seed term was removed 2026-09-06** — it predicted delivery in a system that measures it — but the shape it was introduced for is unchanged and is the durable lesson: the tier is still a SINGLE per-operand value, and the comparator is still a strict total order, now asserted exhaustively rather than argued. Generic lesson encoded in the helper's docstring: **pairwise threshold-fallthrough rules are a classic source of non-transitive comparators; bake all per-operand attributes into a SINGLE per-operand value, then compare values directly.** Tests: +2 (cycle replay across all 6 permutations of the fixture; bucket classification pin). 339 total tests green; commit `c3b41a0`. Full case study: [CLAUDE.md](CLAUDE.md) § "v3.4.1 — ranker root-fix".
-
-### v3.4.0 — Bad-source resilience trio (SHIPPED May 13, 2026) ✅
-
-The Boys S05E07 incident: Cinecalidad H.264 (99 seeds, 5 GB) ranked above MeGusta HEVC (7596 seeds); librqbit truncated at 50 bytes + EBML parse fail; 0 segments; 75 s blue-cast icon. Three orthogonal defenses, single commit `7cd71c6`, +21 tests (329 → 337). Full hard-won lesson + ranker tier-table update in [CLAUDE.md](CLAUDE.md).
-
-- [x] **Layer 1 — Tier 4 seed-disparity override** (`src/search.rs`, `SEED_DISPARITY_OVERRIDE = 30`): HEVC alt with ≥30× the H.264 winner's seeds wins. Resolution + DV gates still fire first; below 30× the existing codec preference applies. 7 boundary tests (exact 30×, 29.99× negative, zero-seed edge, DV/resolution-tier independence, no-regression on common case).
-- [x] **Layer 2 — 20 s HLS pre-buffer fail-fast** (`src/server.rs`, `should_fail_fast_stream_start(elapsed, segments)`): 0 segments at 20 s → `do_cleanup` + error JSON → `handle_play`'s existing auto-retry loop bumps `result_id` and re-enters with the next search candidate. Distinct from `cast_health_monitor`'s cold-start IDLE protection (that handles receiver-side wedges AFTER LOAD; this handles upstream torrent/encoder starvation BEFORE LOAD). User wait 75 s → ~20 s. 6 tests + extracted `count_hls_segments` helper.
-- [x] **Bonus — Head-of-stream probe** (`src/torrent_stream.rs`): 64 KiB / 30 s timeout pre-flight read from the FileStream before constructing the response Body; probed bytes chain-prepended via `tokio_stream::once(...).chain(ReaderStream::new(...))` (no double-read, no re-seek). Probe fail → 503 (ffmpeg's `-reconnect` retries instead of accepting a half-formed response). Complements May 1's `handle.stream()` "initializing" retry: that catches librqbit-not-ready; this catches pieces-not-downloaded. 8 tests pin the clamping / success / failure / constant-stability cases.
-- [x] **Live deploy with Darwin WT-drift forensics** (May 13): Darwin had 2302 LOC of "uncommitted" edits blocking `git pull`. SHA1-compared each WT file against Mac Mini master — 7/8 byte-identical to `ab9a9a5`, 8th (`search.rs`) was an older pre-`cargo fmt` snapshot. All features already in master → safe `git checkout -- <files>` + pull + rebuild + `systemctl restart`. Post-deploy verification: same The Boys S05E07 query now picks MeGusta (7596 seeds) as #1, Cinecalidad (99 seeds) demoted to #2 — disparity override fires at 76.7×. Recovery procedure pinned in [CLAUDE.md](CLAUDE.md) § "Darwin working-tree drift recovery" so future agents can replay the SHA1 forensics rather than discarding blindly.
-
-### v3.3.0 — librqbit migration (SHIPPED Apr 29-30, 2026) ✅
-
-Replaced the Node.js `webtorrent-cli` subprocess with embedded `librqbit = "8.1"`. End state: single Rust binary, no Node dep, torrent streams served through spela's existing axum router on `:7890` (the legacy `:8888` separate HTTP server is gone). HLS chain + DNAT hijack unchanged. Empirical proof of the migration's hypothesis — same Darwin host, same network, librqbit attached 12 peers + 208 KB/s on the magnet that webtorrent-cli got 0 peers on the previous night.
-
-- [x] **Phase 1 — Foundation** (Apr 29, `a583c05`): `src/torrent_engine.rs` + `src/torrent_stream.rs` with 25 new tests (`parse_range_header` RFC 7233 coverage, URL builder, state mapping).
-- [x] **Phase 2 — Wire-up** (Apr 29, `435f2ca`): config-flagged backend dispatch, ServerState gains `Option<Arc<TorrentEngine>>`, helpers (`start_torrent_for_play`, `check_torrent_progress`, `stop_torrent`, `is_torrent_alive`), `handle_torrent_stream` axum handler.
-- [x] **rustls fix** (Apr 30, `8d35a78`): live-test caught `CryptoProvider::install_default()` requirement that was silently panicking and poisoning the cast Mutex. Pinned `rustls = "0.23"` direct dep + `aws_lc_rs::default_provider().install_default().ok()` in main.
-- [x] **Phase 3 — Drop fallback** (Apr 30, `e1eeb75`): removed `torrent_backend` config field + webtorrent dispatch helpers + 200+ lines of legacy code from torrent.rs. ServerState.torrent_engine became non-Optional. Version 3.1.0 → 3.3.0.
-- [x] **TorrentId+1 shift fix** (Apr 30, `6c040de`): librqbit allocates `TorrentId = 0` for the first torrent, colliding with spela's `pid == 0 = Local Bypass` sentinel. `shift_librqbit_id` / `unshift_librqbit_id` pure helpers preserve the invariant; 5 regression tests.
-
-### Apr 30 security + coverage audit follow-through ✅
-
-Two-agent audit (oracle for security/bugs, general-purpose for test gaps) surfaced 5 high + 11 medium + 9 low security findings and ~22 coverage gaps. Triaged + actioned in 13 commits over the same day:
-
-#### Security tier 0 (HIGH)
-- [x] **H1 SSRF magnet validator** (`7445530`): `validate_magnet_uri()` rejects non-magnet URIs at the HTTP boundary. librqbit's `AddTorrent::Url` accepts http(s):// and fetches them — would have turned POST /play into an SSRF pivot against Darwin's internal services. Defense in depth: applied in `do_play`, `handle_queue_add`, AND inside `TorrentEngine::start`. 8 tests.
-- [x] **H2 Host-header allowlist + tightened CORS** (`14671d4`): `require_host_header` middleware + `compute_host_allowlist` (loopback + darwin.home + stream_host + user additions). DNS-rebinding defense. CORS narrowed to LAN origins (no wildcard). 9 tests. **PARTIALLY REVERTED May 1, 2026 (`dcbaed7`)**: tightened CORS dropped `Access-Control-Allow-Origin: *` for non-matching Origins, which broke Cast Receiver / MSE-based HLS playback (Cast Receiver runs on `https://www.gstatic.com/cast/...` — its Origin doesn't match a LAN allowlist). Reverted to `allow_origin(Any)`. Host-header allowlist remains as the primary DNS-rebinding defense. Full case study: [`docs/INCIDENT_REPORT_WILDERPEOPLE_2026_05_01.md`](docs/INCIDENT_REPORT_WILDERPEOPLE_2026_05_01.md).
-- [x] **H3 Mutex panic-cascade recovery** (`61d18e2`): `lock_recover<T>` helper using `PoisonError::into_inner`. Sweep replaced 18 `.lock().unwrap()` sites in server.rs. 2 tests including actual mutex-poisoning.
-- [x] **H4 /torrent/* loopback-only** (`edc4e90` + `610f7a8`): `require_loopback_source` middleware via sub-router. URL builder uses `127.0.0.1` so ffmpeg's source IP is loopback (otherwise the LAN-bind IP would 403 itself).
-
-#### Security tier 3 + perf + hygiene
-- [x] **M1, M5, L2, L7, L9** (`1dc79fd`): empty-target filter, NaN/inf seek_to guard, parse_size unknown-unit returns None, poster_url TMDB-CDN allowlist, drop magnet 300-char truncation. 8 tests.
-- [x] **M3, M7, M8, M9** (`ec57280`): config string length caps, imdb_id format validator, Local Bypass + prune_disk symlink defenses. 4 tests.
-- [x] **L1 librqbit timeouts** (`d1d324f`): 15s connect / 60s read-write / 120s keepalive + concurrent_init_limit=4. Defends against rqbit issue #525 long-running embed FD-exhaustion. (Note: librqbit 8.1.1 has no hard peer-count cap; what we tuned is what's available.)
-- [x] **M2, M4, M6, M11, cosmetic** (`3a3e1f9`): prune_to_fit O(N²)→O(N log N), cast_info device cap, seek_restart NaN guard, retry-loop cleanup consolidation, startup log accuracy.
-
-#### Test gap pins + RGR refactors
-- [x] **shift_srt CRLF + parse_mbps_string** (`d5e86e9`): regression pins for the Apr 18 incident + librqbit Display-format fragility. 4 tests.
-- [x] **top_level_file_is_healthy** (`997607a`): Apr 15 FLUX-fix regression pins. 4 tests covering <100MB, dense full, sparse, nonexistent.
-- [x] **find_local_bypass_match RGR** (`552b49e`): extracted ~100 lines of do_play's Local Bypass scan into a pure helper. 8 tests covering the title/year/quality/health decision matrix (Apr 8/15/18/19/25/28/29 incident-cluster).
-- [x] **cast_health_monitor sub-decision RGR** (`05631cc`): partial extraction (the wiser path — full state-machine rewrite was too risky for one session). `evaluate_buffering_state` (Apr 18+29 pin), `is_natural_eof` (Apr 19 Send-Help pin), `should_save_position` (Apr 15 throttle). 11 tests.
-
-**Test count delta this session arc**: 207 → **266** (+59 audit-driven tests on top of v3.3.0's +20 = +79 total today).
 
 ### Deferred (audit items NOT actioned, with reasons)
 - **H5** Cast-receiver IP allowlist — LAN-IP-config friction without much marginal value over iptables-INPUT-DROP + Host-header + LAN-trust layers already in place. User explicit decision.
@@ -406,35 +212,6 @@ Two-agent audit (oracle for security/bugs, general-purpose for test gaps) surfac
 - [x] **Auto-detect corrupt source files via ffmpeg.log post-mortem** (SHIPPED Apr 30, 2026): `transcode::inspect_ffmpeg_log_for_corruption` parses `~/.spela/ffmpeg.log` for three signals (EBML parse errors, missing HEVC reference frames, `dup=>100` on summary line). `do_cleanup` records corrupt source paths in `AppState.corrupt_files` HashSet; `find_local_bypass_match` skips entries on subsequent scans. 8 unit tests pin parser semantics + corrupt-skip behavior. First failed cast marks the file; manual `rm` no longer needed.
 
 - [ ] ~~**Auto-detect corrupt source files via ffmpeg.log post-mortem**~~ — Apr 29 incident (Hijack S02E05 MeGusta) silently produced ~5 min of NVENC-duplicated junk past byte 417 MB Matroska corruption. Local Bypass treated the broken file as good on every subsequent play; recast loop wedged 5x at the same `time=2022s` before manual rm. Implementation: after each transcode_hls completion, parse `~/.spela/ffmpeg.log` for (a) `dup=<N>` on final summary line where N>100, (b) any `Could not find ref with POC` lines, (c) any `invalid as first byte of an EBML number` lines. If any match, mark the source file path in `state.json::corrupt_files` and have Local Bypass skip it on subsequent matches. Hard-won lesson context in [CLAUDE.md](CLAUDE.md) § "Corrupt source files defeat auto-recast — wedge isn't on the receiver".
-
-### v3.2.1 — DMR overlay-mode correction (Apr 29, 2026) ✅
-- [x] **⚠ SUPERSEDED 2026-06-30 — re-flipped to `true` (now the code default).** This entry's "no-overlay live mode" served a BARE LIVE playlist for torrent/non-Bypass plays, which made hls.js / Safari / Chromecast start at the racing live edge and stall ~15s in (the chronic "Pantheon plays 15s then stops"). VOD-padded fixes it (start at 0); Chromecast overlay returns, browser/phone unaffected. Reasoning: CLAUDE.md § DMR-overlay. Original history kept below. — _Reverted Darwin's `vod_manifest_padded` to false_ — empirical user observation ("I've been able to watch The Boys episodes etc WITHOUT the seek bar in the past, never had a custom receiver") refuted the metadata-driven-overlay model. DMR's progress bar is governed by stream type (live HLS = no overlay; VOD HLS = persistent overlay), not by `Metadata::TvShow`/`Metadata::Movie` richness. Commit `98cb043` (B2) flipped streams to VOD mode upfront via `EXT-X-ENDLIST` padding → introduced the overlay regression. **Fix**: `vod_manifest_padded = false` in Darwin's `~/.config/spela/config.toml` restores live-mode HLS. Code default in `src/config.rs:126` was already false; only Darwin's local user config had been set to `true` during testing. **Trade-offs**: minor display-only costs (no total-duration shown on TV, no native scrub-via-remote — both already absent in v3.0/v3.1 baseline which user described as "the way I've been watching for months"). HWM accuracy is NOT a downside — that was a B1-specific bug (Shaka chasing a *moving* end marker) which honest live mode doesn't have at all (no end marker → no drift surface). The proper end-state for both overlay-free *and* total-duration-display is the parked Custom Receiver path (Cast SDK $5 registration). Hard-won lesson pinned in [CLAUDE.md](CLAUDE.md). Generic lesson: validate UI-symptom hypotheses against historical user observation before committing to a closed-source-receiver workaround — two earlier hypotheses (rich metadata, ENDLIST trick) both *worked technically* but on the wrong axis (each affected splash/auto-hide behavior, neither affected the persistent progress bar that VOD mode renders unconditionally).
-
-### v3.2.0 — Subtitle pipeline + 10-bit + recast hardening (SHIPPED Apr 28-29, 2026) ✅
-Five fixes shipped during the Hijack S2E1/S2E2 watching session. All deployed to Darwin and live-tested. Test suite 125 → 164 (+39 regression pins). Hard-won lessons pinned in [CLAUDE.md](CLAUDE.md):
-
-- [x] **Rich-UI metadata in LOAD message** (`17ef4c0`) — TMDB poster pipeline through ShowInfo → CurrentStream → CastMetadata → Metadata::TvShow/Movie. Gated by `config.rich_metadata_in_load` (default off because DMR's metadata-rich UI doesn't auto-hide on growing-playlist HLS — receipt for the deferred Custom Receiver decision).
-- [x] **Forced English subtitle extraction** (`6e85eba`) — replaces OpenSubtitles SDH (which only NOTATES "[in German]") with the source MKV's embedded `English (forced)` track that actually translates the German speech. Three-tier preference: forced → full non-SDH → SDH → OpenSubtitles fallback. ISO 639-1→639-2 mapping for embedded-track matching. Local Bypass plays only.
-- [x] **10-bit HEVC NVENC fix** (`ee38f92`) — `format=yuv420p` appended to all six video filter chains feeding NVENC h264. Fixes "10 bit encode not supported / Nothing was written into output file" on HEVC Main 10 sources (MeGusta, ELiTE). Receiver was IDLE'ing at <init> with zero diagnostic surface — looked like a Chromecast wedge, was actually ffmpeg producing zero output.
-- [x] **Rate-limited unbounded recast** (`d312913`) — replaced Apr 25's lifetime cap-of-1 with `RECAST_COOLDOWN_SECS=90` frequency cap. Hijack S2E2 incident: receiver IDLE'd every ~15-30 min during sustained playback, recast would have recovered each cycle, but cap-of-1 left the user with permanent dead stream after first recovery. Rapid-fire wedge protection unchanged (cooldown handles it cleanly). Incident replay test pinned.
-- [x] **BUFFERING-too-long detection** (`d312913`) — `MAX_BUFFERING_DURATION_SECS=60` bounds Apr 18's "BUFFERING is transient" rule. After 60s of stalled BUFFERING without transition to Playing, escalates to the same recast/cleanup path IDLE uses. Fixes "permanent BUFFERING, monitor logs transient forever" pattern.
-- [x] **Experimental ENDLIST hack** (`1fda4a7`) — `config.experimental_endlist_hack` (default off). Empirically auto-hides the DMR overlay BUT side-effect: Shaka chases moving end marker, current_time inflates, HWM saves corrupt. Recommend leaving off until Custom Receiver lands; preserved as a parked option. **Note (Apr 29 v3.2.1)**: the hypothesis underlying this commit was wrong — the "auto-hide" effect was actually flipping the stream from live mode to VOD mode, which on DMR shows a *different* overlay (persistent progress bar) instead of the rich-metadata splash. The flag is functionally a redundant subset of `vod_manifest_padded` and should be removed in a future cleanup pass.
-
-### v3.0.0 Smart Resume + Disk Hygiene + Resolution Ranker — SHIPPED (Apr 15, 2026) ✅
-All ten Apr 15 bug fixes + the resolution-preference ranker tier are live on Darwin. Hard-won lessons pinned in [CLAUDE.md](CLAUDE.md). Test suite grew from 58 → 108 (+50 regression pins).
-
-- [x] **Explicit `--seek N` resets the HWM** — do_play branches on `req.seek_to.is_some()`, calls `reset_position` before the auto-resume lookup. Principle: explicit user actions override remembered state.
-- [x] **cast_health_monitor sanity-checks position saves** — `is_position_jump_suspicious(delta_wall, delta_abs)` + `last_save_wall: Option<Instant>` wiring. Blocks physically-impossible jumps (`delta_abs > 2*delta_wall + 60s`), preserves rewind + 2× playback.
-- [x] **Visible auto-resume notification** — do_play returns `resumed_from: Option<f64>`, `print_human` formats as `↩ Resuming at H:MM:SS (from saved position)`.
-- [x] **Per-episode TV resume key** — `state.rs::resume_position_key` parses `SxxExx` from title and appends `_sXXeYY` so S05E02's HWM never bleeds into S05E03. Movies keep raw imdb_id behavior.
-- [x] **cast_health_monitor end-of-episode reset** — past_end guard was silently preventing save_position_smart's completion reset from firing; end-of-episode branch now explicitly calls reset_position before do_cleanup.
-- [x] **ss_offset zero for non-transcoded plays** — no more 176% phantom duration (the Apr 15 evening stream-killed-itself incident).
-- [x] **prune_disk handles top-level files** — was directory-only; single-file releases like `The.Boys.S05E01.FLUX.mkv` were immortal.
-- [x] **prune_disk empty-active-title** — `"any".contains("") == true` used to make empty sentinel a silent no-op; now explicitly handled.
-- [x] **prune_to_fit LRU pressure eviction** — runs age-based prune then LRU-evicts oldest-first until under target_mb. Wired into do_play so the 10 GB cap is a self-maintaining upper bound, not a refusal wall.
-- [x] **Token-based active-title match** — `title_matches_active` tokenizes both sides, tolerates dot/space/dash/underscore separators. Protects `The.Boys.S05E03.FLUX.mkv` against a `The Boys S05E03` active-play.
-- [x] **Resolution preference ranker tier** — v3.0.0 added tier 4 (2160p > 1080p > 720p > 480p, ≥50 seed viability). v3.1.0 rewrote it for Sarpetorp policy: 1080p > 720p > 480p > 2160p (2160p demoted below 480p) AND promoted the whole tier above codec preference (tier 3 now, codec is tier 4 tiebreak). Regression-pinned via `test_ranking_hevc_1080p_beats_h264_720p_v31_policy`, `test_ranking_1080p_h264_beats_2160p_h264_v31_policy`, `test_ranking_2160p_demoted_below_480p`, `test_ranking_dv_gate_fires_before_resolution_tier`.
-- [x] **Old ranker tests refactored to use `rank_results_mut`** — 8 existing tests that inlined their own sort closures now call production sort directly. Eliminates drift risk (the same mechanism that let the "H 265" regression slip past 58 unit tests).
 
 ### Still Open
 
@@ -460,49 +237,6 @@ All ten Apr 15 bug fixes + the resolution-preference ranker tier are live on Dar
 - [ ] Implement Chromecast Receiver UI loading state (spinner/progress) to replace the "Black Flash" transition between video clips. 🎉🏙️
 - [ ] Refine year-aware and quality-aware result prioritisation in `src/search.rs` to better handle franchise sequels (e.g., 2025 vs 2026). 🕵️‍♂️
 - [ ] **TVTime "next unwatched episode" integration for Ruby** — Ruby should know which episodes the user has actually watched before guessing from search ranking. Tonight's failure mode: when user said "play the Boys episode" with no season/episode, Ruby chose the latest available (S05E02 — unwatched) instead of the next unwatched (S05E01). Architecture sketched in `~/.claude/hooks/conversation_engine.py` near `SPELA_TOOL_DECLARATION`: new `tvtime_client.py` with `get_show_progress(show)` + `mark_watched(show, s, e)`, new Gemini tool `get_next_episode(show)` registered alongside `run_spela`, system-prompt rule "before run_spela play on a TV show, always call get_next_episode unless the user explicitly named the season/episode", read-through 1h cache invalidated on every successful spela play of a TV show. Auth: TVTime removed their public API ~2019; reverse-engineered sidecar (`https://beta.tvtime.com/sidecar?o=https://api.tvtime.com/v1/...`) is the only stable route. Trakt.tv has an official API and many TVTime users sync to it — prefer Trakt if available. Currently blocked on user finding working credentials (Apr 15 reset-password-hell). Cross-reference: dotfiles commit `57b2d92`.
-
-### Cast Pipeline Rework — DONE (Apr 15, 2026 overnight) ✅
-- [x] **HLS rework for `/stream/transcode`** — the chunked-transfer fragmented MP4 endpoint is fundamentally incompatible with Chromecast Default Media Receiver. Confirmed live by `cast_health_monitor` on Apr 15, 2026: every cast attempt produced healthy ffmpeg + perfect Local Bypass + `cast_url()` returning OK, while the TV stayed on the blue cast icon and `player_state=IDLE`. Default Media Receiver's MP4 parser refuses the combination of `Transfer-Encoding: chunked` + no `Content-Length` + always-200 (never-206) responses. Workaround that proves the diagnosis: the same FLUX file remuxed via `ffmpeg -c:v copy -c:a aac -movflags +faststart` and served by `catt` (which uses `206 Partial Content` with a real `Content-Length`) plays perfectly on the same Chromecast / same network.
-
-  **Architecture**: rewrite `transcode.rs` to output HLS instead of fMP4: `ffmpeg ... -f hls -hls_time 6 -hls_list_size 0 -hls_playlist_type event -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 -hls_segment_filename seg_%05d.m4s playlist.m3u8`. Add new axum endpoints `/hls/playlist.m3u8` and `/hls/segment/<name>` that serve the manifest + fmp4 init segment + .m4s segments with proper `Content-Length` and `206 Range` support. The cast LOAD URL becomes `http://darwin.home:7890/hls/playlist.m3u8` with content-type `application/vnd.apple.mpegurl`. Default Media Receiver supports HLS natively. The post-playback reaper still tracks ffmpeg, `cast_health_monitor` still tracks the receiver — both unchanged.
-
-  **Trade-off analysis (Apr 15, 2026)**:
-
-  *Disadvantages*: (1) ~5-10 sec cold-start vs current ~3-5 sec broken — HLS needs manifest + init + 1-2 segments before cast can start, ~1-2 sec wall per segment at NVENC's 6x realtime. (2) ~640 small HTTP requests over a 64-min episode instead of one long-lived chunked response (~100µs routing overhead each in axum, negligible). (3) ~640 small `.m4s` files in `~/media/transcoded_hls/` (negligible inode usage). (4) ~150-300 LOC net vs current. (5) ~1% container overhead from per-segment `moof` boxes. (6) Cleanup race window if a play stops while ffmpeg is mid-segment-write — `kill_pid` SIGTERMs ffmpeg cleanly so this is rare; worst case is one stale `.m4s` file deleted on next play.
-
-  *Advantages*: (1) **It actually works on Default Media Receiver** — the entire reason. HLS is what Shaka Player (which DMR uses internally) is built around. (2) Better pause/resume — manifest survives HTTP connection drops, Chromecast can re-fetch and resume from current segment. Current fMP4 design treats long pauses as connection EOF. (3) Better seekability eventually — with `hls_playlist_type=event` the manifest is appendable during transcode and ENDLIST is written when ffmpeg finishes; at that point Chromecast can seek to any segment boundary. fMP4 has no byte index, seeking is impossible (this is exactly why spela has been chasing the Custom Cast Receiver workaround). (4) Standard format — works in VLC, mpv, iOS, Apple TV, web browsers. fMP4 chunked-transfer is bespoke. (5) Custom Cast Receiver becomes simpler — Shaka Player does HLS out of the box, just set `media.contentType = 'application/x-mpegurl'` and Shaka handles seeking, ABR, recovery. (6) `cast_health_monitor` works the same way (orthogonal change).
-
-  *Show-stoppers*: none. Downsides are minor or already true. Going for it.
-
-  *Production workaround until HLS lands*: `catt -d "Fredriks TV" cast /tmp/<remuxed>.mp4` directly on Darwin. Documented in spela CLAUDE.md and global CLAUDE.md.
-
-  *Implementation status (Apr 15, 2026 overnight — DONE)*:
-  - [x] `transcode_hls()` function in `src/transcode.rs` — mirrors filter chain of `transcode()`, swaps the muxer for HLS with MPEG-TS segments (fmp4 abandoned because rust_cast's Media struct doesn't expose `hlsSegmentFormat`)
-  - [x] `serve_static_with_range()` helper in `src/server.rs` — proper Content-Length + 206 Range support
-  - [x] `/hls/master.m3u8`, `/hls/playlist.m3u8`, `/hls/init.mp4`, `/hls/{segment}` axum routes
-  - [x] Synthetic master playlist with explicit `CODECS="avc1.640028,mp4a.40.2"` + BANDWIDTH + RESOLUTION — older Chromecast firmware (CrKey 1.56) refuses to load a bare media playlist without those hints
-  - [x] `do_play` switched to `transcode_hls()` + cast URL `/hls/master.m3u8` + content-type `application/vnd.apple.mpegurl` + `StreamType::Buffered` (auto-inferred from content_type in `cast.rs`)
-  - [x] HLS-aware pre-buffer (waits for manifest + `seg_00001.ts` instead of "5 MB ready")
-  - [x] `do_cleanup` deletes `transcoded_hls/` directory in addition to `transcoded_aac.mp4`
-  - [x] `kill_spela_ffmpeg_workers` pattern updated to also match `ffmpeg.*transcoded_hls`
-  - [x] Live test against Fredriks TV — pychromecast probe + spela CLI play both confirmed `state=PLAYING pos=9.333` within ~2 seconds. Chromecast actively fetched master → playlist → seg_00000 → seg_00001 → seg_00002 at realtime cadence.
-  - [x] `stream_host` config switched from `darwin.home` (which Chromecast can't resolve via Google DNS 8.8.8.8) to LAN IP `192.168.4.1`. Spela startup now WARNs if `stream_host` looks like a hostname.
-  - [x] Reaper pid=0 special-case for Local Bypass plays (without this, `kill_check(0)` always returns true and the reaper's wt_alive check is useless).
-  - [x] Docs updated: spela CLAUDE.md, OPERATIONS.md, global CLAUDE.md.
-
-  *Failure modes encountered during the rework, all resolved*:
-  1. `do_cleanup` mid-flight (commit `4d3ef73`): killed just-started workers
-  2. Sparse-aware `dir_size` (commit `9f58307`): false "disk full" on webtorrent placeholders
-  3. Cast-failure cleanup defense (commit `8735ea4`): orphaned workers when cast errored
-  4. Top-level Local Bypass + title-trust (commits `664b55e` + `3864fd1`): missed FLUX file
-  5. `cast_health_monitor` (commit `dd111ee`): surfaced the silent IDLE failure
-  6. fmp4 segments (reverted to MPEG-TS): rust_cast doesn't expose `hlsSegmentFormat`
-  7. `/hls/segment/{seg}` route → `/hls/{seg}` (commit `2c53b4f`): manifest uses relative URLs
-  8. HLS v6 features (EVENT playlist + independent_segments): CrKey 1.56 can't parse
-  9. Bare media playlist (no master): older receivers need explicit CODECS hints
-  10. `darwin.home` hostname: Chromecast hardcodes Google DNS, can't resolve LAN names
-
-  Cross-references: spela `dd111ee` (the cast_health_monitor that surfaced this), `8735ea4` (cast-failure cleanup defense), [Igalia/cog#463](https://github.com/Igalia/cog/issues/463) (upstream confirmation that chunked + MP4 = broken player parsing).
 
 ### System Hardening
 - [x] Increase Node.js heap memory limits by default for webtorrent-cli to prevent "Ghost Crashes" during large file verification. Implemented in `src/torrent.rs` with `--max-old-space-size=4096`.
