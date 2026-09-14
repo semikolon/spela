@@ -6700,6 +6700,11 @@ fn phys_logical_bytes(path: &std::path::Path) -> (u64, u64) {
 /// equal regardless of dots / brackets / spacing. Distinct releases keep
 /// distinct normals (their group tag + codec differ), so containment matching
 /// on these won't cross-match CATS vs glhf.
+/// `resolution_tier`'s "no resolution named" value. Named because two separate
+/// guards below key off it and a bare `4` reads as a resolution rather than the
+/// absence of one.
+const RES_UNKNOWN: u32 = 4;
+
 fn normalize_release_name(s: &str) -> String {
     let stem = match s.rsplit_once('.') {
         Some((stem, ext))
@@ -6758,6 +6763,23 @@ fn result_partial_pct(
             candidates.push(p);
         }
     }
+    // The RESULT's resolution, taken from the parsed `quality` field first and the
+    // title only as a fallback. 2026-09-14: this is load-bearing precisely because a
+    // release title can carry no resolution token at all (see the collision below),
+    // while Torrentio's `quality` still knows it is a 4K.
+    let want_res = {
+        let t = crate::search::resolution_tier(&result.quality);
+        if t != RES_UNKNOWN {
+            t
+        } else {
+            crate::search::resolution_tier(&result.title)
+        }
+    };
+
+    // Collect every candidate that survives the guards, then pick the BEST — the
+    // old code returned the first, and `read_dir` order is arbitrary, so with two
+    // plausible files on disk the badge was a coin flip.
+    let mut matches: Vec<(bool, f64, u8)> = Vec::new(); // (exact name, |1-ratio|, pct)
     for path in candidates {
         let Some(fname) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
             continue;
@@ -6772,6 +6794,23 @@ fn result_partial_pct(
         if got.len() < 8 || !got.contains(&want) {
             continue;
         }
+        // 2026-09-14: containment + a size window is NOT identity when the result
+        // title is GENERIC. `Terminator 3 Rise of the Machines 2003.mkv` (a real
+        // Torrentio title for a 21.89 GB 4K HDR release, carrying no resolution,
+        // codec or group token) normalizes to a strict PREFIX of the fully-
+        // downloaded 1080p `...TrueHD.5.1.AVC.REMUX-FraMeSToR` sitting beside it,
+        // and 22.20 GB against 21.89 GB is 1.4% — far inside the ±12% window. So
+        // the badge read "✓ on disk" for a 4K that had 13% of its bytes, and the
+        // play that followed downloaded 21.89 GB the badge said were already there.
+        //
+        // No size window can separate those two; they genuinely are the same size.
+        // RESOLUTION can: a file whose name says 1080p is not a 2160p release. Only
+        // applied when BOTH sides name a resolution, so a bare-vs-bare pair falls
+        // back to name + size exactly as before.
+        let got_res = crate::search::resolution_tier(&fname);
+        if want_res != RES_UNKNOWN && got_res != RES_UNKNOWN && want_res != got_res {
+            continue;
+        }
         let (phys, logi) = phys_logical_bytes(&path);
         if logi == 0 {
             continue; // empty/placeholder entry — keep scanning for the real file
@@ -6783,9 +6822,17 @@ fn result_partial_pct(
         let pct = ((phys as f64 / logi as f64) * 100.0)
             .round()
             .clamp(0.0, 100.0) as u8;
-        return (pct >= 1).then_some(pct);
+        matches.push((got == want, (1.0 - ratio).abs(), pct));
     }
-    None
+    // An exact normalized-name equality beats a mere prefix; among equals, the
+    // closest size. Without this the partially-downloaded 4K lost to a complete
+    // 1080p that merely contained its name.
+    matches.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let pct = matches.first()?.2;
+    (pct >= 1).then_some(pct)
 }
 
 async fn handle_targets(State(state): State<SharedState>) -> Json<Value> {
@@ -12459,6 +12506,108 @@ mod tests {
         fh.set_len(300 * 1024 * 1024).unwrap(); // 300 MB logical, ~0 physical
         drop(fh);
         assert!(!top_level_file_is_healthy(&sparse, 110 * 1024 * 1024));
+    }
+
+    /// 2026-09-14 anchor. Both names, both sizes and the `quality` string are
+    /// copied VERBATIM from the live `last_search.json` and `/mnt/hdd/spela-media`
+    /// on Darwin, mid-incident.
+    ///
+    /// The 4K HDR release carries a title with NO resolution, codec or group token,
+    /// so normalized it is a strict PREFIX of the fully-downloaded 1080p REMUX
+    /// beside it, and 22.20 GB against 21.89 GB is 1.4% — inside the ±12% window.
+    /// The badge therefore read "✓ on disk" for a file holding 13% of its bytes,
+    /// and the play that followed downloaded 21.89 GB it had promised were there.
+    #[test]
+    fn test_partial_badge_does_not_claim_a_different_resolutions_release() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+
+        // The COMPLETE 1080p remux (22.20 GB live; scaled down, ratios preserved).
+        let full = dir.path().join(
+            "Terminator.3.Rise.of.the.Machines.2003.BluRay.1080p.TrueHD.5.1.AVC.REMUX-FraMeSToR.mkv",
+        );
+        let mut fh = std::fs::File::create(&full).unwrap();
+        fh.write_all(&vec![1u8; 2220 * 10 * 1024]).unwrap(); // fully present
+        fh.sync_all().unwrap();
+        drop(fh);
+
+        // The 4K HDR, 13% present — sparse, so `set_len` and never a written vec.
+        let partial = dir
+            .path()
+            .join("Terminator 3 Rise of the Machines 2003.mkv");
+        let mut fh = std::fs::File::create(&partial).unwrap();
+        fh.write_all(&vec![1u8; 284 * 10 * 1024]).unwrap();
+        fh.set_len(2189 * 10 * 1024).unwrap();
+        fh.sync_all().unwrap();
+        drop(fh);
+
+        let four_k = crate::search::TorrentResult {
+            id: 1,
+            quality: "4k HDR".into(),
+            title: "Terminator 3 Rise of the Machines 2003.mkv".into(),
+            seeds: 12,
+            size: "21890 KB".into(),
+            source: "1337x".into(),
+            magnet: "magnet:test".into(),
+            info_hash: "x".into(),
+            file_index: Some(0),
+            partial_pct: None,
+        };
+
+        let pct = result_partial_pct(dir.path(), &four_k)
+            .expect("the 4K's own partial file should still be found");
+        assert!(
+            pct < 50,
+            "the 4K is ~13% present; a 100 here means it matched the complete 1080p remux, got {pct}"
+        );
+
+        // And the 1080p remux, asked for by its own name, still reports complete —
+        // the guard must not cost a correct match.
+        let remux = crate::search::TorrentResult {
+            quality: "1080p".into(),
+            title:
+                "Terminator.3.Rise.of.the.Machines.2003.BluRay.1080p.TrueHD.5.1.AVC.REMUX-FraMeSToR.mkv"
+                    .into(),
+            size: "22200 KB".into(),
+            ..four_k.clone()
+        };
+        assert_eq!(result_partial_pct(dir.path(), &remux), Some(100));
+    }
+
+    /// The half the exact-name preference CANNOT cover: when the 4K's own file is
+    /// not on disk at all, the complete 1080p remux is the only candidate, it
+    /// forward-contains the generic 4K title, and its size is within 1.4%. Only the
+    /// resolution guard refuses it. Without that guard this returns Some(100) and
+    /// the badge promises a 4K that was never downloaded.
+    #[test]
+    fn test_partial_badge_refuses_a_lone_wrong_resolution_match() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let full = dir.path().join(
+            "Terminator.3.Rise.of.the.Machines.2003.BluRay.1080p.TrueHD.5.1.AVC.REMUX-FraMeSToR.mkv",
+        );
+        let mut fh = std::fs::File::create(&full).unwrap();
+        fh.write_all(&vec![1u8; 2220 * 10 * 1024]).unwrap();
+        fh.sync_all().unwrap();
+        drop(fh);
+
+        let four_k = crate::search::TorrentResult {
+            id: 1,
+            quality: "4k HDR".into(),
+            title: "Terminator 3 Rise of the Machines 2003.mkv".into(),
+            seeds: 12,
+            size: "21890 KB".into(),
+            source: "1337x".into(),
+            magnet: "magnet:test".into(),
+            info_hash: "x".into(),
+            file_index: Some(0),
+            partial_pct: None,
+        };
+        assert_eq!(
+            result_partial_pct(dir.path(), &four_k),
+            None,
+            "a complete 1080p remux must never satisfy a 2160p result"
+        );
     }
 
     #[test]

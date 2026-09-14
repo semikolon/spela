@@ -2516,7 +2516,7 @@ pub(crate) fn effective_lang_tier(r: &TorrentResult, original_language: Option<&
 /// `effective_res_tier` (a Chromecast wants 1080p, the Mac monitor wants 2160p,
 /// from the same list), and resolution was never the only lever anyway: the
 /// codec tier and the bitrate tier both bear on how sharp the result looks.
-fn resolution_tier(title: &str) -> u32 {
+pub(crate) fn resolution_tier(title: &str) -> u32 {
     let lower = title.to_lowercase();
     // Normalize separator before `p` so `1080 p` / `1080.p` count.
     let res_match = |needle: &str| -> bool {
