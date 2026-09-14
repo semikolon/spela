@@ -14,6 +14,14 @@ log line naming what it deletes and why, then wait for a recurrence. Cost of bei
 wrong is bounded (a re-downloadable partial, never the curated library), which is
 why persistence stays on.
 
+### 📌 NOTE — the subtitle warm logs once per readiness poll while waiting
+`no English subtitle found yet for <imdb>_eng` appears every ~1.5 s for the whole
+buffering window (observed 2026-09-14: a solid two-minute run in the journal). It
+is BOUNDED — it stops when the wait does, and `sub_missing` already negative-caches
+the fetch itself — so this is log noise, not a leak or repeated work. Worth one
+line of suppression the next time `handle_vlc_ready` is open; not worth a trip of
+its own.
+
 ### 🔓 OPEN — unpin the librqbit fork when the upstream PR merges
 `Cargo.toml` points at `semikolon/rqbit` by commit for one fix: the incoming-listener
 starvation (ikatson/rqbit#663). **Next action**: watch that PR; when it lands in a
