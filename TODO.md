@@ -1,5 +1,17 @@
 # Spela TODOs 🎬🍿
 
+### 📌 NOTE — a failed torrent init leaves a 0-byte file named like the release (2026-09-16)
+Twice in four days librqbit logged `Error setting length for file "<release>.mkv" to
+<N>: file is None` during `initialize_and_start` (Contact's remux 2026-09-13, Terminator 3's
+remux 2026-09-14 — both large REMUXes, which may or may not be coincidence). Each left a
+**0-byte file** at the release's exact name in `/mnt/hdd/spela-media`.
+
+Benign today: `top_level_file_is_healthy` requires ≥100 MB non-sparse, so Local Bypass
+cannot pick one, and the 168h top-level file sweep eventually removes it. Recorded because
+it is a **failed start that leaves litter behind**, which is the same subsystem as the open
+1.2 GB-vanishing item above, and because a 0-byte file sharing a release's exact name is
+the kind of thing a future size- or name-based check could trip over. Not investigated.
+
 ### 🔓 OPEN — the ranker has no idea what the VIEWER'S LINK can carry (2026-09-11)
 Ranking is resolution → codec (target-scoped) → seeds. Nothing expresses **bytes per
 second available to the person watching**, so the same #1 pick is served to a Chromecast
