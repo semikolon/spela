@@ -6299,6 +6299,41 @@ pub(crate) fn bypass_match_title(
     }
 }
 
+/// Pick between several on-disk files that all legitimately match one title.
+///
+/// 2026-09-11 (Contact): `find_local_bypass_match` returned the FIRST healthy
+/// hit, so with two copies of one film on disk — a 3.68 GB HEVC and a 41.28 GB
+/// remux — which one played was decided by `read_dir` order. A request carrying
+/// the 3.68 GB result's size was served the 41.28 GB remux (36.8 Mbps), which
+/// no mobile hotspot can carry; VLC reconnected and walked backwards for
+/// minutes. The ±25% size window that would have caught it was removed
+/// 2026-06-30 for a good reason (a high-bitrate x264 and an efficient x265 copy
+/// of the same title differ 2×+, and the window wrongly rejected complete
+/// copies). That removal stays: a LONE candidate still matches at any size.
+/// What is restored is only the tie-break — among SEVERAL, take the one closest
+/// to what the caller asked for.
+fn better_bypass_candidate(
+    best: &mut Option<(u64, std::path::PathBuf)>,
+    cand: std::path::PathBuf,
+    expected_bytes: u64,
+) {
+    // expected_bytes == 0 means the caller has no size to aim at (a library tap
+    // or a title-only play). Nothing to rank by, so keep first-match-wins.
+    if expected_bytes == 0 {
+        if best.is_none() {
+            *best = Some((0, cand));
+        }
+        return;
+    }
+    let Ok(md) = std::fs::metadata(&cand) else {
+        return;
+    };
+    let dist = md.len().abs_diff(expected_bytes);
+    if best.as_ref().is_none_or(|(d, _)| dist < *d) {
+        *best = Some((dist, cand));
+    }
+}
+
 pub(crate) fn find_local_bypass_match(
     media_dir: &std::path::Path,
     title: &str,
@@ -6330,6 +6365,10 @@ pub(crate) fn find_local_bypass_match(
         title
     };
 
+    // Collect every legitimate match, then tie-break by closeness to
+    // `expected_bytes` (see `better_bypass_candidate`). Scanning the whole
+    // directory instead of short-circuiting costs one stat per candidate.
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
     let entries = std::fs::read_dir(media_dir).ok()?;
     for entry in entries.flatten() {
         let file_type = match entry.file_type() {
@@ -6406,7 +6445,7 @@ pub(crate) fn find_local_bypass_match(
                                 );
                                 continue;
                             }
-                            return Some(sub_path);
+                            better_bypass_candidate(&mut best, sub_path, expected_bytes);
                         }
                     }
                 }
@@ -6430,11 +6469,11 @@ pub(crate) fn find_local_bypass_match(
                     );
                     continue;
                 }
-                return Some(path);
+                better_bypass_candidate(&mut best, path, expected_bytes);
             }
         }
     }
-    None
+    best.map(|(_, p)| p)
 }
 
 /// v3.6.0 Local Library Streaming: scan `roots` in order, returning the
@@ -11926,6 +11965,76 @@ mod tests {
         f.set_len(200 * 1024 * 1024).unwrap();
         drop(f);
         p
+    }
+
+    /// RED before 2026-09-11: two complete copies of one film on disk (a 3.68 GB
+    /// HEVC and a 41.28 GB remux, both named "Contact (1997) 1080p...") matched
+    /// equally, and `read_dir` order decided which played. A request carrying the
+    /// SMALL copy's size got the remux — 36.8 Mbps over a mobile hotspot, i.e.
+    /// unwatchable. Both orders are asserted, because passing in one order and
+    /// failing in the other is exactly the bug.
+    #[test]
+    fn find_local_bypass_prefers_the_size_the_caller_asked_for() {
+        for reversed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let small_bytes = 105 * 1024 * 1024;
+            let big_bytes = 160 * 1024 * 1024;
+            let mut names = [
+                (
+                    "Contact (1997) 1080p H265 ita eng AC3-Licdom.mkv",
+                    small_bytes,
+                ),
+                ("Contact (1997) 1080p.Remux.mkv", big_bytes),
+            ];
+            if reversed {
+                names.reverse();
+            }
+            for (n, sz) in names {
+                std::fs::write(root.path().join(n), vec![0u8; sz]).unwrap();
+            }
+
+            let got = find_local_bypass_match(
+                root.path(),
+                "Contact (1997)",
+                Some("1080p"),
+                small_bytes as u64,
+                &std::collections::HashSet::new(),
+            )
+            .expect("a complete local copy exists");
+            assert_eq!(
+                std::fs::metadata(&got).unwrap().len(),
+                small_bytes as u64,
+                "expected the copy matching the requested size, got {:?} (reversed={})",
+                got,
+                reversed
+            );
+        }
+    }
+
+    /// The 2026-06-30 removal of the ±25% size window must survive the tie-break:
+    /// a LONE copy still matches however far its size is from the request, since a
+    /// different encode of the same film legitimately differs several-fold.
+    #[test]
+    fn find_local_bypass_lone_candidate_still_matches_at_any_size() {
+        let root = tempfile::tempdir().unwrap();
+        let on_disk = 160 * 1024 * 1024;
+        std::fs::write(
+            root.path().join("Contact (1997) 1080p.Remux.mkv"),
+            vec![0u8; on_disk],
+        )
+        .unwrap();
+
+        let got = find_local_bypass_match(
+            root.path(),
+            "Contact (1997)",
+            Some("1080p"),
+            (105 * 1024 * 1024) as u64,
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            got.is_some(),
+            "a lone copy must match regardless of size delta"
+        );
     }
 
     #[test]

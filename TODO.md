@@ -1,5 +1,29 @@
 # Spela TODOs 🎬🍿
 
+### 🔓 OPEN — the ranker has no idea what the VIEWER'S LINK can carry (2026-09-11)
+Ranking is resolution → codec (target-scoped) → seeds. Nothing expresses **bytes per
+second available to the person watching**, so the same #1 pick is served to a Chromecast
+on gigabit LAN and to VLC on a phone hotspot two hundred km away over WireGuard. On
+2026-09-11 that meant a 36.8 Mbps remux over a hotspot: unwatchable, and nothing in the
+ranking could have known.
+
+The bitrate is already derivable at rank time — parsed size ÷ TMDB runtime, no probe
+needed. What is missing is the OTHER half: what the requester can actually sustain.
+Options, cheapest first:
+- **Declared**, per target: a `max_bitrate_kbps` on the play/search request, set once in
+  the SPA's target picker (LAN / VPN / hotspot). Deterministic, no measurement, and the
+  viewer knows their own link better than a probe would in the first 10 s.
+- **Observed**: derive it from the last stream's delivered throughput to that client.
+  Accurate, but arrives too late for the first pick of an evening.
+- **Inferred**: the requester's address (LAN subnet vs a WireGuard peer) as a coarse prior.
+  Free, but a hotspot and a fibre line look identical from behind the tunnel.
+
+Leaning declared-with-an-observed-correction. **Decide the UX first** (does the target
+picker grow a link setting, or does it live somewhere else?) — that is Fredrik's call, not
+an implementation detail. Until then the Local-Bypass tie-break shipped 2026-09-11 stops
+the worst case (being handed a remux when a small copy of the same film is on disk), but
+does nothing when the only copies are large.
+
 ### 🔓 OPEN — a 1.2 GB partial download vanished across a restart (2026-09-09)
 Star City S01E03 reached 1.2 GB and `open_pct 100`; after a `systemctl restart` it
 was absent from the persistence store, its directory was gone, and a re-tap started
