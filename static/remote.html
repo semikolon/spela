@@ -1166,10 +1166,21 @@ function tryIosVlc(forms, i, httpUrl){
     }
   }, 1500);
 }
-async function vlcWaitReady(id, gen){
+// `ih` is the chosen release's infohash, and it is what makes this loop safe to
+// leave running. Result ids are positions in the server's single `last_search`
+// slot, so ANY later search — a tap on a To-Watch row, another device, a
+// diagnostic — silently repoints a bare /vlc/{id}/ready at a different release.
+// This loop can run for an hour on a thin 4K swarm, which is a wide window:
+// 2026-09-20, a wait on a 4K film was still polling when a To-Watch tap searched
+// a series, the poll's id then named an episode of THAT series, the server
+// started it, it was ready in minutes because an episode is small, and VLC
+// opened the wrong thing. With ?ih= the server pins the result list to this play
+// and browsing while you wait costs nothing.
+async function vlcWaitReady(id, gen, ih){
+  const q = ih ? ("?ih=" + encodeURIComponent(ih)) : "";
   for(let i=0;i<600;i++){   // ~15 min cap at 1.5s/poll
     if(gen!=null && S.vlcGen!==gen) return "superseded";  // a newer VLC source took over — stop this loop silently
-    let d; try{ d=await api("/vlc/"+id+"/ready"); }catch(e){ S.now.vlcErr="spela unreachable"; return false; }
+    let d; try{ d=await api("/vlc/"+id+"/ready"+q); }catch(e){ S.now.vlcErr="spela unreachable"; return false; }
     // The ffprobe of the file lands here first, while the loading panel is still
     // up — so what you are about to watch is stated BEFORE the wait, not after it.
     if(d && d.quality) S.now.q = d.quality;
@@ -1215,17 +1226,24 @@ async function openInVlc(id,title,poster){
   // one (a VLC play always follows a search, so show.poster_url is available) — /status
   // for a VLC stream carries no poster, so an empty arg → a broken now-view <img>.
   poster = poster || (S.search.data && S.search.data.show && S.search.data.show.poster_url) || "";
+  // Snapshot the results NOW. Rotation used to read the LIVE result list, so a
+  // search run mid-wait moved both the ids and the list length this loop walks —
+  // the same positional hazard the ?ih= pin closes for the server side, one layer
+  // up. A snapshot means "the next ranked source" keeps meaning a source of the
+  // title that was actually clicked.
+  const shot = (S.search.data && S.search.data.results) ? S.search.data.results.slice() : [];
+  const ihOf = rid => { const r = shot.find(x => x.id === rid); return (r && r.info_hash) || ""; };
   // Immediate loading surface (like the Chromecast warmup), THEN wait until spela
   // says the source is ready (head/tail Cues primed) before firing VLC — so a fresh
   // torrent never opens to a hung player, and the user always sees progress.
   beginWarming(title||"Opening in VLC…", poster); stopWarmupPoll();  // /progress isn't the VLC source; vlcWaitReady drives the screen
   S.now.vlcErr=null;
-  let rdy = await vlcWaitReady(id, gen);
+  let rdy = await vlcWaitReady(id, gen, ihOf(id));
   // Rotate past dead sources. Bounded, and each skip is ANNOUNCED rather than silent:
   // a play that quietly switches source is indistinguishable from one that ignored the
   // pick. Matches the Chromecast retry budget of three.
   let skipped = 0;
-  const total = (S.search.data && S.search.data.results && S.search.data.results.length) || 0;
+  const total = shot.length;
   while(rdy && (rdy.rotate || rdy.switchTo) && skipped < 3){
     if(rdy.switchTo){
       // Not a failure — the race found a source that is actually delivering.
@@ -1238,7 +1256,7 @@ async function openInVlc(id,title,poster){
     }
     skipped += 1;
     if(S.now.warming) renderWarmPanel();
-    rdy = await vlcWaitReady(id, gen);
+    rdy = await vlcWaitReady(id, gen, ihOf(id));
   }
   if(rdy && (rdy.rotate || rdy.switchTo)){ S.now.vlcErr="No source for this episode had reachable peers."; rdy=false; }
   S.now.vlcNote=null;
@@ -1247,7 +1265,8 @@ async function openInVlc(id,title,poster){
     showPlayError(title||"VLC", poster, S.now.vlcErr||"Couldn’t buffer this source.", ()=>openInVlc(id,title,poster)); return;
   }
   let m3u;
-  try{ const r=await fetch("/vlc/"+id+"/open.m3u"); if(!r.ok){ showPlayError(title||"VLC",poster,"Couldn’t resolve that source.",()=>openInVlc(id,title,poster)); return; } m3u=await r.text(); }
+  const pinQ = ihOf(id) ? ("?ih=" + encodeURIComponent(ihOf(id))) : "";
+  try{ const r=await fetch("/vlc/"+id+"/open.m3u"+pinQ); if(!r.ok){ showPlayError(title||"VLC",poster,"Couldn’t resolve that source.",()=>openInVlc(id,title,poster)); return; } m3u=await r.text(); }
   catch(e){ showPlayError(title||"VLC",poster,"spela unreachable",()=>openInVlc(id,title,poster)); return; }
   const url=(m3u.split("\n").find(l=>l.startsWith("http"))||"").trim();
   if(!url){ showPlayError(title||"VLC",poster,"No stream URL.",()=>openInVlc(id,title,poster)); return; }
