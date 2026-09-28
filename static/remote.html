@@ -1176,8 +1176,17 @@ function tryIosVlc(forms, i, httpUrl){
 // started it, it was ready in minutes because an episode is small, and VLC
 // opened the wrong thing. With ?ih= the server pins the result list to this play
 // and browsing while you wait costs nothing.
-async function vlcWaitReady(id, gen, ih){
-  const q = ih ? ("?ih=" + encodeURIComponent(ih)) : "";
+// `ih` names the torrent, `fi` the file inside it. Built in one place so the two
+// halves can never travel apart: a request carrying only the hash resolves a
+// season pack to whichever episode was pinned first.
+function pinQuery(pin, lead){
+  if(!pin || !pin.ih) return "";
+  let q = lead + "ih=" + encodeURIComponent(pin.ih);
+  if(pin.fi != null) q += "&fi=" + encodeURIComponent(pin.fi);
+  return q;
+}
+async function vlcWaitReady(id, gen, pin){
+  const q = pinQuery(pin, "?");
   for(let i=0;i<600;i++){   // ~15 min cap at 1.5s/poll
     if(gen!=null && S.vlcGen!==gen) return "superseded";  // a newer VLC source took over — stop this loop silently
     let d; try{ d=await api("/vlc/"+id+"/ready"+q); }catch(e){ S.now.vlcErr="spela unreachable"; return false; }
@@ -1232,13 +1241,17 @@ async function openInVlc(id,title,poster){
   // up. A snapshot means "the next ranked source" keeps meaning a source of the
   // title that was actually clicked.
   const shot = (S.search.data && S.search.data.results) ? S.search.data.results.slice() : [];
-  const ihOf = rid => { const r = shot.find(x => x.id === rid); return (r && r.info_hash) || ""; };
+  // The identity of a play is the torrent AND the file inside it. A season pack
+  // is ONE torrent holding a whole season, so the infohash alone names every
+  // episode of it equally — 2026-09-28: clicking S01E06 replayed S01E05
+  // instantly, because the pin taken for E05 answered for E06's hash too.
+  const pinOf = rid => { const r = shot.find(x => x.id === rid); return r ? {ih:r.info_hash||"", fi:r.file_index} : null; };
   // Immediate loading surface (like the Chromecast warmup), THEN wait until spela
   // says the source is ready (head/tail Cues primed) before firing VLC — so a fresh
   // torrent never opens to a hung player, and the user always sees progress.
   beginWarming(title||"Opening in VLC…", poster); stopWarmupPoll();  // /progress isn't the VLC source; vlcWaitReady drives the screen
   S.now.vlcErr=null;
-  let rdy = await vlcWaitReady(id, gen, ihOf(id));
+  let rdy = await vlcWaitReady(id, gen, pinOf(id));
   // Rotate past dead sources. Bounded, and each skip is ANNOUNCED rather than silent:
   // a play that quietly switches source is indistinguishable from one that ignored the
   // pick. Matches the Chromecast retry budget of three.
@@ -1256,7 +1269,7 @@ async function openInVlc(id,title,poster){
     }
     skipped += 1;
     if(S.now.warming) renderWarmPanel();
-    rdy = await vlcWaitReady(id, gen, ihOf(id));
+    rdy = await vlcWaitReady(id, gen, pinOf(id));
   }
   if(rdy && (rdy.rotate || rdy.switchTo)){ S.now.vlcErr="No source for this episode had reachable peers."; rdy=false; }
   S.now.vlcNote=null;
@@ -1265,7 +1278,7 @@ async function openInVlc(id,title,poster){
     showPlayError(title||"VLC", poster, S.now.vlcErr||"Couldn’t buffer this source.", ()=>openInVlc(id,title,poster)); return;
   }
   let m3u;
-  const pinQ = ihOf(id) ? ("?ih=" + encodeURIComponent(ihOf(id))) : "";
+  const pinQ = pinQuery(pinOf(id), "?");
   try{ const r=await fetch("/vlc/"+id+"/open.m3u"+pinQ); if(!r.ok){ showPlayError(title||"VLC",poster,"Couldn’t resolve that source.",()=>openInVlc(id,title,poster)); return; } m3u=await r.text(); }
   catch(e){ showPlayError(title||"VLC",poster,"spela unreachable",()=>openInVlc(id,title,poster)); return; }
   const url=(m3u.split("\n").find(l=>l.startsWith("http"))||"").trim();

@@ -189,10 +189,10 @@ type SharedState = Arc<ServerState>;
 fn cached_media_quality(
     state: &SharedState,
     rid: usize,
-    ih: Option<&str>,
+    pin: VlcPin<'_>,
 ) -> Option<crate::transcode::MediaQuality> {
-    let (path, _) = resolve_local_file_for_result(state, rid, ih)
-        .or_else(|| resolve_local_file_lenient(state, rid, ih))?;
+    let (path, _) = resolve_local_file_for_result(state, rid, pin)
+        .or_else(|| resolve_local_file_lenient(state, rid, pin))?;
     let key = path.to_string_lossy().to_string();
     lock_recover(&state.media_probe).get(&key).cloned()
 }
@@ -337,9 +337,9 @@ fn spawn_media_probe_at(state: &SharedState, path: std::path::PathBuf) {
 /// Probe the file a result resolves to, once. Lifetime: one bounded ffprobe that
 /// completes on its own; the cache entry is what stops the ~1.5s readiness poll
 /// from spawning another every tick.
-fn spawn_media_probe(state: &SharedState, rid: usize, ih: Option<&str>) {
-    let Some((path, _)) = resolve_local_file_for_result(state, rid, ih)
-        .or_else(|| resolve_local_file_lenient(state, rid, ih))
+fn spawn_media_probe(state: &SharedState, rid: usize, pin: VlcPin<'_>) {
+    let Some((path, _)) = resolve_local_file_for_result(state, rid, pin)
+        .or_else(|| resolve_local_file_lenient(state, rid, pin))
     else {
         return;
     };
@@ -8768,9 +8768,9 @@ pub(crate) fn bypass_size_is_acceptable(have: u64, want: u64) -> bool {
 fn resolve_local_file_for_result(
     state: &SharedState,
     rid: usize,
-    ih: Option<&str>,
+    pin: VlcPin<'_>,
 ) -> Option<(std::path::PathBuf, String)> {
-    resolve_local_file_impl(state, rid, false, ih)
+    resolve_local_file_impl(state, rid, false, pin)
 }
 
 /// Like `resolve_local_file_for_result` but IGNORES the result's expected size.
@@ -8783,18 +8783,18 @@ fn resolve_local_file_for_result(
 fn resolve_local_file_lenient(
     state: &SharedState,
     rid: usize,
-    ih: Option<&str>,
+    pin: VlcPin<'_>,
 ) -> Option<(std::path::PathBuf, String)> {
-    resolve_local_file_impl(state, rid, true, ih)
+    resolve_local_file_impl(state, rid, true, pin)
 }
 
 fn resolve_local_file_impl(
     state: &SharedState,
     rid: usize,
     ignore_size: bool,
-    ih: Option<&str>,
+    pin: VlcPin<'_>,
 ) -> Option<(std::path::PathBuf, String)> {
-    let search = vlc_search(state, ih)?;
+    let search = vlc_search(state, pin)?;
     let r = search.results.iter().find(|r| r.id == rid)?;
     let title = bypass_match_title(
         search.show.as_ref().map(|s| s.title.as_str()),
@@ -8861,14 +8861,13 @@ fn resolve_local_file_impl(
 /// and fully-downloaded sources alike.
 /// The infohash of a result, for pinning a VLC URL to CONTENT rather than to a
 /// position. See `remap_id_by_infohash`.
-fn infohash_for_result(state: &SharedState, rid: usize) -> Option<String> {
+fn infohash_for_result(state: &SharedState, rid: usize) -> Option<(String, Option<u32>)> {
     let search = AppState::load_last_search(&state.state_dir)?;
-    search
-        .results
-        .iter()
-        .find(|r| r.id == rid)
-        .map(|r| r.info_hash.clone())
-        .filter(|h| !h.is_empty())
+    let r = search.results.iter().find(|r| r.id == rid)?;
+    if r.info_hash.is_empty() {
+        return None;
+    }
+    Some((r.info_hash.clone(), r.file_index))
 }
 
 /// How long a pinned VLC search is kept addressable after its last use.
@@ -8881,14 +8880,59 @@ const VLC_INTENT_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 6
 /// Most VLC plays a session can hold open at once before the oldest is dropped.
 const VLC_INTENT_MAX: usize = 8;
 
+/// Which file a VLC request is for: the torrent, and the file inside it.
+///
+/// One value rather than two loose `Option`s threaded side by side through
+/// twenty call sites, where transposing them would compile and quietly resolve
+/// the wrong episode — the exact failure this type exists to prevent.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct VlcPin<'a> {
+    pub ih: Option<&'a str>,
+    pub fi: Option<u32>,
+}
+
+impl<'a> VlcPin<'a> {
+    fn from_query(q: &'a VlcPinQuery) -> Self {
+        Self {
+            ih: q.ih.as_deref().filter(|s| !s.is_empty()),
+            fi: q.fi,
+        }
+    }
+    fn key(&self) -> Option<String> {
+        self.ih.map(|h| vlc_pin_key(h, self.fi))
+    }
+}
+
+/// The identity a VLC play is pinned under: the torrent AND the file inside it.
+///
+/// An infohash alone is the TORRENT, and a season pack is one torrent holding a
+/// whole season — so every episode of a pack shares it. Keying on the infohash
+/// alone therefore collapses them: on 2026-09-28, an episode watched from a pack
+/// pinned the search under the pack's hash, and the next episode's play found
+/// that pin and replayed the one already seen, instantly and with the previous
+/// episode's title. It held for three weeks because a single-file release makes
+/// torrent and file the same thing, which is exactly what made the assumption
+/// invisible.
+///
+/// `file_index` is Torrentio's index of the video inside the torrent, so
+/// (infohash, file_index) names the thing a play is actually FOR. Absent index
+/// keeps its own slot rather than colliding with file 0: a release with no index
+/// is the whole-torrent case, which is a different thing to ask for.
+fn vlc_pin_key(ih: &str, fi: Option<u32>) -> String {
+    match fi {
+        Some(i) => format!("{}:{}", ih.to_ascii_lowercase(), i),
+        None => format!("{}:whole", ih.to_ascii_lowercase()),
+    }
+}
+
 /// The result list a VLC request should resolve against.
 ///
-/// With an infohash, the pinned copy taken when that play began; without one, or
-/// for a release nobody pinned, the live `last_search` exactly as before. So an
+/// With a pin identity, the copy taken when that play began; without one, or for
+/// a file nobody pinned, the live `last_search` exactly as before. So an
 /// in-flight play keeps naming the release it was started for no matter how many
 /// searches run underneath it, and every other caller is unaffected.
-fn vlc_search(state: &SharedState, ih: Option<&str>) -> Option<crate::search::SearchResult> {
-    if let Some(key) = ih.map(str::to_ascii_lowercase).filter(|s| !s.is_empty()) {
+fn vlc_search(state: &SharedState, pin: VlcPin<'_>) -> Option<crate::search::SearchResult> {
+    if let Some(key) = pin.key() {
         let mut pins = lock_recover(&state.vlc_intents);
         pins.retain(|_, (seen, _)| seen.elapsed() < VLC_INTENT_TTL);
         if let Some((seen, search)) = pins.get_mut(&key) {
@@ -8906,8 +8950,8 @@ fn vlc_search(state: &SharedState, ih: Option<&str>) -> Option<crate::search::Se
 /// the release, and re-taking it later is a no-op. A release absent from the
 /// current search is NOT pinned: there is nothing trustworthy to copy, and the
 /// positional fallback is then no worse than it has always been.
-fn pin_vlc_search(state: &SharedState, ih: Option<&str>) {
-    let Some(key) = ih.map(str::to_ascii_lowercase).filter(|s| !s.is_empty()) else {
+fn pin_vlc_search(state: &SharedState, pin: VlcPin<'_>) {
+    let (Some(raw), Some(key)) = (pin.ih, pin.key()) else {
         return;
     };
     {
@@ -8919,10 +8963,13 @@ fn pin_vlc_search(state: &SharedState, ih: Option<&str>) {
     let Some(search) = AppState::load_last_search(&state.state_dir) else {
         return;
     };
+    // The pinned copy must actually contain the FILE being asked for, not merely
+    // its torrent — otherwise a season pack pins on its first episode and every
+    // later one inherits that stale search.
     if !search
         .results
         .iter()
-        .any(|r| r.info_hash.eq_ignore_ascii_case(&key))
+        .any(|r| r.info_hash.eq_ignore_ascii_case(raw) && r.file_index == pin.fi)
     {
         return;
     }
@@ -8936,8 +8983,8 @@ fn pin_vlc_search(state: &SharedState, ih: Option<&str>) {
         pins.remove(&key);
     }
     tracing::info!(
-        "VLC: pinned the result list for infohash {} — later searches cannot repoint this play",
-        &key[..8.min(key.len())]
+        "VLC: pinned the result list for {} — later searches cannot repoint this play",
+        key
     );
     pins.insert(key, (Instant::now(), search));
 }
@@ -8980,32 +9027,32 @@ pub(crate) fn pins_to_evict(ages: &[(String, std::time::Duration)], max: usize) 
 /// So the playlist now embeds `&ih=<infohash>` and this maps it back to the
 /// current id. Falls back to the positional id (with a warning) when the
 /// release has left `last_search` entirely, which is no worse than before.
-fn remap_id_by_infohash(state: &SharedState, rid: usize, ih: Option<&str>) -> usize {
-    let Some(ih) = ih.filter(|s| !s.is_empty()) else {
+fn remap_id_by_infohash(state: &SharedState, rid: usize, pin: VlcPin<'_>) -> usize {
+    let (Some(ih), fi) = (pin.ih, pin.fi) else {
         return rid;
     };
-    let Some(search) = vlc_search(state, Some(ih)) else {
+    let Some(search) = vlc_search(state, pin) else {
         return rid;
     };
     let short = &ih[..8.min(ih.len())];
-    let pairs: Vec<(usize, &str)> = search
+    let rows: Vec<(usize, &str, Option<u32>)> = search
         .results
         .iter()
-        .map(|r| (r.id, r.info_hash.as_str()))
+        .map(|r| (r.id, r.info_hash.as_str(), r.file_index))
         .collect();
-    match pick_id_for_infohash(&pairs, rid, ih) {
+    match pick_id_for_file(&rows, rid, ih, fi) {
         PinOutcome::Unchanged => rid,
         PinOutcome::Remapped(new_id) => {
             tracing::warn!(
-                "VLC: #{} no longer names infohash {} (last_search changed mid-stream) — remapped to #{}",
-                rid, short, new_id
+                "VLC: #{} no longer names {}:{:?} (last_search changed mid-stream) — remapped to #{}",
+                rid, short, fi, new_id
             );
             new_id
         }
         PinOutcome::Absent => {
             tracing::warn!(
-                "VLC: infohash {} is absent from the current last_search — falling back to positional #{}",
-                short, rid
+                "VLC: {}:{:?} is absent from the current last_search — falling back to positional #{}",
+                short, fi, rid
             );
             rid
         }
@@ -9025,15 +9072,28 @@ pub(crate) enum PinOutcome {
 
 /// Pure core of `remap_id_by_infohash`, so the decision is testable without a
 /// live server state.
-pub(crate) fn pick_id_for_infohash(pairs: &[(usize, &str)], rid: usize, ih: &str) -> PinOutcome {
-    if pairs
-        .iter()
-        .any(|(id, h)| *id == rid && h.eq_ignore_ascii_case(ih))
-    {
+///
+/// Matches on the torrent AND the file inside it. Infohash alone was enough for
+/// as long as every release was one file; a season pack is one torrent holding a
+/// season, so on 2026-09-28 an id carrying the pack's hash matched the pack's
+/// FIRST episode and played that instead of the one clicked.
+///
+/// A caller that sends no file index (an older VLC replaying a stored URL) still
+/// matches on the hash alone, which is right for the single-file case it came
+/// from and no worse than it ever was.
+pub(crate) fn pick_id_for_file(
+    rows: &[(usize, &str, Option<u32>)],
+    rid: usize,
+    ih: &str,
+    fi: Option<u32>,
+) -> PinOutcome {
+    let names_it =
+        |h: &str, f: Option<u32>| h.eq_ignore_ascii_case(ih) && (fi.is_none() || f == fi);
+    if rows.iter().any(|(id, h, f)| *id == rid && names_it(h, *f)) {
         return PinOutcome::Unchanged;
     }
-    match pairs.iter().find(|(_, h)| h.eq_ignore_ascii_case(ih)) {
-        Some((id, _)) => PinOutcome::Remapped(*id),
+    match rows.iter().find(|(_, h, f)| names_it(h, *f)) {
+        Some((id, _, _)) => PinOutcome::Remapped(*id),
         None => PinOutcome::Absent,
     }
 }
@@ -9041,9 +9101,9 @@ pub(crate) fn pick_id_for_infohash(pairs: &[(usize, &str)], rid: usize, ih: &str
 fn resolve_result_for_vlc(
     state: &SharedState,
     rid: usize,
-    ih: Option<&str>,
+    pin: VlcPin<'_>,
 ) -> Option<(String, Option<u32>, String, String, Option<String>)> {
-    let search = vlc_search(state, ih)?;
+    let search = vlc_search(state, pin)?;
     let r = search.results.iter().find(|r| r.id == rid)?;
     let title = bypass_match_title(
         search.show.as_ref().map(|s| s.title.as_str()),
@@ -9415,6 +9475,10 @@ fn reap_previous_vlc_torrents(state: &SharedState, keep: u32) {
 struct VlcPinQuery {
     #[serde(default)]
     ih: Option<String>,
+    /// Which file inside that torrent. A season pack is ONE torrent holding a
+    /// season, so the hash alone does not name an episode — see `vlc_pin_key`.
+    #[serde(default)]
+    fi: Option<u32>,
 }
 
 /// One remembered start: the cell the spawned task writes into, and when it began.
@@ -9583,9 +9647,9 @@ async fn stop_seeding_what_has_been_watched(state: &SharedState) {
 async fn adopt_owning_torrent(
     state: &SharedState,
     id: usize,
-    ih: Option<&str>,
+    pin: VlcPin<'_>,
 ) -> Option<(u32, Option<u32>)> {
-    let (path, _) = resolve_local_file_lenient(state, id, ih)?;
+    let (path, _) = resolve_local_file_lenient(state, id, pin)?;
     if is_physically_full(&path, 0) {
         return None;
     }
@@ -9610,11 +9674,11 @@ async fn handle_vlc_stream(
     axum::extract::Query(pin): axum::extract::Query<VlcPinQuery>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    pin_vlc_search(&state, pin.ih.as_deref());
-    let id = remap_id_by_infohash(&state, id, pin.ih.as_deref());
+    pin_vlc_search(&state, VlcPin::from_query(&pin));
+    let id = remap_id_by_infohash(&state, id, VlcPin::from_query(&pin));
     // 2026-07-28: stamp VLC activity so /status can report vlc_active — this path
     // serves VLC directly and never creates a CurrentStream.
-    if let Some((_, _, name, _, _)) = resolve_result_for_vlc(&state, id, pin.ih.as_deref()) {
+    if let Some((_, _, name, _, _)) = resolve_result_for_vlc(&state, id, VlcPin::from_query(&pin)) {
         let imdb = AppState::load_last_search(&state.state_dir)
             .and_then(|s| s.show)
             .and_then(|sh| sh.imdb_id);
@@ -9623,14 +9687,14 @@ async fn handle_vlc_stream(
     // Name the bytes, and probe them. Both are cheap and idempotent: the probe
     // returns early if this path is already cached, so a per-Range-request serve
     // costs one map lookup.
-    if let Some((path, _)) = resolve_local_file_for_result(&state, id, pin.ih.as_deref())
-        .or_else(|| resolve_local_file_lenient(&state, id, pin.ih.as_deref()))
+    if let Some((path, _)) = resolve_local_file_for_result(&state, id, VlcPin::from_query(&pin))
+        .or_else(|| resolve_local_file_lenient(&state, id, VlcPin::from_query(&pin)))
     {
         *lock_recover(&state.serving_path) = Some(path.to_string_lossy().to_string());
     }
-    spawn_media_probe(&state, id, pin.ih.as_deref());
+    spawn_media_probe(&state, id, VlcPin::from_query(&pin));
     // 1. Complete file on disk (strict match) → serve directly (fully seekable).
-    if let Some((path, _)) = resolve_local_file_for_result(&state, id, pin.ih.as_deref()) {
+    if let Some((path, _)) = resolve_local_file_for_result(&state, id, VlcPin::from_query(&pin)) {
         tracing::info!(
             "VLC: result #{} → complete local file {:?} (range={:?})",
             id,
@@ -9642,13 +9706,13 @@ async fn handle_vlc_stream(
     // 1.5. An INCOMPLETE file for this release that another torrent already holds —
     // the season-pack case. Adopting it skips the swarm entirely, which is the whole
     // point when the clicked release's own swarm is dead.
-    let adopted = adopt_owning_torrent(&state, id, pin.ih.as_deref()).await;
+    let adopted = adopt_owning_torrent(&state, id, VlcPin::from_query(&pin)).await;
     // 2/3. Partial or fresh → start/resume the torrent + serve its FileStream.
     let (tid, file_index) = match adopted {
         Some(pair) => pair,
         None => {
             let Some((magnet, file_index, _, _, _)) =
-                resolve_result_for_vlc(&state, id, pin.ih.as_deref())
+                resolve_result_for_vlc(&state, id, VlcPin::from_query(&pin))
             else {
                 return (
                     axum::http::StatusCode::NOT_FOUND,
@@ -9690,7 +9754,7 @@ async fn handle_vlc_stream(
         .map(|p| p.finished)
         .unwrap_or(false)
     {
-        if let Some((path, _)) = resolve_local_file_lenient(&state, id, pin.ih.as_deref()) {
+        if let Some((path, _)) = resolve_local_file_lenient(&state, id, VlcPin::from_query(&pin)) {
             tracing::info!(
                 "VLC: result #{} → finished torrent {} served as STATIC file {:?} (range={:?})",
                 id,
@@ -9778,8 +9842,8 @@ async fn handle_vlc_ready(
     // the first thing every VLC play does, so `last_search` still holds the
     // release here; from the next call on, every lookup below reads the pinned
     // list instead and no later search can repoint this play.
-    pin_vlc_search(&state, pin.ih.as_deref());
-    let id = remap_id_by_infohash(&state, id, pin.ih.as_deref());
+    pin_vlc_search(&state, VlcPin::from_query(&pin));
+    let id = remap_id_by_infohash(&state, id, VlcPin::from_query(&pin));
     // COMPLETE file on disk → instantly ready (served static + fully seekable).
     //
     // "Complete" has to be PROVEN, not assumed from a resolver returning Some. The
@@ -9789,36 +9853,40 @@ async fn handle_vlc_ready(
     // with no tail and stalled. Star City S01E01, 2026-08-27: 845MB of a 9.6GB release
     // reported ready:true. is_physically_full is the same gate the resume start-time
     // already uses, for exactly this reason.
-    let complete = resolve_local_file_for_result(&state, id, pin.ih.as_deref())
+    let complete = resolve_local_file_for_result(&state, id, VlcPin::from_query(&pin))
         .into_iter()
-        .chain(resolve_local_file_lenient(&state, id, pin.ih.as_deref()))
+        .chain(resolve_local_file_lenient(
+            &state,
+            id,
+            VlcPin::from_query(&pin),
+        ))
         .find(|(path, _)| is_physically_full(path, 0));
-    let probed = cached_media_quality(&state, id, pin.ih.as_deref());
+    let probed = cached_media_quality(&state, id, VlcPin::from_query(&pin));
     if complete.is_some() {
         // Warm the external English subtitle before VLC asks for it. On a complete
         // file this is the SLOW case (alass aligns over the whole file, 38.9s measured
         // on Star City S01E06) and VLC blocks on its `--input-slave`, so doing it here
         // — during the poll the SPA already runs — is what keeps the open instant.
-        spawn_vlc_subtitle_warm(&state, id, pin.ih.as_deref());
-        spawn_media_probe(&state, id, pin.ih.as_deref());
+        spawn_vlc_subtitle_warm(&state, id, VlcPin::from_query(&pin));
+        spawn_media_probe(&state, id, VlcPin::from_query(&pin));
         return Json(json!({
             "ready": true, "pct": 100, "phase": "on disk", "quality": probed,
         }));
     }
-    spawn_vlc_subtitle_warm(&state, id, pin.ih.as_deref());
+    spawn_vlc_subtitle_warm(&state, id, VlcPin::from_query(&pin));
     // Safe on a partial torrent: a sparse file reports its full logical size and
     // the duration sits in the container header, so the probe describes the
     // finished encode from the first moments of the download.
-    spawn_media_probe(&state, id, pin.ih.as_deref());
+    spawn_media_probe(&state, id, VlcPin::from_query(&pin));
     // The same adoption the serve does, so readiness and the serve cannot disagree
     // about which torrent is behind this result. They are separate code paths, and
     // when they diverge the failure surfaces as VLC's own "unable to open the MRL".
-    let adopted = adopt_owning_torrent(&state, id, pin.ih.as_deref()).await;
+    let adopted = adopt_owning_torrent(&state, id, VlcPin::from_query(&pin)).await;
     let (magnet, file_index) = match &adopted {
         Some((_, idx)) => (String::new(), *idx),
         None => {
             let Some((magnet, file_index, _, _, _)) =
-                resolve_result_for_vlc(&state, id, pin.ih.as_deref())
+                resolve_result_for_vlc(&state, id, VlcPin::from_query(&pin))
             else {
                 return Json(
                     json!({ "ready": false, "error": "Result not found — search again." }),
@@ -10187,9 +10255,9 @@ fn vlc_sub_cache_path(media_dir: &std::path::Path, key: &str) -> std::path::Path
 async fn ensure_vlc_subtitle(
     state: &SharedState,
     id: usize,
-    ih: Option<&str>,
+    pin: VlcPin<'_>,
 ) -> Option<std::path::PathBuf> {
-    let search = vlc_search(state, ih);
+    let search = vlc_search(state, pin);
     let imdb = search
         .as_ref()
         .and_then(|s| s.show.as_ref())
@@ -10214,9 +10282,9 @@ async fn ensure_vlc_subtitle(
     if std::fs::metadata(&cached).map(|m| m.len()).unwrap_or(0) > 200 {
         return Some(cached);
     }
-    let local_source: Option<std::path::PathBuf> = resolve_local_file_for_result(state, id, ih)
+    let local_source: Option<std::path::PathBuf> = resolve_local_file_for_result(state, id, pin)
         .into_iter()
-        .chain(resolve_local_file_lenient(state, id, ih))
+        .chain(resolve_local_file_lenient(state, id, pin))
         .map(|(p, _)| p)
         .find(|p| is_physically_full(p, 0));
     let client = reqwest::Client::new();
@@ -10268,8 +10336,8 @@ async fn ensure_vlc_subtitle(
 /// Kick off a background subtitle warm for this result, at most once per episode
 /// key. Lifetime: one bounded fetch that completes on its own; the guard set is
 /// what stops the ~1.5s readiness poll from spawning a new one every tick.
-fn spawn_vlc_subtitle_warm(state: &SharedState, id: usize, ih: Option<&str>) {
-    let search = vlc_search(state, ih);
+fn spawn_vlc_subtitle_warm(state: &SharedState, id: usize, pin: VlcPin<'_>) {
+    let search = vlc_search(state, pin);
     let Some(imdb) = search
         .as_ref()
         .and_then(|s| s.show.as_ref())
@@ -10290,9 +10358,18 @@ fn spawn_vlc_subtitle_warm(state: &SharedState, id: usize, ih: Option<&str>) {
         }
     }
     let state = state.clone();
-    let ih = ih.map(str::to_string);
+    let owned_ih = pin.ih.map(str::to_string);
+    let fi = pin.fi;
     tokio::spawn(async move {
-        let found = ensure_vlc_subtitle(&state, id, ih.as_deref()).await;
+        let found = ensure_vlc_subtitle(
+            &state,
+            id,
+            VlcPin {
+                ih: owned_ih.as_deref(),
+                fi,
+            },
+        )
+        .await;
         if found.is_none() {
             // Nothing exists for this title — allow a later retry (OpenSubtitles
             // gains files for a fresh episode over the following days).
@@ -10318,8 +10395,8 @@ async fn handle_vlc_sub(
     axum::extract::Path(id): axum::extract::Path<usize>,
     axum::extract::Query(pin): axum::extract::Query<VlcPinQuery>,
 ) -> axum::response::Response {
-    let id = remap_id_by_infohash(&state, id, pin.ih.as_deref());
-    match ensure_vlc_subtitle(&state, id, pin.ih.as_deref()).await {
+    let id = remap_id_by_infohash(&state, id, VlcPin::from_query(&pin));
+    match ensure_vlc_subtitle(&state, id, VlcPin::from_query(&pin)).await {
         Some(path) => match tokio::fs::read(&path).await {
             Ok(bytes) => axum::response::Response::builder()
                 .status(200)
@@ -10340,10 +10417,10 @@ async fn handle_vlc_playlist(
     // Pin here too: VLC re-requests the playlist on its own after a spela
     // restart, when no pin survives. Safe because `pin_vlc_search` only ever
     // copies a list that actually contains this release.
-    pin_vlc_search(&state, pin.ih.as_deref());
-    let id = remap_id_by_infohash(&state, id, pin.ih.as_deref());
+    pin_vlc_search(&state, VlcPin::from_query(&pin));
+    let id = remap_id_by_infohash(&state, id, VlcPin::from_query(&pin));
     let Some((_, _, name, audio_lang, resume_imdb)) =
-        resolve_result_for_vlc(&state, id, pin.ih.as_deref())
+        resolve_result_for_vlc(&state, id, VlcPin::from_query(&pin))
     else {
         return (
             axum::http::StatusCode::NOT_FOUND,
@@ -10368,8 +10445,8 @@ async fn handle_vlc_playlist(
     // sparse torrent (e.g. 1GB of a 20GB 4K) would otherwise count as complete and
     // re-introduce the resume-into-a-hole hang. is_physically_full(_, 0) = blocks
     // cover the whole logical size.
-    let complete_on_disk = resolve_local_file_for_result(&state, id, pin.ih.as_deref())
-        .or_else(|| resolve_local_file_lenient(&state, id, pin.ih.as_deref()))
+    let complete_on_disk = resolve_local_file_for_result(&state, id, VlcPin::from_query(&pin))
+        .or_else(|| resolve_local_file_lenient(&state, id, VlcPin::from_query(&pin)))
         .map(|(path, _)| is_physically_full(&path, 0))
         .unwrap_or(false);
     let resume = if complete_on_disk {
@@ -10403,18 +10480,25 @@ async fn handle_vlc_playlist(
     // selects an EMBEDDED English track when the release ships one, which is why
     // this looked like it worked until a release turned up with only French.
     let sub_opt = String::new();
-    // `ih` pins this URL to the RELEASE, not to a position in last_search. VLC
-    // re-requests it on every reconnect and seek, and a search run meanwhile
-    // would otherwise repoint the id at a different file mid-playback. Empty
-    // when the result carries no infohash (library plays), which is harmless:
+    // `ih`+`fi` pin this URL to the FILE, not to a position in last_search and
+    // not merely to a torrent. VLC re-requests it on every reconnect and seek,
+    // and a search run meanwhile would otherwise repoint the id at a different
+    // release mid-playback. The file half is what makes a season pack safe: one
+    // torrent holds the whole season, so the hash alone names every episode of
+    // it equally (2026-09-28 — E06 replayed E05 instantly). Empty when the
+    // result carries no infohash (library plays), which is harmless:
     // `remap_id_by_infohash` then just keeps the positional id.
-    let ih_q = pin
+    let ih_q = match pin
         .ih
         .clone()
         .filter(|h| !h.is_empty())
+        .map(|h| (h, pin.fi))
         .or_else(|| infohash_for_result(&state, id))
-        .map(|h| format!("&ih={}", h))
-        .unwrap_or_default();
+    {
+        Some((h, Some(i))) => format!("&ih={}&fi={}", h, i),
+        Some((h, None)) => format!("&ih={}", h),
+        None => String::new(),
+    };
     let body = format!(
         "#EXTM3U\n#EXTINF:-1,{}\n#EXTVLCOPT:audio-language={}\n#EXTVLCOPT:sub-language=en,eng\n#EXTVLCOPT:network-caching={}\n{}{}{}/vlc/{}/stream?al={}{}\n",
         name, audio_lang, netcache, sub_opt, start_opt, base, id, audio_lang, ih_q
@@ -11372,12 +11456,76 @@ mod tests {
         assert!(!pins_to_evict(&ages, 2).contains(&"waiting".to_string()));
     }
 
+    // These five were written against `pick_id_for_infohash`, which matched on
+    // the TORRENT. Superseded in place 2026-09-28 rather than deleted: the cases
+    // are still right, and what changed is that identity now includes the FILE.
+    // A season pack is one torrent holding a season, so hash-only matching
+    // resolved every episode of it to whichever came first.
+    const NO_FILE: Option<u32> = None;
+
     #[test]
     fn pin_keeps_the_id_when_it_still_names_the_same_release() {
-        let pairs = [(1usize, KITSUNE), (2usize, OTHER)];
+        let rows = [(1usize, KITSUNE, NO_FILE), (2usize, OTHER, NO_FILE)];
         assert_eq!(
-            pick_id_for_infohash(&pairs, 1, KITSUNE),
+            pick_id_for_file(&rows, 1, KITSUNE, NO_FILE),
             PinOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_season_pack_resolves_to_the_EPISODE_asked_for_not_the_first_one() {
+        // The 2026-09-28 case, and the whole reason identity gained a file half.
+        // Search Party S01E05 and S01E06 are files 4 and 5 of ONE pack torrent,
+        // so both results carry infohash 37800d0e…; asking for file 5 must never
+        // answer with file 4.
+        let rows = [(1usize, KITSUNE, Some(4)), (2usize, KITSUNE, Some(5))];
+        assert_eq!(
+            pick_id_for_file(&rows, 2, KITSUNE, Some(5)),
+            PinOutcome::Unchanged
+        );
+        assert_eq!(
+            pick_id_for_file(&rows, 9, KITSUNE, Some(5)),
+            PinOutcome::Remapped(2)
+        );
+        // And the episode already watched is still reachable on its own index.
+        assert_eq!(
+            pick_id_for_file(&rows, 9, KITSUNE, Some(4)),
+            PinOutcome::Remapped(1)
+        );
+    }
+
+    #[test]
+    fn a_file_index_that_is_gone_is_absent_rather_than_the_wrong_episode() {
+        // Refusing is the safe direction: the caller keeps its positional id and
+        // logs, where guessing a sibling file plays the wrong episode silently.
+        let rows = [(1usize, KITSUNE, Some(4))];
+        assert_eq!(
+            pick_id_for_file(&rows, 1, KITSUNE, Some(5)),
+            PinOutcome::Absent
+        );
+    }
+
+    #[test]
+    fn a_caller_without_a_file_index_still_matches_on_the_torrent() {
+        // An older VLC replaying a stored URL sends only `ih`. That is exactly
+        // the single-file case it came from, so hash-only matching stays right
+        // there and is no worse than it ever was.
+        let rows = [(3usize, KITSUNE, Some(2))];
+        assert_eq!(
+            pick_id_for_file(&rows, 9, KITSUNE, NO_FILE),
+            PinOutcome::Remapped(3)
+        );
+    }
+
+    #[test]
+    fn the_pin_key_separates_two_files_of_one_torrent() {
+        assert_ne!(vlc_pin_key(KITSUNE, Some(4)), vlc_pin_key(KITSUNE, Some(5)));
+        // A whole-torrent request is its own thing, never file 0's neighbour.
+        assert_ne!(vlc_pin_key(KITSUNE, None), vlc_pin_key(KITSUNE, Some(0)));
+        // Case in an infohash is not meaningful, so it must not split the key.
+        assert_eq!(
+            vlc_pin_key(&KITSUNE.to_uppercase(), Some(4)),
+            vlc_pin_key(KITSUNE, Some(4))
         );
     }
 
@@ -11385,18 +11533,22 @@ mod tests {
     fn pin_follows_the_release_when_a_search_reorders_it() {
         // The 2026-09-04 case: a search run mid-stream moved the playing release
         // from id 4 to a different slot, and the live VLC URL still said 4.
-        let pairs = [(1usize, OTHER), (4usize, "ffffffff"), (7usize, KITSUNE)];
+        let rows = [
+            (1usize, OTHER, NO_FILE),
+            (4usize, "ffffffff", NO_FILE),
+            (7usize, KITSUNE, NO_FILE),
+        ];
         assert_eq!(
-            pick_id_for_infohash(&pairs, 4, KITSUNE),
+            pick_id_for_file(&rows, 4, KITSUNE, NO_FILE),
             PinOutcome::Remapped(7)
         );
     }
 
     #[test]
     fn pin_is_case_insensitive_since_infohash_case_is_not_meaningful() {
-        let pairs = [(3usize, KITSUNE)];
+        let rows = [(3usize, KITSUNE, NO_FILE)];
         assert_eq!(
-            pick_id_for_infohash(&pairs, 9, &KITSUNE.to_uppercase()),
+            pick_id_for_file(&rows, 9, &KITSUNE.to_uppercase(), NO_FILE),
             PinOutcome::Remapped(3)
         );
     }
@@ -11405,13 +11557,19 @@ mod tests {
     fn pin_reports_absent_rather_than_guessing_when_the_release_is_gone() {
         // A wholly different search. Guessing here would be worse than the old
         // positional behaviour; the caller keeps the id and logs.
-        let pairs = [(1usize, OTHER)];
-        assert_eq!(pick_id_for_infohash(&pairs, 1, KITSUNE), PinOutcome::Absent);
+        let rows = [(1usize, OTHER, NO_FILE)];
+        assert_eq!(
+            pick_id_for_file(&rows, 1, KITSUNE, NO_FILE),
+            PinOutcome::Absent
+        );
     }
 
     #[test]
     fn pin_on_an_empty_search_is_absent_not_a_panic() {
-        assert_eq!(pick_id_for_infohash(&[], 1, KITSUNE), PinOutcome::Absent);
+        assert_eq!(
+            pick_id_for_file(&[], 1, KITSUNE, NO_FILE),
+            PinOutcome::Absent
+        );
     }
 
     // ---- v3.22 (2026-08-04): Continue-dedup + Tier B boot-resume + seen-seasons ----
