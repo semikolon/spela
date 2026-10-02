@@ -41,6 +41,21 @@ const DEAD_MAGNET_MEMORY: Duration = Duration::from_secs(10 * 60);
 /// Recognisable by callers, which turn it into an actionable message rather than a spinner.
 pub const NO_PEERS_ERROR: &str = "no peers — this source appears dead";
 
+/// Check and expire a failed source under ONE lock. An `if let` scrutinee's
+/// temporary guard lives through its body in Rust 2021; locking again there
+/// deadlocked the executor as soon as a ten-minute cooldown expired.
+fn magnet_is_cooling_down(cache: &Mutex<HashMap<String, Instant>>, magnet: &str) -> bool {
+    let mut cache = cache.lock().unwrap();
+    match cache.get(magnet) {
+        Some(at) if at.elapsed() < DEAD_MAGNET_MEMORY => true,
+        Some(_) => {
+            cache.remove(magnet);
+            false
+        }
+        None => false,
+    }
+}
+
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Magnet, ManagedTorrent,
@@ -589,14 +604,8 @@ impl TorrentEngine {
         //
         // A healthy magnet resolves in well under a second. The generous ceiling here is
         // to protect a slow-but-alive swarm, not to wait out a dead one.
-        if let Some(at) = self.dead_magnets.lock().unwrap().get(magnet) {
-            if at.elapsed() < DEAD_MAGNET_MEMORY {
-                // Already proven unreachable moments ago. Answer at once rather than
-                // making every ~1s readiness poll re-serve the full timeout — otherwise
-                // the UI is still stuck, just in slower increments.
-                return Err(anyhow!("{}", NO_PEERS_ERROR));
-            }
-            self.dead_magnets.lock().unwrap().remove(magnet);
+        if magnet_is_cooling_down(&self.dead_magnets, magnet) {
+            return Err(anyhow!("{}", NO_PEERS_ERROR));
         }
         let added = tokio::time::timeout(
             METADATA_TIMEOUT,
@@ -1023,6 +1032,26 @@ mod settle_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_dead_magnet_can_be_retried_without_deadlocking_other_sources() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let cache = Mutex::new(HashMap::from([
+                ("expired".into(), Instant::now() - DEAD_MAGNET_MEMORY),
+                ("recent".into(), Instant::now()),
+            ]));
+            assert!(!magnet_is_cooling_down(&cache, "expired"));
+            assert!(!cache.lock().unwrap().contains_key("expired"));
+            assert!(magnet_is_cooling_down(&cache, "recent"));
+            assert!(!magnet_is_cooling_down(&cache, "new"));
+            assert!(!magnet_is_cooling_down(&cache, "expired"));
+            tx.send(()).unwrap();
+        });
+        // A real mutex deadlock cannot be interrupted by a Tokio timeout.
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("expired source wedged the cache lock");
+    }
 
     #[test]
     fn parse_mbps_string_handles_typical_librqbit_format() {
