@@ -1130,42 +1130,7 @@ impl SearchEngine {
             )
         })?;
 
-        let streams = resp["streams"].as_array().cloned().unwrap_or_default();
-        let results: Vec<TorrentResult> = streams
-            .iter()
-            .map(|s| {
-                let title_text = s["title"].as_str().unwrap_or("");
-                let meta = parse_torrentio_title(title_text);
-                let quality = s["name"]
-                    .as_str()
-                    .unwrap_or("")
-                    .replace("Torrentio\n", "")
-                    .trim()
-                    .to_string();
-                let info_hash = s["infoHash"].as_str().unwrap_or("").to_string();
-                let filename = s["behaviorHints"]["filename"]
-                    .as_str()
-                    .or_else(|| title_text.split('\n').next())
-                    .unwrap_or("Unknown")
-                    .to_string();
-
-                TorrentResult {
-                    id: 0, // assigned after sorting
-                    quality,
-                    title: filename,
-                    seeds: meta.0,
-                    size: meta.1,
-                    source: meta.2,
-                    magnet: build_magnet(
-                        &info_hash,
-                        s["behaviorHints"]["filename"].as_str().unwrap_or(""),
-                    ),
-                    info_hash,
-                    file_index: s["fileIdx"].as_u64().map(|n| n as u32),
-                    partial_pct: None, // enriched by the /search handler (media_dir scan)
-                }
-            })
-            .collect();
+        let results = torrent_results_from_streams(&resp);
 
         // Filter spurious cross-show results BEFORE ranking, so result IDs
         // assigned by rank_results_mut reflect only legitimate matches.
@@ -1673,6 +1638,52 @@ pub(crate) fn effective_res_tier_full(
     }
 }
 
+/// Torrentio's `streams` array as spela's own result type, unranked and
+/// unfiltered. A free function rather than a closure inside `torrentio_streams`
+/// so a test can push a REAL recorded payload through the same parser the live
+/// search uses — the ranker crash of 2026-10-03 was only reproducible with real
+/// seed counts and sizes, which no hand-written grid had.
+fn torrent_results_from_streams(resp: &Value) -> Vec<TorrentResult> {
+    resp["streams"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|s| {
+            let title_text = s["title"].as_str().unwrap_or("");
+            let meta = parse_torrentio_title(title_text);
+            let quality = s["name"]
+                .as_str()
+                .unwrap_or("")
+                .replace("Torrentio\n", "")
+                .trim()
+                .to_string();
+            let info_hash = s["infoHash"].as_str().unwrap_or("").to_string();
+            let filename = s["behaviorHints"]["filename"]
+                .as_str()
+                .or_else(|| title_text.split('\n').next())
+                .unwrap_or("Unknown")
+                .to_string();
+
+            TorrentResult {
+                id: 0, // assigned after sorting
+                quality,
+                title: filename,
+                seeds: meta.0,
+                size: meta.1,
+                source: meta.2,
+                magnet: build_magnet(
+                    &info_hash,
+                    s["behaviorHints"]["filename"].as_str().unwrap_or(""),
+                ),
+                info_hash,
+                file_index: s["fileIdx"].as_u64().map(|n| n as u32),
+                partial_pct: None, // enriched by the /search handler (media_dir scan)
+            }
+        })
+        .collect()
+}
+
 #[cfg_attr(not(test), allow(dead_code))] // test entry point; production ranks via rank_results_mut_prefer
 pub fn rank_results_mut(results: &mut [TorrentResult]) {
     // Default preserves the historical behaviour (Chromecast/NVENC needs H.264).
@@ -1787,6 +1798,70 @@ struct RankCtx<'a> {
     original_language: Option<&'a str>,
     pref: QualityPref,
     best_1080p_bpp: Option<f64>,
+    /// The best-seeded HEVC release in each bucket, for the transcoding target
+    /// only: the yardstick an H.264 release's swarm is judged against by
+    /// `codec_tier`. Empty for native targets, which have no codec preference.
+    best_hevc_seeds: std::collections::HashMap<RankBucket, u32>,
+}
+
+impl<'a> RankCtx<'a> {
+    /// The one way a context is built, for the real sort and for tests alike, so
+    /// a test cannot judge a pair against a yardstick the sort would not use.
+    fn for_set(results: &[TorrentResult], opts: RankOpts<'a>) -> Self {
+        let mut ctx = RankCtx {
+            prefer_h264: opts.transcoding,
+            original_language: opts.original_language,
+            pref: opts.pref,
+            best_1080p_bpp: best_1080p_bytes_per_pixel(results),
+            best_hevc_seeds: std::collections::HashMap::new(),
+        };
+        if ctx.prefer_h264 {
+            let mut best = std::collections::HashMap::new();
+            for r in results.iter().filter(|r| is_hevc_from_title(&r.title)) {
+                let seeds = best.entry(rank_bucket(r, &ctx)).or_insert(0u32);
+                *seeds = (*seeds).max(r.seeds);
+            }
+            ctx.best_hevc_seeds = best;
+        }
+        ctx
+    }
+}
+
+/// Everything the ranker decides about one release, as a value that sorts.
+///
+/// 2026-10-03: the comparator used to be a chain of pairwise `if`s, and one of
+/// them (the codec tier's seed-ratio override) compared the two operands'
+/// seed counts against EACH OTHER. That is not transitive, and the real list
+/// for Project Hail Mary held the cycle: a 1839-seed H.264 beat a 1227-seed
+/// HEVC on codec, the HEVC beat a 15-seed H.264 on the 30x override, and the
+/// 15-seed H.264 beat the 1839-seed one on size. Rust's sort detects that and
+/// panics, so the search returned nothing at all.
+///
+/// The second time this class has bitten (see `effective_res_tier`), so it is
+/// now ruled out by construction rather than by care: every tier is a FIELD,
+/// the order is the derived lexicographic one, and a rule that needs to look
+/// at the other operand cannot be written here. A tier that depends on the
+/// rest of the list takes its yardstick from `RankCtx`, computed once.
+///
+/// Field order IS tier order. Lower sorts first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct RankKey {
+    bucket: RankBucket,
+    codec: u32,
+    size: u32,
+    dv_preference: bool,
+    seeds: std::cmp::Reverse<u32>,
+}
+
+/// Tiers 0 to 3: the part of the key that decides which releases are
+/// alternatives to one another. Separate from `RankKey` because the codec tier
+/// judges an H.264 swarm against the best HEVC swarm in the SAME bucket.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct RankBucket {
+    unaddressable: bool,
+    dv_gate: bool,
+    res: u32,
+    lang: u32,
 }
 
 /// The ranking comparator, extracted from the `sort_by` closure so a test can
@@ -1796,13 +1871,12 @@ struct RankCtx<'a> {
 /// ORDER, which reads like a scoring bug and is not one. This project has been
 /// bitten by exactly that (see `effective_res_tier`), so the property is now
 /// tested rather than argued.
+#[cfg(test)] // the tests' view of the order; the real sort uses `rank_key` directly
 fn rank_cmp(a: &TorrentResult, b: &TorrentResult, ctx: &RankCtx<'_>) -> std::cmp::Ordering {
-    const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
-    // May 13, 2026 v3.4.0: when the HEVC alternative has ≥SEED_DISPARITY_OVERRIDE×
-    // the seeds of the H.264 tier-4 winner, override the codec preference. See
-    // tier 4 body below for the full rationale + Apr/May 2026 anchoring incident.
-    const SEED_DISPARITY_OVERRIDE: u32 = 30;
+    rank_key(a, ctx).cmp(&rank_key(b, ctx))
+}
 
+fn rank_bucket(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankBucket {
     // Tier 0: a release spela can ADDRESS beats one it cannot.
     //
     // Torrentio reports which file inside a torrent is the video (`fileIdx`).
@@ -1829,15 +1903,7 @@ fn rank_cmp(a: &TorrentResult, b: &TorrentResult, ctx: &RankCtx<'_>) -> std::cmp
     // title (the disc image and a Rifftrax multi-audio release), 0 of 16 and
     // 0 of 40 for the others. The 22.2 GB FraMeSToR REMUX carries `fileIdx: 0`
     // and is untouched, which is the case that proves this is not a size rule.
-    let a_addressable = a.file_index.is_some();
-    let b_addressable = b.file_index.is_some();
-    if a_addressable != b_addressable {
-        return if a_addressable {
-            std::cmp::Ordering::Less
-        } else {
-            std::cmp::Ordering::Greater
-        };
-    }
+    let unaddressable = r.file_index.is_none();
 
     // Tier 1: non-DV > DV — a HARD gate, but ONLY for the transcoding target.
     //
@@ -1860,15 +1926,7 @@ fn rank_cmp(a: &TorrentResult, b: &TorrentResult, ctx: &RankCtx<'_>) -> std::cmp
     // the lift — he has played DV before without noticing wrong colour — and
     // the failure mode if that is ever wrong is washed-out picture, visible in
     // the first second and revertible by moving this tier back up.
-    let a_dv = has_dolby_vision_in_title(&a.title);
-    let b_dv = has_dolby_vision_in_title(&b.title);
-    if ctx.prefer_h264 && a_dv != b_dv {
-        return if a_dv {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Less
-        };
-    }
+    let dv_gate = ctx.prefer_h264 && has_dolby_vision_in_title(&r.title);
 
     // Tier 2 (v3.4.1): composite `effective_res_tier` value that bakes
     // seed-viability into the resolution bucket. See `effective_res_tier`
@@ -1882,23 +1940,13 @@ fn rank_cmp(a: &TorrentResult, b: &TorrentResult, ctx: &RankCtx<'_>) -> std::cmp
     let force = ctx.pref == QualityPref::ForceUhd;
     // Ordering follows the preference; the seed bar follows the TARGET. Capping
     // at 1080p on a native target must not also import the Chromecast bar.
-    let a_eff = effective_res_tier_full(
-        a,
+    let res = effective_res_tier_full(
+        r,
         res_transcoding,
         ctx.prefer_h264,
         ctx.best_1080p_bpp,
         force,
     );
-    let b_eff = effective_res_tier_full(
-        b,
-        res_transcoding,
-        ctx.prefer_h264,
-        ctx.best_1080p_bpp,
-        force,
-    );
-    if a_eff != b_eff {
-        return a_eff.cmp(&b_eff);
-    }
 
     // Tier 3 (2026-09-05): language fit, WITHIN an equal resolution+viability
     // bucket. Star City S01E06 is the anchor — all three top candidates were
@@ -1907,11 +1955,51 @@ fn rank_cmp(a: &TorrentResult, b: &TorrentResult, ctx: &RankCtx<'_>) -> std::cmp
     // the plain English release (166), and it played with six French subtitle
     // tracks and no English one. Sits below resolution so a dead clean swarm
     // can't win; see `effective_lang_tier` for why it carries no seed term.
-    let a_lang = effective_lang_tier(a, ctx.original_language);
-    let b_lang = effective_lang_tier(b, ctx.original_language);
-    if a_lang != b_lang {
-        return a_lang.cmp(&b_lang);
+    let lang = effective_lang_tier(r, ctx.original_language);
+
+    RankBucket {
+        unaddressable,
+        dv_gate,
+        res,
+        lang,
     }
+}
+
+/// Codec preference for the TRANSCODING target, as a per-release value.
+///
+///   0 → H.264 with a usable swarm: plays without an NVENC transcode
+///   1 → HEVC, or an H.264 too thin (<5 seeds) to be worth preferring
+///   2 → H.264 whose swarm is dwarfed 30x by an HEVC alternative
+///
+/// `best_hevc_seeds` is the best-seeded HEVC release in the same bucket. Judging
+/// each H.264 against that ONE number, instead of against whichever HEVC it
+/// happens to be compared with, is what makes this a property of the release.
+/// For any two releases it gives the same verdict the pairwise rule gave when
+/// the HEVC in the pair IS the best-seeded one, which is the anchoring case.
+fn codec_tier(r: &TorrentResult, best_hevc_seeds: Option<u32>) -> u32 {
+    const MIN_SEEDS_FOR_CODEC_PREF: u32 = 5;
+    // May 13, 2026 v3.4.0: when the HEVC alternative has ≥SEED_DISPARITY_OVERRIDE×
+    // the seeds of the H.264 release, override the codec preference. See
+    // `rank_key` tier 4 for the full rationale + Apr/May 2026 anchoring incident.
+    const SEED_DISPARITY_OVERRIDE: u32 = 30;
+    if is_hevc_from_title(&r.title) {
+        return 1;
+    }
+    // `max(1)` guards seeds = 0 so the multiplier stays meaningful (without it,
+    // saturating_mul yields 0 and any HEVC count satisfies the inequality).
+    let dwarfed = best_hevc_seeds
+        .is_some_and(|hevc| hevc >= r.seeds.max(1).saturating_mul(SEED_DISPARITY_OVERRIDE));
+    if dwarfed {
+        2
+    } else if r.seeds >= MIN_SEEDS_FOR_CODEC_PREF {
+        0
+    } else {
+        1
+    }
+}
+
+fn rank_key(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankKey {
+    let bucket = rank_bucket(r, ctx);
 
     // Tier 4: H.264 > HEVC within same resolution + DV status (insta-play tiebreak).
     // May 13, 2026 v3.4.0 amendment — seed-disparity override:
@@ -1928,40 +2016,19 @@ fn rank_cmp(a: &TorrentResult, b: &TorrentResult, ctx: &RankCtx<'_>) -> std::cmp
     // tradeoff isn't worth flipping. Per-resolution + DV gates still
     // fire first (tier 3 / tier 2), so this override only ever swaps
     // codec WITHIN the same resolution + DV bucket.
-    let a_hevc = is_hevc_from_title(&a.title);
-    let b_hevc = is_hevc_from_title(&b.title);
+    //
+    // AMENDED 2026-10-03: the override is measured against the BEST-seeded HEVC
+    // in the bucket (see `codec_tier`), not against the other operand. The
+    // pairwise form was not transitive and crashed the sort on a real list.
+    //
     // Tier 4 fires ONLY for the Chromecast target (ctx.prefer_h264). Native-HEVC
-    // targets (VLC / browser / phone) fall through to Tier 6 (seed count), so a
+    // targets (VLC / browser / phone) fall through to the later tiers, so a
     // well-seeded HEVC wins instead of being demoted below a starved H.264.
-    if ctx.prefer_h264 && a_hevc != b_hevc {
-        let (h264_seeds, hevc_seeds, h264_is_a) = if a_hevc {
-            (b.seeds, a.seeds, false)
-        } else {
-            (a.seeds, b.seeds, true)
-        };
-        // `max(1)` guards h264_seeds = 0 so the multiplier stays meaningful
-        // (without it, saturating_mul yields 0 and any positive HEVC count
-        // trivially satisfies the inequality — semantically fine but
-        // makes the threshold a no-op for that edge case).
-        let h264_seeds_safe = h264_seeds.max(1);
-        if hevc_seeds >= h264_seeds_safe.saturating_mul(SEED_DISPARITY_OVERRIDE) {
-            return if h264_is_a {
-                std::cmp::Ordering::Greater // H.264 (a) loses to HEVC (b)
-            } else {
-                std::cmp::Ordering::Less // H.264 (b) loses to HEVC (a)
-            };
-        }
-        // No qualifying disparity — apply the existing H.264 preference
-        // if the H.264 winner has viable seeds (≥5).
-        let preferred = if a_hevc { b } else { a }; // the H.264 one
-        if preferred.seeds >= MIN_SEEDS_FOR_CODEC_PREF {
-            return if a_hevc {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Less
-            };
-        }
-    }
+    let codec = if ctx.prefer_h264 {
+        codec_tier(r, ctx.best_hevc_seeds.get(&bucket).copied())
+    } else {
+        0
+    };
 
     // Tier 5 (2026-09-05): bitrate, via file size. Everything above this has
     // tied — same resolution bucket, same viability, same language, same
@@ -1970,15 +2037,11 @@ fn rank_cmp(a: &TorrentResult, b: &TorrentResult, ctx: &RankCtx<'_>) -> std::cmp
     // deliberately: seed count was the de-facto quality decision and it
     // consistently picked the smallest file, because the tiny x265 rips are
     // the ones everybody seeds.
-    let a_size = size_tier(a);
-    let b_size = size_tier(b);
-    if a_size != b_size {
-        return if ctx.pref.is_saver() {
-            b_size.cmp(&a_size) // smallest wins — the quota is the scarce thing
-        } else {
-            a_size.cmp(&b_size)
-        };
-    }
+    let size = if ctx.pref.is_saver() {
+        u32::MAX - size_tier(r) // smallest wins — the quota is the scarce thing
+    } else {
+        size_tier(r)
+    };
 
     // NO PACK PENALTY. It was tier 1 until 2026-09-05 — ahead of resolution,
     // language, codec and bitrate together — so a single episode taken from a
@@ -2008,28 +2071,25 @@ fn rank_cmp(a: &TorrentResult, b: &TorrentResult, ctx: &RankCtx<'_>) -> std::cmp
     // separates two releases that are otherwise the same pick — which is the
     // one place a mild uncertainty about VLC's Dolby Vision handling should be
     // allowed to decide anything.
-    if !ctx.prefer_h264 && a_dv != b_dv {
-        return if a_dv {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Less
-        };
-    }
+    let dv_preference = !ctx.prefer_h264 && has_dolby_vision_in_title(&r.title);
 
     // Tier 8: more seeds > fewer seeds
-    b.seeds.cmp(&a.seeds)
+    RankKey {
+        bucket,
+        codec,
+        size,
+        dv_preference,
+        seeds: std::cmp::Reverse(r.seeds),
+    }
 }
 
 pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) {
     // Pre-pass: the 1080p yardstick a 2160p release is judged against. Computed
     // once, outside the comparator, so every tier stays a per-result value.
-    let ctx = RankCtx {
-        prefer_h264: opts.transcoding,
-        original_language: opts.original_language,
-        pref: opts.pref,
-        best_1080p_bpp: best_1080p_bytes_per_pixel(results),
-    };
-    results.sort_by(|a, b| rank_cmp(a, b, &ctx));
+    let ctx = RankCtx::for_set(results, opts);
+    // A key, not a comparator: the order is the derived one on `RankKey`, so it
+    // is total whatever the tiers say. Stable, like the `sort_by` it replaces.
+    results.sort_by_cached_key(|r| rank_key(r, &ctx));
 
     // 2026-07-04: dead swarms are NOT dropped — the web remote marks them red
     // (mirrors the green "on disk" style) so the user SEES which sources are
@@ -3925,12 +3985,14 @@ mod tests {
     fn test_addressability_does_not_reorder_two_addressable_releases() {
         let a = make_full(1, "Show.S01E01.1080p.WEB.x264-Grp.mkv", 40, "4 GB", Some(0));
         let b = make_full(2, "Show.S01E01.1080p.WEB.x264-Grp.mkv", 40, "4 GB", Some(7));
-        let ctx = RankCtx {
-            prefer_h264: false,
-            original_language: Some("en"),
-            pref: QualityPref::Auto,
-            best_1080p_bpp: None,
-        };
+        let ctx = RankCtx::for_set(
+            &[],
+            RankOpts {
+                transcoding: false,
+                original_language: Some("en"),
+                pref: QualityPref::Auto,
+            },
+        );
         assert_eq!(rank_cmp(&a, &b, &ctx), std::cmp::Ordering::Equal);
     }
 
@@ -5211,6 +5273,109 @@ mod tests {
         assert!(race_candidate_is_not_a_downgrade(unknown, unknown));
     }
 
+    /// Torrentio's stream list for Project Hail Mary (2026), recorded from the
+    /// live API on 2026-10-03: 184 streams, every `name`, `title`, `fileIdx` and
+    /// filename hint verbatim. Only the `infoHash` values are removed — the ranker
+    /// never reads them, and a public repo has no business carrying them.
+    const F_TORRENTIO_PROJECT_HAIL_MARY: &str =
+        include_str!("../tests/fixtures/torrentio/project_hail_mary_2026.json");
+
+    /// Reflexivity, antisymmetry and both transitivities over a whole candidate
+    /// set. The comparison matrix is computed once, so the cubic pass is array
+    /// lookups and a real 166-release list stays cheap.
+    fn assert_strict_total_order(set: &[TorrentResult], ctx: &RankCtx<'_>, label: &str) {
+        let n = set.len();
+        let m: Vec<std::cmp::Ordering> = set
+            .iter()
+            .flat_map(|a| set.iter().map(move |b| rank_cmp(a, b, ctx)))
+            .collect();
+        let at = |i: usize, j: usize| m[i * n + j];
+        for i in 0..n {
+            assert!(
+                at(i, i).is_eq(),
+                "{label}: not reflexive at {:?}",
+                set[i].title
+            );
+            for j in 0..n {
+                assert_eq!(
+                    at(i, j),
+                    at(j, i).reverse(),
+                    "{label}: antisymmetry broke between {:?} and {:?}",
+                    set[i].title,
+                    set[j].title
+                );
+                for k in 0..n {
+                    if at(i, j).is_lt() && at(j, k).is_lt() {
+                        assert!(
+                            at(i, k).is_lt(),
+                            "{label}: transitivity broke: {:?} ({} seeds, {}) < {:?} ({} seeds, {}) < {:?} ({} seeds, {})",
+                            set[i].title,
+                            set[i].seeds,
+                            set[i].size,
+                            set[j].title,
+                            set[j].seeds,
+                            set[j].size,
+                            set[k].title,
+                            set[k].seeds,
+                            set[k].size
+                        );
+                    }
+                    // Equality must be transitive too, or ties become order-dependent.
+                    if at(i, j).is_eq() && at(j, k).is_eq() {
+                        assert!(
+                            at(i, k).is_eq(),
+                            "{label}: equality is not transitive: {:?}, {:?}, {:?}",
+                            set[i].title,
+                            set[j].title,
+                            set[k].title
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 2026-10-03: searching for Project Hail Mary returned nothing at all — the
+    /// sort panicked ("user-provided comparison function does not correctly
+    /// implement a total order"), the handler died and the connection closed
+    /// with an empty reply. Every search ranks for the TRANSCODING target first,
+    /// whatever target was asked for, and the codec tier there was a pairwise
+    /// seed-ratio rule. The grid test below had only ever run the native target,
+    /// where that tier is skipped, so it passed throughout.
+    #[test]
+    fn test_real_torrentio_list_is_a_strict_total_order_for_every_target_and_pref() {
+        let resp: Value = serde_json::from_str(F_TORRENTIO_PROJECT_HAIL_MARY).unwrap();
+        let parsed = torrent_results_from_streams(&resp);
+        assert_eq!(parsed.len(), 184, "the fixture is the whole recorded list");
+        let results = filter_results_by_show_title(parsed, "Project Hail Mary");
+        assert!(
+            results.len() > 150,
+            "the title filter kept only {} of 184",
+            results.len()
+        );
+        for transcoding in [true, false] {
+            for pref in [
+                QualityPref::Auto,
+                QualityPref::ForceUhd,
+                QualityPref::CapHd,
+                QualityPref::Saver,
+            ] {
+                let opts = RankOpts {
+                    transcoding,
+                    original_language: Some("en"),
+                    pref,
+                };
+                let ctx = RankCtx::for_set(&results, opts);
+                let label = format!("transcoding={transcoding} pref={pref:?}");
+                assert_strict_total_order(&results, &ctx, &label);
+                // And the sort itself completes: this is the call that panicked.
+                let mut sorted = results.clone();
+                rank_results_mut_opts(&mut sorted, opts);
+                assert_eq!(sorted.len(), results.len());
+            }
+        }
+    }
+
     #[test]
     fn test_comparator_is_a_strict_total_order_across_the_whole_seed_range() {
         // Removing a term from a multi-tier comparator is exactly where a
@@ -5245,49 +5410,33 @@ mod tests {
         }
         assert_eq!(grid.len(), 48);
 
-        // The yardstick comes from the whole SET, so the context is built once —
+        // The yardsticks come from the whole SET, so the context is built once —
         // comparing a pair in isolation would judge it against a different
         // best-1080p than the real sort does.
-        let ctx = RankCtx {
-            prefer_h264: false,
-            original_language: Some("en"),
-            pref: QualityPref::Auto,
-            best_1080p_bpp: best_1080p_bytes_per_pixel(&grid),
-        };
-
-        for a in &grid {
-            assert_eq!(rank_cmp(a, a, &ctx), std::cmp::Ordering::Equal, "reflexive");
-            for b in &grid {
-                assert_eq!(
-                    rank_cmp(a, b, &ctx),
-                    rank_cmp(b, a, &ctx).reverse(),
-                    "antisymmetry broke between {:?} and {:?}",
-                    a.title,
-                    b.title
-                );
-                for c in &grid {
-                    if rank_cmp(a, b, &ctx).is_lt() && rank_cmp(b, c, &ctx).is_lt() {
-                        assert!(
-                            rank_cmp(a, c, &ctx).is_lt(),
-                            "transitivity broke: {:?} < {:?} < {:?}",
-                            a.title,
-                            b.title,
-                            c.title
-                        );
-                    }
-                    // Equality must be transitive too, or ties become order-dependent.
-                    if rank_cmp(a, b, &ctx).is_eq() && rank_cmp(b, c, &ctx).is_eq() {
-                        assert!(
-                            rank_cmp(a, c, &ctx).is_eq(),
-                            "equality is not transitive: {:?}, {:?}, {:?}",
-                            a.title,
-                            b.title,
-                            c.title
-                        );
-                    }
-                }
-            }
+        //
+        // BOTH targets, since 2026-10-03. This ran the native target alone until
+        // then, which is the one target where the codec tier is skipped, and the
+        // codec tier was the non-transitive one. Every search ranks for the
+        // transcoding target first, so the half left out was the half in use.
+        for transcoding in [true, false] {
+            let ctx = RankCtx::for_set(
+                &grid,
+                RankOpts {
+                    transcoding,
+                    original_language: Some("en"),
+                    pref: QualityPref::Auto,
+                },
+            );
+            assert_strict_total_order(&grid, &ctx, &format!("grid transcoding={transcoding}"));
         }
+        let ctx = RankCtx::for_set(
+            &grid,
+            RankOpts {
+                transcoding: false,
+                original_language: Some("en"),
+                pref: QualityPref::Auto,
+            },
+        );
 
         // And the sort is order-independent in fact, not only in theory. Equality
         // is the subtlety: two releases the ranker cannot separate stay in input
