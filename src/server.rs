@@ -1158,7 +1158,7 @@ fn maybe_resume_stream_on_boot(state: SharedState, prev: CurrentStream) {
             size: prev.size.clone(),
             poster_url: prev.poster_url.clone(),
         };
-        let r = play_request(&state, &mut req, 1).await;
+        let r = play_request(&state, &mut req, SourceFallback::None).await;
         if let Some(err) = r.0.get("error").and_then(|e| e.as_str()) {
             tracing::warn!(
                 "boot-resume: do_play returned error (leaving idle): {}",
@@ -1900,6 +1900,11 @@ struct PlaybackControl {
     active: Mutex<tokio_util::sync::CancellationToken>,
     next_job: std::sync::atomic::AtomicU64,
     jobs: Mutex<std::collections::BTreeMap<u64, Option<Value>>>,
+    /// What the play in flight wants the viewer to know while it warms up. Today that
+    /// is one thing: "source 2 did not deliver, trying source 3". `/progress` carries
+    /// it, because a play that quietly switches source is indistinguishable from one
+    /// that ignored the pick.
+    note: Mutex<Option<String>>,
 }
 
 impl PlaybackControl {
@@ -1909,10 +1914,111 @@ impl PlaybackControl {
         *active = tokio_util::sync::CancellationToken::new();
         active.clone()
     }
+
+    /// Wait for the previous owner to let go of the shared transcoder, but never
+    /// forever. `None` means it did not let go within `wait`.
+    async fn own(&self, wait: std::time::Duration) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        tokio::time::timeout(wait, self.gate.lock()).await.ok()
+    }
 }
+
+/// How long a new Play waits for the play before it to release the transcoder.
+///
+/// A cancelled play lets go at its next checkpoint. The longest stretches between
+/// checkpoints are a source race plus a metadata fetch (15 s + 20 s) and a Chromecast
+/// LOAD (bounded by `CAST_LOAD_TIMEOUT_SECS`), so ninety seconds is only ever reached
+/// when something is genuinely stuck, and then the viewer gets an error to act on
+/// instead of a spinner that never ends.
+const PLAY_GATE_WAIT_SECS: u64 = 90;
+
+/// How long Stop waits for the play in flight before it tears down regardless.
+///
+/// Stop must always answer. Tearing down under a play that has not let go yet is
+/// safe: that play is already cancelled, so it stops its own torrent and cleans up
+/// again (idempotent) at its next checkpoint, and if it had already sent the LOAD it
+/// tells the Chromecast to stop on the way out.
+const STOP_GATE_WAIT_SECS: u64 = 8;
+
+/// Ceiling on the Chromecast LOAD, connect and app launch included. A healthy LOAD
+/// takes a few seconds, and one that has to wake the TV perhaps fifteen. The socket
+/// timeouts in `cast.rs` end a dead connection on their own; this is the outer bound
+/// that keeps `do_play` from holding the transcoder while they do.
+const CAST_LOAD_TIMEOUT_SECS: u64 = 60;
+
+/// How long Stop waits for the Chromecast to confirm a STOP before it tears down the
+/// backend anyway. A live device confirms in about a second. The request is not
+/// withdrawn when the wait ends: it still reaches the TV if the device answers later.
+const CAST_STOP_WAIT_SECS: u64 = 10;
+
+/// Ceiling on the subtitle fetch (embedded-track extraction, OpenSubtitles, timing
+/// sync). Its HTTP calls carry no timeout of their own, and subtitles are optional:
+/// past this the play starts without them rather than not at all.
+const SUBTITLE_FETCH_TIMEOUT_SECS: u64 = 60;
+
+/// Total time the automatic walk down the ranked sources may take.
+///
+/// The walk used to stop after three sources, a count with no reason behind it
+/// (`51120fd`, 2026-03-18): a film whose first three ranked sources were dead and
+/// whose fourth worked was reported as unplayable. The bound that matters to a
+/// viewer is how long they wait, so the walk is now limited by time and by the end
+/// of the list. A dead source costs roughly 35 s (a 15 s race, then a 20 s metadata
+/// timeout), so five minutes covers about eight of them.
+const SOURCE_FALLBACK_BUDGET_SECS: u64 = 300;
 
 fn cancelled_play() -> Json<Value> {
     Json(json!({"status": "cancelled", "cancelled": true}))
+}
+
+/// An error that says THIS SOURCE is the problem (dead swarm, unreadable file, a
+/// stream that never started), so the next ranked source is worth trying.
+///
+/// Everything else is returned to the caller at once: a Chromecast that is off, a
+/// full disk or a bad request fails the same way for every source, and walking the
+/// whole list would only repeat it for five minutes.
+fn source_error(message: String) -> Json<Value> {
+    Json(json!({"error": message, "source_failed": true}))
+}
+
+fn error_implicates_source(v: &Value) -> bool {
+    v.get("source_failed").and_then(Value::as_bool) == Some(true)
+}
+
+/// The source to try after result `rid` failed: the next result in ranked order that
+/// has a magnet. The walk only goes DOWN the list. It never wraps to results ranked
+/// above the pick, so a source the viewer chose deliberately is not silently
+/// upgraded past (the same rule the source race follows).
+pub(crate) fn next_fallback_source(
+    results: &[crate::search::TorrentResult],
+    rid: usize,
+) -> Option<usize> {
+    results
+        .iter()
+        .filter(|r| r.id > rid && !r.magnet.is_empty())
+        .map(|r| r.id)
+        .min()
+}
+
+/// The Chromecast a finished `do_play` is streaming to, read from its success value
+/// (`"target": "chromecast:<device>"`). `None` for an error, a cancelled play or any
+/// other target.
+fn started_on_chromecast(value: &Value) -> Option<String> {
+    if value.get("error").is_some() {
+        return None;
+    }
+    value
+        .get("target")
+        .and_then(Value::as_str)
+        .and_then(|target| target.strip_prefix("chromecast:"))
+        .filter(|device| !device.is_empty())
+        .map(String::from)
+}
+
+/// One line for the loading panel when the walk moves on.
+fn fallback_note(failed_rid: usize, next_rid: usize) -> String {
+    format!(
+        "Source {} did not deliver, trying source {}…",
+        failed_rid, next_rid
+    )
 }
 
 /// Short request for mobile remotes: the task owns startup, the HTTP connection
@@ -1935,8 +2041,10 @@ async fn handle_play_start(
     }
     tokio::spawn(async move {
         let worker_state = state.clone();
-        let result =
-            tokio::spawn(async move { play_request(&worker_state, &mut req, 3).await }).await;
+        let result = tokio::spawn(async move {
+            play_request(&worker_state, &mut req, SourceFallback::WalkList).await
+        })
+        .await;
         let value = match result {
             Ok(Json(value)) => value,
             Err(e) => json!({"error": format!("Playback task failed: {e}")}),
@@ -1969,13 +2077,32 @@ async fn handle_play(
     // this JoinHandle detaches the job; only a newer Play/Stop cancels startup.
     // Previously axum dropped do_play mid-warmup, leaving ffmpeg running but
     // never sending the LOAD to the Chromecast.
-    match tokio::spawn(async move { play_request(&state, &mut req, 3).await }).await {
+    match tokio::spawn(
+        async move { play_request(&state, &mut req, SourceFallback::WalkList).await },
+    )
+    .await
+    {
         Ok(result) => result,
         Err(e) => Json(json!({"error": format!("Playback task failed: {e}")})),
     }
 }
 
-async fn play_request(state: &SharedState, req: &mut PlayRequest, max_retries: u32) -> Json<Value> {
+/// What a play does when its source turns out to be dead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceFallback {
+    /// Play exactly what was asked or fail. A boot-resume or a seek re-plays one
+    /// known stream; a different release would be a different picture.
+    None,
+    /// Walk down the ranked sources until one delivers, the list ends or
+    /// `SOURCE_FALLBACK_BUDGET_SECS` is spent.
+    WalkList,
+}
+
+async fn play_request(
+    state: &SharedState,
+    req: &mut PlayRequest,
+    fallback: SourceFallback,
+) -> Json<Value> {
     // Snapshot before waiting: browsing on another client cannot change what a
     // retry means. A newer Play/Stop cancels this request, then waits for it to
     // release its resources before touching the shared transcoder.
@@ -1990,56 +2117,159 @@ async fn play_request(state: &SharedState, req: &mut PlayRequest, max_retries: u
         .await;
     }
     let cancel = state.playback.replace();
-    let _owner = state.playback.gate.lock().await;
+    let Some(_owner) = state
+        .playback
+        .own(std::time::Duration::from_secs(PLAY_GATE_WAIT_SECS))
+        .await
+    else {
+        tracing::error!(
+            "play: the previous playback did not release the transcoder within {}s",
+            PLAY_GATE_WAIT_SECS
+        );
+        return Json(json!({
+            "error": "The previous playback is still shutting down. Try again in a moment."
+        }));
+    };
     if cancel.is_cancelled() {
         return cancelled_play();
     }
-    // Auto-retry loop: tries up to 3 results on torrent failure
-    for retry in 0..max_retries {
-        let result = do_play(state, req, search.as_ref(), &cancel).await;
+    let result = play_walking_sources(state, req, search.as_ref(), &cancel, fallback).await;
+    // The note belongs to this play; a later one must not inherit it.
+    *lock_recover(&state.playback.note) = None;
+    result
+}
+
+/// What the source walk does after an attempt has failed.
+#[derive(Debug, PartialEq, Eq)]
+enum WalkStep {
+    /// Try result `to` next; `from` is the one that just failed.
+    Next { from: usize, to: usize },
+    /// Report the failure as it stands: it was not the source's fault, the play did
+    /// not come from a search, or nothing is ranked below it.
+    GiveUp,
+    /// Sources remain, but `SOURCE_FALLBACK_BUDGET_SECS` is spent.
+    OutOfTime,
+}
+
+/// The whole fallback policy in one place, so it can be tested without a torrent,
+/// a transcoder or a Chromecast.
+fn walk_step(
+    fallback: SourceFallback,
+    failure: &Value,
+    rid: Option<usize>,
+    results: Option<&[crate::search::TorrentResult]>,
+    elapsed: std::time::Duration,
+) -> WalkStep {
+    // Only a failure of the SOURCE is worth another source, and only for a play
+    // that came from a search (a bare magnet has no list to walk).
+    if fallback != SourceFallback::WalkList || !error_implicates_source(failure) {
+        return WalkStep::GiveUp;
+    }
+    let (Some(rid), Some(results)) = (rid, results) else {
+        return WalkStep::GiveUp;
+    };
+    let Some(next) = next_fallback_source(results, rid) else {
+        return WalkStep::GiveUp;
+    };
+    if elapsed >= std::time::Duration::from_secs(SOURCE_FALLBACK_BUDGET_SECS) {
+        return WalkStep::OutOfTime;
+    }
+    WalkStep::Next {
+        from: rid,
+        to: next,
+    }
+}
+
+/// Play `req`, and when its source is dead walk down the ranked list (see
+/// `SourceFallback`, `walk_step` and `SOURCE_FALLBACK_BUDGET_SECS`).
+async fn play_walking_sources(
+    state: &SharedState,
+    req: &mut PlayRequest,
+    search: Option<&crate::search::SearchResult>,
+    cancel: &tokio_util::sync::CancellationToken,
+    fallback: SourceFallback,
+) -> Json<Value> {
+    let started = Instant::now();
+    let requested_rid = req.result_id;
+    let mut tried = 0usize;
+    loop {
+        tried += 1;
+        let Json(mut value) = do_play(state, req, search, cancel).await;
         if cancel.is_cancelled() {
+            // Cancelled in the instant after it finished starting: the stream is on
+            // the TV and on record. Withdraw it the same way `do_play` would have.
+            if let Some(device) = started_on_chromecast(&value) {
+                stop_receiver(state, device, None).await;
+            }
             do_cleanup(state);
             return cancelled_play();
         }
-        match &result {
-            Json(v) if v.get("error").is_some() && retry < max_retries - 1 => {
-                // Check if we can auto-fallback to next result
-                if let Some(rid) = req.result_id {
-                    if let Some(search) = &search {
-                        let next_rid = rid + 1;
-                        if next_rid <= search.results.len() {
-                            tracing::warn!(
-                                "Play failed ({}), auto-trying result #{}",
-                                v["error"],
-                                next_rid
-                            );
-                            // Apr 30, 2026 (M11): consolidated — do_play's
-                            // own cast-failure path (server.rs:~902 in the
-                            // current version, "Cast-failure cleanup defense"
-                            // shipped Apr 15 / commit 8735ea4) already kills
-                            // ffmpeg, deletes transcoded artifacts, and stops
-                            // the torrent before returning the error. The
-                            // retry loop only needs to bump result_id and
-                            // re-enter — duplicating cleanup here racetimes
-                            // do_play's own cleanup AND can SIGTERM a
-                            // transient ffmpeg PID that the next do_play
-                            // attempt has just spawned.
-                            req.result_id = Some(next_rid);
-                            req.magnet = None;
-                            req.file_index = None;
-                            req.duration = None;
-                            req.quality = None;
-                            req.size = None;
-                            continue;
-                        }
+        if value.get("error").is_none() {
+            // Say what actually played when it is not what was tapped.
+            if tried > 1 {
+                value["fallback"] = json!({
+                    "requested": requested_rid,
+                    "playing": req.result_id,
+                    "tried": tried,
+                });
+            }
+            return Json(value);
+        }
+        let last_error = value["error"].as_str().unwrap_or("unknown").to_string();
+        let step = walk_step(
+            fallback,
+            &value,
+            req.result_id,
+            search.map(|s| s.results.as_slice()),
+            started.elapsed(),
+        );
+        match step {
+            WalkStep::GiveUp => {
+                if tried > 1 {
+                    value["tried"] = json!(tried);
+                    // A later source can fail for a reason that is not the source
+                    // (the Chromecast went away); that error is already the right
+                    // message and is passed on untouched.
+                    if error_implicates_source(&value) {
+                        value["error"] = json!(format!(
+                            "No source worked: tried {} of them. Last error: {}",
+                            tried, last_error
+                        ));
                     }
                 }
+                return Json(value);
             }
-            _ => {}
+            WalkStep::OutOfTime => {
+                tracing::warn!(
+                    "Source walk gave up after {}s and {} sources",
+                    started.elapsed().as_secs(),
+                    tried
+                );
+                value["tried"] = json!(tried);
+                value["error"] = json!(format!(
+                    "No source worked within {} minutes: tried {} of them. Last error: {}",
+                    SOURCE_FALLBACK_BUDGET_SECS / 60,
+                    tried,
+                    last_error
+                ));
+                return Json(value);
+            }
+            WalkStep::Next { from, to } => {
+                tracing::warn!("Play failed ({}), auto-trying result #{}", last_error, to);
+                *lock_recover(&state.playback.note) = Some(fallback_note(from, to));
+                // do_play has already cleaned up after itself on every error path
+                // (ffmpeg killed, torrent paused). Repeating that here would race the
+                // next attempt and can SIGTERM the ffmpeg it has just spawned, so the
+                // walk only moves the request to the next result and re-enters.
+                req.result_id = Some(to);
+                req.magnet = None;
+                req.file_index = None;
+                req.duration = None;
+                req.quality = None;
+                req.size = None;
+            }
         }
-        return result;
     }
-    Json(json!({"error": "All retry attempts failed"}))
 }
 
 /// Caller-facing error when a play request reaches the torrent fallback
@@ -2185,7 +2415,7 @@ async fn handle_seek_retranscode(
         None => return Json(json!({"error": "No active stream to re-transcode"})),
     };
     let mut play = replay_request_from_current(&current, absolute);
-    play_request(&state, &mut play, 1).await
+    play_request(&state, &mut play, SourceFallback::None).await
 }
 
 async fn do_play(
@@ -2194,8 +2424,12 @@ async fn do_play(
     search: Option<&crate::search::SearchResult>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Json<Value> {
-    // Check at resource boundaries; never abandon a blocking cast task mid-LOAD.
-    // The next owner cannot start until this function has completed cleanup.
+    // Cancellation is checked at resource boundaries, and every wait of more than a
+    // few seconds between them also ends on cancel (the source race and the metadata
+    // fetch are the exceptions: dropping a race mid-way would leak its probes). The
+    // Chromecast LOAD is never abandoned by a cancel; only `CAST_LOAD_TIMEOUT_SECS`
+    // ends it, and a STOP follows it. The next owner cannot start until this function
+    // has completed cleanup.
     macro_rules! cancelled {
         ($pid:expr) => {
             if cancel.is_cancelled() {
@@ -2433,7 +2667,7 @@ async fn do_play(
     // supplied; a title-only library play has nothing to validate.
     if let Some(m) = &magnet {
         if let Err(e) = torrent_engine::validate_magnet_uri(m) {
-            return Json(json!({"error": format!("Invalid magnet: {}", e)}));
+            return source_error(format!("Invalid magnet: {}", e));
         }
     }
 
@@ -2747,7 +2981,7 @@ async fn do_play(
 
         let result = match start_torrent_for_play(state, magnet, req.file_index).await {
             Ok(r) => r,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return source_error(e.to_string()),
         };
         pid = result.0;
         server_url = result.1;
@@ -2763,17 +2997,24 @@ async fn do_play(
             &media_dir,
         ));
 
-        // Self-healing: check download progress
-        if !check_torrent_progress(state, pid, progress_gate_secs).await {
+        // Self-healing: check download progress. A newer Play or Stop ends the wait
+        // at once (the poll only reads, so dropping it mid-way leaves nothing behind).
+        let delivering = tokio::select! {
+            alive = check_torrent_progress(state, pid, progress_gate_secs) => alive,
+            _ = cancel.cancelled() => true,
+        };
+        cancelled!(pid);
+        if !delivering {
             tracing::warn!(
                 "Torrent has no download progress after {}s — dead seeds",
                 progress_gate_secs
             );
             stop_torrent(state, pid, false).await;
             disk::prune_disk(&media_dir, ""); // Clean up any dead attempt
-            return Json(json!({
-                "error": format!("Torrent has no active seeds (0% after {}s)", progress_gate_secs)
-            }));
+            return source_error(format!(
+                "Torrent has no active seeds (0% after {}s)",
+                progress_gate_secs
+            ));
         }
 
         cancelled!(pid);
@@ -2786,9 +3027,7 @@ async fn do_play(
                 _ = cancel.cancelled() => Err(anyhow::anyhow!("Playback cancelled")),
             } {
                 stop_torrent(state, pid, false).await;
-                return Json(json!({
-                    "error": format!("Smooth mode download-first gate failed: {}", e)
-                }));
+                return source_error(format!("Smooth mode download-first gate failed: {}", e));
             }
 
             if let Some(local_path) = find_local_bypass_match(
@@ -2805,9 +3044,10 @@ async fn do_play(
                 server_url = format!("file://{}", local_path.to_string_lossy());
                 is_local = true;
             } else {
-                return Json(json!({
-                    "error": "Smooth mode finished downloading but could not locate a healthy local source file"
-                }));
+                return source_error(
+                    "Smooth mode finished downloading but could not locate a healthy local source file"
+                        .into(),
+                );
             }
         }
     }
@@ -2837,29 +3077,43 @@ async fn do_play(
     if !no_subs {
         if let Some(imdb_id) = &req.imdb_id {
             let client = reqwest::Client::new();
-            match subtitles::fetch_subtitles(
-                &client,
-                imdb_id,
-                req.season,
-                req.episode,
-                &sub_lang,
-                &state.media_dir,
-                local_source_for_subs.as_deref(),
-            )
-            .await
-            {
-                Ok(Some(_vtt_path)) => {
+            // Bounded, and a newer Play or Stop ends it: subtitles must never be the
+            // reason a play hangs or a Stop goes unanswered.
+            let fetched = tokio::select! {
+                r = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(SUBTITLE_FETCH_TIMEOUT_SECS),
+                    subtitles::fetch_subtitles(
+                        &client,
+                        imdb_id,
+                        req.season,
+                        req.episode,
+                        &sub_lang,
+                        &state.media_dir,
+                        local_source_for_subs.as_deref(),
+                    ),
+                ) => Some(r),
+                _ = cancel.cancelled() => None,
+            };
+            match fetched {
+                Some(Ok(Ok(Some(_vtt_path)))) => {
                     has_subtitles = true;
                     // Use the SRT version for ffmpeg burn-in (ffmpeg handles SRT natively)
                     subtitle_srt_path =
                         Some(state.media_dir.join(format!("subtitle_{}.srt", sub_lang)));
                     tracing::info!("Subtitles fetched ({})", sub_lang);
                 }
-                Ok(None) => tracing::info!("No subtitles found for {}", sub_lang),
-                Err(e) => tracing::warn!("Subtitle fetch failed: {}", e),
+                Some(Ok(Ok(None))) => tracing::info!("No subtitles found for {}", sub_lang),
+                Some(Ok(Err(e))) => tracing::warn!("Subtitle fetch failed: {}", e),
+                Some(Err(_)) => tracing::warn!(
+                    "Subtitle fetch took over {}s, playing without subtitles",
+                    SUBTITLE_FETCH_TIMEOUT_SECS
+                ),
+                // Cancelled: the check just below ends this play.
+                None => {}
             }
         }
     }
+    cancelled!(pid);
 
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
 
@@ -2952,20 +3206,23 @@ async fn do_play(
                 })
         } else {
             let torrent_codec_detect_timeout_secs: u64 = probe_timeout_secs;
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(torrent_codec_detect_timeout_secs),
-                transcode::detect_codecs(&server_url, preferred_audio_lang.as_deref()),
-            )
-            .await
-            {
+            // The probe can take up to two minutes on a large file. A newer Play or
+            // Stop ends the wait instead of sitting it out.
+            let probed = tokio::select! {
+                r = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(torrent_codec_detect_timeout_secs),
+                    transcode::detect_codecs(&server_url, preferred_audio_lang.as_deref()),
+                ) => r,
+                _ = cancel.cancelled() => Ok(Ok(default_codec_info())),
+            };
+            cancelled!(pid);
+            match probed {
                 Ok(Ok(info)) => info,
                 Ok(Err(e)) => {
                     tracing::warn!("Torrent codec detection failed: {}", e);
                     stop_torrent(state, pid, false).await;
                     disk::prune_disk(&media_dir, "");
-                    return Json(json!({
-                        "error": format!("Torrent probe failed before playback: {}", e)
-                    }));
+                    return source_error(format!("Torrent probe failed before playback: {}", e));
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -2974,12 +3231,10 @@ async fn do_play(
                     );
                     stop_torrent(state, pid, false).await;
                     disk::prune_disk(&media_dir, "");
-                    return Json(json!({
-                        "error": format!(
-                            "Torrent probe timed out after {}s before playback.",
-                            torrent_codec_detect_timeout_secs
-                        )
-                    }));
+                    return source_error(format!(
+                        "Torrent probe timed out after {}s before playback.",
+                        torrent_codec_detect_timeout_secs
+                    ));
                 }
             }
         };
@@ -3138,13 +3393,14 @@ async fn do_play(
                             r = wait_for_complete_hls_before_cast(&manifest_path, ffmpeg_pid, source_duration) => r,
                             _ = cancel.cancelled() => Err(anyhow::anyhow!("Playback cancelled")),
                         } {
+                            if pid != 0 {
+                                stop_torrent(state, pid, false).await;
+                            }
                             do_cleanup(state);
-                            return Json(json!({
-                                "error": format!(
-                                    "Chromecast local-HLS completion gate failed before cast: {}",
-                                    e
-                                )
-                            }));
+                            return source_error(format!(
+                                "Chromecast local-HLS completion gate failed before cast: {}",
+                                e
+                            ));
                         }
                     } else {
                         // HLS pre-buffer: wait for the manifest + enough
@@ -3239,16 +3495,20 @@ async fn do_play(
                                  result if one is available.",
                                     elapsed_secs
                                 );
+                                // Pause this source before giving up on it. The walk
+                                // starts the next one right away, and a starved swarm
+                                // left running would compete with it for the line.
+                                if pid != 0 {
+                                    stop_torrent(state, pid, false).await;
+                                }
                                 do_cleanup(state);
                                 // Error message intentionally describes only what
                                 // happened (not what will happen next); handle_play
                                 // decides retry vs surface based on attempts remaining.
-                                return Json(json!({
-                                    "error": format!(
-                                        "Stream-start fail-fast: ffmpeg produced no HLS segments \
-                                         in {elapsed_secs}s (likely starved swarm or bad source)."
-                                    )
-                                }));
+                                return source_error(format!(
+                                    "Stream-start fail-fast: ffmpeg produced no HLS segments \
+                                     in {elapsed_secs}s (likely starved swarm or bad source)."
+                                ));
                             }
                             if tokio::time::Instant::now() > prebuffer_deadline {
                                 tracing::warn!(
@@ -3299,6 +3559,12 @@ async fn do_play(
                 }
                 Err(e) => {
                     if target == "chromecast" {
+                        // A failed play leaves nothing running: its own torrent is
+                        // paused (bytes kept). `do_cleanup` only knows the torrent of
+                        // the stream on record, and this play is not on record yet.
+                        if pid != 0 {
+                            stop_torrent(state, pid, false).await;
+                        }
                         return Json(json!({
                             "error": format!(
                                 "Chromecast playback requires HLS delivery; refusing raw fallback after HLS preparation failed: {}",
@@ -3371,30 +3637,37 @@ async fn do_play(
             "cast-init [2/4]: about to call cast.cast_url url={} content_type={} duration={:?} seek={:?}",
             url_clone, cast_content_type, cast_duration, seek_to
         );
-        let cast_result = tokio::task::spawn_blocking(move || {
-            let mut cast = lock_recover(&state_clone.cast);
-            cast.cast_url(
-                &cast_name_clone,
-                &url_clone,
-                cast_content_type,
-                cast_duration,
-                seek_to,
-                &cast_metadata_clone,
-            )
-        })
+        // Bounded: this play owns the transcoder until it returns, so a Chromecast
+        // that never answers must not keep it (and every later Play) waiting. The
+        // socket limits in `cast.rs` end the blocking call itself shortly after.
+        let cast_result = tokio::time::timeout(
+            std::time::Duration::from_secs(CAST_LOAD_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(move || {
+                let mut cast = lock_recover(&state_clone.cast);
+                cast.cast_url(
+                    &cast_name_clone,
+                    &url_clone,
+                    cast_content_type,
+                    cast_duration,
+                    seek_to,
+                    &cast_metadata_clone,
+                )
+            }),
+        )
         .await;
 
+        // Every failure below leaves nothing running. `do_cleanup` stops ffmpeg, but
+        // it only knows the torrent of the stream on record and this play is not on
+        // record yet, so its own torrent is paused here (bytes kept for a retry).
+        // None of these are source failures: the next source would meet the same TV.
         match cast_result {
-            Ok(Ok(_)) => {
+            Ok(Ok(Ok(_))) => {
                 tracing::info!("cast-init [3/4]: cast_url returned Ok — proceeding to state save + monitor spawn");
             }
-            Ok(Err(e)) => {
-                // Defense in depth: the post-playback reaper has not been
-                // spawned yet at this point in do_play, so without explicit
-                // cleanup the webtorrent + ffmpeg we just started would
-                // linger as orphans until the next play, the next server
-                // restart, or `spela kill-workers`. This is the exact class
-                // of leak the Apr 8 incident report warns about.
+            Ok(Ok(Err(e))) => {
+                if pid != 0 {
+                    stop_torrent(state, pid, false).await;
+                }
                 do_cleanup(state);
                 return Json(json!({
                     "error": format!("Cast failed: {}", e),
@@ -3402,11 +3675,43 @@ async fn do_play(
                     "recovery_suggestion": "Try 'spela targets' to discover devices, or check if TV is on"
                 }));
             }
-            Err(e) => {
-                // Same defense as above — async task panic must not leak
-                // the freshly-spawned worker pipeline.
+            Ok(Err(e)) => {
+                if pid != 0 {
+                    stop_torrent(state, pid, false).await;
+                }
                 do_cleanup(state);
                 return Json(json!({"error": format!("Cast task failed: {}", e)}));
+            }
+            Err(_) => {
+                tracing::error!(
+                    "cast-init: '{}' did not answer the LOAD within {}s",
+                    cast_name,
+                    CAST_LOAD_TIMEOUT_SECS
+                );
+                // The abandoned LOAD may still reach the TV, after the stream it
+                // points at is gone. Queue a STOP behind it (they share the cast
+                // lock, so it runs once the LOAD has ended). It is dropped if a newer
+                // Play has taken over by then.
+                {
+                    let state = state.clone();
+                    let device = cast_name.clone();
+                    let token = cancel.clone();
+                    tokio::spawn(async move {
+                        stop_receiver(&state, device, Some(token)).await;
+                    });
+                }
+                if pid != 0 {
+                    stop_torrent(state, pid, false).await;
+                }
+                do_cleanup(state);
+                return Json(json!({
+                    "error": format!(
+                        "The Chromecast '{}' did not answer within {} seconds.",
+                        cast_name, CAST_LOAD_TIMEOUT_SECS
+                    ),
+                    "url": final_url,
+                    "recovery_suggestion": "Check that the TV is on and on the same network, then try again"
+                }));
             }
         }
 
@@ -3430,6 +3735,12 @@ async fn do_play(
         }
     }
 
+    if cancel.is_cancelled() && target == "chromecast" {
+        // The LOAD is already on the TV. Whoever cancelled this play cannot take it
+        // back reliably: Stop asks the device of the stream on record, and this play
+        // is not on record yet. So the play that sent the LOAD withdraws it.
+        stop_receiver(state, cast_name.clone(), None).await;
+    }
     cancelled!(pid);
     // Save state
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
@@ -5313,11 +5624,59 @@ async fn cast_health_monitor(
     }
 }
 
+/// Tell a Chromecast to stop what it is playing. Best-effort and bounded: a device
+/// that is gone must not hold up the teardown that follows.
+///
+/// `unless` is the caller's own playback token. The STOP may sit behind another
+/// cast call for a while (they share one connection lock), and by the time it runs
+/// a newer Play may own the TV. A STOP whose token has been cancelled by then is
+/// dropped instead of stopping that newer playback.
+async fn stop_receiver(
+    state: &SharedState,
+    device: String,
+    unless: Option<tokio_util::sync::CancellationToken>,
+) {
+    let state_clone = state.clone();
+    let stop = tokio::task::spawn_blocking(move || {
+        let mut cast = lock_recover(&state_clone.cast);
+        if unless.is_some_and(|token| token.is_cancelled()) {
+            return;
+        }
+        if let Err(e) = cast.stop_cast(&device) {
+            // "No active media session" is the normal answer when nothing is playing.
+            tracing::debug!("stop: receiver STOP to '{}' not delivered: {}", device, e);
+        }
+    });
+    if tokio::time::timeout(std::time::Duration::from_secs(CAST_STOP_WAIT_SECS), stop)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "stop: the Chromecast did not confirm the STOP within {}s, carrying on",
+            CAST_STOP_WAIT_SECS
+        );
+    }
+}
+
 async fn handle_stop(State(state): State<SharedState>) -> Json<Value> {
+    // Cancel the play in flight, then give it a moment to let go of the transcoder
+    // so the two do not fight over ffmpeg and the scratch directory.
     let cancel = state.playback.replace();
-    let _owner = state.playback.gate.lock().await;
+    let owner = state
+        .playback
+        .own(std::time::Duration::from_secs(STOP_GATE_WAIT_SECS))
+        .await;
     if cancel.is_cancelled() {
+        // A newer Play or Stop arrived while this one waited; the outcome is its.
         return cancelled_play();
+    }
+    if owner.is_none() {
+        // Stop always answers. See `STOP_GATE_WAIT_SECS` for why tearing down under
+        // a play that has not let go yet is safe.
+        tracing::warn!(
+            "stop: the play in flight did not let go within {}s, tearing down anyway",
+            STOP_GATE_WAIT_SECS
+        );
     }
     // 2026-07-04: STOP the Chromecast receiver FIRST, then tear down the
     // backend. Previously this only ran do_cleanup (kill ffmpeg + torrent),
@@ -5329,12 +5688,7 @@ async fn handle_stop(State(state): State<SharedState>) -> Json<Value> {
     // (device already gone), still tear down the backend.
     let device = get_current_device(&state);
     if !device.is_empty() {
-        let state_clone = state.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let mut cast = lock_recover(&state_clone.cast);
-            cast.stop_cast(&device)
-        })
-        .await;
+        stop_receiver(&state, device, Some(cancel.clone())).await;
     }
     do_cleanup(&state);
     Json(json!({"status": "stopped"}))
@@ -5984,8 +6338,12 @@ async fn handle_position(
 /// to a single `begin_warmup` call per source path (no scattered phase writes).
 async fn handle_progress(State(state): State<SharedState>) -> Json<Value> {
     let warm = lock_recover(&state.warmup).clone();
+    // The source walk's "source 2 did not deliver, trying source 3". Reported even
+    // when nothing is warming: between two sources there is a gap of up to half a
+    // minute with no warm-up published, and that gap is when the line matters.
+    let note = lock_recover(&state.playback.note).clone();
     let Some(w) = warm else {
-        return Json(json!({ "active": false }));
+        return Json(json!({ "active": false, "note": note }));
     };
     // FRESH segments only — one written since this warmup began. Ignoring stale
     // leftovers keeps the download phase from being mislabeled "transcoding"
@@ -6060,6 +6418,7 @@ async fn handle_progress(State(state): State<SharedState>) -> Json<Value> {
         "segments": segments,
         "torrent": torrent_json,
         "elapsed_secs": w.started_at.elapsed().as_secs(),
+        "note": note,
     }))
 }
 
@@ -11595,6 +11954,228 @@ mod tests {
             second.is_cancelled(),
             "queued stale startup must not run after Stop"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stuck_owner_cannot_make_a_play_or_a_stop_wait_forever() {
+        // 2026-10-02: Stop waited on the transcoder gate with no limit, behind a play
+        // parked on a Chromecast that never answered. Stop never returned, and every
+        // later Play queued behind it.
+        let control = PlaybackControl::default();
+        let stuck = control.gate.lock().await;
+        let started = Instant::now();
+        assert!(
+            control
+                .own(std::time::Duration::from_millis(50))
+                .await
+                .is_none(),
+            "a held gate must time out, not block"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        drop(stuck);
+        assert!(
+            control
+                .own(std::time::Duration::from_millis(50))
+                .await
+                .is_some(),
+            "a free gate is taken at once"
+        );
+    }
+
+    fn ranked_source(id: usize, magnet: &str) -> crate::search::TorrentResult {
+        crate::search::TorrentResult {
+            id,
+            quality: "1080p".into(),
+            title: format!("Example.Release.{id}"),
+            seeds: 10,
+            size: "1.0 GB".into(),
+            source: "test".into(),
+            magnet: magnet.into(),
+            info_hash: String::new(),
+            file_index: None,
+            partial_pct: None,
+        }
+    }
+
+    fn dead_source() -> Value {
+        source_error("Torrent has no active seeds (0% after 12s)".into()).0
+    }
+
+    #[test]
+    fn the_source_walk_reaches_every_ranked_source_not_just_three() {
+        // The walk used to stop after three attempts: a film whose first three
+        // sources were dead and whose fourth worked was reported as unplayable.
+        let results: Vec<_> = (1..=6)
+            .map(|id| ranked_source(id, "magnet:?xt=urn:btih:example"))
+            .collect();
+        let mut rid = 1;
+        let mut walked = vec![rid];
+        while let WalkStep::Next { from, to } = walk_step(
+            SourceFallback::WalkList,
+            &dead_source(),
+            Some(rid),
+            Some(&results),
+            std::time::Duration::from_secs(10),
+        ) {
+            assert_eq!(from, rid);
+            walked.push(to);
+            rid = to;
+        }
+        assert_eq!(walked, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn the_source_walk_only_goes_down_the_list_and_skips_empty_magnets() {
+        let results = vec![
+            ranked_source(1, "magnet:?xt=urn:btih:a"),
+            ranked_source(2, ""),
+            ranked_source(3, ""),
+            ranked_source(4, "magnet:?xt=urn:btih:b"),
+        ];
+        assert_eq!(next_fallback_source(&results, 1), Some(4));
+        // A deliberate pick of #4 is never "upgraded" back to #1.
+        assert_eq!(next_fallback_source(&results, 4), None);
+        assert_eq!(next_fallback_source(&[], 1), None);
+    }
+
+    #[test]
+    fn the_source_walk_stops_for_everything_that_is_not_a_dead_source() {
+        let results: Vec<_> = (1..=4)
+            .map(|id| ranked_source(id, "magnet:?xt=urn:btih:example"))
+            .collect();
+        let soon = std::time::Duration::from_secs(10);
+        let step = |fallback, failure: &Value, rid, results, elapsed| {
+            walk_step(fallback, failure, rid, results, elapsed)
+        };
+
+        // A TV that is off fails the same way for every source.
+        let tv_off = json!({"error": "Cast failed: connection refused"});
+        assert_eq!(
+            step(
+                SourceFallback::WalkList,
+                &tv_off,
+                Some(1),
+                Some(&results[..]),
+                soon
+            ),
+            WalkStep::GiveUp
+        );
+        // A boot-resume or a seek replays one known stream.
+        assert_eq!(
+            step(
+                SourceFallback::None,
+                &dead_source(),
+                Some(1),
+                Some(&results[..]),
+                soon
+            ),
+            WalkStep::GiveUp
+        );
+        // A bare magnet has no list, and neither has a play without a search.
+        assert_eq!(
+            step(
+                SourceFallback::WalkList,
+                &dead_source(),
+                None,
+                Some(&results[..]),
+                soon
+            ),
+            WalkStep::GiveUp
+        );
+        assert_eq!(
+            step(
+                SourceFallback::WalkList,
+                &dead_source(),
+                Some(1),
+                None,
+                soon
+            ),
+            WalkStep::GiveUp
+        );
+        // The end of the list.
+        assert_eq!(
+            step(
+                SourceFallback::WalkList,
+                &dead_source(),
+                Some(4),
+                Some(&results[..]),
+                soon
+            ),
+            WalkStep::GiveUp
+        );
+        // Time, the bound a viewer actually feels.
+        let spent = std::time::Duration::from_secs(SOURCE_FALLBACK_BUDGET_SECS);
+        assert_eq!(
+            step(
+                SourceFallback::WalkList,
+                &dead_source(),
+                Some(1),
+                Some(&results[..]),
+                spent
+            ),
+            WalkStep::OutOfTime
+        );
+        // Out of time AND out of sources is reported as out of sources.
+        assert_eq!(
+            step(
+                SourceFallback::WalkList,
+                &dead_source(),
+                Some(4),
+                Some(&results[..]),
+                spent
+            ),
+            WalkStep::GiveUp
+        );
+    }
+
+    #[test]
+    fn only_a_marked_source_failure_implicates_the_source() {
+        let dead = dead_source();
+        assert!(error_implicates_source(&dead));
+        assert_eq!(dead["error"], "Torrent has no active seeds (0% after 12s)");
+        assert!(!error_implicates_source(&json!({"error": "Cast failed"})));
+        assert!(!error_implicates_source(&json!({"status": "streaming"})));
+        assert!(!error_implicates_source(
+            &json!({"error": "x", "source_failed": false})
+        ));
+    }
+
+    #[test]
+    fn only_a_play_that_reached_a_chromecast_has_a_load_to_withdraw() {
+        assert_eq!(
+            started_on_chromecast(
+                &json!({"status": "streaming", "target": "chromecast:Example TV"})
+            ),
+            Some("Example TV".to_string())
+        );
+        assert_eq!(started_on_chromecast(&cancelled_play().0), None);
+        assert_eq!(
+            started_on_chromecast(
+                &json!({"error": "Cast failed", "target": "chromecast:Example TV"})
+            ),
+            None
+        );
+        assert_eq!(
+            started_on_chromecast(&json!({"status": "streaming", "target": "vlc:"})),
+            None
+        );
+        assert_eq!(
+            started_on_chromecast(&json!({"status": "streaming", "target": "chromecast:"})),
+            None
+        );
+    }
+
+    #[test]
+    fn the_web_remote_announces_the_walk_and_has_no_three_source_cap() {
+        let html = include_str!("../static/remote.html");
+        assert!(
+            !html.contains("skipped < 3"),
+            "the VLC rotation must not go back to a fixed count of three"
+        );
+        // The loading panel renders the server's note, and the play result says
+        // which source actually played.
+        assert!(html.contains("S.now.note"));
+        assert!(html.contains("r.fallback"));
     }
 
     #[test]

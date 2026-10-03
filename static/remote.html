@@ -414,6 +414,7 @@
   .wp .wbar{width:100%;margin:.05rem 0}
   .wpsub{color:var(--dim);font-size:.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .wpact{display:flex;gap:.6rem;margin-top:.15rem;flex-wrap:wrap}
+  .wpnote{white-space:normal;color:var(--warn)}
   .wperr .wpphase{color:var(--bad)}
   .srcbtn.primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
 
@@ -1252,12 +1253,16 @@ async function openInVlc(id,title,poster){
   beginWarming(title||"Opening in VLC…", poster); stopWarmupPoll();  // /progress isn't the VLC source; vlcWaitReady drives the screen
   S.now.vlcErr=null;
   let rdy = await vlcWaitReady(id, gen, pinOf(id));
-  // Rotate past dead sources. Bounded, and each skip is ANNOUNCED rather than silent:
-  // a play that quietly switches source is indistinguishable from one that ignored the
-  // pick. Matches the Chromecast retry budget of three.
+  // Rotate past dead sources until one delivers, the ranked list ends or five minutes
+  // have passed: the same bounds as the server's walk on the Chromecast path
+  // (SOURCE_FALLBACK_BUDGET_SECS). The cap used to be three skips, a count nobody had
+  // a reason for, so a title whose fourth source worked was reported as unplayable.
+  // Each skip is ANNOUNCED rather than silent: a play that quietly switches source is
+  // indistinguishable from one that ignored the pick.
   let skipped = 0;
   const total = shot.length;
-  while(rdy && (rdy.rotate || rdy.switchTo) && skipped < 3){
+  const walkStarted = Date.now(), WALK_BUDGET_MS = 300000;
+  while(rdy && (rdy.rotate || rdy.switchTo) && skipped < total && Date.now()-walkStarted < WALK_BUDGET_MS){
     if(rdy.switchTo){
       // Not a failure — the race found a source that is actually delivering.
       S.now.vlcNote = "Source " + rdy.switchTo + " is downloading faster — switching…";
@@ -2503,6 +2508,7 @@ function showWarmPanel(){ const p=$("#warmpanel"); if(p) p.classList.add("on"); 
 function hideWarmPanel(){ const p=$("#warmpanel"); if(p){ p.classList.remove("on"); p.classList.remove("wperr"); } }
 function beginWarming(title,poster){
   S.now.error=null;   // a fresh attempt clears any prior failure surface
+  S.now.note=null;    // and any source-walk note left by the previous one
   S.now.warming=true; S.now.warmup=null; S.now.warmupData={title:title||"Playing",poster:poster||""};
   S.now.data=null; S.now.phone=false;
   S.now.vlc=false; stopVlcPoll();   // a fresh play supersedes any prior VLC now-view
@@ -2524,7 +2530,17 @@ function startWarmupPoll(){ if(S.warmTimer)return; pollWarmup(); S.warmTimer=set
 function stopWarmupPoll(){ clearInterval(S.warmTimer); S.warmTimer=null; }
 async function pollWarmup(){
   let p; try{ p=await api("/progress"); }catch{ return; }
-  if(!p||!p.active) return;                 // do_play hasn't published yet (race) — keep last frame
+  if(!p) return;
+  // The server walks down the ranked sources when one is dead and says so in `note`
+  // ("Source 2 did not deliver, trying source 3…"). It arrives between two sources
+  // too, when no warm-up is published; without this the panel held the dead
+  // source's last frame for up to half a minute and the switch went unannounced.
+  const note=p.note||null;
+  if(note!==S.now.note){
+    S.now.note=note;
+    if(!p.active){ S.now.warmup=null; if(S.now.warming) renderWarmPanel(); }
+  }
+  if(!p.active) return;                     // do_play hasn't published yet (race) — keep last frame
   S.now.warmup=p;
   if(S.now.warming) renderWarmPanel();
 }
@@ -2617,6 +2633,7 @@ async function castViaPlay(spec, retry){
   if(r&&r.cancelled) return;
   endWarming();
   if(r&&r.error){ showPlayError(spec.label,spec.poster,r.error,retry); return; }
+  if(r&&r.fallback) toast("Source "+r.fallback.requested+" did not deliver — playing source "+r.fallback.playing);
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   S.now.data={title:spec.label,poster_url:spec.poster||"",quality:"",target:":"+(S.target&&S.target.name||"")};
   goNowView(); renderNowFull(); pollNow(true);   // playing → the full now-view (loading stayed in the panel)
@@ -3267,6 +3284,7 @@ function renderWarmPanel(){
       <div class="wpphase"><div class="spin"></div>${esc(label)}</div>
       ${barPct!=null?warmBar(barPct):""}
       <div class="wpsub">${esc(sub)}${el}</div>
+      ${(!w.vlc&&S.now.note)?`<div class="wpsub wpnote">${esc(S.now.note)}</div>`:""}
       <div class="wpact"><button class="srcbtn" id="wCancel">${ic("stop")}Cancel</button></div>
     </div>
   </div>`;

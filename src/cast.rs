@@ -5,17 +5,170 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
+use rust_cast::channels::connection::ConnectionChannel;
+use rust_cast::channels::heartbeat::HeartbeatChannel;
 use rust_cast::channels::media::{
-    Image, Media, Metadata, MovieMediaMetadata, PlayerState, StreamType, TvShowMediaMetadata,
+    Image, Media, MediaChannel, Metadata, MovieMediaMetadata, PlayerState, StreamType,
+    TvShowMediaMetadata,
 };
-use rust_cast::channels::receiver::CastDeviceApp;
-use rust_cast::{CastDevice, ChannelMessage};
+use rust_cast::channels::receiver::{CastDeviceApp, ReceiverChannel};
+use rust_cast::message_manager::MessageManager;
+use rust_cast::{ChannelMessage, NoCertificateVerification};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::rc::Rc;
+use std::sync::Arc;
 
 const CAST_SERVICE: &str = "_googlecast._tcp.local.";
 const CAST_PORT: u16 = 8009;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// How long the TCP connect to a Chromecast may take. On a LAN a live device answers
+/// in milliseconds and a powered-off one fails on ARP within a few seconds; this caps
+/// the rare case in between, where the address routes but nothing answers.
+const CAST_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Longest silence tolerated on an open Chromecast connection. A live device sends a
+/// heartbeat PING every five seconds, so fifteen is three missed pings: the device is
+/// gone, not busy. A launch that wakes the TV keeps pinging throughout.
+const CAST_IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Ceiling on one whole conversation with a Chromecast, from connect to last byte.
+///
+/// The read timeout alone does not bound a conversation. A device that keeps sending
+/// heartbeat PINGs but never answers the request satisfies every read, and `rust_cast`
+/// waits for the matching reply in a loop with no exit (`receive_find_map`). Each
+/// `CastLink` serves ONE operation (a LOAD, a pause, a status read). The longest
+/// healthy one is a LOAD that has to wake the TV: about fifteen seconds to launch the
+/// receiver app, a few for the LOAD reply, up to ten to see playback start.
+const CAST_LINK_LIFETIME: Duration = Duration::from_secs(45);
+
+/// A `TcpStream` that refuses to be read or written past a deadline, and never blocks
+/// in one read for longer than `CAST_IO_TIMEOUT` or the time left, whichever is less.
+struct BoundedStream {
+    inner: TcpStream,
+    deadline: Instant,
+}
+
+impl BoundedStream {
+    fn time_left(&self) -> std::io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the Chromecast conversation ran past its time limit",
+            ));
+        }
+        Ok(left)
+    }
+}
+
+impl Read for BoundedStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.time_left()?;
+        self.inner
+            .set_read_timeout(Some(left.min(CAST_IO_TIMEOUT)))?;
+        self.inner.read(buf)
+    }
+}
+
+impl Write for BoundedStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let left = self.time_left()?;
+        self.inner
+            .set_write_timeout(Some(left.min(CAST_IO_TIMEOUT)))?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+type CastStream = StreamOwned<ClientConnection, BoundedStream>;
+
+/// A connection to one Chromecast: `rust_cast::CastDevice` rebuilt over a socket that
+/// HAS timeouts.
+///
+/// `CastDevice::connect_*` opens its own `TcpStream` with no connect, read or write
+/// timeout and keeps it private. Every call here runs on a blocking thread while
+/// holding the server's one cast mutex, so a device that stopped answering
+/// mid-conversation parked that thread for good, and every later cast call (pause,
+/// stop, the health monitor, the tracker) then waited on the mutex behind it. The
+/// channel types and `MessageManager` are public, so the same four channels are
+/// assembled here over a stream this module configures. Field names match
+/// `CastDevice` so the call sites read the same.
+struct CastLink {
+    message_manager: Rc<MessageManager<CastStream>>,
+    connection: ConnectionChannel<'static, CastStream>,
+    heartbeat: HeartbeatChannel<'static, CastStream>,
+    media: MediaChannel<'static, CastStream>,
+    receiver: ReceiverChannel<'static, CastStream>,
+}
+
+impl CastLink {
+    fn connect(ip: &str, port: u16) -> Result<Self> {
+        let addr = (ip, port)
+            .to_socket_addrs()
+            .map_err(|e| anyhow!("Bad Chromecast address {}:{}: {}", ip, port, e))?
+            .next()
+            .ok_or_else(|| anyhow!("Chromecast address {}:{} did not resolve", ip, port))?;
+        let tcp = TcpStream::connect_timeout(&addr, CAST_CONNECT_TIMEOUT)?;
+        let _ = tcp.set_nodelay(true);
+        // Read and write timeouts are set per call by `BoundedStream`.
+        let tcp = BoundedStream {
+            inner: tcp,
+            deadline: Instant::now() + CAST_LINK_LIFETIME,
+        };
+
+        // Chromecasts present a self-signed device certificate, so verification is
+        // off, exactly as in `CastDevice::connect_without_host_verification`. The
+        // provider is named rather than taken from the process default so this does
+        // not depend on start-up order.
+        let config = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_no_client_auth();
+        let conn = ClientConnection::new(Arc::new(config), ServerName::try_from(ip.to_string())?)?;
+        let message_manager = Rc::new(MessageManager::new(StreamOwned::new(conn, tcp)));
+
+        const SENDER: &str = "sender-0";
+        const RECEIVER: &str = "receiver-0";
+        Ok(Self {
+            connection: ConnectionChannel::new(SENDER, Rc::clone(&message_manager)),
+            heartbeat: HeartbeatChannel::new(SENDER, RECEIVER, Rc::clone(&message_manager)),
+            media: MediaChannel::new(SENDER, Rc::clone(&message_manager)),
+            receiver: ReceiverChannel::new(SENDER, RECEIVER, Rc::clone(&message_manager)),
+            message_manager,
+        })
+    }
+
+    /// The next message from the device, sorted by channel. Mirrors
+    /// `CastDevice::receive`.
+    fn receive(&self) -> std::result::Result<ChannelMessage, rust_cast::errors::Error> {
+        let message = self.message_manager.receive()?;
+        if self.connection.can_handle(&message) {
+            return Ok(ChannelMessage::Connection(self.connection.parse(&message)?));
+        }
+        if self.heartbeat.can_handle(&message) {
+            return Ok(ChannelMessage::Heartbeat(self.heartbeat.parse(&message)?));
+        }
+        if self.media.can_handle(&message) {
+            return Ok(ChannelMessage::Media(self.media.parse(&message)?));
+        }
+        if self.receiver.can_handle(&message) {
+            return Ok(ChannelMessage::Receiver(self.receiver.parse(&message)?));
+        }
+        Ok(ChannelMessage::Raw(message))
+    }
+}
 
 /// Apr 28, 2026: Inputs to `build_cast_metadata`, derived from the play
 /// request + `last_search.json` context. Pure data — no network/IO. Default
@@ -343,6 +496,11 @@ impl CastController {
                         }
                     }
                 }
+                // The LOAD was acknowledged above, so the cast stands. A read that
+                // fails here (silence past the socket timeout, or a closed
+                // connection, which fails instantly) only ends the wait. Looping on
+                // it would spin this thread until the deadline.
+                Err(_) => break,
                 _ => {}
             }
         }
@@ -494,15 +652,14 @@ impl CastController {
         })
     }
 
-    /// Connect to a device with retry logic. Uses owned String for host to avoid lifetime issues.
-    fn connect_with_retry(&self, ip: &str, port: u16) -> Result<CastDevice<'static>> {
+    /// Connect to a device with retry logic, over a socket with timeouts (`CastLink`).
+    fn connect_with_retry(&self, ip: &str, port: u16) -> Result<CastLink> {
         let mut last_err = None;
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
                 std::thread::sleep(RETRY_DELAY);
             }
-            // Pass owned String so CastDevice gets Cow::Owned — no borrow lifetime issues
-            match CastDevice::connect_without_host_verification(ip.to_string(), port) {
+            match CastLink::connect(ip, port) {
                 Ok(device) => {
                     if let Err(e) = device.connection.connect("receiver-0") {
                         last_err = Some(anyhow!("Connection setup failed: {}", e));
@@ -523,7 +680,7 @@ impl CastController {
     }
 
     /// Get or launch the Default Media Receiver app on the device.
-    fn get_or_launch_app(device: &CastDevice) -> Result<(String, String)> {
+    fn get_or_launch_app(device: &CastLink) -> Result<(String, String)> {
         let status = device.receiver.get_status()?;
         for app in &status.applications {
             if app.app_id == "CC1AD845" {
@@ -539,7 +696,7 @@ impl CastController {
     }
 
     /// Find active media session on a device.
-    fn get_active_media(device: &CastDevice) -> Result<(String, i32)> {
+    fn get_active_media(device: &CastLink) -> Result<(String, i32)> {
         let status = device.receiver.get_status()?;
         for app in &status.applications {
             if app.app_id == "CC1AD845" {
@@ -645,7 +802,7 @@ fn classify_metadata(
 /// controls anything (read-only). Returns every app that answered with media.
 pub fn probe_device_media(device_name: &str, ip: &str, port: u16) -> Vec<ObservedPlayback> {
     let mut out = Vec::new();
-    let device = match CastDevice::connect_without_host_verification(ip.to_string(), port) {
+    let device = match CastLink::connect(ip, port) {
         Ok(d) => d,
         Err(_) => return out,
     };

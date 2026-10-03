@@ -148,6 +148,9 @@ async fn extract_embedded_subtitle(source: &Path, lang: &str, dest_srt: &Path) -
             .arg(source)
             .args(["-map", &map_arg, "-c:s", "srt"])
             .arg(dest_srt)
+            // The play path bounds and cancels this fetch by dropping it; the
+            // extraction must stop with it instead of reading on to the end of the file.
+            .kill_on_drop(true)
             .output()
             .await?;
 
@@ -458,6 +461,7 @@ async fn extract_any_text_subtitle_ref(source: &Path, work_dir: &Path) -> Option
             .arg(source)
             .args(["-map", &format!("0:{idx}"), "-c:s", "srt"])
             .arg(&cand)
+            .kill_on_drop(true)
             .output()
             .await
             .map(|o| o.status.success())
