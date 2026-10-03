@@ -136,6 +136,12 @@
   .src.partial{border-color:var(--good);background:linear-gradient(90deg,rgba(55,200,122,.16),var(--bg3))}
   .src .dl{color:var(--good);font-weight:800;white-space:nowrap}
   .src-toggle.has-partial{color:var(--good)}
+  /* 2026-10-03: a complete copy on disk is said on the card itself, not only inside
+     the collapsed source list. Same green as the on-disk row in that list. */
+  .ondisk{display:block;margin:.55rem .7rem;padding:.45rem .7rem;border:1px solid var(--good);
+    border-radius:9px;background:linear-gradient(90deg,rgba(55,200,122,.16),var(--bg3));
+    color:var(--good);font-size:.8rem;font-weight:700;text-align:left}
+  button.ondisk:active{transform:scale(.98)}
   /* 2026-07-13: "Continue watching" row (spela-native tracker, slice 1) */
   .recent{display:none;margin:.2rem 0 .4rem}
   .recent.on{display:block}
@@ -301,6 +307,7 @@
     .detail .body>.meta{padding:0}
     .detail .body>.meta .t{font-size:1.2rem;-webkit-line-clamp:3}
     .detail .body>.play{margin:.75rem 0 0;max-width:260px}
+    .detail .body>.ondisk{margin:.65rem 0 0}
     .detail .body>.src-toggle{text-align:left;margin:.65rem 0 0}
     .detail .body>.sources{margin:.5rem 0 0;align-self:stretch}
     .detail .sources.open{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.45rem}
@@ -1799,6 +1806,18 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
   }
   if(actions.children.length) body.appendChild(actions);
   if(sources&&sources.length){
+    // A complete copy on disk is stated here, above the collapsed list, where it was
+    // previously only visible after opening "More sources". When it is not the source
+    // ▶ would play, it is a button: it starts at once, and the choice is the viewer's.
+    const disk=onDiskOffer(sources);
+    if(disk && disk.isBest){
+      body.appendChild(el("div",{className:"ondisk",textContent:"✓ On disk · starts at once"}));
+    }else if(disk){
+      const d=el("button",{className:"ondisk",textContent:`✓ On disk: ${disk.what} · play this copy`});
+      d.title=`A complete copy is already downloaded and starts at once. ▶ plays the best source instead (${disk.best}).`;
+      d.onclick=()=>doPlay({result_id:disk.id});
+      body.appendChild(d);
+    }
     const anyPartial=sources.some(s=>typeof s.partial_pct==="number");
     const collapsed=()=>`More sources (${sources.length})`+(anyPartial?" · ↓ resume available":"");
     const tg=el("button",{className:"src-toggle"+(anyPartial?" has-partial":""),textContent:collapsed()});
@@ -1836,6 +1855,19 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
     c._openSources=()=>{box.classList.add("open");tg.textContent="Hide sources";};
   }
   return c;
+}
+/* Is a COMPLETE copy of this title already on disk, and is it the one ▶ would play?
+   `results` is the ranked list (best first); the best-ranked complete copy is the one
+   offered. Play best stays best picture: a smaller copy on disk never replaces the pick
+   silently, it is shown and left to the viewer. Returns null when nothing complete is
+   on disk. */
+function onDiskOffer(results){
+  const list=results||[];
+  const i=list.findIndex(r=>r && typeof r.partial_pct==="number" && r.partial_pct>=100);
+  if(i<0) return null;
+  const r=list[i], best=list[0]||{};
+  const label=x=>[x.quality,x.size].filter(Boolean).join(" · ");
+  return {id:r.id, isBest:i===0, what:label(r), best:label(best)};
 }
 const codec=t=>/(\bx265\b|\bh\.?\s?265\b|hevc)/i.test(t||"")?"HEVC"
   :/(\bx264\b|\bh\.?\s?264\b|avc)/i.test(t||"")?"H.264":"—";
@@ -2661,7 +2693,15 @@ async function fastPlay(query, isTV, poster){
   S.search.data=d;
   const first=(d&&d.results&&d.results[0]);
   if(!first){ showPlayError(query,poster,"No playable sources for “"+esc(query)+"”.",()=>fastPlay(query,isTV,poster)); return; }
-  doPlay({result_id:first.id, title:(d.show&&d.show.title)||query, poster_url:poster||(d.show&&d.show.poster_url)||""}, null);
+  const meta={title:(d.show&&d.show.title)||query, poster_url:poster||(d.show&&d.show.poster_url)||""};
+  doPlay({result_id:first.id, ...meta}, null);
+  // Fast-play never shows the search card, so a complete copy on disk that is NOT the
+  // best source would go unmentioned while the best one downloads. Say so, with the
+  // way to take it. Tapping it starts a new play, which cancels the one in flight.
+  const disk=onDiskOffer(d.results);
+  if(disk && !disk.isBest){
+    toastAction(`On disk: ${disk.what}`, "Play that copy", ()=>doPlay({result_id:disk.id, ...meta}, null));
+  }
 }
 
 /* ---------- Shannon-TV playback (Phase-7 / target=shannon, 2026-05-23) ----------

@@ -13321,6 +13321,45 @@ mod tests {
     }
 
     #[test]
+    fn a_much_smaller_copy_on_disk_is_judged_differently_by_the_two_play_paths() {
+        // OPEN DECISION, pinned so it is visible rather than accidental (2026-10-03).
+        // The picked release is 5 GB; a complete 160 MB copy of the same episode sits
+        // at the top of the media directory.
+        //
+        // The Chromecast path (`do_play`) asks this matcher and nothing else, and the
+        // matcher takes any complete top-level file whatever its size, so the small
+        // copy plays in place of the pick without a word.
+        //
+        // The VLC path asks the same matcher and then applies the 2026-09-05 size
+        // floor (`bypass_size_is_acceptable`), which refuses the same file, so the
+        // picked release is fetched.
+        //
+        // Whether the Chromecast path should get the floor too is the viewer's call:
+        // the web remote now shows the copy on disk either way.
+        let media = tempfile::tempdir().unwrap();
+        let small = make_dense_mkv(media.path(), "The.Boys.S05E03.1080p.FLUX.mkv");
+        let have = std::fs::metadata(&small).unwrap().len();
+        let picked: u64 = 5 * 1024 * 1024 * 1024;
+        let roots = vec![media.path().to_path_buf()];
+        let cast_path = first_local_bypass_match(
+            &roots,
+            "The Boys S05E03",
+            Some("1080p"),
+            picked,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            cast_path.as_deref(),
+            Some(small.as_path()),
+            "the Chromecast path takes the small copy"
+        );
+        assert!(
+            !bypass_size_is_acceptable(have, picked),
+            "the VLC path's floor refuses the same copy"
+        );
+    }
+
+    #[test]
     fn first_local_bypass_match_media_dir_precedence_wins() {
         // Same title in BOTH roots. roots[0] (media_dir) MUST win — a
         // cached/just-downloaded copy beats a colder library copy.

@@ -190,5 +190,30 @@ const mkPoll = (answer, S, onRender) =>
      "the VLC panel has its own note and does not draw this one");
 }
 
+// --- onDiskOffer: a complete copy on disk is stated on the card ----------------------
+// Play best stays best picture. A copy on disk that is not the best source is never
+// played in its place silently and never hidden either: the card shows it and the viewer
+// picks. Until 2026-10-03 it was only visible inside the collapsed source list.
+{
+  const offer = new Function(extract("onDiskOffer") + "\nreturn onDiskOffer;")();
+  const film = [
+    { id: 1, quality: "1080p", size: "7.35 GB" },
+    { id: 2, quality: "1080p", size: "5.88 GB", partial_pct: 40 },
+    { id: 4, quality: "1080p", size: "1.76 GB", partial_pct: 100 },
+    { id: 5, quality: "1080p", size: "1.76 GB", partial_pct: 100 },
+  ];
+  eq(offer(film), { id: 4, isBest: false, what: "1080p · 1.76 GB", best: "1080p · 7.35 GB" },
+     "a smaller complete copy is offered by name, next to what the best source is");
+  eq(offer([{ id: 1, quality: "2160p", size: "20 GB", partial_pct: 100 }, film[2]]).isBest, true,
+     "when the best source is the one on disk, there is nothing to choose");
+  eq(offer([film[0], film[1]]), null, "a partial download is not a copy on disk");
+  eq(offer([film[0]]), null, "nothing on disk, nothing said");
+  eq(offer([]), null, "an empty list must not throw");
+  eq(offer(null), null, "a missing list must not throw");
+  eq(offer([{ id: 1 }, { id: 2, partial_pct: 100 }]),
+     { id: 2, isBest: false, what: "", best: "" },
+     "missing quality and size leave the labels empty rather than 'undefined'");
+}
+
 console.log(failed === 0 ? "ALL PASS" : `${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

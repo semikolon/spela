@@ -1,6 +1,6 @@
 # Spela TODOs 🎬🍿
 
-### 🔓 OPEN — 3 October 2026: the play path is bounded and live; three things still open
+### 🔓 OPEN — 3 October 2026: the play path is bounded and live; what is still open
 
 **Live on the server (commit `aec8d7e`).** A play is a server job the remote polls
 (`/play/start`, `/play/jobs/{id}`), so it no longer depends on the phone keeping a
@@ -24,20 +24,25 @@ during warm-up (the job API was driven by a script); and the loading panel watch
 browser during a real walk. The first needs a device that misbehaves on demand, the other
 two need one play from a phone.
 
-**Open: a zero-seed result is tried in its ranked position.** The walk goes down the list
-in rank order, so two results listed with zero seeds cost about 35 s each before a seeded
-one below them is reached. Trying seedless results last would shorten that wait, and it
-would also trust a seed count, which the ranker treats as a claim: one of the two "zero
-seed" sources in the 3 October run delivered and played. Not built. The deciding
-measurement is how often a zero-seed listing delivers.
+**Decided 3 October: best picture stays the lean, and a copy on disk is always shown.**
+- A zero-seed result is tried in its ranked position and that stands. It follows the
+  2026-09-06 rule that seeds prefer and never exclude, and one of the two "zero seed"
+  sources in the 3 October run delivered and played.
+- The walk does not jump to a smaller copy on disk after a failed pick. Instead the title
+  card now states a complete copy on disk (`onDiskOffer` in `remote.html`): a plain note
+  when it is the source ▶ would play, a button naming its resolution and size when it is a
+  different release, and an action toast on the fast-play path, which never shows the
+  card. Until now the copy was only visible inside the collapsed source list.
 
-**Open: after a failed pick, the walk does not prefer a complete copy already on disk.**
-By design since 2026-09-05 (`MIN_BYPASS_SIZE_FRACTION`) a small file does not stand in for
-a much larger top pick, so Play best on a film with a complete 1.76 GB copy in the library
-still starts with the 7.35 GB release, and only reaches the copy on disk when the walk
-arrives at that result. Tapping that source plays from disk at once. Whether a walk that
-has already lost its pick should jump to a complete on-disk source is undecided: it trades
-a wait for a lower bitrate.
+**Open, the viewer's call: a much smaller copy on disk still wins silently on the
+Chromecast path.** The VLC path refuses a copy below 75 % of the picked release's size
+(`bypass_size_is_acceptable`, 2026-09-05) and fetches the pick. The Chromecast path
+(`do_play`) has no such floor, so a complete top-level file of any size plays in place of
+the pick. The test `a_much_smaller_copy_on_disk_is_judged_differently_by_the_two_play_paths`
+pins both halves. Giving the Chromecast path the same floor makes "best picture" hold on
+the TV as well; the cost is that a half-watched episode whose best source has since
+changed would resume from a new download rather than from the copy on disk, unless the
+on-disk button is tapped.
 
 **Diagnosed, not built: a season pack's files are looked up at the media root.**
 Persistence and file lookup assume a torrent's files sit directly under the media root,
