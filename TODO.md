@@ -1,71 +1,57 @@
 # Spela TODOs 🎬🍿
 
-### 🔓 OPEN — 2 October 2026: a deadlock fixed and live, a play fix on a branch, three things open
+### 🔓 OPEN — 3 October 2026: the play path is bounded and live; three things still open
 
-**Live on the server (commit `b3ccc3e`).** The server froze twice in one evening, health
-endpoint included. Cause: the torrent engine's start path checked a failed source's
-cooldown with `if let Some(at) = self.dead_magnets.lock().unwrap().get(magnet)` and locked
-`dead_magnets` again inside the body to drop the expired entry. In Rust 2021 the
-scrutinee's guard lives through the body, so the second lock never returns. It can only
-fire once a ten-minute cooldown has expired, which is why retrying an earlier failed
-source froze every later request. Fixed by `magnet_is_cooling_down`, which does both under
-one lock, with a regression test that fails on the old code. The same commit added
-`bin/deploy-server.sh` (see `CLAUDE.md` § Build & Deploy).
+**Live on the server (commit `aec8d7e`).** A play is a server job the remote polls
+(`/play/start`, `/play/jobs/{id}`), so it no longer depends on the phone keeping a
+request open through the warm-up. One Play or Stop owns the transcoder, and no wait in that
+hand-over is unbounded. Every Chromecast conversation has timeouts. The automatic fallback
+walks the whole ranked list inside five minutes and announces each switch. Local Bypass
+finds an episode inside `release/Season 02/`. Failed and discarded torrents are paused,
+not deleted. The mechanics and their constants are in `CLAUDE.md` § Hard-Won Lessons
+(*Play ownership and bounded waits*, *Source walk*, *Chromecast connection*).
 
-*The findings in the rest of this entry are that session's own reading of the server and
-proxy logs, taken from its transcript; the deadlock mechanism and the branch's code were
-re-read on 3 October, the log lines were not.*
+**What was run against real hardware on 3 October** (an isolated test instance, then
+production): a film whose first two sources were dead walked to the third and reported
+both switches on `/progress`, loaded on a Chromecast in 7 s and played; Stop answered in
+0.3 s and the TV went idle; Stop pressed 6 s into a warm-up answered in 8 s and the job
+ended as cancelled; production reads Chromecast status through the new connection code.
+The loading panel's handling of the note is covered by `tests/spa_pure.mjs`.
 
-**Built, not deployed: branch `play-detach`.** `cargo fmt --check` clean and 652 tests
-pass on it; it has never run against a real Chromecast.
-- **A play is now a server job.** `/play/start` returns a job id and the remote polls
-  `/play/jobs/{id}`. A phone that backgrounds its browser used to close the `/play`
-  request after 9 to 16 seconds, which dropped `do_play` mid-warmup: ffmpeg kept running
-  and the Chromecast never got its LOAD. This is the item *decouple `/play` from the HTTP
-  request lifecycle* further down, done with a job and polling instead of a `last_error`
-  field on `/status`.
-- **One play or stop owns the transcoder.** A newer Play or Stop cancels the one in
-  flight and waits for it to let go. Overlapping retries had been killing each other's
-  transcoders.
-- **A retry uses the search results from when the play began**, not what another client
-  searched for meanwhile.
-- **Local Bypass finds an episode inside `release/Season 02/`** (three levels deep within
-  a title-matched release, never through a symlink).
-- **Raced-and-discarded and failed-start torrents are paused, not deleted.** Pruning owns
-  eviction. This touches both suspects named in the vanished-partial item below.
+**Not exercised, so still unproven:** a Chromecast that stops answering in the middle of a
+LOAD (the 60 s ceiling and the STOP queued behind it); a real phone suspending its browser
+during warm-up (the job API was driven by a script); and the loading panel watched in a
+browser during a real walk. The first needs a device that misbehaves on demand, the other
+two need one play from a phone.
 
-**Why it is on a branch and what merging needs.** Stop now waits for the play in flight
-to release the transcoder. If a cast call inside that play hangs, Stop hangs with it, where
-it used to tear down regardless. Check on a test instance (recipe in `CLAUDE.md`): start a
-play, background the phone browser, confirm the cast starts anyway; press Stop during
-warm-up; then merge and deploy.
+**Open: a zero-seed result is tried in its ranked position.** The walk goes down the list
+in rank order, so two results listed with zero seeds cost about 35 s each before a seeded
+one below them is reached. Trying seedless results last would shorten that wait, and it
+would also trust a seed count, which the ranker treats as a claim: one of the two "zero
+seed" sources in the 3 October run delivered and played. Not built. The deciding
+measurement is how often a zero-seed listing delivers.
+
+**Open: after a failed pick, the walk does not prefer a complete copy already on disk.**
+By design since 2026-09-05 (`MIN_BYPASS_SIZE_FRACTION`) a small file does not stand in for
+a much larger top pick, so Play best on a film with a complete 1.76 GB copy in the library
+still starts with the 7.35 GB release, and only reaches the copy on disk when the walk
+arrives at that result. Tapping that source plays from disk at once. Whether a walk that
+has already lost its pick should jump to a complete on-disk source is undecided: it trades
+a wait for a lower bitrate.
 
 **Diagnosed, not built: a season pack's files are looked up at the media root.**
 Persistence and file lookup assume a torrent's files sit directly under the media root,
-while librqbit puts a pack inside its own release folder. The same evening's log reported
-`0 physical bytes` for a pack whose episode was on disk. The session was correcting that
-lookup when it ended, and none of it is in the branch.
+while librqbit puts a pack inside its own release folder. The session that found this
+on 2 October read `0 physical bytes` in the log for a pack whose episode was on disk; that
+log line has not been re-read since. None of the correction is in the code.
 
-**The automatic fallback gives up after three sources.** `play_request(.., 3)` is a
-hard-coded count from commit `51120fd` (2026-03-18, *"auto-try next search result (up to
-3 retries)"*); no reason for three is recorded. The loop tries results N, N+1 and N+2 in
-ranked order. The case that showed it: a film with five results, where the first claimed
-six seeds and had no peers, the second and third were listed with zero seeds, and the
-fourth, with one seed, downloaded fine. Two of the three attempts went to sources the
-search itself listed as seedless. Two changes would fix it, neither built: keep trying
-until the list ends, inside a time budget rather than a count; and try a zero-seed result
-only after every seeded one. Source racing was off in that check, so whether racing would
-have reached the fourth is untested.
-
-**Left on the server by that session.** A hard link at the media root for one episode
-that sat inside a season folder, made so the shallow scanner could see it; redundant once
-the nested lookup ships. And the isolated test instance on port 17890 ran for 17 hours
-before it was stopped on 3 October; its directory under `/tmp` still holds one complete
-film download (1.8 GB) that is not in the library.
+**Left on the server.** A hard link at the media root for one episode that sat inside a
+season folder, made on 2 October so the shallow scanner could see it. It is redundant now
+that the nested lookup is live, costs no space, and the 168 h top-level sweep removes it.
 
 **Lint is not clean, and nothing enforces it.** `cargo clippy -- -D warnings` reports
 about 20 style lints in non-test code and 40 with tests (doc list indentation, complex
-types, one manual prefix strip). None are in the code changed on 2 October.
+types, one manual prefix strip). The repository has no CI.
 
 ### 📌 NOTE — a failed torrent init leaves a 0-byte file named like the release (2026-09-16)
 Twice in four days librqbit logged `Error setting length for file "<release>.mkv" to
@@ -108,14 +94,14 @@ Star City S01E03 reached 1.2 GB and `open_pct 100`; after a `systemctl restart` 
 was absent from the persistence store, its directory was gone, and a re-tap started
 from 27 MB. **The pruner is exonerated by its own silence** (no eviction line) and
 the boot reconciler by its own log (it recorded forgetting only a different,
-genuinely empty torrent). Not ruled out: `race_torrent_sources` losing-candidate
-cleanup, and `stop_torrent(.., delete_files = true)` on a failed start. The
-reconciler was made incapable of deleting files the same evening — not because it
-was proven guilty, but because removing the capability is cheaper than defending it.
-**Next action**: instrument every remaining path that can delete a media file with a
-log line naming what it deletes and why, then wait for a recurrence. Cost of being
-wrong is bounded (a re-downloadable partial, never the curated library), which is
-why persistence stays on.
+genuinely empty torrent). The two paths that were never ruled out,
+`race_torrent_sources` losing-candidate cleanup and `stop_torrent(.., delete_files =
+true)` on a failed start, now pause instead of delete (live since 2026-10-03; no caller
+passes `true` any longer). The reconciler was made incapable of deleting files on the
+first evening. None of the three was proven guilty: removing the capability is cheaper
+than defending it. **What deletes media files now:** the pruner (`disk.rs`, which logs
+each eviction) and `do_cleanup`'s scratch directories. **Next action**: none unless it
+recurs; a recurrence with these paths closed would point at librqbit itself.
 
 ### 📌 NOTE — the subtitle warm logs once per readiness poll while waiting
 `no English subtitle found yet for <imdb>_eng` appears every ~1.5 s for the whole
@@ -222,8 +208,12 @@ Fredrik's insight (correct): Cast receivers render subtitles as a **layered text
 ### NEXT — cold-cache subtitle prefetch during search
 First-play subtitle cost is the cold alass audio-VAD (~15s, now capped at 5s → raw sub fallback). Prefetch + align subtitles in the BACKGROUND when the user views search results (before they tap play) → by play-time the aligned SRT is cached → fast first-play WITH aligned subs. Decouples subtitle latency from the play entirely (for the DMR-burn-in path; the custom receiver makes it moot).
 
-### NEXT (architectural, deferred): decouple `/play` from the HTTP request lifecycle
-The proxy-timeout bump (300s) is the robust interim, but the *proper* fix is to make `/play` return fast (right after starting the transcode) and run the cast-gate + cast + monitor in a DETACHED tokio task that the HTTP request's cancellation can't kill. Then no proxy/browser timeout can ever orphan a cast, and `/play` is instant. The warmup UI already polls `/progress` + `/status`, so the frontend is ready — needs: (a) `/play` spawns the cast pipeline detached + returns `{status:"starting"}`; (b) background-task errors surface via a `/status` `last_error` field; (c) SPA keeps the warmup screen until `/status` shows streaming (don't `endWarming` on the fast `/play` return). Also consider lowering the race-ahead `MIN_LEAD_SECS` (120s → ~40s) for COMPLETE local files — a 3.5× transcode of a complete file never gets frontier-caught, so 120s of pre-buffer just adds ~30s to every start; a smaller lead would make Chromecast plays start in ~15-20s instead of ~50s.
+### NEXT: a shorter race-ahead lead for COMPLETE local files
+Lower the race-ahead `MIN_LEAD_SECS` (120 s → about 40 s) when the source is a complete
+local file. A 3.5× transcode of a complete file is never caught by playback, so 120 s of
+pre-buffer only adds about 30 s to every start; a smaller lead would start a Chromecast
+play in 15 to 20 s instead of about 50. (Split out of the *decouple `/play` from the HTTP
+request* item, which shipped on 2026-10-03 as the play job.)
 
 ### samklang — torrent-streamed music extension (SPEC SHIPPED 2026-06-02, NOT YET IMPLEMENTED) 🎵
 Three-file Kiro spec at `.claude/specs/samklang/{requirements,design,tasks}.md`. Music streaming for a small invited circle, built as `MediaType::Music` extension to spela (one binary; `/music/*` routes; new `/listen` tab in `static/remote.html`). Torrent-only streaming (BT primary v1, Soulseek + Internet Archive in phase-4 try-harder path), progressive in-time quality upgrade via Web Audio + MSE source-swap (mp3 → FLAC seamlessly), bearer-token multi-user, Postgres on Darwin :5433 for state. 5 phases ~5-6 weeks at AI-augmented velocity; **phase 1 weekend-shippable** (search + play + web /listen tab, single user, Jackett-on-Darwin-Docker as the indexer hub). Cross-cutting non-regression invariant: existing video paths (`MediaType::{Movie, TvShow}`) bit-identical throughout. Companion: dotfiles (B3) Shannon BT-audio side-quest must resolve before T-3.11 Marshall-via-Shannon target can land — Chromecast cast (T-3.7) ships first.

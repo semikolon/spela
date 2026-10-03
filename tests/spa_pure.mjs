@@ -115,5 +115,80 @@ eq(forms[1].url, "vlc://spela.home/vlc/1/open.m3u?al=eng",
 eq(forms.every(f => f.label && !/vlc-x-callback|vlc:\/\//.test(f.label)), true,
    "labels are human-readable, since they are offered to Fredrik in a toast");
 
+// --- the source walk's note: announced in the loading panel ---------------------------
+// The server walks down the ranked sources when one is dead and reports each switch in
+// /progress `note`. Two things have to hold for the viewer to see it: the poll must take
+// the note even when no warm-up is published (between two sources there is none), and the
+// Chromecast panel must draw it. Both functions need a DOM or the network in the page, so
+// they run here against stubs.
+function extractFrom(marker) {
+  const start = src.indexOf(marker);
+  if (start < 0) throw new Error(`${marker} not found`);
+  let i = src.indexOf("{", start);
+  let depth = 0;
+  for (; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}" && --depth === 0) return src.slice(start, i + 1);
+  }
+  throw new Error(`unbalanced braces extracting ${marker}`);
+}
+const mkPoll = (answer, S, onRender) =>
+  new Function("api", "S", "renderWarmPanel",
+    extractFrom("async function pollWarmup") + "\nreturn pollWarmup;")(
+    async () => { if (answer instanceof Error) throw answer; return answer; }, S, onRender);
+
+{
+  const NOTE = "Source 1 did not deliver, trying source 2…";
+  let renders = 0;
+  const S = { now: { warming: true, note: null, warmup: { active: true, phase: "connecting" } } };
+  await mkPoll({ active: false, note: NOTE }, S, () => renders++)();
+  eq(S.now.note, NOTE, "a note arriving between two sources is taken");
+  eq(S.now.warmup, null, "…and the dead source's last frame is dropped");
+  eq(renders, 1, "…and the panel is redrawn once");
+
+  await mkPoll({ active: false, note: NOTE }, S, () => renders++)();
+  eq(renders, 1, "the same note again does not redraw an idle panel");
+
+  const live = { active: true, phase: "downloading", note: NOTE };
+  await mkPoll(live, S, () => renders++)();
+  eq(S.now.warmup === live && renders === 2, true, "an active frame is shown, note kept");
+  eq(S.now.note, NOTE, "the note survives into the next source's warm-up");
+
+  await mkPoll({ active: false, note: null }, S, () => renders++)();
+  eq(S.now.note, null, "the server clearing the note clears it here");
+
+  const before = JSON.stringify(S.now);
+  await mkPoll(new Error("offline"), S, () => renders++)();
+  eq(JSON.stringify(S.now), before, "an unreachable server changes nothing");
+}
+
+{
+  const NOTE = "Source 2 did not deliver, trying source 3…";
+  const draw = (now) => {
+    const root = { classList: { remove() {} }, innerHTML: "" };
+    const stubs = {
+      $: sel => (sel === "#warmpanel" ? root : null),
+      S: { now },
+      qualityLabel: () => "", warmBar: () => "<bar>", fmtSpeed: () => "1.2 MB/s",
+      fmtRunway: () => "~7 min", esc: v => String(v), posterSrc: v => v, ic: () => "",
+      api: async () => ({}), endWarming: () => {},
+    };
+    const names = Object.keys(stubs);
+    new Function(...names, extract("renderWarmPanel") + "\nreturn renderWarmPanel;")(
+      ...names.map(n => stubs[n]))();
+    return root.innerHTML;
+  };
+  const cast = draw({ note: NOTE, warmupData: { title: "T" },
+    warmup: { active: true, phase: "downloading", torrent: { percent: 3, speed_bps: 1, peers: 2 } } });
+  eq(cast.includes("wpnote") && cast.includes(NOTE), true,
+     "the Chromecast panel shows the note next to the progress, not instead of it");
+  eq(cast.includes("Downloading"), true, "…and the progress line is still there");
+  eq(draw({ note: null, warmupData: { title: "T" }, warmup: null }).includes("wpnote"), false,
+     "no note, no line");
+  eq(draw({ note: NOTE, warmupData: { title: "T" }, warmup: { active: true, vlc: true, pct: 10 } })
+       .includes("wpnote"), false,
+     "the VLC panel has its own note and does not draw this one");
+}
+
 console.log(failed === 0 ? "ALL PASS" : `${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);
