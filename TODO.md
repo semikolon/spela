@@ -1,5 +1,72 @@
 # Spela TODOs 🎬🍿
 
+### 🔓 OPEN — 2 October 2026: a deadlock fixed and live, a play fix on a branch, three things open
+
+**Live on the server (commit `b3ccc3e`).** The server froze twice in one evening, health
+endpoint included. Cause: the torrent engine's start path checked a failed source's
+cooldown with `if let Some(at) = self.dead_magnets.lock().unwrap().get(magnet)` and locked
+`dead_magnets` again inside the body to drop the expired entry. In Rust 2021 the
+scrutinee's guard lives through the body, so the second lock never returns. It can only
+fire once a ten-minute cooldown has expired, which is why retrying an earlier failed
+source froze every later request. Fixed by `magnet_is_cooling_down`, which does both under
+one lock, with a regression test that fails on the old code. The same commit added
+`bin/deploy-server.sh` (see `CLAUDE.md` § Build & Deploy).
+
+*The findings in the rest of this entry are that session's own reading of the server and
+proxy logs, taken from its transcript; the deadlock mechanism and the branch's code were
+re-read on 3 October, the log lines were not.*
+
+**Built, not deployed: branch `play-detach`.** `cargo fmt --check` clean and 652 tests
+pass on it; it has never run against a real Chromecast.
+- **A play is now a server job.** `/play/start` returns a job id and the remote polls
+  `/play/jobs/{id}`. A phone that backgrounds its browser used to close the `/play`
+  request after 9 to 16 seconds, which dropped `do_play` mid-warmup: ffmpeg kept running
+  and the Chromecast never got its LOAD. This is the item *decouple `/play` from the HTTP
+  request lifecycle* further down, done with a job and polling instead of a `last_error`
+  field on `/status`.
+- **One play or stop owns the transcoder.** A newer Play or Stop cancels the one in
+  flight and waits for it to let go. Overlapping retries had been killing each other's
+  transcoders.
+- **A retry uses the search results from when the play began**, not what another client
+  searched for meanwhile.
+- **Local Bypass finds an episode inside `release/Season 02/`** (three levels deep within
+  a title-matched release, never through a symlink).
+- **Raced-and-discarded and failed-start torrents are paused, not deleted.** Pruning owns
+  eviction. This touches both suspects named in the vanished-partial item below.
+
+**Why it is on a branch and what merging needs.** Stop now waits for the play in flight
+to release the transcoder. If a cast call inside that play hangs, Stop hangs with it, where
+it used to tear down regardless. Check on a test instance (recipe in `CLAUDE.md`): start a
+play, background the phone browser, confirm the cast starts anyway; press Stop during
+warm-up; then merge and deploy.
+
+**Diagnosed, not built: a season pack's files are looked up at the media root.**
+Persistence and file lookup assume a torrent's files sit directly under the media root,
+while librqbit puts a pack inside its own release folder. The same evening's log reported
+`0 physical bytes` for a pack whose episode was on disk. The session was correcting that
+lookup when it ended, and none of it is in the branch.
+
+**The automatic fallback gives up after three sources.** `play_request(.., 3)` is a
+hard-coded count from commit `51120fd` (2026-03-18, *"auto-try next search result (up to
+3 retries)"*); no reason for three is recorded. The loop tries results N, N+1 and N+2 in
+ranked order. The case that showed it: a film with five results, where the first claimed
+six seeds and had no peers, the second and third were listed with zero seeds, and the
+fourth, with one seed, downloaded fine. Two of the three attempts went to sources the
+search itself listed as seedless. Two changes would fix it, neither built: keep trying
+until the list ends, inside a time budget rather than a count; and try a zero-seed result
+only after every seeded one. Source racing was off in that check, so whether racing would
+have reached the fourth is untested.
+
+**Left on the server by that session.** A hard link at the media root for one episode
+that sat inside a season folder, made so the shallow scanner could see it; redundant once
+the nested lookup ships. And the isolated test instance on port 17890 ran for 17 hours
+before it was stopped on 3 October; its directory under `/tmp` still holds one complete
+film download (1.8 GB) that is not in the library.
+
+**Lint is not clean, and nothing enforces it.** `cargo clippy -- -D warnings` reports
+about 20 style lints in non-test code and 40 with tests (doc list indentation, complex
+types, one manual prefix strip). None are in the code changed on 2 October.
+
 ### 📌 NOTE — a failed torrent init leaves a 0-byte file named like the release (2026-09-16)
 Twice in four days librqbit logged `Error setting length for file "<release>.mkv" to
 <N>: file is None` during `initialize_and_start` (Contact's remux 2026-09-13, Terminator 3's
