@@ -35,6 +35,8 @@ pub struct ServerState {
     pub media_dir: PathBuf,
     /// PID of the running ffmpeg transcode process (if any)
     pub ffmpeg_pid: Mutex<Option<u32>>,
+    /// One startup/stop owns the shared transcoder and scratch directory at a time.
+    playback: PlaybackControl,
     /// librqbit-backed pure-Rust torrent engine (since v3.3.0 / Apr 30, 2026
     /// — Phase 3 dropped the optional webtorrent fallback after the Phase 2
     /// live test validated peer attach + end-to-end cast on librqbit). The
@@ -530,6 +532,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         state_dir,
         media_dir,
         ffmpeg_pid: Mutex::new(None),
+        playback: PlaybackControl::default(),
         torrent_engine,
         host_allowlist,
         warmup: Mutex::new(None),
@@ -643,6 +646,8 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/search", get(handle_search))
         .route("/play", post(handle_play))
+        .route("/play/start", post(handle_play_start))
+        .route("/play/jobs/{id}", get(handle_play_job))
         .route("/stop", post(handle_stop))
         .route("/status", get(handle_status))
         .route("/progress", get(handle_progress))
@@ -1153,7 +1158,7 @@ fn maybe_resume_stream_on_boot(state: SharedState, prev: CurrentStream) {
             size: prev.size.clone(),
             poster_url: prev.poster_url.clone(),
         };
-        let r = do_play(&state, &mut req).await;
+        let r = play_request(&state, &mut req, 1).await;
         if let Some(err) = r.0.get("error").and_then(|e| e.as_str()) {
             tracing::warn!(
                 "boot-resume: do_play returned error (leaving idle): {}",
@@ -1418,12 +1423,12 @@ async fn race_torrent_sources(
     match winner_idx {
         Some(win) => {
             tracing::info!("race: winner = candidate {}", win);
-            // Stop + delete every OTHER started torrent (raced-and-discarded
-            // partials would otherwise bloat the media cap). The winner stays
+            // Pause every OTHER started torrent, preserving downloaded episodes
+            // in season packs. Disk pruning owns eviction. The winner stays
             // in the session so the caller's re-`start` gets `AlreadyManaged`.
             for (idx, pid) in &started {
                 if *idx != win {
-                    stop_torrent(state, *pid, true).await;
+                    stop_torrent(state, *pid, false).await;
                 }
             }
             let (magnet, fidx) = candidates[win].clone();
@@ -1433,7 +1438,7 @@ async fn race_torrent_sources(
             // Nobody won — stop whatever started and let the caller fall back
             // to its original pick (then its 12s dead-seed check errors as today).
             for pid in started.values() {
-                stop_torrent(state, *pid, true).await;
+                stop_torrent(state, *pid, false).await;
             }
             None
         }
@@ -1450,12 +1455,13 @@ async fn race_torrent_sources(
 async fn maybe_race_sources(
     state: &SharedState,
     req: &PlayRequest,
+    search: Option<&crate::search::SearchResult>,
 ) -> Option<(String, Option<u32>)> {
     if !state.config.race_sources_enabled {
         return None;
     }
     let rid = req.result_id?;
-    let search = AppState::load_last_search(&state.state_dir)?;
+    let search = search?;
     let selected_seeds = search
         .results
         .iter()
@@ -1888,19 +1894,118 @@ async fn handle_search(
     }
 }
 
+#[derive(Default)]
+struct PlaybackControl {
+    gate: tokio::sync::Mutex<()>,
+    active: Mutex<tokio_util::sync::CancellationToken>,
+    next_job: std::sync::atomic::AtomicU64,
+    jobs: Mutex<std::collections::BTreeMap<u64, Option<Value>>>,
+}
+
+impl PlaybackControl {
+    fn replace(&self) -> tokio_util::sync::CancellationToken {
+        let mut active = lock_recover(&self.active);
+        active.cancel();
+        *active = tokio_util::sync::CancellationToken::new();
+        active.clone()
+    }
+}
+
+fn cancelled_play() -> Json<Value> {
+    Json(json!({"status": "cancelled", "cancelled": true}))
+}
+
+/// Short request for mobile remotes: the task owns startup, the HTTP connection
+/// only owns this receipt. Polling may stop while the phone app is backgrounded.
+async fn handle_play_start(
+    State(state): State<SharedState>,
+    Json(mut req): Json<PlayRequest>,
+) -> Json<Value> {
+    let id = state
+        .playback
+        .next_job
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    {
+        let mut jobs = lock_recover(&state.playback.jobs);
+        jobs.insert(id, None);
+        while jobs.len() > 8 {
+            jobs.pop_first();
+        }
+    }
+    tokio::spawn(async move {
+        let worker_state = state.clone();
+        let result =
+            tokio::spawn(async move { play_request(&worker_state, &mut req, 3).await }).await;
+        let value = match result {
+            Ok(Json(value)) => value,
+            Err(e) => json!({"error": format!("Playback task failed: {e}")}),
+        };
+        if let Some(slot) = lock_recover(&state.playback.jobs).get_mut(&id) {
+            *slot = Some(value);
+        }
+    });
+    Json(json!({"job_id": id}))
+}
+
+async fn handle_play_job(
+    State(state): State<SharedState>,
+    AxumPath(id): AxumPath<u64>,
+) -> Json<Value> {
+    match lock_recover(&state.playback.jobs).get(&id) {
+        Some(Some(value)) => Json(json!({"done": true, "result": value})),
+        Some(None) => Json(json!({"done": false})),
+        None => Json(
+            json!({"done": true, "result": {"error": "Playback request expired; check Now before retrying"}}),
+        ),
+    }
+}
+
 async fn handle_play(
     State(state): State<SharedState>,
     Json(mut req): Json<PlayRequest>,
 ) -> Json<Value> {
+    // A mobile browser can drop its HTTP connection when backgrounded. Dropping
+    // this JoinHandle detaches the job; only a newer Play/Stop cancels startup.
+    // Previously axum dropped do_play mid-warmup, leaving ffmpeg running but
+    // never sending the LOAD to the Chromecast.
+    match tokio::spawn(async move { play_request(&state, &mut req, 3).await }).await {
+        Ok(result) => result,
+        Err(e) => Json(json!({"error": format!("Playback task failed: {e}")})),
+    }
+}
+
+async fn play_request(state: &SharedState, req: &mut PlayRequest, max_retries: u32) -> Json<Value> {
+    // Snapshot before waiting: browsing on another client cannot change what a
+    // retry means. A newer Play/Stop cancels this request, then waits for it to
+    // release its resources before touching the shared transcoder.
+    let search = AppState::load_last_search(&state.state_dir);
+    if req.target.as_deref() == Some("shannon") {
+        return do_play(
+            state,
+            req,
+            search.as_ref(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    }
+    let cancel = state.playback.replace();
+    let _owner = state.playback.gate.lock().await;
+    if cancel.is_cancelled() {
+        return cancelled_play();
+    }
     // Auto-retry loop: tries up to 3 results on torrent failure
-    let max_retries = 3u32;
     for retry in 0..max_retries {
-        let result = do_play(&state, &mut req).await;
+        let result = do_play(state, req, search.as_ref(), &cancel).await;
+        if cancel.is_cancelled() {
+            do_cleanup(state);
+            return cancelled_play();
+        }
         match &result {
             Json(v) if v.get("error").is_some() && retry < max_retries - 1 => {
                 // Check if we can auto-fallback to next result
                 if let Some(rid) = req.result_id {
-                    if let Some(search) = AppState::load_last_search(&state.state_dir) {
+                    if let Some(search) = &search {
                         let next_rid = rid + 1;
                         if next_rid <= search.results.len() {
                             tracing::warn!(
@@ -2080,10 +2185,29 @@ async fn handle_seek_retranscode(
         None => return Json(json!({"error": "No active stream to re-transcode"})),
     };
     let mut play = replay_request_from_current(&current, absolute);
-    do_play(&state, &mut play).await
+    play_request(&state, &mut play, 1).await
 }
 
-async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
+async fn do_play(
+    state: &SharedState,
+    req: &mut PlayRequest,
+    search: Option<&crate::search::SearchResult>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Json<Value> {
+    // Check at resource boundaries; never abandon a blocking cast task mid-LOAD.
+    // The next owner cannot start until this function has completed cleanup.
+    macro_rules! cancelled {
+        ($pid:expr) => {
+            if cancel.is_cancelled() {
+                if $pid != 0 {
+                    stop_torrent(state, $pid, false).await;
+                }
+                do_cleanup(state);
+                return cancelled_play();
+            }
+        };
+    }
+    cancelled!(0);
     let mut media_dir = state.media_dir.clone();
     if media_dir.to_string_lossy().starts_with("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -2106,7 +2230,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
 
     // Resolve result_id from last search — fills magnet, file_index, and metadata automatically
     if let Some(rid) = req.result_id {
-        match AppState::load_last_search(&state.state_dir) {
+        match search {
             Some(search) => {
                 let result = search.results.iter().find(|r| r.id == rid);
                 match result {
@@ -2508,6 +2632,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         }
     }
 
+    cancelled!(0);
     // Stop the previous stream's torrent (if any) before starting a new one.
     // The previous torrent's id lives in `app_state.current.pid`; we route
     // through `engine.stop`. `pid == 0` is Local Bypass — no torrent worker
@@ -2604,7 +2729,8 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         // `AlreadyManaged` continues its head-start download; losers were
         // stopped + deleted in-race. do_play's cleanup/cast invariants stay
         // untouched (this only chooses WHICH magnet to start).
-        let raced_winner = maybe_race_sources(state, req).await;
+        let raced_winner = maybe_race_sources(state, req, search).await;
+        cancelled!(0);
         let magnet_owned: String = match &raced_winner {
             Some((m, fidx)) => {
                 req.file_index = *fidx;
@@ -2625,6 +2751,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         };
         pid = result.0;
         server_url = result.1;
+        cancelled!(pid);
 
         // 2026-07-04: publish warmup so GET /progress can report live
         // download + transcode progress while this whole block waits
@@ -2642,18 +2769,22 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 "Torrent has no download progress after {}s — dead seeds",
                 progress_gate_secs
             );
-            stop_torrent(state, pid, true).await;
+            stop_torrent(state, pid, false).await;
             disk::prune_disk(&media_dir, ""); // Clean up any dead attempt
             return Json(json!({
                 "error": format!("Torrent has no active seeds (0% after {}s)", progress_gate_secs)
             }));
         }
 
+        cancelled!(pid);
         if smooth_mode && target == "chromecast" {
             tracing::info!(
                 "Smooth mode: waiting for torrent completion before local HLS transcode"
             );
-            if let Err(e) = wait_for_torrent_completion(state, pid, 14_400).await {
+            if let Err(e) = tokio::select! {
+                r = wait_for_torrent_completion(state, pid, 14_400) => r,
+                _ = cancel.cancelled() => Err(anyhow::anyhow!("Playback cancelled")),
+            } {
                 stop_torrent(state, pid, false).await;
                 return Json(json!({
                     "error": format!("Smooth mode download-first gate failed: {}", e)
@@ -2689,6 +2820,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         _warmup_guard = Some(begin_warmup(state, req.title.clone(), None, &media_dir));
     }
 
+    cancelled!(pid);
     // Fetch subtitles FIRST (needed for burn-in during transcode)
     let mut has_subtitles = false;
     let mut subtitle_srt_path: Option<PathBuf> = None;
@@ -2778,6 +2910,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
     // immediately fail with "Connection refused" on the now-dead server).
     // Pre-start cleanup already happened at the top of `do_play`.
 
+    cancelled!(pid);
     // Codec detection + transcode decision
     let mut final_url = server_url.clone();
     let mut is_transcoded = false;
@@ -2828,7 +2961,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 Ok(Ok(info)) => info,
                 Ok(Err(e)) => {
                     tracing::warn!("Torrent codec detection failed: {}", e);
-                    stop_torrent(state, pid, true).await;
+                    stop_torrent(state, pid, false).await;
                     disk::prune_disk(&media_dir, "");
                     return Json(json!({
                         "error": format!("Torrent probe failed before playback: {}", e)
@@ -2839,7 +2972,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                         "Torrent codec detection timed out after {}s — trying next source",
                         torrent_codec_detect_timeout_secs
                     );
-                    stop_torrent(state, pid, true).await;
+                    stop_torrent(state, pid, false).await;
                     disk::prune_disk(&media_dir, "");
                     return Json(json!({
                         "error": format!(
@@ -2850,6 +2983,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                 }
             }
         };
+        cancelled!(pid);
         let video_codec = codec_info.video_codec;
         let audio_codec = codec_info.audio_codec;
         source_duration = codec_info.duration;
@@ -3000,13 +3134,10 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                         tracing::info!(
                             "Local-file cast gate: fast-cast as soon as transcode races ahead of playback (full pre-transcode only as slow-source fallback)"
                         );
-                        if let Err(e) = wait_for_complete_hls_before_cast(
-                            &manifest_path,
-                            ffmpeg_pid,
-                            source_duration,
-                        )
-                        .await
-                        {
+                        if let Err(e) = tokio::select! {
+                            r = wait_for_complete_hls_before_cast(&manifest_path, ffmpeg_pid, source_duration) => r,
+                            _ = cancel.cancelled() => Err(anyhow::anyhow!("Playback cancelled")),
+                        } {
                             do_cleanup(state);
                             return Json(json!({
                                 "error": format!(
@@ -3077,6 +3208,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
                         let prebuffer_deadline = prebuffer_start
                             + tokio::time::Duration::from_secs(prebuffer_timeout_secs);
                         loop {
+                            cancelled!(pid);
                             // May 13, 2026 v3.4.0: stream-start fail-fast. If ffmpeg
                             // has produced 0 segments after FAIL_FAST_STREAM_START_SECS
                             // (20 s), declare stream-start failure and return an error
@@ -3180,6 +3312,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         }
     } // end `if cache_hit_key.is_none()` — cache-MISS transcode region (v3.7.9)
 
+    cancelled!(pid);
     // Cast to Chromecast
     if target == "chromecast" {
         // 2026-05-26 diagnose-add for cast-init silent-failure investigation.
@@ -3297,6 +3430,7 @@ async fn do_play(state: &SharedState, req: &mut PlayRequest) -> Json<Value> {
         }
     }
 
+    cancelled!(pid);
     // Save state
     let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
     let duration = source_duration;
@@ -5180,6 +5314,11 @@ async fn cast_health_monitor(
 }
 
 async fn handle_stop(State(state): State<SharedState>) -> Json<Value> {
+    let cancel = state.playback.replace();
+    let _owner = state.playback.gate.lock().await;
+    if cancel.is_cancelled() {
+        return cancelled_play();
+    }
     // 2026-07-04: STOP the Chromecast receiver FIRST, then tear down the
     // backend. Previously this only ran do_cleanup (kill ffmpeg + torrent),
     // so the Chromecast kept playing the already-buffered HLS after the user
@@ -6357,6 +6496,27 @@ fn better_bypass_candidate(
     }
 }
 
+/// Season packs may have a release/season/episode layout. Walk only within a
+/// title-matched release, at bounded depth, and never follow symlinked entries.
+/// Selection, quality, size and physical-completeness checks remain at the caller.
+fn nested_release_files(dir: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_file() {
+            files.push(entry.path());
+        } else if kind.is_dir() && depth > 0 {
+            files.extend(nested_release_files(&entry.path(), depth - 1));
+        }
+    }
+    files
+}
+
 pub(crate) fn find_local_bypass_match(
     media_dir: &std::path::Path,
     title: &str,
@@ -6443,9 +6603,8 @@ pub(crate) fn find_local_bypass_match(
             required_se.is_some_and(|se| name_matches_episode(&folder_name, se));
 
         if file_type.is_dir() {
-            if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                for sub_entry in sub_entries.flatten() {
-                    let sub_path = sub_entry.path();
+            {
+                for sub_path in nested_release_files(&path, 3) {
                     let fname = sub_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                     let ext = sub_path.extension().and_then(|s| s.to_str()).unwrap_or("");
                     if (ext == "mp4" || ext == "mkv") && !fname.starts_with("transcoded") {
@@ -7302,13 +7461,16 @@ fn spawn_chromecast_tracker(state: SharedState) {
             ticker.tick().await;
             // Resolve targets under a brief cast-lock, then probe OFF the lock
             // (a hung Chromecast connection must never block do_play's casts).
-            let targets = {
-                let mut cast = lock_recover(&state.cast);
+            let tracker_state = state.clone();
+            let targets = tokio::task::spawn_blocking(move || {
+                let mut cast = lock_recover(&tracker_state.cast);
                 cast.resolve_track_targets(
-                    &state.config.auto_track_devices,
-                    &state.config.default_device,
+                    &tracker_state.config.auto_track_devices,
+                    &tracker_state.config.default_device,
                 )
-            };
+            })
+            .await
+            .unwrap_or_default();
             if targets.is_empty() {
                 continue;
             }
@@ -11412,6 +11574,104 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn newer_play_and_stop_cancel_waiters_without_overlapping_owners() {
+        let control = PlaybackControl::default();
+        let first = control.replace();
+        let owner = control.gate.lock().await;
+        let second = control.replace();
+        assert!(first.is_cancelled());
+        assert!(control.gate.try_lock().is_err());
+        let stop = control.replace();
+        assert!(second.is_cancelled());
+        assert!(!stop.is_cancelled());
+        drop(owner);
+        let _stop_owner =
+            tokio::time::timeout(std::time::Duration::from_secs(1), control.gate.lock())
+                .await
+                .expect("previous startup must release ownership before stop");
+        assert!(
+            second.is_cancelled(),
+            "queued stale startup must not run after Stop"
+        );
+    }
+
+    #[test]
+    fn nested_season_pack_preserves_episode_and_completeness_gates() {
+        let root = tempfile::tempdir().unwrap();
+        let pack = root.path().join("Example.Show.S01-S05.1080p.WEB-DL.x265");
+        let season = pack.join("Season 02");
+        std::fs::create_dir_all(&season).unwrap();
+        // Small real blocks plus a completion marker exercise the existing
+        // marker path without writing hundreds of MB of fixture data.
+        std::fs::write(pack.join(".spela_done"), b"").unwrap();
+        let wanted = season.join("Example.Show.S02E06.1080p.mkv");
+        std::fs::write(&wanted, [1u8; 4096]).unwrap();
+        std::fs::write(season.join("Example.Show.S02E05.1080p.mkv"), [2u8; 4096]).unwrap();
+        let partial = season.join("Example.Show.S02E07.1080p.mkv");
+        std::fs::File::create(&partial)
+            .unwrap()
+            .set_len(200 * 1024 * 1024)
+            .unwrap();
+        let empty = HashSet::new();
+        assert_eq!(
+            find_local_bypass_match(root.path(), "Example Show S02E06", Some("1080p"), 0, &empty),
+            Some(wanted.clone())
+        );
+        assert!(find_local_bypass_match(
+            root.path(),
+            "Example Show S02E07",
+            Some("1080p"),
+            0,
+            &empty
+        )
+        .is_none());
+        assert!(find_local_bypass_match(
+            root.path(),
+            "Example Show S03E06",
+            Some("1080p"),
+            0,
+            &empty
+        )
+        .is_none());
+        assert!(find_local_bypass_match(
+            root.path(),
+            "Example Show S02E06",
+            Some("2160p"),
+            0,
+            &empty
+        )
+        .is_none());
+        let corrupt = HashSet::from([wanted.to_string_lossy().to_string()]);
+        assert!(find_local_bypass_match(
+            root.path(),
+            "Example Show S02E06",
+            Some("1080p"),
+            0,
+            &corrupt
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn nested_season_pack_never_follows_symlinked_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let pack = root.path().join("Example.Show.S01-S05.1080p");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join(".spela_done"), b"").unwrap();
+        std::fs::write(outside.path().join("Example.Show.S02E06.mkv"), [1u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(outside.path(), pack.join("Season 02")).unwrap();
+        assert!(find_local_bypass_match(
+            root.path(),
+            "Example Show S02E06",
+            Some("1080p"),
+            0,
+            &HashSet::new()
+        )
+        .is_none());
+    }
 
     // Infohashes copied verbatim from a real Torrentio response for Silo
     // S01E01 / S03E10 rather than invented, per the fixtures-from-reality rule.
