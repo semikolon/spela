@@ -2577,12 +2577,44 @@ async function playToTarget(spec, retry){
   }
   return castViaPlay(spec, retry);   // chromecast
 }
+// A play is a server job. iOS may suspend this polling loop when switching
+// apps; the server still finishes warming and sends the Chromecast LOAD.
+async function requestPlay(body){
+  const gen=S.playGen=(S.playGen||0)+1;
+  const started=await api("/play/start",{method:"POST",body});
+  if(!started || !started.job_id) return started;
+  let failures=0;
+  while(gen===S.playGen){
+    if(document.visibilityState!=="visible"){
+      await new Promise(resolve=>{
+        const visible=()=>{if(document.visibilityState==="visible"){
+          document.removeEventListener("visibilitychange",visible);resolve();
+        }};
+        document.addEventListener("visibilitychange",visible);
+      });
+    }
+    if(gen!==S.playGen) break;
+    try{
+      const job=await api("/play/jobs/"+started.job_id);
+      if(gen!==S.playGen) break;
+      failures=0;
+      if(job.done) return job.result;
+    }catch(e){
+      // A suspended fetch is not evidence the server-side play failed.
+      if(document.visibilityState==="visible" && ++failures>=5) throw e;
+    }
+    await new Promise(resolve=>setTimeout(resolve,1000));
+  }
+  return {cancelled:true};
+}
+
 async function castViaPlay(spec, retry){
   beginWarming(spec.label, spec.poster);
   const body={...spec.body, target:"chromecast", cast_name:S.target.name};
   let r;
-  try{ r=await api("/play",{method:"POST",body}); }
+  try{ r=await requestPlay(body); }
   catch{ showPlayError(spec.label,spec.poster,"spela unreachable",retry); return; }
+  if(r&&r.cancelled) return;
   endWarming();
   if(r&&r.error){ showPlayError(spec.label,spec.poster,r.error,retry); return; }
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
@@ -2647,8 +2679,9 @@ async function doPhoneDirect(opts,cardForSources,label){
   // transcode-warmup await; on success we build the in-page <video>.
   beginWarming(label||opts.title||"Playing",opts.poster_url);
   let r;
-  try{ r=await api("/play",{method:"POST",body:{...opts,target:"vlc"}}); }
+  try{ r=await requestPlay({...opts,target:"vlc"}); }
   catch{ showPlayError(label||opts.title,opts.poster_url,"spela unreachable",()=>doPhoneDirect(opts,cardForSources,label)); return; }
+  if(r&&r.cancelled) return;
   endWarming();
   if(r&&r.error){ showPlayError(label||opts.title,opts.poster_url,r.error,()=>doPhoneDirect(opts,cardForSources,label)); return; }
   S.now.phone=true; S.now.phoneLoading=false; S.now.everRan=true; S.now.playing=true;
@@ -3246,6 +3279,7 @@ function renderWarmPanel(){
   // having cancelled. Bumping the generation token is the abort the loop already
   // honours at both of its checkpoints.
   if(cb) cb.onclick=async()=>{
+    S.playGen=(S.playGen||0)+1;
     S.vlcGen=(S.vlcGen||0)+1;
     S.now.vlcNote=null; S.now.vlcErr=null;
     endWarming(); S.now.data=null;
@@ -3472,6 +3506,7 @@ function leaveNowViewAfterStop(){
 }
 
 async function stopPlayback(){
+  S.playGen=(S.playGen||0)+1;
   if(S.now.stopping) return;
   if(S.now.vlc){   // VLC: tell the Mac watcher to stop VLC, clear the now-view
     S.now.stopping=true; stopVlcPoll();
