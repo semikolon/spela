@@ -118,8 +118,10 @@ function, so a rule that looks at the other candidate cannot be written.
 3. **A real source before a cam copy.** A release filmed in a cinema still says 1080p
    and still has a size, so everything below would rank it as picture. It is read from
    the release name after the year, not from the tracker's quality label, which calls
-   every release of a film titled *Cam* a cam. Like the first tier it sinks and is
-   marked rather than removed: while a film is only in cinemas, a cam is all there is.
+   every release of a film titled *Cam* a cam. It sinks and is marked rather than
+   removed, and it never plays by itself: when cams are all there is, the remote says
+   there is no release yet, and the fallback and the race step over them. A cam plays
+   only from a deliberate tap on its marked row.
 4. **Resolution, scoped to the target.** A Chromecast is a 1080p screen fed by a
    transcoder, so `1080p > 720p > 480p > 2160p`. A 4K monitor decoding natively is the
    other way round, `2160p > 1080p > 720p > 480p`, because a 1080p source upscaled twice

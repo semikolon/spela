@@ -32,9 +32,11 @@ liveness probe. Mechanics in `CLAUDE.md` § Hard-Won Lessons.
   the banner should either not appear or clear by itself within seconds.
 - **The phone search bar on the device itself.** Measured in an emulated 375 px and 402 px
   viewport only.
-- **The cam notice on the title card.** No film in the recorded lists has a cam as its
-  best source, so `camNotice` is covered by its unit test only. It will first be seen on
-  a film that is still in cinemas.
+- **"No release yet" on a film that has only cam copies.** No recorded list has a cam as
+  its best source, so the withheld ▶, the card's note and the server's refusal are covered
+  by unit tests on real release names only. It will first be seen on a film that is still
+  in cinemas; that is the moment to look at the card and at one deliberate tap on a marked
+  row.
 
 **Open idea, not proposed yet: a crashed handler should say so.** A panic in a request
 handler closes the connection with no reply, which through the proxy is an HTTP 502. The

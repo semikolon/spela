@@ -2532,6 +2532,11 @@ fn pixels_for_res_tier(tier: u32) -> Option<f64> {
 /// a substitute for a known one — it cannot be shown to be equivalent, and a race
 /// that cannot prove equivalence must not switch.
 pub fn race_candidate_is_not_a_downgrade(candidate_title: &str, chosen_title: &str) -> bool {
+    // A cam copy is never a substitute for a real source, whatever it calls its
+    // resolution (2026-10-04). Between two cams the ordinary rule applies.
+    if is_cam_source(candidate_title) && !is_cam_source(chosen_title) {
+        return false;
+    }
     let chosen_px = pixels_for_res_tier(resolution_tier(chosen_title));
     let cand_px = pixels_for_res_tier(resolution_tier(candidate_title));
     match (chosen_px, cand_px) {

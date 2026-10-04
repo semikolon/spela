@@ -1157,6 +1157,7 @@ fn maybe_resume_stream_on_boot(state: SharedState, prev: CurrentStream) {
             quality: prev.quality.clone(),
             size: prev.size.clone(),
             poster_url: prev.poster_url.clone(),
+            allow_cam: None,
         };
         let r = play_request(&state, &mut req, SourceFallback::None).await;
         if let Some(err) = r.0.get("error").and_then(|e| e.as_str()) {
@@ -1738,6 +1739,10 @@ pub struct PlayRequest {
     /// that is governed by stream type (live vs VOD HLS). See spela
     /// CLAUDE.md § "DMR overlay is stream-type-dependent".
     pub poster_url: Option<String>,
+    /// 2026-10-04: play this search result even though it is a cam copy. Sent by
+    /// the remote only for a tap on a row marked as one. See `refuses_cam`.
+    #[serde(default)]
+    pub allow_cam: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1998,11 +2003,47 @@ pub(crate) fn next_fallback_source(
     results: &[crate::search::TorrentResult],
     rid: usize,
 ) -> Option<usize> {
+    // The walk never lands on a cam copy by itself (2026-10-04): when the real
+    // sources are exhausted the honest answer is that nothing worked, not a film
+    // shot off a cinema screen. A walk that STARTED on a cam was asked for one.
+    let from_cam = results
+        .iter()
+        .find(|r| r.id == rid)
+        .is_some_and(|r| crate::search::is_cam_source(&r.title));
     results
         .iter()
         .filter(|r| r.id > rid && !r.magnet.is_empty())
+        .filter(|r| from_cam || !crate::search::is_cam_source(&r.title))
         .map(|r| r.id)
         .min()
+}
+
+/// What every refused cam play says. One string, so the remote, the CLI and the
+/// voice assistant all report the same thing.
+pub(crate) const NO_RELEASE_YET: &str =
+    "No release yet. Only cam copies exist so far, filmed in a cinema.";
+
+/// A cam copy plays only when it was asked for BY NAME (2026-10-04, Fredrik: cam
+/// and telesync "are generally not nice to watch", so a film that has nothing
+/// else is reported as not released yet).
+///
+/// The gate is here, on the server, because every client plays "result 1"
+/// without looking at it: the remote's play button, the one-tap rows, the CLI,
+/// the voice assistant and the kiosk. A deliberate tap on a marked row sends
+/// `allow_cam`. A play that names no search result (a bare magnet, a library
+/// title) is not judged.
+fn refuses_cam(req: &PlayRequest, search: Option<&crate::search::SearchResult>) -> bool {
+    if req.allow_cam == Some(true) {
+        return false;
+    }
+    let (Some(rid), Some(search)) = (req.result_id, search) else {
+        return false;
+    };
+    search
+        .results
+        .iter()
+        .find(|r| r.id == rid)
+        .is_some_and(|r| crate::search::is_cam_source(&r.title))
 }
 
 /// The Chromecast a finished `do_play` is streaming to, read from its success value
@@ -2114,6 +2155,10 @@ async fn play_request(
     // retry means. A newer Play/Stop cancels this request, then waits for it to
     // release its resources before touching the shared transcoder.
     let search = AppState::load_last_search(&state.state_dir);
+    // Before anything is cancelled: a refused play must not stop what is playing.
+    if refuses_cam(req, search.as_ref()) {
+        return Json(json!({"error": NO_RELEASE_YET, "no_release_yet": true}));
+    }
     if req.target.as_deref() == Some("shannon") {
         return do_play(
             state,
@@ -2393,6 +2438,7 @@ pub(crate) fn replay_request_from_current(current: &CurrentStream, seek_to: f64)
         quality: current.quality.clone(),
         size: current.size.clone(),
         poster_url: current.poster_url.clone(),
+        allow_cam: None,
     }
 }
 
@@ -6615,6 +6661,11 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
     }
 
     let best = &result.results[0];
+    // This path plays a magnet directly, so the result-id gate in `play_request`
+    // never sees it. Same answer, same words.
+    if crate::search::is_cam_source(&best.title) {
+        return Json(json!({"error": NO_RELEASE_YET, "no_release_yet": true}));
+    }
     let target_parts: Vec<&str> = current.target.splitn(2, ':').collect();
 
     let play_req = PlayRequest {
@@ -6637,6 +6688,7 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         quality: Some(best.quality.clone()),
         size: Some(best.size.clone()),
         poster_url: result.show.as_ref().and_then(|s| s.poster_url.clone()),
+        allow_cam: None,
     };
 
     handle_play(State(state.clone()), Json(play_req)).await
@@ -12045,6 +12097,83 @@ mod tests {
         // A deliberate pick of #4 is never "upgraded" back to #1.
         assert_eq!(next_fallback_source(&results, 4), None);
         assert_eq!(next_fallback_source(&[], 1), None);
+    }
+
+    /// 2026-10-04: a cam copy is never played unless it was picked by hand. The
+    /// two cam names are real, from the recorded Project Hail Mary list.
+    fn cam_list() -> Vec<crate::search::TorrentResult> {
+        let named = |id: usize, title: &str| {
+            let mut r = ranked_source(id, "magnet:?xt=urn:btih:a");
+            r.title = title.into();
+            r
+        };
+        vec![
+            named(
+                1,
+                "Project.Hail.Mary.2026.1080p.WEB-DL.DDP5.1.Atmos.H.264-RDNYB.mkv",
+            ),
+            named(
+                2,
+                "Project.Hail.Mary.2026.1080p.BluRay.x264-ZoroSenpai_EniaHD.mkv",
+            ),
+            named(
+                3,
+                "Project.Hail.Mary.2026.1080p.TELESYNC.HC.x264-SyncUP.mkv",
+            ),
+            named(
+                4,
+                "Project.Hail.Mary.2026.1080p.CAMRip.Dublado.Official.mkv",
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_source_walk_never_lands_on_a_cam_copy_by_itself() {
+        let results = cam_list();
+        assert_eq!(next_fallback_source(&results, 1), Some(2));
+        // The real sources are exhausted: the walk ends rather than play a cam.
+        assert_eq!(next_fallback_source(&results, 2), None);
+        // A walk that STARTED on a cam was asked for one, and may try the next.
+        assert_eq!(next_fallback_source(&results, 3), Some(4));
+    }
+
+    #[test]
+    fn a_cam_copy_plays_only_when_it_was_asked_for_by_name() {
+        let search = crate::search::SearchResult {
+            query: "project hail mary".into(),
+            show: None,
+            searching: None,
+            error: None,
+            torrent_available: true,
+            results: cam_list(),
+        };
+        let play = |result_id: Option<usize>, allow_cam: Option<bool>| {
+            let mut req: PlayRequest = serde_json::from_value(json!({})).unwrap();
+            req.result_id = result_id;
+            req.allow_cam = allow_cam;
+            req
+        };
+        // "Play result 3" from any client that did not look at it: refused.
+        assert!(refuses_cam(&play(Some(3), None), Some(&search)));
+        assert!(refuses_cam(&play(Some(3), Some(false)), Some(&search)));
+        // The marked row, tapped on purpose.
+        assert!(!refuses_cam(&play(Some(3), Some(true)), Some(&search)));
+        // A real source is never judged, nor is a play that names no result.
+        assert!(!refuses_cam(&play(Some(1), None), Some(&search)));
+        assert!(!refuses_cam(&play(None, None), Some(&search)));
+        assert!(!refuses_cam(&play(Some(3), None), None));
+        // The wire form the remote sends for that deliberate tap.
+        let wire: PlayRequest =
+            serde_json::from_value(json!({"result_id": 3, "allow_cam": true})).unwrap();
+        assert!(!refuses_cam(&wire, Some(&search)));
+        // And a race may not hand a real pick over to a cam of the same resolution.
+        let (real, cam) = (&search.results[0].title, &search.results[2].title);
+        assert!(!crate::search::race_candidate_is_not_a_downgrade(cam, real));
+        assert!(crate::search::race_candidate_is_not_a_downgrade(real, cam));
+        assert!(crate::search::race_candidate_is_not_a_downgrade(
+            &search.results[3].title,
+            cam
+        ));
     }
 
     #[test]

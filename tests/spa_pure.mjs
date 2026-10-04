@@ -215,16 +215,27 @@ const mkPoll = (answer, S, onRender) =>
      "missing quality and size leave the labels empty rather than 'undefined'");
 }
 
-// --- camNotice: ▶ on a cam copy is announced, not prevented ---------------------------
+// --- camNotice + nextVlcSource: a cam copy never plays by itself ------------------------
 // The ranker puts a cam copy below every real source that can play, so the best source is
-// a cam only when nothing better exists: a film still in cinemas. The row marker is inside
-// the collapsed list, so the card and the one-tap path say it where ▶ is.
+// a cam only while a film is still in cinemas. Then there is no release yet: ▶ is withheld
+// and the card says so. The rotation past dead sources must not reach a cam either.
 {
   const camNotice = new Function(extract("camNotice") + "\nreturn camNotice;")();
-  eq(camNotice([{ id: 1, cam: true }, { id: 2 }]) !== null, true, "a cam leading the list is announced");
-  eq(camNotice([{ id: 1 }, { id: 2, cam: true }]), null, "a cam further down is the row marker's job");
+  eq(/^No release yet/.test(camNotice([{ id: 1, cam: true }, { id: 2 }]) || ""), true,
+     "only cam copies: 'No release yet', which is what replaces the play button");
+  eq(camNotice([{ id: 1 }, { id: 2, cam: true }]), null, "a real source leads: nothing to say");
   eq(camNotice([]), null, "an empty list must not throw");
   eq(camNotice(null), null, "a missing list must not throw");
+
+  const next = new Function(extract("nextVlcSource") + "\nreturn nextVlcSource;")();
+  const shot = [{ id: 1 }, { id: 2 }, { id: 3, cam: true }, { id: 4, cam: true }, { id: 5 }];
+  eq(next(shot, 1, false), 2, "the next real source");
+  eq(next(shot, 2, false), 5, "cam copies are stepped over, not played");
+  eq(next(shot, 5, false), null, "the end of the list");
+  eq(next([{ id: 1 }, { id: 2, cam: true }], 1, false), null,
+     "real sources exhausted and only cams remain: the rotation ends");
+  eq(next(shot, 3, true), 4, "a rotation that started on a cam may try the next one");
+  eq(next(null, 1, false), null, "a missing list must not throw");
 }
 
 // --- The "spela unreachable" banner: a verdict from a probe, not from a failed request ---

@@ -1369,6 +1369,7 @@ async function openInVlc(id,title,poster){
   // indistinguishable from one that ignored the pick.
   let skipped = 0;
   const total = shot.length;
+  const startedOnCam = !!(shot.find(x => x.id === id) || {}).cam;
   const walkStarted = Date.now(), WALK_BUDGET_MS = 300000;
   while(rdy && (rdy.rotate || rdy.switchTo) && skipped < total && Date.now()-walkStarted < WALK_BUDGET_MS){
     if(rdy.switchTo){
@@ -1376,9 +1377,10 @@ async function openInVlc(id,title,poster){
       S.now.vlcNote = "Source " + rdy.switchTo + " is downloading faster — switching…";
       id = rdy.switchTo;
     }else{
-      if(id + 1 > total) break;
-      id += 1;
-      S.now.vlcNote = "Source " + (id-1) + " had no peers — trying source " + id + "…";
+      const next = nextVlcSource(shot, id, startedOnCam);
+      if(next == null) break;
+      S.now.vlcNote = "Source " + id + " had no peers — trying source " + next + "…";
+      id = next;
     }
     skipped += 1;
     if(S.now.warming) renderWarmPanel();
@@ -1955,7 +1957,9 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
       row.appendChild(el("span",{className:"s "+health,
         title:fresh?"just aired — seed counts unreliable for a day or so; tap to try (spela verifies real delivery)":"",
         textContent:fresh?"🌱 new":(health==="dead"?"⚠ ":"")+sc+"🌱"}));
-      row.onclick=()=>doPlay({result_id:r.id});
+      // A tap on a marked cam row is the one way a cam plays: the server refuses it
+      // from every other path (`refuses_cam`).
+      row.onclick=()=>doPlay(r.cam?{result_id:r.id,allow_cam:true}:{result_id:r.id});
       box.appendChild(row);
     });
     tg.onclick=()=>{box.classList.toggle("open");
@@ -2552,7 +2556,8 @@ async function runSearch(q){
     poster:show.poster_url, title:show.title||res[0].title, detailLine:true, seLabel,
     epName: se&&se.name?se.name:undefined,
     cta:"Play best source", sources:res,
-    onPlay:()=>doPlay({result_id:res[0].id}, card),
+    // No ▶ when the best source is a cam copy: the card says there is no release yet.
+    onPlay:camNotice(res)?undefined:()=>doPlay({result_id:res[0].id}, card),
     onMarkWatched:()=>markWatched(show.title||res[0].title, show.imdb_id),
     rtTitle:show.title||res[0].title, followBtn:fb, airInfo,
     // Just-aired episode → its swarm is still forming, so low/0 seed counts are
@@ -2785,12 +2790,24 @@ async function castViaPlay(spec, retry){
 /* Fast-play: search a title + play its best source directly (the ▶ on Continue /
    New-Episodes rows). Skips the manual search→tap-play step. Shows the loading
    surface instantly, then hands off to the normal doPlay (target-aware). */
-// When the BEST source is a cam copy, ▶ plays a film shot off a cinema screen. The
-// ranker only lets that happen when no real source can play, which is the normal state
-// of a film still in cinemas, so it is said rather than prevented. Null otherwise.
+// When the BEST source is a cam copy there is no release yet: the ranker puts cams below
+// every real source that can play, so a cam leads only while a film is still in cinemas.
+// ▶ is then withheld and this is shown in its place (Fredrik, 2026-10-04: cam and telesync
+// "are generally not nice to watch"). The cam rows stay in the list, marked, and a tap on
+// one is a deliberate choice (`allow_cam`). Null when a real source leads.
 function camNotice(sources){
   const best=(sources||[])[0];
-  return best&&best.cam ? "⚠ The best source is a cam copy, filmed in a cinema" : null;
+  return best&&best.cam ? "No release yet · only cam copies so far, filmed in a cinema" : null;
+}
+// The next source the VLC rotation may try after `id` went dead, or null. It never moves
+// onto a cam copy by itself; a rotation that STARTED on one was asked for one. Mirrors
+// `next_fallback_source` on the server, which does the same for the Chromecast walk.
+function nextVlcSource(shot, id, startedOnCam){
+  const isCam = rid => { const r=(shot||[]).find(x=>x.id===rid); return !!(r&&r.cam); };
+  for(let next=id+1; next<=(shot||[]).length; next++){
+    if(startedOnCam || !isCam(next)) return next;
+  }
+  return null;
 }
 async function fastPlay(query, isTV, poster){
   if(!S.target){ S.pending=()=>fastPlay(query,isTV,poster); toast("Pick where to play — it starts right after"); openSheet(); return; }
@@ -2814,13 +2831,14 @@ async function fastPlay(query, isTV, poster){
   if(d&&d.failed){ showPlayError(query,poster,d.error,()=>fastPlay(query,isTV,poster)); return; }
   const first=(d&&d.results&&d.results[0]);
   if(!first){ showPlayError(query,poster,"No playable sources for “"+esc(query)+"”.",()=>fastPlay(query,isTV,poster)); return; }
+  // Only cam copies exist: nothing is played, and there is nothing to retry.
+  const camNote=camNotice(d.results);
+  if(camNote){ showPlayError(query,poster,camNote,null); return; }
   const meta={title:(d.show&&d.show.title)||query, poster_url:poster||(d.show&&d.show.poster_url)||""};
   doPlay({result_id:first.id, ...meta}, null);
   // Fast-play never shows the search card, so a complete copy on disk that is NOT the
   // best source would go unmentioned while the best one downloads. Say so, with the
   // way to take it. Tapping it starts a new play, which cancels the one in flight.
-  const camNote=camNotice(d.results);
-  if(camNote) toast(camNote);
   const disk=onDiskOffer(d.results);
   if(disk && !disk.isBest){
     toastAction(`On disk: ${disk.what}`, "Play that copy", ()=>doPlay({result_id:disk.id, ...meta}, null));
