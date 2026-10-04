@@ -215,17 +215,31 @@ const mkPoll = (answer, S, onRender) =>
      "missing quality and size leave the labels empty rather than 'undefined'");
 }
 
-// --- camNotice + nextVlcSource: a cam copy never plays by itself ------------------------
-// The ranker puts a cam copy below every real source that can play, so the best source is
-// a cam only while a film is still in cinemas. Then there is no release yet: ▶ is withheld
-// and the card says so. The rotation past dead sources must not reach a cam either.
+// --- noReleaseNotice + nextVlcSource: a marked result never plays by itself -------------
+// The ranker puts a cam copy, and a release of a different film, below every real source
+// that can play, so the best source is marked only when nothing real exists. Then there is
+// no release yet: ▶ is withheld and the card says so. The rotation past dead sources must
+// not reach a marked result either.
 {
-  const camNotice = new Function(extract("camNotice") + "\nreturn camNotice;")();
+  const camNotice = new Function(extract("noReleaseNotice") + "\nreturn noReleaseNotice;")();
   eq(/^No release yet/.test(camNotice([{ id: 1, cam: true }, { id: 2 }]) || ""), true,
      "only cam copies: 'No release yet', which is what replaces the play button");
   eq(camNotice([{ id: 1 }, { id: 2, cam: true }]), null, "a real source leads: nothing to say");
   eq(camNotice([]), null, "an empty list must not throw");
   eq(camNotice(null), null, "a missing list must not throw");
+  eq(/1994/.test(camNotice([{ id: 1, other_year: 1994 }]) || ""), true,
+     "the only source is another film: the notice names its year");
+
+  // A film that is not out yet. The date is Street Fighter's, as TMDB gave it on 2026-10-04.
+  const unreleasedNote = new Function(extract("fmtDate") + extract("unreleasedNote") + "\nreturn unreleasedNote;")();
+  const oct4 = Date.UTC(2026, 9, 4, 12);
+  eq(/^Not released yet · out Oct 13/.test(unreleasedNote({ release_date: "2026-10-13" }, oct4) || ""), true,
+     "a release date ahead of today is announced with its date");
+  eq(unreleasedNote({ release_date: "2026-10-04" }, oct4), null, "out today is out");
+  eq(unreleasedNote({ release_date: "2026-09-30" }, oct4), null, "a released film says nothing");
+  eq(unreleasedNote({}, oct4), null, "a series has no release date: nothing to say");
+  eq(unreleasedNote(null, oct4), null, "a missing show must not throw");
+  eq(unreleasedNote({ release_date: "soon" }, oct4), null, "an unreadable date is not a future one");
 
   const next = new Function(extract("nextVlcSource") + "\nreturn nextVlcSource;")();
   const shot = [{ id: 1 }, { id: 2 }, { id: 3, cam: true }, { id: 4, cam: true }, { id: 5 }];
@@ -235,6 +249,8 @@ const mkPoll = (answer, S, onRender) =>
   eq(next([{ id: 1 }, { id: 2, cam: true }], 1, false), null,
      "real sources exhausted and only cams remain: the rotation ends");
   eq(next(shot, 3, true), 4, "a rotation that started on a cam may try the next one");
+  eq(next([{ id: 1 }, { id: 2, other_year: 1994 }, { id: 3 }], 1, false), 3,
+     "a release of a different film is stepped over like a cam");
   eq(next(null, 1, false), null, "a missing list must not throw");
 }
 

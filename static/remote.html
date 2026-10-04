@@ -1369,7 +1369,7 @@ async function openInVlc(id,title,poster){
   // indistinguishable from one that ignored the pick.
   let skipped = 0;
   const total = shot.length;
-  const startedOnCam = !!(shot.find(x => x.id === id) || {}).cam;
+  const startedOnMarked = isMarked(shot.find(x => x.id === id));
   const walkStarted = Date.now(), WALK_BUDGET_MS = 300000;
   while(rdy && (rdy.rotate || rdy.switchTo) && skipped < total && Date.now()-walkStarted < WALK_BUDGET_MS){
     if(rdy.switchTo){
@@ -1377,7 +1377,7 @@ async function openInVlc(id,title,poster){
       S.now.vlcNote = "Source " + rdy.switchTo + " is downloading faster — switching…";
       id = rdy.switchTo;
     }else{
-      const next = nextVlcSource(shot, id, startedOnCam);
+      const next = nextVlcSource(shot, id, startedOnMarked);
       if(next == null) break;
       S.now.vlcNote = "Source " + id + " had no peers — trying source " + next + "…";
       id = next;
@@ -1922,7 +1922,7 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
       body.appendChild(d);
     }
     // The row marker sits inside the collapsed list; ▶ is here, so the warning is too.
-    const camNote=camNotice(sources);
+    const camNote=noReleaseNotice(sources);
     if(camNote) body.appendChild(el("div",{className:"camnote",textContent:camNote}));
     const anyPartial=sources.some(s=>typeof s.partial_pct==="number");
     const collapsed=()=>`More sources (${sources.length})`+(anyPartial?" · ↓ resume available":"");
@@ -1957,9 +1957,13 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
       row.appendChild(el("span",{className:"s "+health,
         title:fresh?"just aired — seed counts unreliable for a day or so; tap to try (spela verifies real delivery)":"",
         textContent:fresh?"🌱 new":(health==="dead"?"⚠ ":"")+sc+"🌱"}));
-      // A tap on a marked cam row is the one way a cam plays: the server refuses it
-      // from every other path (`refuses_cam`).
-      row.onclick=()=>doPlay(r.cam?{result_id:r.id,allow_cam:true}:{result_id:r.id});
+      // A tap on a marked row is the one way it plays: the server refuses it from
+      // every other path (`refusal_for_marked`).
+      // A release named for another year is a different film with the same title.
+      if(r.other_year!=null) row.appendChild(el("span",{className:"disc",
+        title:"this release is named for "+r.other_year+", so it is a different film with the same title",
+        textContent:"⚠ "+r.other_year+" film"}));
+      row.onclick=()=>doPlay(isMarked(r)?{result_id:r.id,allow_marked:true}:{result_id:r.id});
       box.appendChild(row);
     });
     tg.onclick=()=>{box.classList.toggle("open");
@@ -2550,14 +2554,24 @@ async function runSearch(q){
     fillDetailLine(card, show.title||"", true);
     return;
   }
+  // A film that is not out yet: the same card an unaired episode gets, with its date.
+  const unrel=!res.length ? unreleasedNote(show, Date.now()) : null;
+  if(unrel){
+    const grid=el("div",{className:"detail"});
+    const card=posterCard({poster:show.poster_url, title:show.title||"", detailLine:true,
+      airsNote:unrel, rtTitle:show.title||""});
+    grid.appendChild(card); out.innerHTML=""; out.appendChild(grid);
+    fillDetailLine(card, show.title||"", false);
+    return;
+  }
   if(!res.length){ out.innerHTML=`<div class="state"><div class="big">No playable sources</div>Nothing found for “${esc(q)}”. Try the Movies / TV toggle.</div>`; return; }
   const grid=el("div",{className:"detail"});
   const card=posterCard({
     poster:show.poster_url, title:show.title||res[0].title, detailLine:true, seLabel,
     epName: se&&se.name?se.name:undefined,
     cta:"Play best source", sources:res,
-    // No ▶ when the best source is a cam copy: the card says there is no release yet.
-    onPlay:camNotice(res)?undefined:()=>doPlay({result_id:res[0].id}, card),
+    // No ▶ when the best source is marked: the card says there is no release yet.
+    onPlay:noReleaseNotice(res)?undefined:()=>doPlay({result_id:res[0].id}, card),
     onMarkWatched:()=>markWatched(show.title||res[0].title, show.imdb_id),
     rtTitle:show.title||res[0].title, followBtn:fb, airInfo,
     // Just-aired episode → its swarm is still forming, so low/0 seed counts are
@@ -2790,22 +2804,36 @@ async function castViaPlay(spec, retry){
 /* Fast-play: search a title + play its best source directly (the ▶ on Continue /
    New-Episodes rows). Skips the manual search→tap-play step. Shows the loading
    surface instantly, then hands off to the normal doPlay (target-aware). */
-// When the BEST source is a cam copy there is no release yet: the ranker puts cams below
-// every real source that can play, so a cam leads only while a film is still in cinemas.
-// ▶ is then withheld and this is shown in its place (Fredrik, 2026-10-04: cam and telesync
-// "are generally not nice to watch"). The cam rows stay in the list, marked, and a tap on
-// one is a deliberate choice (`allow_cam`). Null when a real source leads.
-function camNotice(sources){
+// A MARKED result is listed but never played automatically: a cam copy, or a release of
+// a different film with the same title (the server's `plays_only_by_hand`). A tap on its
+// row is a deliberate choice and sends `allow_marked`.
+function isMarked(r){ return !!(r && (r.cam || r.other_year!=null)); }
+// When the BEST source is marked there is no release yet: the ranker puts marked results
+// below every real source that can play, so one leads only when nothing real exists. ▶ is
+// then withheld and this is shown in its place (Fredrik, 2026-10-04: cam and telesync "are
+// generally not nice to watch"). Null when a real source leads.
+function noReleaseNotice(sources){
   const best=(sources||[])[0];
-  return best&&best.cam ? "No release yet · only cam copies so far, filmed in a cinema" : null;
+  if(!best) return null;
+  if(best.other_year!=null) return "No release yet · the only source is a different film, from "+best.other_year;
+  return best.cam ? "No release yet · only cam copies so far, filmed in a cinema" : null;
+}
+// A film whose release date is still ahead: the server does not search for sources at all
+// (whatever is listed under its id is another film or a fake), so the list is empty and
+// this says why. Null for a series, a released film, or an unknown date.
+function unreleasedNote(show, nowMs){
+  const d=show&&show.release_date;
+  if(!d || !/^\d{4}-\d{2}-\d{2}/.test(d)) return null;
+  const today=new Date(nowMs).toISOString().slice(0,10);
+  return d.slice(0,10)>today ? "Not released yet · out "+fmtDate(d.slice(0,10)) : null;
 }
 // The next source the VLC rotation may try after `id` went dead, or null. It never moves
-// onto a cam copy by itself; a rotation that STARTED on one was asked for one. Mirrors
+// onto a marked result by itself; a rotation that STARTED on one was asked for one. Mirrors
 // `next_fallback_source` on the server, which does the same for the Chromecast walk.
-function nextVlcSource(shot, id, startedOnCam){
-  const isCam = rid => { const r=(shot||[]).find(x=>x.id===rid); return !!(r&&r.cam); };
+function nextVlcSource(shot, id, startedOnMarked){
+  const marked = rid => { const r=(shot||[]).find(x=>x.id===rid); return !!(r && (r.cam || r.other_year!=null)); };
   for(let next=id+1; next<=(shot||[]).length; next++){
-    if(startedOnCam || !isCam(next)) return next;
+    if(startedOnMarked || !marked(next)) return next;
   }
   return null;
 }
@@ -2830,10 +2858,10 @@ async function fastPlay(query, isTV, poster){
   // not "no playable sources", which is a statement about the film.
   if(d&&d.failed){ showPlayError(query,poster,d.error,()=>fastPlay(query,isTV,poster)); return; }
   const first=(d&&d.results&&d.results[0]);
+  // Not out yet, or nothing but marked results: nothing is played, nothing to retry.
+  const notYet=first ? noReleaseNotice(d.results) : unreleasedNote(d&&d.show, Date.now());
+  if(notYet){ showPlayError(query,poster,notYet,null); return; }
   if(!first){ showPlayError(query,poster,"No playable sources for “"+esc(query)+"”.",()=>fastPlay(query,isTV,poster)); return; }
-  // Only cam copies exist: nothing is played, and there is nothing to retry.
-  const camNote=camNotice(d.results);
-  if(camNote){ showPlayError(query,poster,camNote,null); return; }
   const meta={title:(d.show&&d.show.title)||query, poster_url:poster||(d.show&&d.show.poster_url)||""};
   doPlay({result_id:first.id, ...meta}, null);
   // Fast-play never shows the search card, so a complete copy on disk that is NOT the

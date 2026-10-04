@@ -1157,7 +1157,7 @@ fn maybe_resume_stream_on_boot(state: SharedState, prev: CurrentStream) {
             quality: prev.quality.clone(),
             size: prev.size.clone(),
             poster_url: prev.poster_url.clone(),
-            allow_cam: None,
+            allow_marked: None,
         };
         let r = play_request(&state, &mut req, SourceFallback::None).await;
         if let Some(err) = r.0.get("error").and_then(|e| e.as_str()) {
@@ -1480,6 +1480,14 @@ async fn maybe_race_sources(
         .iter()
         .filter(|r| r.id >= rid && !r.magnet.is_empty())
         .filter(|r| crate::search::race_candidate_is_not_a_downgrade(&r.title, &chosen_title))
+        // Nor onto a result that plays only by hand, unless the pick is one.
+        .filter(|r| {
+            !r.plays_only_by_hand()
+                || search
+                    .results
+                    .iter()
+                    .any(|c| c.id == rid && c.plays_only_by_hand())
+        })
         .take(state.config.race_max_sources)
         .map(|r| (r.magnet.clone(), r.file_index))
         .collect();
@@ -1623,6 +1631,14 @@ async fn maybe_race_sources_for_vlc(state: &SharedState, rid: usize) -> Option<u
         .iter()
         .filter(|r| r.id >= rid && !r.magnet.is_empty())
         .filter(|r| crate::search::race_candidate_is_not_a_downgrade(&r.title, &chosen_title))
+        // Nor onto a result that plays only by hand, unless the pick is one.
+        .filter(|r| {
+            !r.plays_only_by_hand()
+                || search
+                    .results
+                    .iter()
+                    .any(|c| c.id == rid && c.plays_only_by_hand())
+        })
         .take(state.config.race_max_sources)
         .map(|r| (r.magnet.clone(), r.file_index))
         .collect();
@@ -1739,10 +1755,11 @@ pub struct PlayRequest {
     /// that is governed by stream type (live vs VOD HLS). See spela
     /// CLAUDE.md § "DMR overlay is stream-type-dependent".
     pub poster_url: Option<String>,
-    /// 2026-10-04: play this search result even though it is a cam copy. Sent by
-    /// the remote only for a tap on a row marked as one. See `refuses_cam`.
-    #[serde(default)]
-    pub allow_cam: Option<bool>,
+    /// 2026-10-04: play this search result even though it is MARKED (a cam copy,
+    /// or a release of a different film). Sent by the remote only for a tap on a
+    /// row marked as one. See `refusal_for_marked`.
+    #[serde(default, alias = "allow_cam")]
+    pub allow_marked: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -2003,17 +2020,18 @@ pub(crate) fn next_fallback_source(
     results: &[crate::search::TorrentResult],
     rid: usize,
 ) -> Option<usize> {
-    // The walk never lands on a cam copy by itself (2026-10-04): when the real
-    // sources are exhausted the honest answer is that nothing worked, not a film
-    // shot off a cinema screen. A walk that STARTED on a cam was asked for one.
-    let from_cam = results
+    // The walk never lands on a cam copy, or on a release of a different film, by
+    // itself (2026-10-04): when the real sources are exhausted the honest answer
+    // is that nothing worked. A walk that STARTED on a marked result was asked
+    // for one. See `TorrentResult::plays_only_by_hand`.
+    let from_marked = results
         .iter()
         .find(|r| r.id == rid)
-        .is_some_and(|r| crate::search::is_cam_source(&r.title));
+        .is_some_and(|r| r.plays_only_by_hand());
     results
         .iter()
         .filter(|r| r.id > rid && !r.magnet.is_empty())
-        .filter(|r| from_cam || !crate::search::is_cam_source(&r.title))
+        .filter(|r| from_marked || !r.plays_only_by_hand())
         .map(|r| r.id)
         .min()
 }
@@ -2023,27 +2041,35 @@ pub(crate) fn next_fallback_source(
 pub(crate) const NO_RELEASE_YET: &str =
     "No release yet. Only cam copies exist so far, filmed in a cinema.";
 
-/// A cam copy plays only when it was asked for BY NAME (2026-10-04, Fredrik: cam
-/// and telesync "are generally not nice to watch", so a film that has nothing
-/// else is reported as not released yet).
+/// A marked result plays only when it was asked for BY NAME (2026-10-04).
+///
+/// Two kinds are marked (`TorrentResult::plays_only_by_hand`): a cam copy
+/// (Fredrik: cam and telesync "are generally not nice to watch", so a film that
+/// has nothing else is reported as not released yet), and a release of a
+/// DIFFERENT film with the same title.
 ///
 /// The gate is here, on the server, because every client plays "result 1"
 /// without looking at it: the remote's play button, the one-tap rows, the CLI,
 /// the voice assistant and the kiosk. A deliberate tap on a marked row sends
-/// `allow_cam`. A play that names no search result (a bare magnet, a library
-/// title) is not judged.
-fn refuses_cam(req: &PlayRequest, search: Option<&crate::search::SearchResult>) -> bool {
-    if req.allow_cam == Some(true) {
-        return false;
+/// `allow_marked`. A play that names no search result (a bare magnet, a library
+/// title) is not judged. `None` means the play may go ahead.
+fn refusal_for_marked(
+    req: &PlayRequest,
+    search: Option<&crate::search::SearchResult>,
+) -> Option<String> {
+    if req.allow_marked == Some(true) {
+        return None;
     }
-    let (Some(rid), Some(search)) = (req.result_id, search) else {
-        return false;
-    };
-    search
+    let result = search?
         .results
         .iter()
-        .find(|r| r.id == rid)
-        .is_some_and(|r| crate::search::is_cam_source(&r.title))
+        .find(|r| Some(r.id) == req.result_id)?;
+    if let Some(year) = result.other_year {
+        return Some(format!(
+            "No release yet. The only source is a different film of the same name, from {year}."
+        ));
+    }
+    crate::search::is_cam_source(&result.title).then(|| NO_RELEASE_YET.to_string())
 }
 
 /// The Chromecast a finished `do_play` is streaming to, read from its success value
@@ -2156,8 +2182,8 @@ async fn play_request(
     // release its resources before touching the shared transcoder.
     let search = AppState::load_last_search(&state.state_dir);
     // Before anything is cancelled: a refused play must not stop what is playing.
-    if refuses_cam(req, search.as_ref()) {
-        return Json(json!({"error": NO_RELEASE_YET, "no_release_yet": true}));
+    if let Some(why) = refusal_for_marked(req, search.as_ref()) {
+        return Json(json!({"error": why, "no_release_yet": true}));
     }
     if req.target.as_deref() == Some("shannon") {
         return do_play(
@@ -2438,7 +2464,7 @@ pub(crate) fn replay_request_from_current(current: &CurrentStream, seek_to: f64)
         quality: current.quality.clone(),
         size: current.size.clone(),
         poster_url: current.poster_url.clone(),
-        allow_cam: None,
+        allow_marked: None,
     }
 }
 
@@ -6688,7 +6714,7 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         quality: Some(best.quality.clone()),
         size: Some(best.size.clone()),
         poster_url: result.show.as_ref().and_then(|s| s.poster_url.clone()),
-        allow_cam: None,
+        allow_marked: None,
     };
 
     handle_play(State(state.clone()), Json(play_req)).await
@@ -12055,6 +12081,7 @@ mod tests {
             file_index: None,
             partial_pct: None,
             cam: false,
+            other_year: None,
         }
     }
 
@@ -12138,34 +12165,56 @@ mod tests {
     }
 
     #[test]
-    fn a_cam_copy_plays_only_when_it_was_asked_for_by_name() {
+    fn a_marked_result_plays_only_when_it_was_asked_for_by_name() {
+        // Result 5 is the real wrong-film release Torrentio listed under Street
+        // Fighter (2026) on 2026-10-04; `other_year` is what the search marks it with.
+        let mut results = cam_list();
+        let mut other = ranked_source(5, "magnet:?xt=urn:btih:a");
+        other.title = "Uliczny wojownik-Street Fighter 1994 [HLG HDR SDR] [1080p.BluRay.H264.AC3..5.1.AS76-FT] [Lektor PL] [Alusia].mkv".into();
+        other.other_year = Some(1994);
+        results.push(other);
         let search = crate::search::SearchResult {
             query: "project hail mary".into(),
             show: None,
             searching: None,
             error: None,
             torrent_available: true,
-            results: cam_list(),
+            results,
         };
-        let play = |result_id: Option<usize>, allow_cam: Option<bool>| {
+        let play = |result_id: Option<usize>, allow_marked: Option<bool>| {
             let mut req: PlayRequest = serde_json::from_value(json!({})).unwrap();
             req.result_id = result_id;
-            req.allow_cam = allow_cam;
+            req.allow_marked = allow_marked;
             req
         };
+        let refused = |req: &PlayRequest| refusal_for_marked(req, Some(&search));
         // "Play result 3" from any client that did not look at it: refused.
-        assert!(refuses_cam(&play(Some(3), None), Some(&search)));
-        assert!(refuses_cam(&play(Some(3), Some(false)), Some(&search)));
+        assert_eq!(
+            refused(&play(Some(3), None)).as_deref(),
+            Some(NO_RELEASE_YET)
+        );
+        assert!(refused(&play(Some(3), Some(false))).is_some());
+        // A release of a different film is refused too, and says which year.
+        let why = refused(&play(Some(5), None)).expect("another film is not played");
+        assert!(why.contains("1994"), "{why}");
         // The marked row, tapped on purpose.
-        assert!(!refuses_cam(&play(Some(3), Some(true)), Some(&search)));
+        assert_eq!(refused(&play(Some(3), Some(true))), None);
+        assert_eq!(refused(&play(Some(5), Some(true))), None);
         // A real source is never judged, nor is a play that names no result.
-        assert!(!refuses_cam(&play(Some(1), None), Some(&search)));
-        assert!(!refuses_cam(&play(None, None), Some(&search)));
-        assert!(!refuses_cam(&play(Some(3), None), None));
-        // The wire form the remote sends for that deliberate tap.
-        let wire: PlayRequest =
-            serde_json::from_value(json!({"result_id": 3, "allow_cam": true})).unwrap();
-        assert!(!refuses_cam(&wire, Some(&search)));
+        assert_eq!(refused(&play(Some(1), None)), None);
+        assert_eq!(refused(&play(None, None)), None);
+        assert_eq!(refusal_for_marked(&play(Some(3), None), None), None);
+        // The wire form the remote sends for that deliberate tap, and the name the
+        // field had for a few hours, which an already-open page may still send.
+        for body in [
+            json!({"result_id": 3, "allow_marked": true}),
+            json!({"result_id": 3, "allow_cam": true}),
+        ] {
+            let wire: PlayRequest = serde_json::from_value(body).unwrap();
+            assert_eq!(refused(&wire), None);
+        }
+        // The walk steps over the other film exactly as it steps over a cam.
+        assert_eq!(next_fallback_source(&search.results, 2), None);
         // And a race may not hand a real pick over to a cam of the same resolution.
         let (real, cam) = (&search.results[0].title, &search.results[2].title);
         assert!(!crate::search::race_candidate_is_not_a_downgrade(cam, real));
@@ -14028,6 +14077,7 @@ mod tests {
             file_index: Some(0),
             partial_pct: None,
             cam: false,
+            other_year: None,
         };
 
         let pct = result_partial_pct(dir.path(), &four_k)
@@ -14079,6 +14129,7 @@ mod tests {
             file_index: Some(0),
             partial_pct: None,
             cam: false,
+            other_year: None,
         };
         assert_eq!(
             result_partial_pct(dir.path(), &four_k),
@@ -14102,6 +14153,7 @@ mod tests {
             file_index: Some(0),
             partial_pct: None,
             cam: false,
+            other_year: None,
         };
         let dir = tempfile::tempdir().unwrap();
         // ~32%-downloaded sparse partial named like a real release (the Pantheon

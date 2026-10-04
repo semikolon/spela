@@ -188,10 +188,26 @@ pub struct TorrentResult {
     /// remote can say why such a release sits where it does.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cam: bool,
+    /// 2026-10-04: the year this release NAMES, when it is a different year from
+    /// the film that was searched: a release of another film with the same title
+    /// (see `release_year_mismatch`). Set once for a film search, when the list
+    /// is fetched; never set for a series.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_year: Option<u16>,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+impl TorrentResult {
+    /// A result that is listed and marked but never played automatically: a cam
+    /// copy, or a release of a different film. It plays only from a deliberate
+    /// tap on its marked row. The play button, the one-tap rows, the fallback
+    /// walk and the source race all step over it.
+    pub fn plays_only_by_hand(&self) -> bool {
+        self.other_year.is_some() || is_cam_source(&self.title)
+    }
 }
 
 pub struct SearchEngine {
@@ -929,15 +945,8 @@ impl SearchEngine {
         let results = if unaired {
             Vec::new()
         } else {
-            self.torrentio_streams(
-                &imdb_id,
-                &show_info.title,
-                show_info.original_language.as_deref(),
-                Some(s),
-                Some(e),
-                show_info.runtime_min,
-            )
-            .await?
+            self.torrentio_streams(&imdb_id, &show_info, Some(s), Some(e))
+                .await?
         };
         Ok(SearchResult {
             query: query.into(),
@@ -997,16 +1006,21 @@ impl SearchEngine {
             }
         };
 
-        let results = self
-            .torrentio_streams(
-                &imdb_id,
-                &show_info.title,
-                show_info.original_language.as_deref(),
-                None,
-                None,
-                show_info.runtime_min,
-            )
-            .await?;
+        // A film that has not been released has no real source: whatever Torrentio
+        // lists under its id is another film or a fake. Same guard as an unaired
+        // episode, and for the same reason. Anchor 2026-10-04: Street Fighter
+        // (2026, out 13 October) returned the 1994 film and a 360p "Official Full
+        // Movie" upload, and the play button would have played the first.
+        let unreleased = show_info
+            .release_date
+            .as_deref()
+            .is_some_and(is_future_date);
+        let results = if unreleased {
+            Vec::new()
+        } else {
+            self.torrentio_streams(&imdb_id, &show_info, None, None)
+                .await?
+        };
         Ok(SearchResult {
             query: query.into(),
             show: Some(show_info),
@@ -1078,12 +1092,13 @@ impl SearchEngine {
     async fn torrentio_streams(
         &self,
         imdb_id: &str,
-        show_title: &str,
-        original_language: Option<&str>,
+        show: &ShowInfo,
         season: Option<u32>,
         episode: Option<u32>,
-        runtime_min: Option<u32>,
     ) -> Result<Vec<TorrentResult>> {
+        let show_title = show.title.as_str();
+        let original_language = show.original_language.as_deref();
+        let runtime_min = show.runtime_min;
         let path = match (season, episode) {
             (Some(s), Some(e)) => format!("stream/series/{}:{}:{}.json", imdb_id, s, e),
             _ => format!("stream/movie/{}.json", imdb_id),
@@ -1164,6 +1179,14 @@ impl SearchEngine {
         // as a top-seeded candidate for a `The Boys` S05E03 query (IMDb-ID
         // routed, no cross-show data should have been possible — but it was).
         let mut results = filter_results_by_show_title(results, show_title);
+        // A film's releases name its year. One naming a different year is another
+        // film with the same title; mark it, and the ranker and the play paths do
+        // the rest. A series has no single year (`release_date` is a film field).
+        if let Some(year) = film_year(show.release_date.as_deref()) {
+            for r in results.iter_mut() {
+                r.other_year = release_year_mismatch(&r.title, show_title, year);
+            }
+        }
         rank_results_mut_opts(
             &mut results,
             RankOpts {
@@ -1724,6 +1747,7 @@ fn torrent_results_from_streams(resp: &Value) -> Vec<TorrentResult> {
                 file_index: s["fileIdx"].as_u64().map(|n| n as u32),
                 partial_pct: None, // enriched by the /search handler (media_dir scan)
                 cam: false,        // written by the ranker
+                other_year: None,  // written by `torrentio_streams` for a film
             }
         })
         .collect()
@@ -1930,6 +1954,7 @@ struct RankKey {
 /// judges an H.264 swarm against the best HEVC swarm in the SAME bucket.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 struct RankBucket {
+    other_film: bool,
     unaddressable: bool,
     dv_gate: bool,
     cam: bool,
@@ -1950,6 +1975,11 @@ fn rank_cmp(a: &TorrentResult, b: &TorrentResult, ctx: &RankCtx<'_>) -> std::cmp
 }
 
 fn rank_bucket(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankBucket {
+    // Before everything (2026-10-04): the right film. A release that names a
+    // different year is another film with the same title, and no property of it
+    // matters after that. Marked when the list is fetched (`release_year_mismatch`).
+    let other_film = r.other_year.is_some();
+
     // Tier 0: a release spela can ADDRESS beats one it cannot.
     //
     // Torrentio reports which file inside a torrent is the video (`fileIdx`).
@@ -2039,12 +2069,50 @@ fn rank_bucket(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankBucket {
     let lang = effective_lang_tier(r, ctx.original_language);
 
     RankBucket {
+        other_film,
         unaddressable,
         dv_gate,
         cam,
         res,
         lang,
     }
+}
+
+/// The year of a film from TMDB's `release_date` (`YYYY-MM-DD`).
+fn film_year(release_date: Option<&str>) -> Option<u16> {
+    release_date?
+        .get(..4)?
+        .parse()
+        .ok()
+        .filter(|y| (1900..=2099).contains(y))
+}
+
+/// The year a release names, when it is NOT the year of the film searched for.
+///
+/// Films share titles: Street Fighter 1994 and 2026, Dune 1984 and 2021, The
+/// Lion King 1994 and 2019. Torrentio sometimes lists one under the other's id,
+/// and the title filter matches on the words of the title alone.
+///
+/// A release is the other film only when it names a year and NONE of the years
+/// it names is within one of the film's (a festival year and a release year
+/// differ by one often enough). Years that are part of the film's own TITLE do
+/// not count: `Blade.Runner.2049.2017`, `Wonder.Woman.1984.2020`,
+/// `2001.A.Space.Odyssey.1968`. No year in the name → no judgement.
+///
+/// Checked 2026-10-04 against Torrentio's lists for eight films, 436 releases,
+/// four of them with a number in the title: nothing genuine was flagged.
+fn release_year_mismatch(release_title: &str, film_title: &str, film_year: u16) -> Option<u16> {
+    let title_tokens = release_tokens(film_title);
+    let named: Vec<u16> = release_tokens(release_title)
+        .iter()
+        .filter(|t| t.len() == 4 && !title_tokens.contains(t))
+        .filter_map(|t| t.parse::<u16>().ok())
+        .filter(|y| (1900..=2099).contains(y))
+        .collect();
+    if named.iter().any(|y| y.abs_diff(film_year) <= 1) {
+        return None;
+    }
+    named.first().copied()
 }
 
 /// Is this release a cam-class copy: filmed off a cinema screen, or pulled from
@@ -2661,7 +2729,7 @@ fn best_1080p_bytes_per_pixel(results: &[TorrentResult], ceiling_secs: Option<f6
     let best = results
         .iter()
         // A cam copy's bytes are not picture, so it cannot set the bar for one.
-        .filter(|r| resolution_tier(&r.title) == 0 && !is_cam_source(&r.title))
+        .filter(|r| resolution_tier(&r.title) == 0 && !r.plays_only_by_hand())
         .filter_map(bytes_per_pixel)
         .fold(None, |acc: Option<f64>, v| {
             Some(acc.map_or(v, |a: f64| a.max(v)))
@@ -3985,6 +4053,7 @@ mod tests {
             file_index,
             partial_pct: None,
             cam: false,
+            other_year: None,
         }
     }
 
@@ -5912,6 +5981,130 @@ mod tests {
                 "transcoding={transcoding}: a cam at {} outranks a real source at {last_playable_real}",
                 cams[0]
             );
+        }
+    }
+
+    /// Real release names throughout. The two Street Fighter names are everything
+    /// Torrentio listed under the unreleased 2026 film on 2026-10-04. The others
+    /// are from its lists for films that carry a number in the title, which is
+    /// where a naive year check goes wrong.
+    #[test]
+    fn test_release_year_mismatch_finds_another_film_and_spares_numbered_titles() {
+        // The 1994 film, listed under the 2026 one.
+        assert_eq!(
+            release_year_mismatch(
+                "Uliczny wojownik-Street Fighter 1994 [HLG HDR SDR] [1080p.BluRay.H264.AC3..5.1.AS76-FT] [Lektor PL] [Alusia].mkv",
+                "Street Fighter",
+                2026
+            ),
+            Some(1994)
+        );
+        // A release that names the right year is not judged on the year, whatever
+        // else is wrong with it. (This one is why an unreleased film is not
+        // searched at all: the year check cannot catch a fake.)
+        assert_eq!(
+            release_year_mismatch(
+                "STREET FIGHTER (2026) Official Full Movie Vidyut Jammwal New Blockbuster Action Movie (640x360).mp4",
+                "Street Fighter",
+                2026
+            ),
+            None
+        );
+        // One year out is the same film: these telesyncs say 2025 for a 2026 film.
+        assert_eq!(
+            release_year_mismatch(
+                "Project.Hail.Mary.2025.1080p.hdts.h264.Dual YG.mkv",
+                "Project Hail Mary",
+                2026
+            ),
+            None
+        );
+        // A year that is part of the TITLE is not the release year. The last two
+        // name no release year at all, so there is nothing to judge.
+        for (release, title, year) in [
+            (
+                "Blade.Runner.2049.2017.1080p.BluRay.x264-SPARKS.mkv",
+                "Blade Runner 2049",
+                2017,
+            ),
+            (
+                "Blade Runner (2017) 2049 1080p Surround.mp4",
+                "Blade Runner 2049",
+                2017,
+            ),
+            (
+                "Wonder.Woman.1984.2020.1080p.BluRay.x264.AAC5.1-[YTS.MX].mp4",
+                "Wonder Woman 1984",
+                2020,
+            ),
+            (
+                "2001.A.Space.Odyssey.1968.1080p.BluRay.x264-[YTS.AM].mp4",
+                "2001: A Space Odyssey",
+                1968,
+            ),
+            ("1917.2019.720p.BluRay.x264.AAC.mp4", "1917", 2019),
+            (
+                "Blade Runner 2049.HDRip.XviD.AC3-EVO.avi",
+                "Blade Runner 2049",
+                2017,
+            ),
+            ("Wonder Woman 1984 4K.mkv", "Wonder Woman 1984", 2020),
+        ] {
+            assert_eq!(
+                release_year_mismatch(release, title, year),
+                None,
+                "{release}"
+            );
+        }
+        // The film's year, from TMDB's date.
+        assert_eq!(film_year(Some("2026-10-13")), Some(2026));
+        assert_eq!(film_year(Some("")), None);
+        assert_eq!(film_year(None), None);
+    }
+
+    /// A release of another film sinks below everything, a cam included, and is
+    /// one of the results that never plays by itself. The third name is the real
+    /// one; the first two are CONSTRUCTED, because the 2026 film has no releases
+    /// to copy yet.
+    #[test]
+    fn test_another_film_ranks_last_and_plays_only_by_hand() {
+        let mut list = vec![
+            make_sized(1, "Street.Fighter.2026.1080p.TELESYNC.x264-GRP.mkv", 900, "3 GB"),
+            make_sized(2, "Street.Fighter.2026.720p.WEB-DL.x264-GRP.mkv", 3, "1 GB"),
+            make_sized(3, "Uliczny wojownik-Street Fighter 1994 [HLG HDR SDR] [1080p.BluRay.H264.AC3..5.1.AS76-FT] [Lektor PL] [Alusia].mkv", 5000, "9 GB"),
+        ];
+        for r in list.iter_mut() {
+            r.other_year = release_year_mismatch(&r.title, "Street Fighter", 2026);
+        }
+        for transcoding in [true, false] {
+            let r = ranked(
+                list.clone(),
+                RankOpts {
+                    transcoding,
+                    original_language: Some("en"),
+                    pref: QualityPref::Auto,
+                    runtime_min: Some(120),
+                },
+            );
+            let order: Vec<&str> = r
+                .iter()
+                .map(|x| {
+                    if x.other_year.is_some() {
+                        "other film"
+                    } else if x.cam {
+                        "cam"
+                    } else {
+                        "real"
+                    }
+                })
+                .collect();
+            assert_eq!(
+                order,
+                ["real", "cam", "other film"],
+                "transcoding={transcoding}"
+            );
+            assert!(!r[0].plays_only_by_hand());
+            assert!(r[1].plays_only_by_hand() && r[2].plays_only_by_hand());
         }
     }
 

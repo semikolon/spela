@@ -107,6 +107,11 @@ threshold, which is how you get an ordering that changes depending on the input 
 a sort that panics. The ranker is a sort key with a derived order rather than a comparison
 function, so a rule that looks at the other candidate cannot be written.
 
+0. **The right film, before anything.** Films share titles, and the tracker sometimes
+   lists one under the other's id. A release naming a year more than one away from the
+   film's is the other film: it sinks to the bottom, marked, and never plays by itself.
+   Years that are part of the title do not count (`Blade.Runner.2049.2017`). A film
+   that has not been released yet is not searched at all, like an unaired episode.
 1. **A release spela can address first.** The tracker names which file inside a torrent
    is the video; when it cannot, spela has to fetch every file — fine for a single-file
    release, ruinous for a Blu-ray disc folder where the feature is one file among dozens

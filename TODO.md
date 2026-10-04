@@ -21,9 +21,10 @@ HDR is not a ranked axis, so an SDR 4K can lead an HDR one on thirteen seeds.
 ### 🔓 OPEN — 4 October 2026: the search and remote fixes, what is unproven and what is open
 
 **Live:** the ranker is a sort key (it cannot crash the sort again), the 40-result cut
-follows the final ranking, cam and telesync copies rank below every playable real source,
-the phone search field owns its own row, and the "unreachable" banner is decided by a
-liveness probe. Mechanics in `CLAUDE.md` § Hard-Won Lessons.
+follows the final ranking, cam and telesync copies and releases of a different film are
+marked and never play by themselves, a film that is not out yet is not searched, the phone
+search field owns its own row, and the "unreachable" banner is decided by a liveness probe.
+Mechanics in `CLAUDE.md` § Hard-Won Lessons.
 
 **Not exercised, so still unproven:**
 - **The banner on a real phone.** It is tested against a scripted fetch (eleven cases in
@@ -37,15 +38,6 @@ liveness probe. Mechanics in `CLAUDE.md` § Hard-Won Lessons.
   sources, all cam): the server refused the play on both `/play` and the job API with
   nothing started, and the remote's own code drew that result with the note and no ▶. What
   was not done is letting a tapped cam row actually download and play.
-
-**Seen 4 October, not proposed yet: a release of a DIFFERENT film can pass the title
-filter.** Searching *Street Fighter* (2026, not yet released) returned two sources, both
-the 1994 film: `Uliczny wojownik-Street Fighter 1994 [HLG HDR SDR]`. Torrentio listed
-them under the 2026 film's id, the title filter matches on the words of the title only,
-and nothing compares the YEAR in a release name with the film's `release_date`. ▶ would
-have played the 1994 film as the 2026 one. A year in the name that differs from the
-film's by more than one is the obvious signal; remakes and sequels sharing a title are
-exactly where it matters.
 
 **Open idea, not proposed yet: a crashed handler should say so.** A panic in a request
 handler closes the connection with no reply, which through the proxy is an HTTP 502. The
