@@ -780,12 +780,6 @@
     .tgt,.tbtn,.topt,.newbadge,nav a,.seg button,.toast button,.banner button,
     .markw,.followbtn,.rtlink{
       position:relative;overflow:hidden;transition:box-shadow .25s ease}
-  /* The quality segment sits beside Movies/TV and must read as secondary to it:
-     the primary choice is what to watch. Smaller type, dimmer until chosen. */
-  .qseg{margin-left:.5rem}
-  .qseg button{font-size:.78rem;padding:.42rem .6rem;opacity:.72}
-  .qseg button.on{opacity:1}
-  @media (max-width:560px){ .qseg{margin-left:0;margin-top:.4rem} }
     /* FRUGAL HINT — hold Shift and the play buttons say what they will do.
        Uses ::before because ::after belongs to the hover gleam, and sits behind
        @media (hover:hover) for the same reason the gleam does: iOS strands
@@ -859,6 +853,28 @@
     #v-search .card{overflow:visible;transition:none}
     #v-search .card::after{content:none}
     #v-search .card:hover{box-shadow:none}
+  }
+  /* The quality segment sits beside Movies/TV and must read as secondary to it:
+     the primary choice is what to watch. Smaller type, dimmer until chosen.
+     OUTSIDE the hover block above since 2026-10-03: these rules sat inside
+     `@media (hover:hover)` by accident, so no touch device ever received them
+     and the phone drew the quality segment at full size, 320px of a 348px row. */
+  .qseg{margin-left:.5rem}
+  .qseg button{font-size:.78rem;padding:.42rem .6rem;opacity:.72}
+  .qseg button.on{opacity:1}
+  /* PHONE SEARCH BAR (2026-10-03). One unwrapping row cannot hold an input and
+     two segments: measured at 375px the input was 39px wide and the quality
+     segment ran to x=606, past the edge and unreachable (overflow-x is clipped).
+     The input takes the whole first row. The segments share the second where
+     the quality buttons can keep a 44px touch width, and the quality segment
+     drops to a third, full-width row where they cannot (that is what the 184px
+     basis decides). Scoped to .searchbar: .seg is used by other views. */
+  @media (max-width:560px){
+    .searchbar{flex-wrap:wrap}
+    .searchbar input{flex:1 1 100%}
+    .searchbar .seg button{padding:.5rem .6rem}
+    .searchbar .qseg{flex:1 1 184px;margin-left:0}
+    .searchbar .qseg button{flex:1 1 0;justify-content:center;padding:.42rem .2rem}
   }
   @keyframes spelaGleam{0%{transform:translateX(-120%)}100%{transform:translateX(120%)}}
   @keyframes spelaTextGleam{ from{background-position:130% 0} to{background-position:-30% 0} }
