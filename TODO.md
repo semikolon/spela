@@ -1,5 +1,76 @@
 # Spela TODOs 🎬🍿
 
+### 🟡 PROPOSED, NOT BUILT — 4 October 2026: size stops counting once the picture is good enough
+
+**Status: designed, awaiting Fredrik's ruling. Nothing in the ranker changes before he approves.**
+
+**What prompted it.** After the 40-result cut was moved behind the final ranking
+(`75ed963`), a VLC search for Project Hail Mary leads with a **75.71 GB** 4K remux with
+**26 seeds**. Fredrik: *"75 GB... maybe we need some kinda 'big enough but not too fat'
+soft rule?"*
+
+**Measured on the recorded list** (`tests/fixtures/torrentio/project_hail_mary_2026.json`,
+runtime 157 min from `/title-meta`), 45 releases at 2160p:
+
+| kind | size | bitrate | seeds |
+|---|---|---|---|
+| disc remuxes | 75–80 GB | 65–69 Mbps | 8–384, most under 75 |
+| 4K disc encodes | 30–40 GB | 27–34 Mbps | 75–162 |
+| 4K streaming copies (WEB-DL) | 23–28 GB | 20–24 Mbps | **1,036 and 1,049** |
+| thin "4K" | 7–11 GB | 6–9 Mbps | 231–578 |
+
+Two rules produce the 75 GB pick, and the second is the less obvious one:
+
+1. **`size_tier` has no ceiling.** Bigger always ranks higher, so a remux beats every
+   encode however little the extra bytes show.
+2. **The starvation floor's yardstick is the fattest 1080p in the list.**
+   `best_1080p_bytes_per_pixel` takes the MAXIMUM, and this list holds a 41 GB and a 40 GB
+   1080p. Against that, a 27.59 GB 4K HEVC scores 0.29 of the reference and a 39.79 GB one
+   0.41, both under the 0.5 floor, so they rank below ALL 1080p. The live VLC list showed
+   exactly two 4K releases in its top 40, both remuxes. On a big title Auto therefore means
+   "remux or nothing". Same shape as the disc-image case: the yardstick is won by the
+   candidate that breaks its premise.
+
+**The disk is not the constraint, the cache cap is.** `/mnt/hdd` has 167 GB free of 916.
+spela's own cache (`MAX_MEDIA_MB`) is 100 GB and held 84 GB on 4 October, so a 75 GB
+download makes the pruner evict about 59 GB of other titles.
+
+**The proposed rule.** Bitrate = size ÷ runtime, weighted for codec as today (HEVC × 1.7).
+Each resolution gets an "enough" level. Below it, bigger still ranks higher, exactly as
+now. At or above it, releases TIE on size and the later tiers decide: non-DV first, then
+seeds. The same ceiling is applied to the 1080p yardstick, so a 4K is judged against a
+good 1080p rather than against a remux.
+
+- Starting levels, to be tuned by watching, not argued: 2160p about 18–20 Mbps HEVC,
+  1080p about 10–12 Mbps H.264. Anchored on what Fredrik has already chosen and been
+  happy with: Star City S01E08 at 2160p / ~24 Mbps, The Diplomat S03E07 at 2160p /
+  19 Mbps; and on what he rejected: 1080p at 5.2 Mbps "still visibly compressed".
+- Runtime comes from TMDB, which `title_meta` already fetches (movie `runtime`; an
+  episode's runtime for TV). **Unknown runtime → no ceiling, today's behaviour.**
+- Expressed as a per-release value (a clamp on the size band), so it fits `RankKey`
+  without a pairwise rule.
+- **The 4K pill keeps today's behaviour**: no floor, no ceiling, fattest first. The remux
+  stays one tap away for the night he wants it. Saver is unaffected (it inverts size).
+- Expected result on this list, NOT yet run: a 23–28 GB streaming-grade 4K with 1,000+
+  seeds leads on VLC. Chromecast's pick is unchanged (the 29 GB 1080p is the best-seeded
+  release above the 1080p level).
+
+**Considered and rejected.**
+- *A fixed size cap* ("never above 40 GB"). Size is not the thing being judged: a
+  three-and-a-half-hour film needs more than a forty-minute episode does.
+- *A cap relative to the list* (say twice the median size at that resolution). Needs no
+  runtime, but it depends on what happens to be listed, which is the fragility the
+  1080p yardstick already has.
+- *Demoting thin swarms.* Removed on 2026-09-06 and stays removed. The ceiling gets the
+  useful half of it for free: among sufficient releases, seeds break the tie.
+- *Penalising large files outright.* A soft rule should stop rewarding fat, not punish it;
+  where every release is a remux, the best one should still win.
+
+**Optional, independent of the above:** never let Auto pick a file larger than some share
+of the cache cap. It is a fact about the machine rather than a judgement about picture,
+but with the ceiling in place Auto reaches a remux only when nothing else is sufficient,
+so it may never fire. Not proposed for now.
+
 ### 🔓 OPEN — 3 October 2026: the play path is bounded and live; what is still open
 
 **Live on the server (commit `aec8d7e`).** A play is a server job the remote polls
