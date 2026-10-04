@@ -215,5 +215,142 @@ const mkPoll = (answer, S, onRender) =>
      "missing quality and size leave the labels empty rather than 'undefined'");
 }
 
+// --- The "spela unreachable" banner: a verdict from a probe, not from a failed request ---
+// The banner used to be set by whichever request last failed and cleared by whichever next
+// succeeded. On 2026-10-03 a search crashed its handler: directly that read as "unreachable"
+// while the server answered everything else, and through the proxy it arrived as HTTP 502,
+// parsed to {} and drew an empty result. These run the real client against a scripted fetch.
+{
+  // `extract` matches plain declarations only; the client is mostly async.
+  const extractAny = (name) => {
+    const m = new RegExp(`(^|\\n)(async\\s+)?function ${name}\\s*\\(`).exec(src);
+    if (!m) throw new Error(`helper ${name}() not found as a top-level function declaration`);
+    const start = src.indexOf("function " + name, m.index);
+    // Skip the parameter list first: `api(path,{method="GET",…}={})` has braces of its
+    // own, and matching from the first `{` would stop at the end of that default.
+    let p = src.indexOf("(", start), parens = 0;
+    for (; p < src.length; p++) {
+      if (src[p] === "(") parens++;
+      else if (src[p] === ")" && --parens === 0) break;
+    }
+    let depth = 0;
+    for (let i = src.indexOf("{", p); i < src.length; i++) {
+      if (src[i] === "{") depth++;
+      else if (src[i] === "}" && --depth === 0) {
+        return (m[2] ? "async " : "") + src.slice(start, i + 1);
+      }
+    }
+    throw new Error(`unbalanced braces extracting ${name}()`);
+  };
+  const CLIENT = ["setBanner", "isGatewayDown", "requestFailure", "probeOnce", "probeServer",
+    "markReachable", "markUnreachable", "scheduleRecover", "recheckNow", "api"];
+  const body = CLIENT.map(extractAny).join("\n");
+
+  // `script(url)` returns a status number, a {status, json} pair, or throws.
+  const boot = (script, doc = { hidden: false }) => {
+    const log = { bannerOn: false, bannerMsg: "", routed: 0, probes: 0 };
+    const banner = { classList: { toggle: (_c, on) => { log.bannerOn = on; } } };
+    const msg = { set textContent(v) { log.bannerMsg = v; } };
+    const $ = (sel) => (sel === "#banner" ? banner : msg);
+    const fetch = async (url, opts = {}) => {
+      if (url === "/status") log.probes++;
+      const out = script(url, opts);
+      const status = typeof out === "number" ? out : out.status;
+      const json = typeof out === "number" ? {} : out.json;
+      return {
+        ok: status >= 200 && status < 300, status,
+        json: async () => { if (json === undefined) throw new Error("not json"); return json; },
+      };
+    };
+    const env = new Function("fetch", "$", "route", "pollNow", "document", `
+      let reachable=true, probing=null, recoverT=null;
+      const PROBE_TIMEOUT_MS=200, PROBE_RETRY_MS=1, RECOVER_EVERY_MS=5;
+      ${body}
+      return { api, recheckNow, reachable: () => reachable, armed: () => recoverT !== null };
+    `)(fetch, $, () => { log.routed++; }, () => {}, doc);
+    return { ...env, log };
+  };
+  const netErr = () => { throw new TypeError("Failed to fetch"); };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // One request dies, the server is fine: no banner, and the caller is told which it was.
+  {
+    const c = boot((url) => (url === "/status" ? 200 : netErr()));
+    const d = await c.api("/search?q=x");
+    eq([d.failed, c.log.bannerOn, c.reachable()], [true, false, true],
+       "a dropped request with a healthy server is that request's failure, not 'unreachable'");
+  }
+  // The same crash seen through the proxy: HTTP 502 on the request, /status still answers.
+  {
+    const c = boot((url) => (url === "/status" ? 200 : 502));
+    const d = await c.api("/search?q=x");
+    eq([d.failed, /HTTP 502/.test(d.error), c.log.bannerOn], [true, true, false],
+       "a 502 on one request is reported with its status and raises no banner");
+  }
+  // The server really is gone, directly: every fetch fails.
+  {
+    const c = boot(netErr);
+    let threw = false;
+    try { await c.api("/home"); } catch { threw = true; }
+    eq([threw, c.log.bannerOn, c.log.probes, c.armed()], [true, true, 2, true],
+       "no answer from the probe either (two attempts): banner on, recovery armed");
+  }
+  // The server really is gone, behind the proxy: 502 on everything, the probe included.
+  // This is the case that used to draw an empty page with no banner at all.
+  {
+    const c = boot(() => 502);
+    let threw = false;
+    try { await c.api("/home"); } catch { threw = true; }
+    eq([threw, c.log.bannerOn], [true, true],
+       "a gateway status on the probe too means the server is down: banner on");
+  }
+  // It comes back by itself: no tap needed, and the view is redrawn once.
+  {
+    let up = false;
+    const c = boot(() => (up ? 200 : netErr()));
+    try { await c.api("/home"); } catch {}
+    up = true;
+    await sleep(60);
+    eq([c.log.bannerOn, c.reachable(), c.armed(), c.log.routed], [false, true, false, 1],
+       "the recovery probe clears the banner, stops its own timer and redraws the view");
+  }
+  // While the tab is hidden nothing keeps probing; returning to it checks at once.
+  {
+    let up = false;
+    const doc = { hidden: true };
+    const c2 = boot(() => (up ? 200 : netErr()), doc);
+    try { await c2.api("/home"); } catch {}
+    await sleep(40);
+    const probesWhileHidden = c2.log.probes;
+    await sleep(40);
+    eq([c2.log.probes === probesWhileHidden, c2.armed(), c2.log.bannerOn], [true, false, true],
+       "a hidden tab stops probing and keeps the banner");
+    up = true; doc.hidden = false;
+    await c2.recheckNow();
+    eq([c2.log.bannerOn, c2.log.routed], [false, 1], "coming back to the tab re-checks at once");
+  }
+  // An aborted request is the user's own doing: no probe, no banner.
+  {
+    const c = boot(() => { const e = new Error("aborted"); e.name = "AbortError"; throw e; });
+    let name = "";
+    try { await c.api("/search?q=x"); } catch (e) { name = e.name; }
+    eq([name, c.log.probes, c.log.bannerOn], ["AbortError", 0, false],
+       "an aborted request is rethrown untouched");
+  }
+  // Ordinary answers pass straight through, error bodies included.
+  {
+    const c = boot((url) => (url.startsWith("/search")
+      ? { status: 200, json: { error: "No results" } } : { status: 200, json: { ok: 1 } }));
+    eq(await c.api("/search?q=x"), { error: "No results" }, "the server's own JSON error is passed through");
+    eq((await c.api("/x")).failed, undefined, "a normal answer carries no failure flag");
+  }
+  // A 500 that is not JSON is that request failing, and is said so rather than read as {}.
+  {
+    const c = boot((url) => (url === "/status" ? 200 : { status: 500 }));
+    const d = await c.api("/play");
+    eq([d.failed, c.log.bannerOn], [true, false], "a non-JSON 500 is a request failure, not an empty answer");
+  }
+}
+
 console.log(failed === 0 ? "ALL PASS" : `${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

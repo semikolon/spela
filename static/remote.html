@@ -1043,25 +1043,108 @@ const S={
   followedIds:null   // Set<tmdb_id> of followed shows; lazily loaded (ensureFollowedIds)
 };
 
-/* ---------- API client (abortable; network err -> banner) ---------- */
-let reachable=true;
+/* ---------- API client (abortable; the banner is decided by a liveness probe) ----------
+   The banner means ONE thing: the spela server cannot be reached right now.
+
+   Until 2026-10-04 it was a latch set by whichever request last failed and cleared
+   by whichever next succeeded, and that made it wrong in three ways:
+   - ONE request failing is not the server being down. A search that crashed its
+     handler (2026-10-03) dropped the connection, so the remote said "unreachable"
+     while every other endpoint answered.
+   - Behind the proxy the opposite happened. A dead or crashed spela arrives as HTTP
+     502/503/504, which is a RESPONSE, so nothing failed, the body parsed to {} and
+     the view drew an empty result. The banner never fired on the address the phone
+     uses, and the crashed search read as "nothing found".
+   - Nothing re-checked. A single failed request on a view that does not poll (a
+     phone waking before its Wi-Fi is back) left the banner up until Retry was tapped.
+
+   So a failed request is EVIDENCE, and the verdict comes from asking the server
+   directly: GET /status. Probe answers -> the server is fine and only that request
+   failed, reported to its caller as {error, failed:true}. Probe fails -> banner on,
+   and a recovery probe every 3s takes it down again by itself.
+
+   LIFETIME of that recovery timer: it exists only while the banner is up. It is
+   cleared on recovery and does not re-arm while the tab is hidden; coming back to
+   the tab (or the network returning) probes at once. */
+let reachable=true, probing=null, recoverT=null;
+const PROBE_TIMEOUT_MS=4000, PROBE_RETRY_MS=700, RECOVER_EVERY_MS=3000;
 function setBanner(on,msg){ const b=$("#banner"); if(msg)$("#bannerMsg").textContent=msg;
   b.classList.toggle("on",on); }
+// A gateway status is the proxy speaking for a server that did not answer.
+function isGatewayDown(status){ return status===502||status===503||status===504; }
+function requestFailure(status){
+  return {failed:true, error: status
+    ? "The server failed on this request (HTTP "+status+"). spela itself is running."
+    : "This request failed. spela itself is running."};
+}
+async function probeOnce(){
+  const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),PROBE_TIMEOUT_MS);
+  try{ const r=await fetch("/status",{cache:"no-store",signal:ac.signal}); return r.ok; }
+  catch(e){ return false; }
+  finally{ clearTimeout(t); }
+}
+// One verdict shared by every caller that asks while it is being reached. Two
+// attempts, because the first request after a phone wakes often fails on its own.
+function probeServer(){
+  if(!probing){
+    probing=(async()=>{
+      try{
+        if(await probeOnce()) return true;
+        await new Promise(r=>setTimeout(r,PROBE_RETRY_MS));
+        return await probeOnce();
+      } finally{ probing=null; }
+    })();
+  }
+  return probing;
+}
+function markReachable(){
+  if(reachable) return;
+  reachable=true; clearTimeout(recoverT); recoverT=null; setBanner(false);
+  route(); pollNow(true);   // the view on screen was drawn from failed requests
+}
+function markUnreachable(){
+  reachable=false; setBanner(true,"spela unreachable"); scheduleRecover();
+}
+function scheduleRecover(){
+  clearTimeout(recoverT);
+  recoverT=setTimeout(async()=>{
+    recoverT=null;
+    if(reachable||document.hidden) return;   // hidden: visibilitychange resumes it
+    if(await probeServer()) markReachable(); else scheduleRecover();
+  },RECOVER_EVERY_MS);
+}
+async function recheckNow(){
+  if(reachable) return;
+  if(await probeServer()) markReachable(); else scheduleRecover();
+}
 async function api(path,{method="GET",body,signal}={}){
+  let r;
   try{
-    const r=await fetch(path,{method,signal,
+    r=await fetch(path,{method,signal,
       headers:body?{"Content-Type":"application/json"}:undefined,
       body:body?JSON.stringify(body):undefined});
-    const j=await r.json().catch(()=>({}));
-    if(!reachable){reachable=true;setBanner(false);}
-    return j;
   }catch(e){
     if(e.name==="AbortError") throw e;
-    reachable=false; setBanner(true,"spela unreachable");
-    throw e;
+    if(await probeServer()){ markReachable(); return requestFailure(0); }
+    markUnreachable(); throw e;
   }
+  if(isGatewayDown(r.status)){
+    if(await probeServer()){ markReachable(); return requestFailure(r.status); }
+    markUnreachable(); throw new Error("spela unreachable (HTTP "+r.status+")");
+  }
+  markReachable();
+  const j=await r.json().catch(()=>null);
+  if(j===null) return r.ok ? {} : requestFailure(r.status);
+  return j;
 }
-$("#bannerRetry").onclick=()=>{ setBanner(false); route(); pollNow(true); };
+$("#bannerRetry").onclick=async()=>{
+  $("#bannerMsg").textContent="Checking…";
+  if(await probeServer()) markReachable();
+  else{ setBanner(true,"spela unreachable"); scheduleRecover(); }
+};
+// Page-lifetime listeners, deliberately never removed: the page is their scope.
+document.addEventListener("visibilitychange",()=>{ if(!document.hidden) recheckNow(); });
+window.addEventListener("online",recheckNow);
 
 let toastT;
 // Open a source directly in VLC (native HEVC/Dolby-Vision decode, full seek, no
@@ -2430,6 +2513,8 @@ async function runSearch(q){
   catch(e){ if(e.name==="AbortError")return;
     out.innerHTML=`<div class="state"><div class="big">spela unreachable</div>Check the connection and retry.</div>`; return; }
   S.search.data=d;
+  // The request itself failed while the server is up (see `api`): that is not "no match".
+  if(d.failed){ out.innerHTML=`<div class="state"><div class="big">Search failed</div>${esc(d.error)}<div style="margin-top:.6rem;font-size:.82rem">Try again in a moment.</div></div>`; return; }
   if(d.error){ out.innerHTML=`<div class="state"><div class="big">No match</div>${esc(d.error)}<div style="margin-top:.6rem;font-size:.82rem">Try the Movies / TV toggle above.</div></div>`; return; }
   const res=d.results||[];
   const show=d.show||{}, year=(show.release_date||"").slice(0,4);
