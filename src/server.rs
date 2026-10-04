@@ -12002,6 +12002,7 @@ mod tests {
             info_hash: String::new(),
             file_index: None,
             partial_pct: None,
+            cam: false,
         }
     }
 
@@ -13897,6 +13898,7 @@ mod tests {
             info_hash: "x".into(),
             file_index: Some(0),
             partial_pct: None,
+            cam: false,
         };
 
         let pct = result_partial_pct(dir.path(), &four_k)
@@ -13947,6 +13949,7 @@ mod tests {
             info_hash: "x".into(),
             file_index: Some(0),
             partial_pct: None,
+            cam: false,
         };
         assert_eq!(
             result_partial_pct(dir.path(), &four_k),
@@ -13969,6 +13972,7 @@ mod tests {
             info_hash: "x".into(),
             file_index: Some(0),
             partial_pct: None,
+            cam: false,
         };
         let dir = tempfile::tempdir().unwrap();
         // ~32%-downloaded sparse partial named like a real release (the Pantheon

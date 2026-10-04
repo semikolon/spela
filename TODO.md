@@ -18,30 +18,12 @@ resolution (`enough_mbps` in `src/search.rs`; reasoning and the rejected alterna
 **Not built, and not proposed yet:** AV1 is counted as H.264 (no efficiency weight), and
 HDR is not a ranked axis, so an SDR 4K can lead an HDR one on thirteen seeds.
 
-### 🟡 PROPOSED, NOT BUILT — a cam or telesync copy is ranked as if it were picture (2026-10-04)
-
-**Awaiting Fredrik's ruling: this is ranking policy.** Nothing in the ranker reads the
-SOURCE of a release. Torrentio labels them (`quality` = `TeleSync`, `CAM`), and the names
-say `TELESYNC`, `HDCAM`, `HDTS`, but a cam copy that says 1080p sits in the 1080p bucket
-and is ranked on size and seeds like any other.
-
-Measured on the live Project Hail Mary list for the Chromecast: three `1080p.TELESYNC`
-releases at ranks 9, 10 and 13 of 40 (8.26 GB / 271 seeds, 8.69 GB / 103, 6.99 GB / 58),
-above every genuine copy smaller than they are. None leads here only because they fall
-under the 1080p level (7 Mbps against 9). **A telesync above the level would tie with the
-real copies and seeds would decide**, and in the weeks before a film reaches streaming the
-telesync is the well-seeded one.
-
-Proposal: one more tier before resolution, the same shape as addressability. A cam-class
-source (`CAM`, `HDCAM`, `TS`, `HDTS`, `TELESYNC`, `TC`, `TELECINE`, matched as exact
-release tokens as the language markers are) ranks below every real source, marked in the
-list, never dropped: when a cam is all there is, it should still be found.
-
 ### 🔓 OPEN — 4 October 2026: the search and remote fixes, what is unproven and what is open
 
 **Live:** the ranker is a sort key (it cannot crash the sort again), the 40-result cut
-follows the final ranking, the phone search field owns its own row, and the "unreachable"
-banner is decided by a liveness probe. Mechanics in `CLAUDE.md` § Hard-Won Lessons.
+follows the final ranking, cam and telesync copies rank below every playable real source,
+the phone search field owns its own row, and the "unreachable" banner is decided by a
+liveness probe. Mechanics in `CLAUDE.md` § Hard-Won Lessons.
 
 **Not exercised, so still unproven:**
 - **The banner on a real phone.** It is tested against a scripted fetch (eleven cases in
@@ -50,6 +32,9 @@ banner is decided by a liveness probe. Mechanics in `CLAUDE.md` § Hard-Won Less
   the banner should either not appear or clear by itself within seconds.
 - **The phone search bar on the device itself.** Measured in an emulated 375 px and 402 px
   viewport only.
+- **The cam notice on the title card.** No film in the recorded lists has a cam as its
+  best source, so `camNotice` is covered by its unit test only. It will first be seen on
+  a film that is still in cinemas.
 
 **Open idea, not proposed yet: a crashed handler should say so.** A panic in a request
 handler closes the connection with no reply, which through the proxy is an HTTP 502. The

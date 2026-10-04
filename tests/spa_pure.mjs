@@ -215,6 +215,18 @@ const mkPoll = (answer, S, onRender) =>
      "missing quality and size leave the labels empty rather than 'undefined'");
 }
 
+// --- camNotice: ▶ on a cam copy is announced, not prevented ---------------------------
+// The ranker puts a cam copy below every real source that can play, so the best source is
+// a cam only when nothing better exists: a film still in cinemas. The row marker is inside
+// the collapsed list, so the card and the one-tap path say it where ▶ is.
+{
+  const camNotice = new Function(extract("camNotice") + "\nreturn camNotice;")();
+  eq(camNotice([{ id: 1, cam: true }, { id: 2 }]) !== null, true, "a cam leading the list is announced");
+  eq(camNotice([{ id: 1 }, { id: 2, cam: true }]), null, "a cam further down is the row marker's job");
+  eq(camNotice([]), null, "an empty list must not throw");
+  eq(camNotice(null), null, "a missing list must not throw");
+}
+
 // --- The "spela unreachable" banner: a verdict from a probe, not from a failed request ---
 // The banner used to be set by whichever request last failed and cleared by whichever next
 // succeeded. On 2026-10-03 a search crashed its handler: directly that read as "unreachable"

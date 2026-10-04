@@ -138,6 +138,7 @@
   .src-toggle.has-partial{color:var(--good)}
   /* 2026-10-03: a complete copy on disk is said on the card itself, not only inside
      the collapsed source list. Same green as the on-disk row in that list. */
+  .camnote{display:block;margin:.55rem .7rem;color:var(--warn);font-weight:700;font-size:.88rem}
   .ondisk{display:block;margin:.55rem .7rem;padding:.45rem .7rem;border:1px solid var(--good);
     border-radius:9px;background:linear-gradient(90deg,rgba(55,200,122,.16),var(--bg3));
     color:var(--good);font-size:.8rem;font-weight:700;text-align:left}
@@ -308,6 +309,7 @@
     .detail .body>.meta .t{font-size:1.2rem;-webkit-line-clamp:3}
     .detail .body>.play{margin:.75rem 0 0;max-width:260px}
     .detail .body>.ondisk{margin:.65rem 0 0}
+    .detail .body>.camnote{margin:.65rem 0 0}
     .detail .body>.src-toggle{text-align:left;margin:.65rem 0 0}
     .detail .body>.sources{margin:.5rem 0 0;align-self:stretch}
     .detail .sources.open{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.45rem}
@@ -1917,6 +1919,9 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
       d.onclick=()=>doPlay({result_id:disk.id});
       body.appendChild(d);
     }
+    // The row marker sits inside the collapsed list; ▶ is here, so the warning is too.
+    const camNote=camNotice(sources);
+    if(camNote) body.appendChild(el("div",{className:"camnote",textContent:camNote}));
     const anyPartial=sources.some(s=>typeof s.partial_pct==="number");
     const collapsed=()=>`More sources (${sources.length})`+(anyPartial?" · ↓ resume available":"");
     const tg=el("button",{className:"src-toggle"+(anyPartial?" has-partial":""),textContent:collapsed()});
@@ -1942,6 +1947,11 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
       if(r.file_index==null) row.appendChild(el("span",{className:"disc",
         title:"no single video file named in this torrent — playing it downloads every file in it",
         textContent:"⚠ whole torrent"}));
+      // A copy filmed in a cinema (`is_cam_source` in search.rs). The ranker put it
+      // below every real source; this says why, so a deliberate tap is informed.
+      if(r.cam) row.appendChild(el("span",{className:"disc",
+        title:"filmed off a cinema screen or a projector feed, not taken from a disc or a stream",
+        textContent:"⚠ cam copy"}));
       row.appendChild(el("span",{className:"s "+health,
         title:fresh?"just aired — seed counts unreliable for a day or so; tap to try (spela verifies real delivery)":"",
         textContent:fresh?"🌱 new":(health==="dead"?"⚠ ":"")+sc+"🌱"}));
@@ -2775,6 +2785,13 @@ async function castViaPlay(spec, retry){
 /* Fast-play: search a title + play its best source directly (the ▶ on Continue /
    New-Episodes rows). Skips the manual search→tap-play step. Shows the loading
    surface instantly, then hands off to the normal doPlay (target-aware). */
+// When the BEST source is a cam copy, ▶ plays a film shot off a cinema screen. The
+// ranker only lets that happen when no real source can play, which is the normal state
+// of a film still in cinemas, so it is said rather than prevented. Null otherwise.
+function camNotice(sources){
+  const best=(sources||[])[0];
+  return best&&best.cam ? "⚠ The best source is a cam copy, filmed in a cinema" : null;
+}
 async function fastPlay(query, isTV, poster){
   if(!S.target){ S.pending=()=>fastPlay(query,isTV,poster); toast("Pick where to play — it starts right after"); openSheet(); return; }
   setMode(isTV?"tv":"movie"); $("#q").value=query; S.search.q=query;
@@ -2792,6 +2809,9 @@ async function fastPlay(query, isTV, poster){
   let d; try{ d=await api("/search?q="+encodeURIComponent(query)+(isTV?"&tv=1":"&movie=1")+tq+fq); }
   catch{ showPlayError(query,poster,"spela unreachable",()=>fastPlay(query,isTV,poster)); return; }
   S.search.data=d;
+  // The search request itself failed while the server is up (see `api`): say that,
+  // not "no playable sources", which is a statement about the film.
+  if(d&&d.failed){ showPlayError(query,poster,d.error,()=>fastPlay(query,isTV,poster)); return; }
   const first=(d&&d.results&&d.results[0]);
   if(!first){ showPlayError(query,poster,"No playable sources for “"+esc(query)+"”.",()=>fastPlay(query,isTV,poster)); return; }
   const meta={title:(d.show&&d.show.title)||query, poster_url:poster||(d.show&&d.show.poster_url)||""};
@@ -2799,6 +2819,8 @@ async function fastPlay(query, isTV, poster){
   // Fast-play never shows the search card, so a complete copy on disk that is NOT the
   // best source would go unmentioned while the best one downloads. Say so, with the
   // way to take it. Tapping it starts a new play, which cancels the one in flight.
+  const camNote=camNotice(d.results);
+  if(camNote) toast(camNote);
   const disk=onDiskOffer(d.results);
   if(disk && !disk.isBest){
     toastAction(`On disk: ${disk.what}`, "Play that copy", ()=>doPlay({result_id:disk.id, ...meta}, null));

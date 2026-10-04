@@ -115,7 +115,12 @@ function, so a rule that looks at the other candidate cannot be written.
 2. **Non-Dolby-Vision first**, and this one is a hard gate for the Chromecast: consumer
    NVENC cannot parse a DV profile 5/7 RPU, so those releases produce no output at all.
    For native decoding it is a preference rather than a gate. Plain HDR10 is unaffected.
-3. **Resolution, scoped to the target.** A Chromecast is a 1080p screen fed by a
+3. **A real source before a cam copy.** A release filmed in a cinema still says 1080p
+   and still has a size, so everything below would rank it as picture. It is read from
+   the release name after the year, not from the tracker's quality label, which calls
+   every release of a film titled *Cam* a cam. Like the first tier it sinks and is
+   marked rather than removed: while a film is only in cinemas, a cam is all there is.
+4. **Resolution, scoped to the target.** A Chromecast is a 1080p screen fed by a
    transcoder, so `1080p > 720p > 480p > 2160p`. A 4K monitor decoding natively is the
    other way round, `2160p > 1080p > 720p > 480p`, because a 1080p source upscaled twice
    reads as soft at close distance whatever its bitrate. The one thing that can still
@@ -125,12 +130,12 @@ function, so a rule that looks at the other candidate cannot be written.
    not itself a remux look starved. That comparison is
    weighted by codec, since HEVC gets substantially more picture out of the same byte
    than H.264 does, and ignoring that refused legitimate 4K releases by a hair.
-4. **Language fit** against the show's original language: a clean release, then a
+5. **Language fit** against the show's original language: a clean release, then a
    multi-market or dual-language one, then a foreign dub.
-5. **H.264 over HEVC**, but only for targets that re-encode through NVENC, where H.264
+6. **H.264 over HEVC**, but only for targets that re-encode through NVENC, where H.264
    plays instantly, and not when the best-seeded HEVC has thirty times its seeds. Skipped
    entirely for native decoding.
-6. **Bitrate, via file size, up to "good enough".** Every candidate in one search is the
+7. **Bitrate, via file size, up to "good enough".** Every candidate in one search is the
    same minutes, so size *is* bitrate, in logarithmic bands. That holds only while the
    size is one file, which is what the first tier is there to guarantee. With the runtime
    from TMDB the size becomes megabits per second, and each resolution has a level past
@@ -138,7 +143,7 @@ function, so a rule that looks at the other candidate cannot be written.
    1080p. Releases at or above it tie and the next tier decides. A disc remux at 65 Mbps
    costs three times the download, the wait and the cache of a 20 Mbps streaming copy for
    a difference few screens show, so it stays in the list without leading it.
-7. **More seeds**, as the final tiebreak.
+8. **More seeds**, as the final tiebreak.
 
 **Seeds prefer; they do not exclude.** A viability bar used to demote thin swarms
 outright, which is a prediction about delivery in a system that measures delivery: a

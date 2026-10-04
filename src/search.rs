@@ -183,6 +183,15 @@ pub struct TorrentResult {
     /// not computed. The web remote tints such sources green.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_pct: Option<u8>,
+    /// 2026-10-04: a copy filmed in a cinema or taken off a projector feed (see
+    /// `is_cam_source`). Written by the ranker for every result it ranks, so the
+    /// remote can say why such a release sits where it does.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cam: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 pub struct SearchEngine {
@@ -1714,6 +1723,7 @@ fn torrent_results_from_streams(resp: &Value) -> Vec<TorrentResult> {
                 info_hash,
                 file_index: s["fileIdx"].as_u64().map(|n| n as u32),
                 partial_pct: None, // enriched by the /search handler (media_dir scan)
+                cam: false,        // written by the ranker
             }
         })
         .collect()
@@ -1922,6 +1932,7 @@ struct RankKey {
 struct RankBucket {
     unaddressable: bool,
     dv_gate: bool,
+    cam: bool,
     res: u32,
     lang: u32,
 }
@@ -1990,6 +2001,14 @@ fn rank_bucket(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankBucket {
     // the first second and revertible by moving this tier back up.
     let dv_gate = ctx.prefer_h264 && has_dolby_vision_in_title(&r.title);
 
+    // Tier 2 (2026-10-04): a real source beats a cam copy. A release filmed in a
+    // cinema or taken off a projector feed still says 1080p and still has a
+    // size, so every tier below would rank it as picture. It sits AFTER the two
+    // tiers above on purpose: those mark releases that cannot play properly at
+    // all, and a cam at least plays. Demoted, never dropped, by the same argument
+    // as tier 0: while a film is only in cinemas a cam is all there is.
+    let cam = is_cam_source(&r.title);
+
     // Tier 2 (v3.4.1): composite `effective_res_tier` value that bakes
     // seed-viability into the resolution bucket. See `effective_res_tier`
     // doc for the full mapping + the non-transitive-comparator history
@@ -2022,9 +2041,57 @@ fn rank_bucket(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankBucket {
     RankBucket {
         unaddressable,
         dv_gate,
+        cam,
         res,
         lang,
     }
+}
+
+/// Is this release a cam-class copy: filmed off a cinema screen, or pulled from
+/// a projector or a film reel, rather than taken from a disc or a stream?
+///
+/// Read from the release NAME, and only from the part after the year or the
+/// resolution, which is where scene names put the source. Both halves of that
+/// are load-bearing:
+///
+/// - Torrentio's own `quality` label is NOT usable. It labels every release of
+///   the 2018 film *Cam* as `CAM` (`Cam.2018.1080p.NF.WEB-DL.DD5.1.H264-CMRG`),
+///   because its parser reads the title as a source tag. Checked live 2026-10-04.
+/// - For the same reason a token BEFORE the year is the film's name, not a tag.
+///
+/// Tokens match exactly, never as substrings (`DTS` is not `TS`), and a trailing
+/// container extension is dropped first: `.ts` is an MPEG transport stream.
+/// A name with neither a year nor a resolution gets no judgement.
+pub(crate) fn is_cam_source(title: &str) -> bool {
+    let mut tokens = release_tokens(title);
+    if tokens.last().is_some_and(|t| {
+        matches!(
+            t.as_str(),
+            "MKV" | "MP4" | "AVI" | "TS" | "M2TS" | "M4V" | "MOV" | "WMV"
+        )
+    }) {
+        tokens.pop();
+    }
+    let is_year = |t: &str| {
+        t.len() == 4
+            && (t.starts_with("19") || t.starts_with("20"))
+            && t.bytes().all(|b| b.is_ascii_digit())
+    };
+    let is_res = |t: &str| {
+        matches!(
+            t,
+            "480P" | "576P" | "720P" | "1080P" | "2160P" | "4K" | "UHD"
+        )
+    };
+    let Some(anchor) = tokens.iter().position(|t| is_year(t) || is_res(t)) else {
+        return false;
+    };
+    tokens[anchor + 1..].iter().any(|t| {
+        matches!(
+            t.as_str(),
+            "CAM" | "CAMRIP" | "HDCAM" | "TS" | "HDTS" | "TELESYNC" | "TC" | "HDTC" | "TELECINE"
+        )
+    })
 }
 
 /// Codec preference for the TRANSCODING target, as a per-release value.
@@ -2171,6 +2238,7 @@ pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) 
     // and whether it delivers is settled by racing and the stall gate.
     for (i, r) in results.iter_mut().enumerate() {
         r.id = i + 1;
+        r.cam = is_cam_source(&r.title);
     }
 }
 
@@ -2587,7 +2655,8 @@ fn is_enough(r: &TorrentResult, runtime_secs: f64) -> bool {
 fn best_1080p_bytes_per_pixel(results: &[TorrentResult], ceiling_secs: Option<f64>) -> Option<f64> {
     let best = results
         .iter()
-        .filter(|r| resolution_tier(&r.title) == 0)
+        // A cam copy's bytes are not picture, so it cannot set the bar for one.
+        .filter(|r| resolution_tier(&r.title) == 0 && !is_cam_source(&r.title))
         .filter_map(bytes_per_pixel)
         .fold(None, |acc: Option<f64>, v| {
             Some(acc.map_or(v, |a: f64| a.max(v)))
@@ -3910,6 +3979,7 @@ mod tests {
             info_hash: "test".into(),
             file_index,
             partial_pct: None,
+            cam: false,
         }
     }
 
@@ -5756,6 +5826,90 @@ mod tests {
         ));
     }
 
+    /// Real release names. The seven cam-class copies are from the recorded
+    /// Project Hail Mary list. The five `Cam.2018` names are every release
+    /// Torrentio listed for the 2018 film "Cam" on 2026-10-04, each of which
+    /// Torrentio's own quality label calls `CAM` — the reason that label is not
+    /// what this reads.
+    #[test]
+    fn test_is_cam_source_reads_the_source_tag_and_not_the_title() {
+        for cam in [
+            "Project.Hail.Mary.2026.1080p.TELESYNC.HC.x264-SyncUP.mkv",
+            "Project.Hail.Mary.2025.1080p.hdts.h264.Dual YG.mkv",
+            "Project.Hail.Mary.2026.1080p.TELESYNC.V2.x264-SyncUP.mkv",
+            "Project.Hail.Mary.2026.1080p.TELESYNC.x264.ENG HIN TAM TEL-EaZy.mkv",
+            "Project.Hail.Mary.2025.1080p.HDTS-v2.h264.Dual YG.mkv",
+            "Project.Hail.Mary.2026.1080p.CAMRip.Dublado.Official.mkv",
+            "Project.Hail.Mary.2026.1080p.CAMRip.LAT.ENG.DUB.1XBET.mp4",
+        ] {
+            assert!(is_cam_source(cam), "a cam-class copy: {cam}");
+        }
+        for real in [
+            // A film whose TITLE is a source tag.
+            "Cam.2018.1080p.WEBRip.x264-[YTS.AM].mp4",
+            "Cam.2018.720p.WEBRip.x264-[YTS.AM].mp4",
+            "Cam.2018.WEB-DL.1080p.mkv",
+            "Cam.2018.1080p.NF.WEB-DL.DD5.1.H264-CMRG.mkv",
+            "Cam.2018.720p.WebRip.x264-[MoviesFD].mkv",
+            // Ordinary releases from the recorded list.
+            "Project.Hail.Mary.2026.2160p.WEB-DL.DDP5.1.Atmos.H.265-RDNYB.mkv",
+            "Project.Hail.Mary.2026.1080p.BluRay.x264-ZoroSenpai_EniaHD.mkv",
+            "Project.Hail.Mary.2026.Hybrid.2160p.UHD.Blu-ray.Remux.DV.HDR10P.HEVC.TrueHD.Atmos.7.1-CiNEPHiLES.mkv",
+        ] {
+            assert!(!is_cam_source(real), "a real source: {real}");
+        }
+        // Constructed, no recorded instance to copy: a transport-stream capture,
+        // whose extension is the same two letters as the telesync tag.
+        assert!(!is_cam_source("Some.Show.S01E01.1080p.HDTV.H264-GRP.ts"));
+        assert!(is_cam_source("Some.Film.2026.TS.x264-GRP.mkv"));
+        // A token that merely contains one is not one.
+        assert!(!is_cam_source(
+            "Some.Film.2026.1080p.BluRay.DTS.x264-GRP.mkv"
+        ));
+        // Neither a year nor a resolution: nothing says where the title ends.
+        assert!(!is_cam_source("Cam.mkv"));
+    }
+
+    /// 2026-10-04: three `1080p.TELESYNC` copies sat at ranks 9, 10 and 13 of 40 on
+    /// the Chromecast list, above every genuine copy smaller than they were.
+    #[test]
+    fn test_cam_copies_rank_below_every_playable_real_source_and_stay_listed() {
+        for transcoding in [true, false] {
+            let r = ranked(
+                project_hail_mary(),
+                RankOpts {
+                    transcoding,
+                    original_language: Some("en"),
+                    pref: QualityPref::Auto,
+                    runtime_min: Some(PROJECT_HAIL_MARY_MIN),
+                },
+            );
+            let cams: Vec<usize> = (0..r.len())
+                .filter(|&i| is_cam_source(&r[i].title))
+                .collect();
+            assert_eq!(cams.len(), 7, "demoted, never dropped");
+            assert!(
+                r.iter().all(|x| x.cam == is_cam_source(&x.title)),
+                "the ranker writes the flag the remote reads"
+            );
+            // A real source that can actually play: addressable, and not behind
+            // the Dolby Vision wall on the transcoding target.
+            let last_playable_real = (0..r.len())
+                .filter(|&i| {
+                    !is_cam_source(&r[i].title)
+                        && r[i].file_index.is_some()
+                        && !(transcoding && has_dolby_vision_in_title(&r[i].title))
+                })
+                .max()
+                .unwrap();
+            assert!(
+                last_playable_real < cams[0],
+                "transcoding={transcoding}: a cam at {} outranks a real source at {last_playable_real}",
+                cams[0]
+            );
+        }
+    }
+
     #[test]
     fn test_plausible_runtime() {
         assert_eq!(plausible_runtime_min(Some(157)), Some(157));
@@ -5784,20 +5938,23 @@ mod tests {
                     // this would be asserted over by a fixture that never
                     // exercises it.
                     for file_index in [Some(0u32), None] {
-                        id += 1;
-                        let mut r = make_sized(
-                            id as usize,
-                            &format!("Show.S01E01.{res}.WEB.{codec}-Grp.mkv"),
-                            seeds,
-                            size,
-                        );
-                        r.file_index = file_index;
-                        grid.push(r);
+                        // The source tag (tier 2) is an axis too, since 2026-10-04.
+                        for source in ["WEB", "TELESYNC"] {
+                            id += 1;
+                            let mut r = make_sized(
+                                id as usize,
+                                &format!("Show.S01E01.{res}.{source}.{codec}-Grp.mkv"),
+                                seeds,
+                                size,
+                            );
+                            r.file_index = file_index;
+                            grid.push(r);
+                        }
                     }
                 }
             }
         }
-        assert_eq!(grid.len(), 48);
+        assert_eq!(grid.len(), 96);
 
         // The yardsticks come from the whole SET, so the context is built once —
         // comparing a pair in isolation would judge it against a different
