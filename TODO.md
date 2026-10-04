@@ -15,6 +15,19 @@ resolution (`enough_mbps` in `src/search.rs`; reasoning and the rejected alterna
   likely case is a Netflix or Amazon 4K series, whose own streams run about 13–16 Mbps
   HEVC and are therefore below the 2160p level today.
 
+**Seen on the live lists 4 October, working as ruled but worth his eye:**
+- **The fattest copy still leads when it is also the best-seeded sufficient one.** Blade
+  Runner 2049 on VLC: the 77.97 GB remux has 211 seeds, the 22.2 GB 4K encode at 18 Mbps
+  has 6. Both are "enough", so they tie on size and seeds decide. For older films the
+  remux is often the copy people keep seeding. If that is not what "not too fat" should
+  mean, the next rule is a preference for the SMALLER of two sufficient copies once both
+  swarms are adequate; penalising size outright was rejected on 4 October.
+- **The Dolby Vision preference now decides more than it was written to.** It sits after
+  size and before seeds, and was meant to separate "two releases that are otherwise the
+  same pick". With the ceiling, every sufficient release ties on size, so a 1-seed
+  non-DV copy outranks a 6-seed DV one (Wonder Woman 1984). Seeds before the DV
+  preference would restore the intent.
+
 **Not built, and not proposed yet:** AV1 is counted as H.264 (no efficiency weight), and
 HDR is not a ranked axis, so an SDR 4K can lead an HDR one on thirteen seeds.
 
