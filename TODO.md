@@ -32,11 +32,20 @@ liveness probe. Mechanics in `CLAUDE.md` § Hard-Won Lessons.
   the banner should either not appear or clear by itself within seconds.
 - **The phone search bar on the device itself.** Measured in an emulated 375 px and 402 px
   viewport only.
-- **"No release yet" on a film that has only cam copies.** No recorded list has a cam as
-  its best source, so the withheld ▶, the card's note and the server's refusal are covered
-  by unit tests on real release names only. It will first be seen on a film that is still
-  in cinemas; that is the moment to look at the card and at one deliberate tap on a marked
-  row.
+- **A deliberate tap on a cam row, played through to the end.** The rest of "No release
+  yet" was checked on 4 October against *Verity* (in cinemas since 30 September, six
+  sources, all cam): the server refused the play on both `/play` and the job API with
+  nothing started, and the remote's own code drew that result with the note and no ▶. What
+  was not done is letting a tapped cam row actually download and play.
+
+**Seen 4 October, not proposed yet: a release of a DIFFERENT film can pass the title
+filter.** Searching *Street Fighter* (2026, not yet released) returned two sources, both
+the 1994 film: `Uliczny wojownik-Street Fighter 1994 [HLG HDR SDR]`. Torrentio listed
+them under the 2026 film's id, the title filter matches on the words of the title only,
+and nothing compares the YEAR in a release name with the film's `release_date`. ▶ would
+have played the 1994 film as the 2026 one. A year in the name that differs from the
+film's by more than one is the obvious signal; remakes and sequels sharing a title are
+exactly where it matters.
 
 **Open idea, not proposed yet: a crashed handler should say so.** A panic in a request
 handler closes the connection with no reply, which through the proxy is an HTTP 502. The
