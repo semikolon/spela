@@ -1041,35 +1041,35 @@ impl SearchEngine {
     /// best. Falls back to first result if no candidate clears the floor,
     /// preserving old behavior for genuine zero-overlap cases.
     async fn tmdb_search(&self, query: &str, media_type: &str) -> Result<Value> {
-        let (q_clean, q_year) = extract_year_from_query(query);
-        let api_q = if q_clean.is_empty() { query } else { &q_clean };
-        // TMDB's typed search accepts a year filter — use it when extractable.
-        // `/search/movie` uses `&year=` (primary_release_year);
-        // `/search/tv`    uses `&first_air_date_year=`.
-        let year_param = match (q_year, media_type) {
-            (Some(y), "movie") => format!("&year={}", y),
-            (Some(y), "tv") => format!("&first_air_date_year={}", y),
-            _ => String::new(),
-        };
-        let url = format!(
-            "https://api.themoviedb.org/3/search/{}?query={}{}&api_key={}",
-            media_type,
-            urlencoded(api_q),
-            year_param,
-            self.tmdb_key
-        );
-        let resp: Value = self.client.get(&url).send().await?.json().await?;
-        let results = resp["results"]
-            .as_array()
-            .ok_or_else(|| anyhow!("No {} found for \"{}\"", media_type, query))?;
-        let refs: Vec<&Value> = results.iter().collect();
-        if let Some(best) = pick_best_tmdb_candidate(&refs, api_q, q_year) {
-            return Ok(best.clone());
+        // A year-shaped number in a query is a release year OR part of the title,
+        // and nothing in the query says which. Reading it as a year alone made
+        // "Blade Runner 2049", "Wonder Woman 1984" and "Death Race 2000"
+        // unfindable (no film named "Blade Runner" came out in 2049), and sent
+        // "1917" to a film released in 1917. So both readings are asked and
+        // `choose_tmdb_match` decides. One extra request, only when a year-shaped
+        // number is present. (2026-10-04)
+        let readings = query_readings(query);
+        let mut found: Vec<Vec<Value>> = Vec::with_capacity(readings.len());
+        for (title, year) in &readings {
+            // TMDB's typed search accepts a year filter — use it when extractable.
+            // `/search/movie` uses `&year=` (primary_release_year);
+            // `/search/tv`    uses `&first_air_date_year=`.
+            let year_param = match (year, media_type) {
+                (Some(y), "movie") => format!("&year={}", y),
+                (Some(y), "tv") => format!("&first_air_date_year={}", y),
+                _ => String::new(),
+            };
+            let url = format!(
+                "https://api.themoviedb.org/3/search/{}?query={}{}&api_key={}",
+                media_type,
+                urlencoded(title),
+                year_param,
+                self.tmdb_key
+            );
+            let resp: Value = self.client.get(&url).send().await?.json().await?;
+            found.push(resp["results"].as_array().cloned().unwrap_or_default());
         }
-        // Fallback preserves old behavior for queries where nothing
-        // confidently matches (e.g. typos beyond title_similarity's reach).
-        refs.first()
-            .map(|v| (*v).clone())
+        choose_tmdb_match(&readings, &found)
             .ok_or_else(|| anyhow!("No {} found for \"{}\"", media_type, query))
     }
 
@@ -3192,10 +3192,15 @@ fn title_token_score(query: &str, cand: &str) -> f32 {
 /// Pure — testable without TMDB.
 fn extract_year_from_query(query: &str) -> (String, Option<u32>) {
     // Scan for a 4-digit token whose value is 1900..=2099, allowing
-    // surrounding `(` / `)` / whitespace. Use the FIRST match: a query like
-    // "2001 A Space Odyssey 1968" is rare and ambiguous; first-match prefers
-    // titles-that-open-with-a-year less than they'd suffer.
+    // surrounding `(` / `)` / whitespace. Use the LAST match (2026-10-04): a
+    // release year is written after the title in every form people and the web
+    // remote use ("Dune 2021", "Spring (2014)", and the year the remote appends
+    // to a row's title), so in "2001 A Space Odyssey 1968" and "Blade Runner 2049
+    // 2017" the trailing number is the year and the other one is the title. It
+    // was the FIRST match until then, which read those two as films from 2001
+    // and 2049.
     let bytes = query.as_bytes();
+    let mut last: Option<(String, u32)> = None;
     let mut i = 0;
     while i + 4 <= bytes.len() {
         // Find a digit run of exactly 4
@@ -3231,14 +3236,69 @@ fn extract_year_from_query(query: &str) -> (String, Option<u32>) {
                         // Collapse runs of whitespace.
                         let cleaned: String =
                             cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-                        return (cleaned, Some(year));
+                        last = Some((cleaned, year));
                     }
                 }
             }
         }
         i += 1;
     }
-    (query.to_string(), None)
+    match last {
+        Some((cleaned, year)) => (cleaned, Some(year)),
+        None => (query.to_string(), None),
+    }
+}
+
+/// The ways a query can be read, in the order they are tried: with its trailing
+/// year-shaped number as a RELEASE YEAR, and whole, as a title. A query with no
+/// such number, or one that is nothing but the number ("1917"), has one reading.
+fn query_readings(query: &str) -> Vec<(String, Option<u32>)> {
+    let (clean, year) = extract_year_from_query(query);
+    let mut readings = Vec::with_capacity(2);
+    if year.is_some() && !clean.is_empty() {
+        readings.push((clean, year));
+    }
+    readings.push((query.to_string(), None));
+    readings
+}
+
+/// Pick the TMDB result for a query, given what each reading of it found.
+///
+/// 1. A result whose title IS the whole query wins outright: someone who types
+///    "Blade Runner 2049" means the film called that, even if a film called
+///    "Blade Runner" had come out in 2049.
+/// 2. Otherwise the first reading with a confident pick, the year reading first,
+///    which is what keeps "Dune 2021" and "Street Fighter 2026" disambiguated.
+/// 3. Otherwise the first result of the first reading that found anything, the
+///    old behaviour for a query nothing matches confidently.
+fn choose_tmdb_match(readings: &[(String, Option<u32>)], found: &[Vec<Value>]) -> Option<Value> {
+    let title_of = |c: &Value| -> String {
+        title_norm(
+            c["title"]
+                .as_str()
+                .or_else(|| c["name"].as_str())
+                .unwrap_or(""),
+        )
+    };
+    if readings.len() > 1 {
+        if let (Some((whole, _)), Some(results)) = (readings.last(), found.last()) {
+            let want = title_norm(whole);
+            if let Some(exact) = results
+                .iter()
+                .filter(|c| title_of(c) == want)
+                .max_by_key(|c| c["vote_count"].as_u64().unwrap_or(0))
+            {
+                return Some(exact.clone());
+            }
+        }
+    }
+    for ((title, year), results) in readings.iter().zip(found) {
+        let refs: Vec<&Value> = results.iter().collect();
+        if let Some(best) = pick_best_tmdb_candidate(&refs, title, *year) {
+            return Some(best);
+        }
+    }
+    found.iter().find_map(|results| results.first().cloned())
 }
 
 /// 2026-06-09: Composite score for a TMDB search candidate (movie or tv),
@@ -6911,12 +6971,90 @@ mod tests {
     }
 
     #[test]
-    fn extract_year_first_match_wins_for_ambiguous() {
-        // "2001 A Space Odyssey 1968" — both look year-shaped. First wins
-        // (the canonical title leader is the common case).
+    fn extract_year_last_match_is_the_release_year() {
+        // Superseded 2026-10-04. This used to assert the FIRST match (2001, leaving
+        // "A Space Odyssey 1968"), which read the film as one from 2001. A release
+        // year is written after the title, so the last number is the year.
         let (q, y) = extract_year_from_query("2001 A Space Odyssey 1968");
-        assert_eq!(y, Some(2001));
-        assert_eq!(q, "A Space Odyssey 1968");
+        assert_eq!(y, Some(1968));
+        assert_eq!(q, "2001 A Space Odyssey");
+        // What the web remote sends for a row it knows the year of.
+        let (q, y) = extract_year_from_query("Blade Runner 2049 2017");
+        assert_eq!((q.as_str(), y), ("Blade Runner 2049", Some(2017)));
+    }
+
+    #[test]
+    fn a_query_is_read_both_as_title_plus_year_and_as_a_whole_title() {
+        assert_eq!(
+            query_readings("Blade Runner 2049"),
+            vec![
+                ("Blade Runner".to_string(), Some(2049)),
+                ("Blade Runner 2049".to_string(), None)
+            ]
+        );
+        // Nothing but the number: it can only be a title.
+        assert_eq!(query_readings("1917"), vec![("1917".to_string(), None)]);
+        assert_eq!(
+            query_readings("The Boys"),
+            vec![("The Boys".to_string(), None)]
+        );
+    }
+
+    /// Titles and years are the real films'; the candidate objects are built with
+    /// this module's `fake_candidate`, as the scorer tests around it are.
+    #[test]
+    fn a_year_shaped_number_in_a_title_is_not_mistaken_for_a_release_year() {
+        let movie = |t: &str, date: &str, votes: u64| fake_candidate(t, "movie", date, votes);
+        // "Blade Runner 2049": no film called "Blade Runner" came out in 2049, so
+        // the year reading finds nothing and the whole-title reading finds the film.
+        let readings = query_readings("blade runner 2049");
+        let found = vec![
+            vec![],
+            vec![
+                movie("Blade Runner 2049", "2017-10-04", 13000),
+                movie("Blade Runner", "1982-06-25", 14000),
+            ],
+        ];
+        let hit = choose_tmdb_match(&readings, &found).unwrap();
+        assert_eq!(hit["title"], "Blade Runner 2049");
+
+        // "Wonder Woman 1984", when the year reading DOES find something: a film
+        // whose title is the whole query still wins.
+        let readings = query_readings("wonder woman 1984");
+        let found = vec![
+            vec![movie("Wonder Woman", "1984-01-01", 3)],
+            vec![
+                movie("Wonder Woman 1984", "2020-12-16", 8000),
+                movie("Wonder Woman", "2017-05-30", 20000),
+            ],
+        ];
+        let hit = choose_tmdb_match(&readings, &found).unwrap();
+        assert_eq!(hit["title"], "Wonder Woman 1984");
+
+        // "Dune 2021": no film is called that, so the year reading decides, and it
+        // is what tells the 2021 film from the 1984 one.
+        let readings = query_readings("dune 2021");
+        let found = vec![
+            vec![movie("Dune", "2021-09-15", 12000)],
+            vec![
+                movie("Dune", "1984-12-14", 3000),
+                movie("Dune", "2021-09-15", 12000),
+            ],
+        ];
+        let hit = choose_tmdb_match(&readings, &found).unwrap();
+        assert_eq!(hit["release_date"], "2021-09-15");
+
+        // "1917": one reading, no year filter, so the 2019 film is reachable.
+        let readings = query_readings("1917");
+        let found = vec![vec![
+            movie("1917 Val Duchesse", "1917-01-01", 1),
+            movie("1917", "2019-12-25", 12000),
+        ]];
+        let hit = choose_tmdb_match(&readings, &found).unwrap();
+        assert_eq!(hit["release_date"], "2019-12-25");
+
+        // Nothing anywhere: no match, which the caller reports as not found.
+        assert!(choose_tmdb_match(&query_readings("zzzz 2049"), &[vec![], vec![]]).is_none());
     }
 
     fn fake_candidate(title: &str, media_type: &str, year: &str, votes: u64) -> serde_json::Value {
