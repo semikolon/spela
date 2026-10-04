@@ -1751,16 +1751,16 @@ pub enum QualityPref {
     /// The ranker's own judgement, guards and all.
     #[default]
     Auto,
-    /// Give me 4K if any exists, whatever the guards think. Since the
-    /// seed-viability bar was removed (2026-09-06) there is only one guard left to
-    /// skip: the bits-per-pixel starvation test, so this reaches even a 4K whose
-    /// bitrate says it will look worse than the 1080p beside it. Among the 4Ks the
-    /// later tiers still sort by language, size and seeds, so this yields the best
-    /// of them and not an arbitrary one.
+    /// Give me 4K if any exists, whatever the guards think. It skips the
+    /// bits-per-pixel starvation test, so it reaches even a 4K whose bitrate says
+    /// it will look worse than the 1080p beside it, and it skips the size ceiling
+    /// (2026-10-04), so among the 4Ks the FATTEST leads. Language and seeds still
+    /// sort the rest. This is the deliberate way to a disc remux.
     ForceUhd,
-    /// Cap at 1080p, but otherwise rank normally — the fattest 1080p, not the
-    /// smallest. For a screen that cannot use the pixels on a connection that can
-    /// afford the bytes.
+    /// Cap at 1080p, but otherwise rank as Auto does. With a known runtime that
+    /// is the best-seeded 1080p that is good enough (2026-10-04); without one it
+    /// is the fattest 1080p, as before. Never the smallest, which is Saver. For a
+    /// screen that cannot use the pixels on a connection that can afford the bytes.
     CapHd,
     /// Bandwidth costs money: cap at 1080p AND take the SMALLEST encode. Roughly
     /// 12 GB to 1 GB for the same episode.
@@ -1812,7 +1812,8 @@ pub struct RankOpts<'a> {
     ///
     /// The seed half of that has since been settled at the source: the bar was
     /// removed the same day, so Auto now reaches a thin-swarm 4K by itself and
-    /// ForceUhd is left overriding the bits-per-pixel floor alone.
+    /// ForceUhd is left overriding the bits-per-pixel floor and, since 2026-10-04,
+    /// the size ceiling.
     ///
     /// Replaces re-tuning thresholds every time a case comes out unwanted. A
     /// threshold moved to satisfy one episode is a threshold wrong for the next.
@@ -4531,7 +4532,8 @@ mod tests {
 
     /// Capping at 1080p is NOT the same as saver: it wants the fattest 1080p, not
     /// the smallest. A screen that cannot use the pixels on a connection that can
-    /// afford the bytes.
+    /// afford the bytes. (No runtime is given here, so there is no ceiling; with
+    /// one, the capped mode takes the best-seeded 1080p that is good enough.)
     #[test]
     fn test_capping_to_hd_still_wants_the_fattest_1080p() {
         let mut r = diplomat_s03e07_live_candidates();

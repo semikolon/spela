@@ -38,7 +38,9 @@ assistant should be able to play something when you ask nicely.
   defaults to whichever suits the device you opened it on.
 - **A quality control, because the guards are judgement.** `Auto · 4K · 1080p · Saver`.
   Auto is the ranker's own opinion; the others exist because it is judgement rather than
-  fact, and both directions of being wrong are ones only you can see. Saver caps at
+  fact, and both directions of being wrong are ones only you can see. Auto stops rewarding
+  size once the picture is good enough, so it picks a well-seeded streaming-grade copy over
+  a disc remux three times its size; 4K asks for the fattest 4K outright. Saver caps at
   1080p **and** takes the smallest encode, which is roughly 12 GB against 1 GB for the
   same episode; it is the default off-LAN, where bandwidth is likely to cost money.
 - **Subtitles that are actually in sync.** An embedded track in your language is used
@@ -101,7 +103,9 @@ assistant should be able to play something when you ask nicely.
 ## How sources are ranked
 
 Lower is better, and each tier is a value computed per result — never a pairwise
-threshold, which is how you get an ordering that changes depending on the input order.
+threshold, which is how you get an ordering that changes depending on the input order, or
+a sort that panics. The ranker is a sort key with a derived order rather than a comparison
+function, so a rule that looks at the other candidate cannot be written.
 
 1. **A release spela can address first.** The tracker names which file inside a torrent
    is the video; when it cannot, spela has to fetch every file — fine for a single-file
@@ -115,23 +119,31 @@ threshold, which is how you get an ordering that changes depending on the input 
    transcoder, so `1080p > 720p > 480p > 2160p`. A 4K monitor decoding natively is the
    other way round, `2160p > 1080p > 720p > 480p`, because a 1080p source upscaled twice
    reads as soft at close distance whatever its bitrate. The one thing that can still
-   push a 4K down is bits-per-pixel: a 2160p carrying under half the best 1080p's data
-   per pixel will look worse than the 1080p it would displace. That comparison is
+   push a 4K down is bits-per-pixel: a 2160p carrying under half a good 1080p's data
+   per pixel will look worse than the 1080p it would displace. "A good 1080p" is capped:
+   measured against the fattest 1080p in the list, a 40 GB remux made every 4K that was
+   not itself a remux look starved. That comparison is
    weighted by codec, since HEVC gets substantially more picture out of the same byte
    than H.264 does, and ignoring that refused legitimate 4K releases by a hair.
 4. **Language fit** against the show's original language: a clean release, then a
    multi-market or dual-language one, then a foreign dub.
 5. **H.264 over HEVC**, but only for targets that re-encode through NVENC, where H.264
-   plays instantly. Skipped entirely for native decoding.
-6. **Bitrate, via file size.** Every candidate in one search is the same minutes, so size
-   *is* bitrate, in logarithmic bands. That holds only while the size is one file, which
-   is what the first tier is there to guarantee.
+   plays instantly, and not when the best-seeded HEVC has thirty times its seeds. Skipped
+   entirely for native decoding.
+6. **Bitrate, via file size, up to "good enough".** Every candidate in one search is the
+   same minutes, so size *is* bitrate, in logarithmic bands. That holds only while the
+   size is one file, which is what the first tier is there to guarantee. With the runtime
+   from TMDB the size becomes megabits per second, and each resolution has a level past
+   which more bytes earn nothing: about 18 Mbps of HEVC at 2160p, about 9 of H.264 at
+   1080p. Releases at or above it tie and the next tier decides. A disc remux at 65 Mbps
+   costs three times the download, the wait and the cache of a 20 Mbps streaming copy for
+   a difference few screens show, so it stays in the list without leading it.
 7. **More seeds**, as the final tiebreak.
 
 **Seeds prefer; they do not exclude.** A viability bar used to demote thin swarms
 outright, which is a prediction about delivery in a system that measures delivery: a
 slow pick is raced against one alternative, a stall gate condemns a source sending
-nothing, and the remote rotates past up to three dead ones — all of which observe what
+nothing, and the fallback walks down the ranked list out loud — all of which observe what
 actually arrives instead of guessing from a tracker's count. The race is deliberately
 narrow, and it will only switch to a same-or-better release after several seconds of a
 source delivering nothing at all, so it cannot quietly trade your picture quality for a

@@ -18,6 +18,45 @@ resolution (`enough_mbps` in `src/search.rs`; reasoning and the rejected alterna
 **Not built, and not proposed yet:** AV1 is counted as H.264 (no efficiency weight), and
 HDR is not a ranked axis, so an SDR 4K can lead an HDR one on thirteen seeds.
 
+### 🟡 PROPOSED, NOT BUILT — a cam or telesync copy is ranked as if it were picture (2026-10-04)
+
+**Awaiting Fredrik's ruling: this is ranking policy.** Nothing in the ranker reads the
+SOURCE of a release. Torrentio labels them (`quality` = `TeleSync`, `CAM`), and the names
+say `TELESYNC`, `HDCAM`, `HDTS`, but a cam copy that says 1080p sits in the 1080p bucket
+and is ranked on size and seeds like any other.
+
+Measured on the live Project Hail Mary list for the Chromecast: three `1080p.TELESYNC`
+releases at ranks 9, 10 and 13 of 40 (8.26 GB / 271 seeds, 8.69 GB / 103, 6.99 GB / 58),
+above every genuine copy smaller than they are. None leads here only because they fall
+under the 1080p level (7 Mbps against 9). **A telesync above the level would tie with the
+real copies and seeds would decide**, and in the weeks before a film reaches streaming the
+telesync is the well-seeded one.
+
+Proposal: one more tier before resolution, the same shape as addressability. A cam-class
+source (`CAM`, `HDCAM`, `TS`, `HDTS`, `TELESYNC`, `TC`, `TELECINE`, matched as exact
+release tokens as the language markers are) ranks below every real source, marked in the
+list, never dropped: when a cam is all there is, it should still be found.
+
+### 🔓 OPEN — 4 October 2026: the search and remote fixes, what is unproven and what is open
+
+**Live:** the ranker is a sort key (it cannot crash the sort again), the 40-result cut
+follows the final ranking, the phone search field owns its own row, and the "unreachable"
+banner is decided by a liveness probe. Mechanics in `CLAUDE.md` § Hard-Won Lessons.
+
+**Not exercised, so still unproven:**
+- **The banner on a real phone.** It is tested against a scripted fetch (eleven cases in
+  `tests/spa_pure.mjs`), and Claude's built-in browser cannot run the remote's requests at
+  all. The case worth one look: wake the phone on the search view after a few minutes, and
+  the banner should either not appear or clear by itself within seconds.
+- **The phone search bar on the device itself.** Measured in an emulated 375 px and 402 px
+  viewport only.
+
+**Open idea, not proposed yet: a crashed handler should say so.** A panic in a request
+handler closes the connection with no reply, which through the proxy is an HTTP 502. The
+remote now reports that honestly ("Search failed"), but the server could answer with a
+500 and the reason itself (`tower-http`'s catch-panic layer), which would also put the
+cause in the remote instead of only in the journal.
+
 ### 🔓 OPEN — 3 October 2026: the play path is bounded and live; what is still open
 
 **Live on the server (commit `aec8d7e`).** A play is a server job the remote polls
@@ -89,14 +128,18 @@ it is a **failed start that leaves litter behind**, which is the same subsystem 
 the kind of thing a future size- or name-based check could trip over. Not investigated.
 
 ### 🔓 OPEN — the ranker has no idea what the VIEWER'S LINK can carry (2026-09-11)
-Ranking is resolution → codec (target-scoped) → seeds. Nothing expresses **bytes per
+Ranking is addressability → Dolby Vision → resolution → language → codec → bitrate → seeds (README §
+*How sources are ranked*). Nothing expresses **bytes per
 second available to the person watching**, so the same #1 pick is served to a Chromecast
 on gigabit LAN and to VLC on a phone hotspot two hundred km away over WireGuard. On
 2026-09-11 that meant a 36.8 Mbps remux over a hotspot: unwatchable, and nothing in the
 ranking could have known.
 
-The bitrate is already derivable at rank time — parsed size ÷ TMDB runtime, no probe
-needed. What is missing is the OTHER half: what the requester can actually sustain.
+The bitrate is derived at rank time since 2026-10-04: the runtime travels as
+`RankOpts.runtime_min` and `is_enough` turns a size into Mbps. That work also softened the
+worst case, because Auto no longer leads with a remux when a smaller copy is good enough.
+What is missing is the OTHER half: what the requester can actually sustain. A declared
+limit would now be a small change, a lower ceiling for that request.
 Options, cheapest first:
 - **Declared**, per target: a `max_bitrate_kbps` on the play/search request, set once in
   the SPA's target picker (LAN / VPN / hotspot). Deterministic, no measurement, and the
