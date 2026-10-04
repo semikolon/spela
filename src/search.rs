@@ -1139,13 +1139,14 @@ impl SearchEngine {
         // routed, no cross-show data should have been possible — but it was).
         let mut results = filter_results_by_show_title(results, show_title);
         rank_results_mut_prefer(&mut results, true, original_language);
-        // 2026-07-13: keep more results so 4K/2160p survives to the UI. The
-        // ranker demotes 2160p to the bottom tier (right for the 1080p-capped
-        // Chromecast path), and the old take(8) then truncated every 4K release
-        // off the list entirely — so a browser on a 4K display could never even
-        // pick one. 24 keeps the well-seeded 4K reachable under "More sources"
-        // while still bounding the list.
-        Ok(results.into_iter().take(40).collect())
+        // The WHOLE ranked list goes back; the caller cuts it with
+        // `truncate_ranked` after ITS last ranking. Cutting here cut by the
+        // transcoding order, which puts 2160p last and the fattest file first,
+        // so on a title with more releases than the cap a native target could
+        // never be offered a 4K, and a preference re-rank only reordered those forty.
+        // 2026-07-13 raised the cap from 8 to 40 for exactly this and it held
+        // until a film arrived with 166 releases (2026-10-03).
+        Ok(results)
     }
 
     /// TMDB air-date status for a followed series (slice 2b). None on any TMDB /
@@ -1682,6 +1683,17 @@ fn torrent_results_from_streams(resp: &Value) -> Vec<TorrentResult> {
             }
         })
         .collect()
+}
+
+/// How many ranked results a search hands to a client.
+pub const MAX_RESULTS: usize = 40;
+
+/// Bound a ranked list to what a client is shown. Call it AFTER the last
+/// ranking for the request: the cut keeps whatever that ranking put first, so
+/// a cut made under one target's order silently decides what another target
+/// can ever be offered.
+pub fn truncate_ranked(results: &mut Vec<TorrentResult>) {
+    results.truncate(MAX_RESULTS);
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // test entry point; production ranks via rank_results_mut_prefer
@@ -5374,6 +5386,48 @@ mod tests {
                 assert_eq!(sorted.len(), results.len());
             }
         }
+    }
+
+    /// 2026-10-03, found on the same search. With 166 releases the list was cut
+    /// to 40 by the TRANSCODING order before the native re-rank ever saw it, so
+    /// a VLC search came back as 37 x 1080p plus 3 TeleSync and not one 2160p.
+    /// (Any preference re-rank had the same limit: it could only reorder those
+    /// forty. On this list Saver's pick happened to be among them, so only the
+    /// 2160p half is asserted.)
+    #[test]
+    fn test_the_cut_follows_the_final_ranking_on_a_long_real_list() {
+        let resp: Value = serde_json::from_str(F_TORRENTIO_PROJECT_HAIL_MARY).unwrap();
+        let mut all =
+            filter_results_by_show_title(torrent_results_from_streams(&resp), "Project Hail Mary");
+        // What `torrentio_streams` hands back: everything, in transcoding order.
+        rank_results_mut_prefer(&mut all, true, Some("en"));
+        assert!(
+            all.len() > MAX_RESULTS,
+            "the case needs a list longer than the cap"
+        );
+        let count_4k =
+            |r: &[TorrentResult]| r.iter().filter(|x| resolution_tier(&x.title) == 3).count();
+        assert!(
+            count_4k(&all) > 0,
+            "the recorded list does hold 2160p releases"
+        );
+
+        // The old order of operations, pinned so the regression stays visible:
+        // cut first, re-rank second.
+        let mut cut_first = all.clone();
+        cut_first.truncate(MAX_RESULTS);
+        rank_results_mut_prefer(&mut cut_first, false, Some("en"));
+        assert_eq!(count_4k(&cut_first), 0, "cutting first loses every 2160p");
+
+        // Native target: rank, THEN cut.
+        let mut native = all.clone();
+        rank_results_mut_prefer(&mut native, false, Some("en"));
+        truncate_ranked(&mut native);
+        assert_eq!(native.len(), MAX_RESULTS);
+        assert!(
+            count_4k(&native) > 0,
+            "a native target must be offered 2160p"
+        );
     }
 
     #[test]

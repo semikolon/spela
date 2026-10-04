@@ -1845,6 +1845,9 @@ async fn handle_search(
                     },
                 );
             }
+            // The cut comes last, after every ranking above has had the whole
+            // list to choose from (see `truncate_ranked`).
+            crate::search::truncate_ranked(&mut result.results);
             // 2026-06-30: enrich each result with its on-disk partial-download
             // % so the web remote can tint already-(part-)downloaded sources
             // green — tapping one resumes (librqbit overwrite:true) instead of
@@ -6585,7 +6588,7 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         return Json(json!({"error": "Already at first episode"}));
     };
 
-    let result = match state
+    let mut result = match state
         .search_engine
         .search(
             &show,
@@ -6598,6 +6601,7 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
         Ok(r) => r,
         Err(e) => return Json(json!({"error": e.to_string()})),
     };
+    crate::search::truncate_ranked(&mut result.results);
 
     if !result.torrent_available || result.results.is_empty() {
         return Json(json!({
