@@ -1818,12 +1818,14 @@ async fn handle_search(
                     .show
                     .as_ref()
                     .and_then(|sh| sh.original_language.clone());
+                let runtime_min = result.show.as_ref().and_then(|sh| sh.runtime_min);
                 crate::search::rank_results_mut_opts(
                     &mut result.results,
                     crate::search::RankOpts {
                         transcoding: true,
                         original_language: orig_lang.as_deref(),
                         pref,
+                        runtime_min,
                     },
                 );
             }
@@ -1836,12 +1838,14 @@ async fn handle_search(
                     .show
                     .as_ref()
                     .and_then(|sh| sh.original_language.clone());
+                let runtime_min = result.show.as_ref().and_then(|sh| sh.runtime_min);
                 crate::search::rank_results_mut_opts(
                     &mut result.results,
                     crate::search::RankOpts {
                         transcoding: false,
                         original_language: orig_lang.as_deref(),
                         pref,
+                        runtime_min,
                     },
                 );
             }

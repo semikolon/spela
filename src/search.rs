@@ -125,6 +125,12 @@ pub struct ShowInfo {
     /// is stream-type-dependent").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poster_url: Option<String>,
+    /// Runtime in minutes of what this search is FOR: the film, or the searched
+    /// episode. It is what lets the ranker turn a file size into a bitrate (see
+    /// `enough_mbps`). Absent when TMDB does not know it, and the ranker then
+    /// applies no ceiling at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_min: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -843,6 +849,7 @@ impl SearchEngine {
             release_date: None,
             overview: None,
             poster_url: tmdb_poster_url(detail["poster_path"].as_str()),
+            runtime_min: None, // set below, once the searched episode is known
         };
 
         let imdb_id = match &show_info.imdb_id {
@@ -883,8 +890,14 @@ impl SearchEngine {
         // only "results" for an unaired episode are mislabeled junk the title-filter
         // would reject anyway (the S04E03 "no worky" incident, 2026-08-02) — and let
         // the UI show "Airs <date>" instead of a dead Play button.
-        let (mut ep_name, mut ep_air) =
+        let (mut ep_name, mut ep_air, ep_runtime) =
             self.episode_detail(tmdb_id, s, e).await.unwrap_or_default();
+        // The episode's own runtime where TMDB has it; else the show's usual
+        // episode length; else the last aired episode's. A double-length finale
+        // is exactly the case where the first differs from the other two.
+        show_info.runtime_min = ep_runtime
+            .or_else(|| plausible_runtime_min(detail["episode_run_time"][0].as_u64()))
+            .or_else(|| plausible_runtime_min(detail["last_episode_to_air"]["runtime"].as_u64()));
         // Correct the searched episode's air date from TVmaze (Silo E06: TMDB=Aug 6 →
         // real Aug 7), so the unaired guard + "Airs <date>" line reflect reality.
         if let Some(eps) = &tvmaze {
@@ -913,6 +926,7 @@ impl SearchEngine {
                 show_info.original_language.as_deref(),
                 Some(s),
                 Some(e),
+                show_info.runtime_min,
             )
             .await?
         };
@@ -957,6 +971,7 @@ impl SearchEngine {
                 .as_str()
                 .map(|s| s.chars().take(200).collect()),
             poster_url: tmdb_poster_url(detail["poster_path"].as_str()),
+            runtime_min: plausible_runtime_min(detail["runtime"].as_u64()),
         };
 
         let imdb_id = match &show_info.imdb_id {
@@ -980,6 +995,7 @@ impl SearchEngine {
                 show_info.original_language.as_deref(),
                 None,
                 None,
+                show_info.runtime_min,
             )
             .await?;
         Ok(SearchResult {
@@ -1057,6 +1073,7 @@ impl SearchEngine {
         original_language: Option<&str>,
         season: Option<u32>,
         episode: Option<u32>,
+        runtime_min: Option<u32>,
     ) -> Result<Vec<TorrentResult>> {
         let path = match (season, episode) {
             (Some(s), Some(e)) => format!("stream/series/{}:{}:{}.json", imdb_id, s, e),
@@ -1138,7 +1155,15 @@ impl SearchEngine {
         // as a top-seeded candidate for a `The Boys` S05E03 query (IMDb-ID
         // routed, no cross-show data should have been possible — but it was).
         let mut results = filter_results_by_show_title(results, show_title);
-        rank_results_mut_prefer(&mut results, true, original_language);
+        rank_results_mut_opts(
+            &mut results,
+            RankOpts {
+                transcoding: true,
+                original_language,
+                pref: QualityPref::Auto,
+                runtime_min,
+            },
+        );
         // The WHOLE ranked list goes back; the caller cuts it with
         // `truncate_ranked` after ITS last ranking. Cutting here cut by the
         // transcoding order, which puts 2160p last and the fattest file first,
@@ -1325,13 +1350,14 @@ impl SearchEngine {
                 // Keep TMDB's name if TVmaze has none, but the DATE is TVmaze's job.
                 if let Some(d) = date {
                     let tmdb = self.episode_detail(tmdb_id, season, episode).await;
-                    let nm = name.unwrap_or_else(|| tmdb.map(|(n, _)| n).unwrap_or_default());
+                    let nm = name.unwrap_or_else(|| tmdb.map(|(n, _, _)| n).unwrap_or_default());
                     return (nm, d);
                 }
             }
         }
         self.episode_detail(tmdb_id, season, episode)
             .await
+            .map(|(name, date, _)| (name, date))
             .unwrap_or_default()
     }
 
@@ -1408,7 +1434,7 @@ impl SearchEngine {
         tmdb_id: u64,
         season: u32,
         episode: u32,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, Option<u32>)> {
         if self.tmdb_key.is_empty() {
             return None;
         }
@@ -1422,8 +1448,16 @@ impl SearchEngine {
         Some((
             d["name"].as_str().unwrap_or("").to_string(),
             d["air_date"].as_str().unwrap_or("").to_string(),
+            plausible_runtime_min(d["runtime"].as_u64()),
         ))
     }
+}
+
+/// A runtime in minutes, kept only when it could be a real one. TMDB reports 0
+/// for "unknown", and a wrong runtime turns every size into a wrong bitrate, so
+/// an implausible value is treated as absent rather than believed.
+fn plausible_runtime_min(minutes: Option<u64>) -> Option<u32> {
+    minutes.filter(|m| (5..=600).contains(m)).map(|m| m as u32)
 }
 
 /// Detect HEVC/x265 from torrent filename — these need NVENC re-encoding
@@ -1783,6 +1817,10 @@ pub struct RankOpts<'a> {
     /// Replaces re-tuning thresholds every time a case comes out unwanted. A
     /// threshold moved to satisfy one episode is a threshold wrong for the next.
     pub pref: QualityPref,
+    /// Runtime in minutes of the film or episode being ranked, when known. With
+    /// it a size becomes a bitrate and the "good enough" ceiling applies (see
+    /// `enough_mbps`). `None` ranks exactly as before the ceiling existed.
+    pub runtime_min: Option<u32>,
 }
 
 pub fn rank_results_mut_prefer(
@@ -1796,6 +1834,7 @@ pub fn rank_results_mut_prefer(
             transcoding: prefer_h264,
             original_language,
             pref: QualityPref::Auto,
+            runtime_min: None,
         },
     );
 }
@@ -1814,18 +1853,28 @@ struct RankCtx<'a> {
     /// only: the yardstick an H.264 release's swarm is judged against by
     /// `codec_tier`. Empty for native targets, which have no codec preference.
     best_hevc_seeds: std::collections::HashMap<RankBucket, u32>,
+    /// The runtime in seconds, present only when the "good enough" ceiling
+    /// applies: the runtime is known AND the viewer left the judgement to the
+    /// ranker (Auto, or capped at 1080p). The 4K preference asks for the fattest
+    /// 4K and Saver for the smallest file, so neither has a ceiling.
+    ceiling_secs: Option<f64>,
 }
 
 impl<'a> RankCtx<'a> {
     /// The one way a context is built, for the real sort and for tests alike, so
     /// a test cannot judge a pair against a yardstick the sort would not use.
     fn for_set(results: &[TorrentResult], opts: RankOpts<'a>) -> Self {
+        let ceiling_secs = matches!(opts.pref, QualityPref::Auto | QualityPref::CapHd)
+            .then_some(opts.runtime_min)
+            .flatten()
+            .map(|m| f64::from(m) * 60.0);
         let mut ctx = RankCtx {
             prefer_h264: opts.transcoding,
             original_language: opts.original_language,
             pref: opts.pref,
-            best_1080p_bpp: best_1080p_bytes_per_pixel(results),
+            best_1080p_bpp: best_1080p_bytes_per_pixel(results, ceiling_secs),
             best_hevc_seeds: std::collections::HashMap::new(),
+            ceiling_secs,
         };
         if ctx.prefer_h264 {
             let mut best = std::collections::HashMap::new();
@@ -2049,10 +2098,18 @@ fn rank_key(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankKey {
     // deliberately: seed count was the de-facto quality decision and it
     // consistently picked the smallest file, because the tiny x265 rips are
     // the ones everybody seeds.
+    //
+    // AMENDED 2026-10-04: with a CEILING. Once a release carries enough bitrate
+    // for its resolution (`is_enough`), more bytes earn nothing: every such
+    // release shares the best value and the later tiers decide, which in
+    // practice means seeds. Below the ceiling the order is the old one, bigger
+    // first. See `enough_mbps` for the levels and the reasoning.
     let size = if ctx.pref.is_saver() {
         u32::MAX - size_tier(r) // smallest wins — the quota is the scarce thing
+    } else if ctx.ceiling_secs.is_some_and(|secs| is_enough(r, secs)) {
+        0
     } else {
-        size_tier(r)
+        size_tier(r) + 1 // 0 is reserved for "enough", so it outranks any size
     };
 
     // NO PACK PENALTY. It was tier 1 until 2026-09-05 — ahead of resolution,
@@ -2442,27 +2499,102 @@ const HEVC_EFFICIENCY_OVER_H264: f64 = 1.7;
 /// reader of this value gets the corrected comparison and the floor stays one number.
 fn bytes_per_pixel(r: &TorrentResult) -> Option<f64> {
     let px = pixels_for_res_tier(resolution_tier(&r.title))?;
+    weighted_bytes(r).map(|b| b / px)
+}
+
+/// A release's size in H.264-equivalent bytes: what its bytes are worth as
+/// picture, whatever codec they are in.
+fn weighted_bytes(r: &TorrentResult) -> Option<f64> {
     let bytes = crate::server::parse_size_to_bytes(&r.size)?;
     let weight = if is_hevc_from_title(&r.title) {
         HEVC_EFFICIENCY_OVER_H264
     } else {
         1.0
     };
-    (bytes > 0).then(|| bytes as f64 * weight / px)
+    (bytes > 0).then(|| bytes as f64 * weight)
+}
+
+/// The bitrate at which a picture is GOOD ENOUGH for its resolution, in
+/// H.264-equivalent megabits per second (an HEVC release needs this divided by
+/// `HEVC_EFFICIENCY_OVER_H264`: about 17.6 Mbps at 2160p, 5.3 at 1080p).
+///
+/// Past this level more bytes buy almost nothing the eye can use, while every
+/// cost of a release keeps growing with its size: the wait before it opens, the
+/// swarm it needs, and the room it takes in a 100 GB cache. So size counts UP TO
+/// here and no further (see tier 5 in `rank_key`).
+///
+/// Anchor 2026-10-04, Project Hail Mary, 45 releases at 2160p. With no ceiling
+/// the native pick was a 75.71 GB disc remux at 65 Mbps with 26 seeds, while two
+/// streaming-grade 4Ks at 20 and 24 Mbps had 1,049 and 1,036 seeds. Fredrik:
+/// "big enough but not too fat".
+///
+/// The 2160p level is set from what he has chosen and been content with (Star
+/// City S01E08 at about 24 Mbps, The Diplomat S03E07 at 19). The 1080p level
+/// sits above what he rejected (5.2 Mbps "still visibly compressed") and below
+/// the best a streaming service sends (about 10 Mbps H.264), so that a service's
+/// own top copy counts as enough at BOTH resolutions. They are starting values,
+/// to be moved by watching.
+///
+/// Each level sits in a GAP between classes of release, never on top of one.
+/// 11 Mbps was tried first for 1080p and put the whole streaming class 9% under
+/// the line (two real 11.8 GB copies at 10.0 Mbps): a verdict that close to its
+/// own threshold says the threshold is in the wrong place, not that the
+/// releases are borderline.
+///
+/// `None` for an unreadable resolution: no judgement is possible, so size ranks
+/// it as before.
+fn enough_mbps(res_tier: u32) -> Option<f64> {
+    Some(match res_tier {
+        0 => ENOUGH_1080P_MBPS,
+        1 => 4.5,
+        2 => 2.3,
+        3 => ENOUGH_2160P_MBPS,
+        _ => return None,
+    })
+}
+const ENOUGH_2160P_MBPS: f64 = 30.0;
+const ENOUGH_1080P_MBPS: f64 = 9.0;
+
+/// Does this release carry enough bitrate for its resolution? `runtime_secs` is
+/// what turns its size into a bitrate.
+///
+/// The precondition, written down because the candidate that breaks it is the one
+/// to look for: SIZE ÷ RUNTIME IS PICTURE BITRATE only when the file is one
+/// playthrough of the film and its bytes are picture. A disc image is not (tier
+/// 0 handles it), and neither is an upscale, a 3D double-frame encode or a
+/// release carrying six lossless audio tracks. Before the ceiling such a file
+/// LED the list for being fat. Now the worst it can do is tie.
+fn is_enough(r: &TorrentResult, runtime_secs: f64) -> bool {
+    let (Some(enough), Some(bytes)) = (enough_mbps(resolution_tier(&r.title)), weighted_bytes(r))
+    else {
+        return false;
+    };
+    runtime_secs > 0.0 && bytes * 8.0 / runtime_secs / 1e6 >= enough
 }
 
 /// The best bytes-per-pixel any 1080p candidate in this search reaches — the
 /// yardstick a 2160p release is measured against, since 1080p is what it would
 /// otherwise displace. Computed in a pre-pass so the comparator stays a pure
 /// function of per-result values.
-fn best_1080p_bytes_per_pixel(results: &[TorrentResult]) -> Option<f64> {
-    results
+///
+/// 2026-10-04: CAPPED at the 1080p "good enough" level when a runtime is known
+/// (`ceiling_secs`). The yardstick was the MAXIMUM, so the fattest 1080p in the
+/// list set the bar for every 4K: on Project Hail Mary a 41 GB and a 40 GB 1080p
+/// made a 27.59 GB 4K HEVC score 0.29 of the reference and a 39.79 GB one 0.41,
+/// both under the 0.5 floor, and every 4K that was not a disc remux ranked below
+/// ALL 1080p. A 4K has to beat a GOOD 1080p, not a remux.
+fn best_1080p_bytes_per_pixel(results: &[TorrentResult], ceiling_secs: Option<f64>) -> Option<f64> {
+    let best = results
         .iter()
         .filter(|r| resolution_tier(&r.title) == 0)
         .filter_map(bytes_per_pixel)
         .fold(None, |acc: Option<f64>, v| {
             Some(acc.map_or(v, |a: f64| a.max(v)))
-        })
+        })?;
+    Some(match ceiling_secs {
+        Some(secs) => best.min(ENOUGH_1080P_MBPS * 1e6 / 8.0 * secs / (1920.0 * 1080.0)),
+        None => best,
+    })
 }
 
 /// A 2160p release is STARVED when its bytes-per-pixel falls below this fraction
@@ -4003,6 +4135,7 @@ mod tests {
                 transcoding: false,
                 original_language: Some("en"),
                 pref: QualityPref::Auto,
+                runtime_min: None,
             },
         );
         assert_eq!(rank_cmp(&a, &b, &ctx), std::cmp::Ordering::Equal);
@@ -4110,7 +4243,7 @@ mod tests {
         let real_4k = make_sized(3, "Star.City.S01E08.2160p.WEB.h265-Group", 200, "11.85 GB");
 
         // Yardstick: the best 1080p in the set.
-        let bpp = best_1080p_bytes_per_pixel(&[fat_1080p.clone(), thin_4k.clone()]);
+        let bpp = best_1080p_bytes_per_pixel(&[fat_1080p.clone(), thin_4k.clone()], None);
         assert!(bpp.is_some());
 
         // The thin 4K carries less data per pixel than the 1080p it would
@@ -4259,6 +4392,7 @@ mod tests {
                 transcoding: false, // still VLC — frugal is about bytes, not decoding
                 original_language: Some("en"),
                 pref: QualityPref::Saver,
+                runtime_min: None,
             },
         );
         assert!(
@@ -4379,6 +4513,7 @@ mod tests {
                 transcoding: false,
                 original_language: Some("en"),
                 pref: QualityPref::ForceUhd,
+                runtime_min: None,
             },
         );
         assert!(r[0].title.contains("2160p"), "got {:?}", r[0].title);
@@ -4406,6 +4541,7 @@ mod tests {
                 transcoding: false,
                 original_language: Some("en"),
                 pref: QualityPref::CapHd,
+                runtime_min: None,
             },
         );
         assert!(!r[0].title.contains("2160p"));
@@ -4423,6 +4559,7 @@ mod tests {
                 transcoding: false,
                 original_language: Some("en"),
                 pref: QualityPref::Saver,
+                runtime_min: None,
             },
         );
         assert!(!r[0].title.contains("2160p"));
@@ -5220,7 +5357,7 @@ mod tests {
                 "6.22 GB",
             ),
         ];
-        let bpp = best_1080p_bytes_per_pixel(&r);
+        let bpp = best_1080p_bytes_per_pixel(&r, None);
         assert!(
             !is_starved_4k(&r[1], bpp),
             "unweighted this measured 0.47 against a 0.50 floor and was refused; \
@@ -5238,7 +5375,7 @@ mod tests {
             make_sized(1, "Show.S01E01.1080p.WEB.H264-Grp.mkv", 40, "3.28 GB"),
             make_sized(2, "Show.S01E01.2160p.WEB.HEVC-Grp.mkv", 40, "2 GB"),
         ];
-        let bpp = best_1080p_bytes_per_pixel(&r);
+        let bpp = best_1080p_bytes_per_pixel(&r, None);
         assert!(is_starved_4k(&r[1], bpp));
     }
 
@@ -5372,18 +5509,23 @@ mod tests {
                 QualityPref::CapHd,
                 QualityPref::Saver,
             ] {
-                let opts = RankOpts {
-                    transcoding,
-                    original_language: Some("en"),
-                    pref,
-                };
-                let ctx = RankCtx::for_set(&results, opts);
-                let label = format!("transcoding={transcoding} pref={pref:?}");
-                assert_strict_total_order(&results, &ctx, &label);
-                // And the sort itself completes: this is the call that panicked.
-                let mut sorted = results.clone();
-                rank_results_mut_opts(&mut sorted, opts);
-                assert_eq!(sorted.len(), results.len());
+                // With and without a runtime: the ceiling is a tier like any other.
+                for runtime_min in [None, Some(157)] {
+                    let opts = RankOpts {
+                        transcoding,
+                        original_language: Some("en"),
+                        pref,
+                        runtime_min,
+                    };
+                    let ctx = RankCtx::for_set(&results, opts);
+                    let label =
+                        format!("transcoding={transcoding} pref={pref:?} runtime={runtime_min:?}");
+                    assert_strict_total_order(&results, &ctx, &label);
+                    // And the sort itself completes: this is the call that panicked.
+                    let mut sorted = results.clone();
+                    rank_results_mut_opts(&mut sorted, opts);
+                    assert_eq!(sorted.len(), results.len());
+                }
             }
         }
     }
@@ -5430,6 +5572,197 @@ mod tests {
         );
     }
 
+    /// The recorded Project Hail Mary list, title-filtered, as `torrentio_streams`
+    /// holds it before ranking. The film runs 157 minutes (TMDB).
+    fn project_hail_mary() -> Vec<TorrentResult> {
+        let resp: Value = serde_json::from_str(F_TORRENTIO_PROJECT_HAIL_MARY).unwrap();
+        filter_results_by_show_title(torrent_results_from_streams(&resp), "Project Hail Mary")
+    }
+    const PROJECT_HAIL_MARY_MIN: u32 = 157;
+
+    fn ranked(mut r: Vec<TorrentResult>, opts: RankOpts<'_>) -> Vec<TorrentResult> {
+        rank_results_mut_opts(&mut r, opts);
+        r
+    }
+    fn gb(r: &TorrentResult) -> f64 {
+        crate::server::parse_size_to_bytes(&r.size).unwrap_or(0) as f64 / 1e9
+    }
+    fn top(r: &[TorrentResult], n: usize) -> String {
+        r.iter()
+            .take(n)
+            .map(|x| {
+                format!(
+                    "\n  {} | {} | {} seeds | {}",
+                    x.quality, x.title, x.seeds, x.size
+                )
+            })
+            .collect()
+    }
+
+    /// 2026-10-04, "big enough but not too fat". With no ceiling the native pick
+    /// for this film was a 75.71 GB disc remux with 26 seeds, and the
+    /// streaming-grade 4Ks with a thousand seeds each ranked below every 1080p.
+    #[test]
+    fn test_enough_bitrate_ceiling_picks_a_sufficient_4k_over_a_remux() {
+        let native = |pref, runtime_min| RankOpts {
+            transcoding: false,
+            original_language: Some("en"),
+            pref,
+            runtime_min,
+        };
+        let secs = f64::from(PROJECT_HAIL_MARY_MIN) * 60.0;
+
+        // Runtime unknown: the ranking is exactly what it was before the ceiling.
+        let before = ranked(project_hail_mary(), native(QualityPref::Auto, None));
+        assert!(
+            before[0].title.to_lowercase().contains("remux") && gb(&before[0]) > 70.0,
+            "without a runtime the fattest clean 4K still leads:{}",
+            top(&before, 4)
+        );
+
+        // Runtime known: a 4K that is enough, and the best-seeded of those.
+        let after = ranked(
+            project_hail_mary(),
+            native(QualityPref::Auto, Some(PROJECT_HAIL_MARY_MIN)),
+        );
+        let pick = &after[0];
+        assert_eq!(
+            resolution_tier(&pick.title),
+            3,
+            "a 2160p leads:{}",
+            top(&after, 6)
+        );
+        assert!(is_enough(pick, secs), "and it is enough:{}", top(&after, 6));
+        assert!(
+            gb(pick) < 40.0 && pick.seeds > 1000,
+            "a streaming-grade 4K with a full swarm, not a remux:{}",
+            top(&after, 6)
+        );
+        // Soft, not a cap: the remux is still offered, further down the same list.
+        assert!(
+            after.iter().any(|r| r.title == before[0].title),
+            "the remux is demoted, never dropped"
+        );
+        // Seeds decide among releases that are all enough and otherwise equal.
+        let bucket_of_pick = |r: &&TorrentResult| {
+            resolution_tier(&r.title) == 3
+                && is_enough(r, secs)
+                && language_fit_bucket(&r.title, Some("en"))
+                    == language_fit_bucket(&pick.title, Some("en"))
+                && has_dolby_vision_in_title(&r.title) == has_dolby_vision_in_title(&pick.title)
+        };
+        let best_seeded = after.iter().filter(bucket_of_pick).map(|r| r.seeds).max();
+        assert_eq!(Some(pick.seeds), best_seeded, "{}", top(&after, 6));
+
+        // A thin "4K" is still starved: the floor moved its yardstick, it did not go.
+        let thin = after
+            .iter()
+            .position(|r| resolution_tier(&r.title) == 3 && gb(r) < 8.0 && gb(r) > 0.0)
+            .expect("the recorded list holds a sub-8 GB 2160p");
+        let first_1080p = after
+            .iter()
+            .position(|r| resolution_tier(&r.title) == 0)
+            .unwrap();
+        assert!(
+            thin > first_1080p,
+            "a 6 Mbps 2160p ranks below 1080p: thin at {thin}, first 1080p at {first_1080p}"
+        );
+
+        // The 4K pill keeps the old behaviour: fattest first, no ceiling.
+        let forced = ranked(
+            project_hail_mary(),
+            native(QualityPref::ForceUhd, Some(PROJECT_HAIL_MARY_MIN)),
+        );
+        assert!(
+            gb(&forced[0]) > 70.0,
+            "asking for 4K outright still yields the fattest one:{}",
+            top(&forced, 4)
+        );
+
+        // Saver is untouched by the runtime either way.
+        let saver_a = ranked(project_hail_mary(), native(QualityPref::Saver, None));
+        let saver_b = ranked(
+            project_hail_mary(),
+            native(QualityPref::Saver, Some(PROJECT_HAIL_MARY_MIN)),
+        );
+        assert_eq!(saver_a[0].title, saver_b[0].title);
+    }
+
+    /// The transcoding target gets the same ceiling at 1080p: the pick must be a
+    /// 1080p that is enough, and no longer simply the largest file.
+    #[test]
+    fn test_enough_bitrate_ceiling_on_the_transcoding_target() {
+        let secs = f64::from(PROJECT_HAIL_MARY_MIN) * 60.0;
+        let r = ranked(
+            project_hail_mary(),
+            RankOpts {
+                transcoding: true,
+                original_language: Some("en"),
+                pref: QualityPref::Auto,
+                runtime_min: Some(PROJECT_HAIL_MARY_MIN),
+            },
+        );
+        assert_eq!(resolution_tier(&r[0].title), 0, "{}", top(&r, 5));
+        assert!(is_enough(&r[0], secs), "{}", top(&r, 5));
+        let fattest_1080p = r
+            .iter()
+            .filter(|x| resolution_tier(&x.title) == 0)
+            .map(gb)
+            .fold(0.0, f64::max);
+        assert!(
+            gb(&r[0]) < fattest_1080p,
+            "the largest 1080p ({fattest_1080p:.1} GB) no longer wins for being largest:{}",
+            top(&r, 5)
+        );
+    }
+
+    /// The levels themselves, on the real releases they were set against.
+    #[test]
+    fn test_is_enough_on_recorded_releases() {
+        let secs = f64::from(PROJECT_HAIL_MARY_MIN) * 60.0;
+        let all = project_hail_mary();
+        let find = |needle: &str| {
+            all.iter()
+                .find(|r| r.title.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} is in the recorded list"))
+        };
+        // 23.33 GB HEVC 2160p, 19.9 Mbps: a streaming copy. Enough.
+        assert!(is_enough(
+            find("2160p.WEB-DL.DDP5.1.Atmos.H.265-RDNYB"),
+            secs
+        ));
+        // 27.59 GB HEVC 2160p HDR, 23.6 Mbps. Enough.
+        assert!(is_enough(find("PROPER.HDR.2160p.WEB.h265-GRACE"), secs));
+        // 9.1 GB H.264 1080p, 7.7 Mbps: watchable, short of the level.
+        assert!(!is_enough(find("1080p WEB AC3 H264-DJT"), secs));
+        // Half the runtime doubles every bitrate: the same file then is enough.
+        assert!(is_enough(find("1080p WEB AC3 H264-DJT"), secs / 2.0));
+        // No resolution in the name, no judgement.
+        let mut bare = find("1080p WEB AC3 H264-DJT").clone();
+        bare.title = "Project Hail Mary.mkv".into();
+        assert!(!is_enough(&bare, secs));
+
+        // The yardstick: capped, so a streaming-grade 4K is no longer "starved".
+        let grace = find("PROPER.HDR.2160p.WEB.h265-GRACE");
+        assert!(
+            is_starved_4k(grace, best_1080p_bytes_per_pixel(&all, None)),
+            "against the fattest 1080p in the list it was"
+        );
+        assert!(!is_starved_4k(
+            grace,
+            best_1080p_bytes_per_pixel(&all, Some(secs))
+        ));
+    }
+
+    #[test]
+    fn test_plausible_runtime() {
+        assert_eq!(plausible_runtime_min(Some(157)), Some(157));
+        assert_eq!(plausible_runtime_min(Some(0)), None, "TMDB's 'unknown'");
+        assert_eq!(plausible_runtime_min(Some(4)), None);
+        assert_eq!(plausible_runtime_min(Some(6000)), None);
+        assert_eq!(plausible_runtime_min(None), None);
+    }
+
     #[test]
     fn test_comparator_is_a_strict_total_order_across_the_whole_seed_range() {
         // Removing a term from a multi-tier comparator is exactly where a
@@ -5473,15 +5806,24 @@ mod tests {
         // codec tier was the non-transitive one. Every search ranks for the
         // transcoding target first, so the half left out was the half in use.
         for transcoding in [true, false] {
-            let ctx = RankCtx::for_set(
-                &grid,
-                RankOpts {
-                    transcoding,
-                    original_language: Some("en"),
-                    pref: QualityPref::Auto,
-                },
-            );
-            assert_strict_total_order(&grid, &ctx, &format!("grid transcoding={transcoding}"));
+            // 50 minutes puts the grid's 1.2, 4 and 9 GB on both sides of the
+            // ceiling at every resolution, so the tier is genuinely exercised.
+            for runtime_min in [None, Some(50)] {
+                let ctx = RankCtx::for_set(
+                    &grid,
+                    RankOpts {
+                        transcoding,
+                        original_language: Some("en"),
+                        pref: QualityPref::Auto,
+                        runtime_min,
+                    },
+                );
+                assert_strict_total_order(
+                    &grid,
+                    &ctx,
+                    &format!("grid transcoding={transcoding} runtime={runtime_min:?}"),
+                );
+            }
         }
         let ctx = RankCtx::for_set(
             &grid,
@@ -5489,6 +5831,7 @@ mod tests {
                 transcoding: false,
                 original_language: Some("en"),
                 pref: QualityPref::Auto,
+                runtime_min: None,
             },
         );
 
