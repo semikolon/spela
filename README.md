@@ -147,9 +147,11 @@ function, so a rule that looks at the other candidate cannot be written.
    size is one file, which is what the first tier is there to guarantee. With the runtime
    from TMDB the size becomes megabits per second, and each resolution has a level past
    which more bytes earn nothing: about 18 Mbps of HEVC at 2160p, about 9 of H.264 at
-   1080p. Releases at or above it tie and the next tier decides. A disc remux at 65 Mbps
-   costs three times the download, the wait and the cache of a 20 Mbps streaming copy for
-   a difference few screens show, so it stays in the list without leading it.
+   1080p. Among the releases at or above it, the lean ones come first: those no more
+   than twice the size of the smallest that is enough. Seeds decide within the lean ones,
+   then within the rest. A disc remux at 65 Mbps costs three times the download, the wait
+   and the cache of a 20 Mbps streaming copy for a difference few screens show, so it
+   stays in the list without leading it, however well seeded it is.
 8. **More seeds**, as the final tiebreak.
 
 **Seeds prefer; they do not exclude.** A viability bar used to demote thin swarms

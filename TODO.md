@@ -7,7 +7,8 @@ resolution (`enough_mbps` in `src/search.rs`; reasoning and the rejected alterna
 `CLAUDE.md` § Hard-Won *Size stops counting once the picture is good enough*).
 
 **To tune by watching, not by argument.** The levels are 30 Mbps H.264-equivalent at 2160p
-(about 17.6 as HEVC) and 9 at 1080p. Two things would move them:
+(about 17.6 as HEVC) and 9 at 1080p, and a sufficient copy counts as lean up to twice the
+smallest sufficient one. Two things would move the levels:
 - A pick that looks compressed on the 4K monitor: the level is too low. Note the title,
   the resolution and the Mbps shown under the episode title.
 - Auto leading with something far fatter than needed while a well-seeded smaller copy sits
@@ -16,12 +17,10 @@ resolution (`enough_mbps` in `src/search.rs`; reasoning and the rejected alterna
   HEVC and are therefore below the 2160p level today.
 
 **Seen on the live lists 4 October, working as ruled but worth his eye:**
-- **The fattest copy still leads when it is also the best-seeded sufficient one.** Blade
-  Runner 2049 on VLC: the 77.97 GB remux has 211 seeds, the 22.2 GB 4K encode at 18 Mbps
-  has 6. Both are "enough", so they tie on size and seeds decide. For older films the
-  remux is often the copy people keep seeding. If that is not what "not too fat" should
-  mean, the next rule is a preference for the SMALLER of two sufficient copies once both
-  swarms are adequate; penalising size outright was rejected on 4 October.
+- **A lean pick can have a very thin swarm.** Blade Runner 2049 on VLC now leads with a
+  22.2 GB copy that has 6 seeds, the 211-seed remux next. Accepted on 4 October ("one is
+  bound to notice"). If it turns out to stall too often in practice, the evidence to bring
+  is how often the race or the walk had to rescue a lean pick.
 - **The Dolby Vision preference now decides more than it was written to.** It sits after
   size and before seeds, and was meant to separate "two releases that are otherwise the
   same pick". With the ceiling, every sufficient release ties on size, so a 1-seed

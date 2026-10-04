@@ -1893,6 +1893,10 @@ struct RankCtx<'a> {
     /// ranker (Auto, or capped at 1080p). The 4K preference asks for the fattest
     /// 4K and Saver for the smallest file, so neither has a ceiling.
     ceiling_secs: Option<f64>,
+    /// The size in bytes of the smallest release that is ENOUGH, per group of
+    /// releases the size tier chooses between (same bucket, same codec tier).
+    /// The yardstick `LEAN_FACTOR` is applied to. Empty when no ceiling applies.
+    smallest_enough: std::collections::HashMap<(RankBucket, u32), u64>,
 }
 
 impl<'a> RankCtx<'a> {
@@ -1910,6 +1914,7 @@ impl<'a> RankCtx<'a> {
             best_1080p_bpp: best_1080p_bytes_per_pixel(results, ceiling_secs),
             best_hevc_seeds: std::collections::HashMap::new(),
             ceiling_secs,
+            smallest_enough: std::collections::HashMap::new(),
         };
         if ctx.prefer_h264 {
             let mut best = std::collections::HashMap::new();
@@ -1918,6 +1923,20 @@ impl<'a> RankCtx<'a> {
                 *seeds = (*seeds).max(r.seeds);
             }
             ctx.best_hevc_seeds = best;
+        }
+        // After the HEVC yardstick, because the codec tier reads it.
+        if let Some(secs) = ctx.ceiling_secs {
+            let mut smallest = std::collections::HashMap::new();
+            for r in results.iter().filter(|r| is_enough(r, secs)) {
+                let Some(bytes) = crate::server::parse_size_to_bytes(&r.size) else {
+                    continue;
+                };
+                let bucket = rank_bucket(r, &ctx);
+                let group = (bucket, codec_key(r, bucket, &ctx));
+                let least = smallest.entry(group).or_insert(bytes);
+                *least = (*least).min(bytes);
+            }
+            ctx.smallest_enough = smallest;
         }
         ctx
     }
@@ -2162,6 +2181,36 @@ pub(crate) fn is_cam_source(title: &str) -> bool {
     })
 }
 
+/// How many times the smallest sufficient copy a release may be and still count
+/// as LEAN (2026-10-04, Fredrik: prefer the smaller of two good-enough copies;
+/// if the smaller one turns out too slow, "one is bound to notice").
+///
+/// Among releases that are all enough, the lean ones rank first and seeds decide
+/// among them; the rest follow, seeds deciding again. So a copy three times the
+/// size of a sufficient one no longer leads for being the best-seeded, while
+/// copies of comparable size are still chosen between by their swarms.
+///
+/// Relative to the smallest sufficient copy of the SAME group, not fixed bands:
+/// a fixed band boundary splits two copies 10% apart and joins two that are 90%
+/// apart, depending on where they happen to fall. The cost when the lean pick's
+/// swarm is thin is bounded and visible, as for every thin pick: the stall gate,
+/// the race against the next candidates (which the well-seeded fat copy joins)
+/// and the fallback walk.
+///
+/// Raw bytes, not codec-weighted: what is being saved is the download.
+const LEAN_FACTOR: f64 = 2.0;
+
+/// The codec tier of one release in its bucket: `codec_tier` for the transcoding
+/// target, nothing for native ones. Shared by the key and by the pre-pass that
+/// finds the smallest sufficient copy per (bucket, codec) group.
+fn codec_key(r: &TorrentResult, bucket: RankBucket, ctx: &RankCtx<'_>) -> u32 {
+    if ctx.prefer_h264 {
+        codec_tier(r, ctx.best_hevc_seeds.get(&bucket).copied())
+    } else {
+        0
+    }
+}
+
 /// Codec preference for the TRANSCODING target, as a per-release value.
 ///
 ///   0 → H.264 with a usable swarm: plays without an NVENC transcode
@@ -2221,11 +2270,7 @@ fn rank_key(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankKey {
     // Tier 4 fires ONLY for the Chromecast target (ctx.prefer_h264). Native-HEVC
     // targets (VLC / browser / phone) fall through to the later tiers, so a
     // well-seeded HEVC wins instead of being demoted below a starved H.264.
-    let codec = if ctx.prefer_h264 {
-        codec_tier(r, ctx.best_hevc_seeds.get(&bucket).copied())
-    } else {
-        0
-    };
+    let codec = codec_key(r, bucket, ctx);
 
     // Tier 5 (2026-09-05): bitrate, via file size. Everything above this has
     // tied — same resolution bucket, same viability, same language, same
@@ -2240,12 +2285,29 @@ fn rank_key(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankKey {
     // release shares the best value and the later tiers decide, which in
     // practice means seeds. Below the ceiling the order is the old one, bigger
     // first. See `enough_mbps` for the levels and the reasoning.
+    //
+    // AMENDED again the same day: among releases that are enough, the LEAN ones
+    // come first — those no more than `LEAN_FACTOR` times the smallest sufficient
+    // one in the same group. A tie on "enough" alone let seeds pick a 78 GB
+    // remux over a 22 GB encode whenever the remux was the copy people kept
+    // seeding (Blade Runner 2049: 211 seeds against 6). See `LEAN_FACTOR`.
     let size = if ctx.pref.is_saver() {
         u32::MAX - size_tier(r) // smallest wins — the quota is the scarce thing
     } else if ctx.ceiling_secs.is_some_and(|secs| is_enough(r, secs)) {
-        0
+        let lean = match (
+            ctx.smallest_enough.get(&(bucket, codec)),
+            crate::server::parse_size_to_bytes(&r.size),
+        ) {
+            (Some(&smallest), Some(bytes)) => bytes as f64 <= smallest as f64 * LEAN_FACTOR,
+            _ => true,
+        };
+        if lean {
+            0
+        } else {
+            1
+        }
     } else {
-        size_tier(r) + 1 // 0 is reserved for "enough", so it outranks any size
+        size_tier(r) + 2 // 0 and 1 are the two "enough" values, so they outrank any size
     };
 
     // NO PACK PENALTY. It was tier 1 until 2026-09-05 — ahead of resolution,
@@ -5732,6 +5794,28 @@ mod tests {
                     rank_results_mut_opts(&mut sorted, opts);
                     assert_eq!(sorted.len(), results.len());
                 }
+                // A second recorded list, with the year check's mark applied the
+                // way a film search applies it, so that field is exercised too.
+                let resp: Value = serde_json::from_str(F_TORRENTIO_BLADE_RUNNER_2049).unwrap();
+                let mut other = filter_results_by_show_title(
+                    torrent_results_from_streams(&resp),
+                    "Blade Runner 2049",
+                );
+                for r in other.iter_mut() {
+                    r.other_year = release_year_mismatch(&r.title, "Blade Runner 2049", 2017);
+                }
+                let opts = RankOpts {
+                    transcoding,
+                    original_language: Some("en"),
+                    pref,
+                    runtime_min: Some(164),
+                };
+                let ctx = RankCtx::for_set(&other, opts);
+                assert_strict_total_order(
+                    &other,
+                    &ctx,
+                    &format!("blade runner 2049 transcoding={transcoding} pref={pref:?}"),
+                );
             }
         }
     }
@@ -5892,6 +5976,73 @@ mod tests {
             native(QualityPref::Saver, Some(PROJECT_HAIL_MARY_MIN)),
         );
         assert_eq!(saver_a[0].title, saver_b[0].title);
+    }
+
+    /// Torrentio's list for Blade Runner 2049, recorded 2026-10-04 (68 streams,
+    /// `infoHash` removed). The film runs 164 minutes.
+    const F_TORRENTIO_BLADE_RUNNER_2049: &str =
+        include_str!("../tests/fixtures/torrentio/blade_runner_2049.json");
+
+    /// 2026-10-04: with the ceiling alone, every sufficient copy tied on size and
+    /// seeds chose between them, so the 77.97 GB remux (211 seeds) led over the
+    /// 22.2 GB encode (6 seeds). "Prefer the smaller of two good-enough copies."
+    #[test]
+    fn test_a_lean_sufficient_copy_leads_over_a_fat_one_whatever_their_seeds() {
+        let resp: Value = serde_json::from_str(F_TORRENTIO_BLADE_RUNNER_2049).unwrap();
+        let list =
+            filter_results_by_show_title(torrent_results_from_streams(&resp), "Blade Runner 2049");
+        let native = |pref| RankOpts {
+            transcoding: false,
+            original_language: Some("en"),
+            pref,
+            runtime_min: Some(164),
+        };
+        let secs = 164.0 * 60.0;
+        let r = ranked(list.clone(), native(QualityPref::Auto));
+        let pick = &r[0];
+        assert_eq!(resolution_tier(&pick.title), 3, "{}", top(&r, 6));
+        assert!(is_enough(pick, secs), "{}", top(&r, 6));
+        assert!(
+            gb(pick) < 30.0,
+            "a sufficient 4K a third of the remux's size leads:{}",
+            top(&r, 6)
+        );
+        // The remux is next in line, not gone: it is what the race and the walk
+        // reach if the lean copy's thin swarm delivers nothing.
+        let remux = r
+            .iter()
+            .position(|x| x.title.to_lowercase().contains("remux") && gb(x) > 70.0)
+            .expect("the remux stays in the list");
+        assert!(remux > 0 && remux < 8, "remux at {remux}:{}", top(&r, 8));
+        assert!(
+            r[remux].seeds > pick.seeds,
+            "and it IS the better-seeded one"
+        );
+
+        // Within one group, nothing fat precedes anything lean.
+        let group: Vec<&TorrentResult> = r
+            .iter()
+            .filter(|x| {
+                resolution_tier(&x.title) == 3
+                    && is_enough(x, secs)
+                    && !x.plays_only_by_hand()
+                    && x.file_index.is_some()
+                    && language_fit_bucket(&x.title, Some("en")) == 0
+            })
+            .collect();
+        let smallest = group.iter().map(|x| gb(x)).fold(f64::MAX, f64::min);
+        let first_fat = group.iter().position(|x| gb(x) > smallest * LEAN_FACTOR);
+        let last_lean = group.iter().rposition(|x| gb(x) <= smallest * LEAN_FACTOR);
+        if let (Some(fat), Some(lean)) = (first_fat, last_lean) {
+            assert!(
+                lean < fat,
+                "a fat copy at {fat} precedes a lean one at {lean}"
+            );
+        }
+
+        // The 4K pill is still the way to the fattest.
+        let forced = ranked(list, native(QualityPref::ForceUhd));
+        assert!(gb(&forced[0]) > 70.0, "{}", top(&forced, 4));
     }
 
     /// The transcoding target gets the same ceiling at 1080p: the pick must be a
