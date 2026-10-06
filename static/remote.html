@@ -1954,6 +1954,12 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
       if(r.cam) row.appendChild(el("span",{className:"disc",
         title:"filmed off a cinema screen or a projector feed, not taken from a disc or a stream",
         textContent:"⚠ cam copy"}));
+      // Tagged for another language, with the title's own language named nowhere
+      // (`language_fit_of` in search.rs). `dub` lists the languages; empty when the
+      // release says only DUBBED.
+      if(r.dub) row.appendChild(el("span",{className:"disc",
+        title:"tagged for another language, and the original audio is not named, so most likely a dub",
+        textContent:"⚠ "+(r.dub.length?r.dub.join("+")+" ":"")+"dub"}));
       row.appendChild(el("span",{className:"s "+health,
         title:fresh?"just aired — seed counts unreliable for a day or so; tap to try (spela verifies real delivery)":"",
         textContent:fresh?"🌱 new":(health==="dead"?"⚠ ":"")+sc+"🌱"}));
@@ -2804,19 +2810,22 @@ async function castViaPlay(spec, retry){
 /* Fast-play: search a title + play its best source directly (the ▶ on Continue /
    New-Episodes rows). Skips the manual search→tap-play step. Shows the loading
    surface instantly, then hands off to the normal doPlay (target-aware). */
-// A MARKED result is listed but never played automatically: a cam copy, or a release of
-// a different film with the same title (the server's `plays_only_by_hand`). A tap on its
-// row is a deliberate choice and sends `allow_marked`.
-function isMarked(r){ return !!(r && (r.cam || r.other_year!=null)); }
-// When the BEST source is marked there is no release yet: the ranker puts marked results
-// below every real source that can play, so one leads only when nothing real exists. ▶ is
-// then withheld and this is shown in its place (Fredrik, 2026-10-04: cam and telesync "are
-// generally not nice to watch"). Null when a real source leads.
+// A MARKED result is listed but never played automatically: a cam copy, a dub, or a
+// release of a different film with the same title (the server's `plays_only_by_hand`). A
+// tap on its row is a deliberate choice and sends `allow_marked`. `dub` is a list, and an
+// empty one still marks the row (a release that says only DUBBED).
+function isMarked(r){ return !!(r && (r.cam || r.other_year!=null || r.dub)); }
+// When the BEST source is marked there is nothing to play by itself: the ranker puts marked
+// results below every real source that can play, so one leads only when nothing real
+// exists. ▶ is then withheld and this is shown in its place (Fredrik, 2026-10-04: cam and
+// telesync "are generally not nice to watch"; 2026-10-06: "If it's dubbed it should not be
+// auto played"). Null when a real source leads.
 function noReleaseNotice(sources){
   const best=(sources||[])[0];
   if(!best) return null;
   if(best.other_year!=null) return "No release yet · the only source is a different film, from "+best.other_year;
-  return best.cam ? "No release yet · only cam copies so far, filmed in a cinema" : null;
+  if(best.cam) return "No release yet · only cam copies so far, filmed in a cinema";
+  return best.dub ? "Only dubbed copies · none with the original audio. Pick one from the sources to play it anyway" : null;
 }
 // A film whose release date is still ahead: the server does not search for sources at all
 // (whatever is listed under its id is another film or a fake), so the list is empty and
@@ -2831,7 +2840,7 @@ function unreleasedNote(show, nowMs){
 // onto a marked result by itself; a rotation that STARTED on one was asked for one. Mirrors
 // `next_fallback_source` on the server, which does the same for the Chromecast walk.
 function nextVlcSource(shot, id, startedOnMarked){
-  const marked = rid => { const r=(shot||[]).find(x=>x.id===rid); return !!(r && (r.cam || r.other_year!=null)); };
+  const marked = rid => { const r=(shot||[]).find(x=>x.id===rid); return !!(r && (r.cam || r.other_year!=null || r.dub)); };
   for(let next=id+1; next<=(shot||[]).length; next++){
     if(startedOnMarked || !marked(next)) return next;
   }

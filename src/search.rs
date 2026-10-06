@@ -194,6 +194,25 @@ pub struct TorrentResult {
     /// is fetched; never set for a series.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub other_year: Option<u16>,
+    /// 2026-10-06: the torrent's own title, Torrentio's first line (`title` is the
+    /// FILE name). Kept because it names languages the file name leaves out:
+    /// `... / Napisy PL`, `...S01.SweSub.1080p...`, `...WEB-DL.ITA-SPA...`. Read by
+    /// `language_fit` and nothing else.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub torrent_title: String,
+    /// 2026-10-06: Torrentio's own language line, decoded by
+    /// `parse_torrentio_languages`: an ISO 639-1 code per flag (`ru`, `en`) and
+    /// its four labels (`dubbed`, `multi-audio`, `dual-audio`, `multi-subs`).
+    /// Empty when Torrentio printed no such line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
+    /// 2026-10-06: `Some` when the release is a DUB: tagged for another language,
+    /// with the title's own language named nowhere (see `language_fit`). Holds the
+    /// languages it is tagged for, upper case (`["RU"]`); empty when the release
+    /// says only `DUBBED`. Written by the ranker for every result it ranks, and
+    /// only when the title's original language is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dub: Option<Vec<String>>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -202,11 +221,11 @@ fn is_false(b: &bool) -> bool {
 
 impl TorrentResult {
     /// A result that is listed and marked but never played automatically: a cam
-    /// copy, or a release of a different film. It plays only from a deliberate
-    /// tap on its marked row. The play button, the one-tap rows, the fallback
-    /// walk and the source race all step over it.
+    /// copy, a dub, or a release of a different film. It plays only from a
+    /// deliberate tap on its marked row. The play button, the one-tap rows, the
+    /// fallback walk and the source race all step over it.
     pub fn plays_only_by_hand(&self) -> bool {
-        self.other_year.is_some() || is_cam_source(&self.title)
+        self.other_year.is_some() || self.dub.is_some() || is_cam_source(&self.title)
     }
 }
 
@@ -1726,6 +1745,7 @@ fn torrent_results_from_streams(resp: &Value) -> Vec<TorrentResult> {
                 .trim()
                 .to_string();
             let info_hash = s["infoHash"].as_str().unwrap_or("").to_string();
+            let (torrent_title, languages) = parse_torrentio_languages(title_text);
             let filename = s["behaviorHints"]["filename"]
                 .as_str()
                 .or_else(|| title_text.split('\n').next())
@@ -1748,6 +1768,9 @@ fn torrent_results_from_streams(resp: &Value) -> Vec<TorrentResult> {
                 partial_pct: None, // enriched by the /search handler (media_dir scan)
                 cam: false,        // written by the ranker
                 other_year: None,  // written by `torrentio_streams` for a film
+                torrent_title,
+                languages,
+                dub: None, // written by the ranker
             }
         })
         .collect()
@@ -1977,6 +2000,7 @@ struct RankBucket {
     unaddressable: bool,
     dv_gate: bool,
     cam: bool,
+    dub: bool,
     res: u32,
     lang: u32,
 }
@@ -2078,20 +2102,36 @@ fn rank_bucket(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankBucket {
         force,
     );
 
-    // Tier 3 (2026-09-05): language fit, WITHIN an equal resolution+viability
+    // Tier 5 (2026-09-05): language fit, WITHIN an equal resolution+viability
     // bucket. Star City S01E06 is the anchor — all three top candidates were
     // well-seeded 1080p, so they tied on every existing tier and seed count
     // alone decided: a Polish AI-dub (903) and a French MULTI (174) outranked
     // the plain English release (166), and it played with six French subtitle
-    // tracks and no English one. Sits below resolution so a dead clean swarm
-    // can't win; see `effective_lang_tier` for why it carries no seed term.
-    let lang = effective_lang_tier(r, ctx.original_language);
+    // tracks and no English one.
+    //
+    // Deliberately carries NO seed-viability term. The first draft baked
+    // viability in and it was wrong twice over: it duplicated work the
+    // resolution tier already did, and, because it ran first, it turned into a
+    // seed filter BETWEEN two equally-clean releases, silently overriding the
+    // codec tier's own tuned 30x seed-disparity rule (caught by
+    // `test_ranking_h264_over_hevc_with_enough_seeds`). Language only ever
+    // reorders releases that are already equal on resolution.
+    let fit = language_fit(r, ctx.original_language);
+    let lang = fit.bucket;
+
+    // Tier 3 (2026-10-06): the original audio beats a dub, whatever the dub's
+    // resolution or size. Fredrik's ruling the day a Russian release of Babylon
+    // Berlin opened by itself: a dubbed copy is not played automatically "or
+    // ranked high at all". Demoted and marked, never dropped: when nothing else
+    // exists it is still there to tap. See `language_fit` for what counts.
+    let dub = fit.dub.is_some();
 
     RankBucket {
         other_film,
         unaddressable,
         dv_gate,
         cam,
+        dub,
         res,
         lang,
     }
@@ -2351,6 +2391,12 @@ fn rank_key(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankKey {
 }
 
 pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) {
+    // The marks first: the yardsticks below leave out every result that plays
+    // only by hand, and a dub is known as one only once this has run.
+    for r in results.iter_mut() {
+        r.cam = is_cam_source(&r.title);
+        r.dub = language_fit(r, opts.original_language).dub;
+    }
     // Pre-pass: the 1080p yardstick a 2160p release is judged against. Computed
     // once, outside the comparator, so every tier stays a per-result value.
     let ctx = RankCtx::for_set(results, opts);
@@ -2368,7 +2414,6 @@ pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) 
     // and whether it delivers is settled by racing and the stall gate.
     for (i, r) in results.iter_mut().enumerate() {
         r.id = i + 1;
-        r.cam = is_cam_source(&r.title);
     }
 }
 
@@ -2520,7 +2565,7 @@ fn extract_significant_tokens(title: &str) -> Vec<String> {
 }
 
 /// 2026-09-05: scene-release language markers → the ISO 639-1 code of the
-/// language the release is packaged FOR.
+/// language the release's AUDIO is in.
 ///
 /// A release tagged for a language the show was not made in ships that
 /// market's dub and/or only that market's subtitles. That is how Star City
@@ -2536,21 +2581,32 @@ fn extract_significant_tokens(title: &str) -> Vec<String> {
 /// `DL` is deliberately ABSENT even as an exact token — German releases use it
 /// for "Dual Language", but `WEB-DL` splits to `WEB` + `DL`, so including it
 /// would demote essentially every web release in existence.
+///
+/// Two-letter codes are absent for the same reason, with two exceptions that
+/// real lists carry as language tags and nothing else: `PL`, and `RU` (2026-10-06,
+/// `Babylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv`). `IT` is an iTunes source tag
+/// and `DE` a Spanish word (`La.casa.de.papel`), both seen in the same lists.
+///
+/// Subtitle-only tags (`VOSTFR`, `PLSUB`, ...) live in `subtitle_marker`: they
+/// name a language the release is subtitled in, which is not a dub.
 fn release_language_marker(token: &str) -> Option<&'static str> {
     Some(match token {
         "ENG" | "ENGLISH" => "en",
-        "FRENCH" | "TRUEFRENCH" | "VOSTFR" | "VFF" | "VFQ" => "fr",
+        "FRENCH" | "TRUEFRENCH" | "VFF" | "VFQ" => "fr",
         "GERMAN" | "DEUTSCH" => "de",
         "ITA" | "ITALIAN" => "it",
-        "SPANISH" | "ESPANOL" | "CASTELLANO" | "LATINO" | "SUBESPANOL" => "es",
-        "PL" | "POLISH" | "PLDUB" | "PLSUB" | "LEKTOR" | "DUBBINGPL" => "pl",
-        "RUS" | "RUSSIAN" => "ru",
-        "PORTUGUESE" | "DUBLADO" | "NACIONAL" | "LEGENDADO" => "pt",
+        "SPANISH" | "ESPANOL" | "CASTELLANO" | "LATINO" | "DOBLADA" | "DOBLADO" => "es",
+        "PL" | "POLISH" | "PLDUB" | "LEKTOR" | "DUBBINGPL" => "pl",
+        "RU" | "RUS" | "RUSSIAN" | "RUDUB" => "ru",
+        "UKR" | "UKRAINIAN" => "uk",
+        "PORTUGUESE" | "DUBLADO" | "NACIONAL" => "pt",
+        // One code for the three: Torrentio flags them all with the same flag,
+        // and `same_language` treats the Indian languages as one family.
         "HINDI" | "HIN" | "TAMIL" | "TELUGU" => "hi",
         "KOREAN" => "ko",
         "JAPANESE" => "ja",
         "CZECH" | "DABING" => "cs",
-        "HUNGARIAN" | "HUNSUB" => "hu",
+        "HUNGARIAN" => "hu",
         "TURKISH" => "tr",
         "ARABIC" => "ar",
         "SWEDISH" => "sv",
@@ -2558,9 +2614,115 @@ fn release_language_marker(token: &str) -> Option<&'static str> {
         "NORWEGIAN" => "no",
         "FINNISH" => "fi",
         "DUTCH" => "nl",
-        "NORDIC" => "sv",
         _ => return None,
     })
+}
+
+/// Three-letter language codes that are also names and ordinary words: `Dan`,
+/// `Nor`, and `Chi` in the Italian episode title `Silo.3x01.Chi.Sei.Tu`. They
+/// count ONLY as a sign that the title's OWN language is named
+/// (`...2023.iTA-DAN.Bluray...` on a Danish film, `...ITA.KOR...` on a Korean
+/// one), never as a sign of a foreign one, so a stray word can clear a release
+/// but cannot condemn it.
+fn weak_language_code(token: &str) -> Option<&'static str> {
+    Some(match token {
+        "KOR" => "ko",
+        "GER" | "DEU" => "de",
+        "SPA" | "ESP" | "LAT" => "es",
+        "NOR" => "no",
+        "DAN" => "da",
+        "FRE" | "FRA" => "fr",
+        "JAP" | "JPN" => "ja",
+        "SWE" => "sv",
+        "FIN" => "fi",
+        "POR" => "pt",
+        "TUR" => "tr",
+        "DUT" | "NLD" => "nl",
+        "CZE" => "cs",
+        "HUN" => "hu",
+        "POL" => "pl",
+        "CHI" | "ZHO" => "zh",
+        _ => return None,
+    })
+}
+
+/// A language named inside a subtitle list (`Sub Ita Eng`, `SUBS: FR EN ES`,
+/// `Napisy PL`), where the two-letter codes are safe because the list says what
+/// they are.
+fn listed_subtitle_language(token: &str) -> Option<&'static str> {
+    release_language_marker(token)
+        .or_else(|| weak_language_code(token))
+        .or_else(|| {
+            Some(match token {
+                "EN" => "en",
+                "FR" => "fr",
+                "DE" => "de",
+                "ES" => "es",
+                "IT" => "it",
+                "PT" => "pt",
+                "NL" => "nl",
+                "DK" => "da",
+                "SE" => "sv",
+                "NO" => "no",
+                "FI" => "fi",
+                "HU" => "hu",
+                "CZ" => "cs",
+                "TR" => "tr",
+                _ => return None,
+            })
+        })
+}
+
+/// A token that says SUBTITLES, and the language it names when it names one.
+/// `Some((language, bare))`; `bare` is a plain word (`Sub`, `Subs`, `Napisy`)
+/// whose language, if any, is the token next to it.
+///
+/// A subtitle language is not an audio language. Without this, the German-audio
+/// `Babylon.Berlin.S05e01.Fansub.Vostfr` and the English-audio Silo pack titled
+/// `... / Napisy PL` would both read as dubs.
+fn subtitle_marker(token: &str) -> Option<(Option<&'static str>, bool)> {
+    match token {
+        "SUB" | "SUBS" | "SUBBED" | "SUBTITLE" | "SUBTITLES" | "SUBTITLED" | "NAPISY"
+        | "SOTTOTITOLI" | "LEGENDAS" | "UNTERTITEL" | "TITULKY" | "FELIRAT" | "SUBTITULOS"
+        | "SUBTITULADO" => return Some((None, true)),
+        "VOSTFR" => return Some((Some("fr"), false)),
+        "LEGENDADO" => return Some((Some("pt"), false)),
+        "NORDIC" => return Some((Some("sv"), false)),
+        _ => {}
+    }
+    // `SweSub`, `PLSUB`, `HUNSUB`, `ENGsubs`, `eSubs`, `MSubs`, `Fansub`, `Multisub`.
+    for suffix in ["SUBS", "SUB"] {
+        if let Some(prefix) = token.strip_suffix(suffix).filter(|p| !p.is_empty()) {
+            let language = match prefix {
+                "E" => Some("en"),
+                _ => listed_subtitle_language(prefix),
+            };
+            return Some((language, false));
+        }
+    }
+    // `subITA`, `SUBFRENCH`, `SUBESPANOL`.
+    let rest = token.strip_prefix("SUB")?;
+    let language = release_language_marker(rest).or_else(|| weak_language_code(rest))?;
+    Some((Some(language), false))
+}
+
+/// A token that says the audio was replaced. Several are language markers too
+/// (`LEKTOR` is a Polish voice-over, `DUBLADO` a Portuguese dub).
+fn is_dub_word(token: &str) -> bool {
+    matches!(
+        token,
+        "DUB"
+            | "DUBBED"
+            | "DUBBING"
+            | "RUDUB"
+            | "PLDUB"
+            | "DUBBINGPL"
+            | "DUBLADO"
+            | "DOBLADA"
+            | "DOBLADO"
+            | "LEKTOR"
+            | "DABING"
+    )
 }
 
 /// Markers that mean "packaged for several markets at once". The original
@@ -2580,30 +2742,278 @@ fn release_tokens(title: &str) -> Vec<String> {
         .collect()
 }
 
-/// How well a release's advertised language fits the show's own. Lower is better.
+/// Two language codes that name the same thing for this purpose. TMDB and
+/// Torrentio do not use one vocabulary: TMDB says `cn` for Cantonese and `ta` /
+/// `te` for Tamil and Telugu, where Torrentio prints one flag for Chinese and
+/// one for every Indian language.
+fn same_language(a: &str, b: &str) -> bool {
+    const FAMILIES: [&[&str]; 3] = [
+        &["hi", "ta", "te", "ml", "kn", "bn", "mr", "pa", "ur", "gu"],
+        &["zh", "cn"],
+        &["no", "nb", "nn"],
+    ];
+    a == b
+        || FAMILIES
+            .iter()
+            .any(|family| family.contains(&a) && family.contains(&b))
+}
+
+/// The language a Torrentio flag stands for: the flag's two-letter country code,
+/// except where a country and its language are spelled differently.
+fn flag_language(country: &str) -> String {
+    match country {
+        "GB" | "US" => "en",
+        "MX" => "es",
+        "KR" => "ko",
+        "JP" => "ja",
+        "CN" | "TW" => "zh",
+        "BR" => "pt",
+        "DK" => "da",
+        "SE" => "sv",
+        "CZ" => "cs",
+        "IN" => "hi",
+        "UA" => "uk",
+        "GR" => "el",
+        "IL" => "he",
+        "SA" => "ar",
+        "IR" => "fa",
+        "VN" => "vi",
+        "MY" => "ms",
+        "RS" => "sr",
+        "SI" => "sl",
+        "EE" => "et",
+        other => return other.to_ascii_lowercase(),
+    }
+    .to_string()
+}
+
+/// The two parts of a Torrentio stream title that say what language a release
+/// is in, besides its file name:
 ///
-///   0 → clean: no foreign marker at all, or a marker naming the show's OWN
-///        language (a `FRENCH` tag on a French film is the right release)
-///   1 → multi-language packaging: original audio usually present, foreign subs
-///   2 → a foreign dub/sub marker: the release is FOR another language
+/// ```text
+/// Babylon.Berlin.S05.1080p.Ru.Ultradox            <- the torrent's own title
+/// Babylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv     <- the file, for a pack
+/// 👤 17 💾 1.48 GB ⚙️ EXT
+/// 🇷🇺                                             <- Torrentio's language line
+/// ```
 ///
-/// `original_language` is TMDB's `original_language` for the title. `None`
-/// falls back to `"en"` — nearly everything watched here is English-original,
-/// and a bare `rank_results_mut` call (CLI, tests) has no show context.
-pub(crate) fn language_fit_bucket(title: &str, original_language: Option<&str>) -> u32 {
-    let orig = original_language.unwrap_or("en").to_ascii_lowercase();
-    let (mut has_foreign, mut has_orig, mut has_multi) = (false, false, false);
-    for token in release_tokens(title) {
-        if let Some(lang) = release_language_marker(&token) {
-            if lang == orig {
-                has_orig = true;
-            } else {
-                has_foreign = true;
+/// Returns the title lines joined, and the language line decoded: one ISO 639-1
+/// code per flag, and `dubbed`, `multi-audio`, `dual-audio`, `multi-subs` for the
+/// four labels Torrentio prints there. 409 of 573 releases across 14 lists
+/// recorded on 2026-10-06 carried the line; before that day spela threw it away.
+fn parse_torrentio_languages(title: &str) -> (String, Vec<String>) {
+    let lines: Vec<&str> = title.split('\n').collect();
+    let Some(meta) = lines.iter().position(|l| l.contains('👤')) else {
+        return (lines.first().copied().unwrap_or("").to_string(), Vec::new());
+    };
+    let mut languages: Vec<String> = Vec::new();
+    for part in lines[meta + 1..].iter().flat_map(|l| l.split(" / ")) {
+        let label = match part.trim().to_ascii_lowercase().as_str() {
+            "dubbed" => Some("dubbed"),
+            "multi audio" => Some("multi-audio"),
+            "dual audio" => Some("dual-audio"),
+            "multi subs" => Some("multi-subs"),
+            _ => None,
+        };
+        if let Some(label) = label {
+            languages.push(label.to_string());
+            continue;
+        }
+        // A flag is two REGIONAL INDICATOR letters, U+1F1E6 (A) to U+1F1FF (Z).
+        let letters: Vec<char> = part
+            .chars()
+            .filter_map(|c| {
+                let offset = (c as u32).checked_sub(0x1F1E6).filter(|o| *o < 26)?;
+                char::from_u32('A' as u32 + offset)
+            })
+            .collect();
+        for pair in letters.chunks_exact(2) {
+            let language = flag_language(&pair.iter().collect::<String>());
+            if !languages.contains(&language) {
+                languages.push(language);
             }
-        } else if is_multi_language_marker(&token) {
-            has_multi = true;
         }
     }
+    (lines[..meta].join(" "), languages)
+}
+
+/// What one release name says about its languages.
+#[derive(Default)]
+struct LanguageScan {
+    /// Languages named as audio.
+    audio: Vec<&'static str>,
+    /// Languages named as subtitles.
+    subs: Vec<&'static str>,
+    /// `weak_language_code` hits: evidence for the original language only.
+    weak: Vec<&'static str>,
+    multi: bool,
+    dub_word: bool,
+}
+
+impl LanguageScan {
+    /// Read one name. A language is a SUBTITLE language when it sits in a
+    /// subtitle list (`Sub Ita Eng`, `Napisy PL`), directly before a bare
+    /// subtitle word (`ENG.SUB`, `English subs`), or inside a compound marker
+    /// (`VOSTFR`, `SweSub`). Everywhere else it is audio.
+    fn read(&mut self, name: &str) {
+        enum Tag {
+            Audio(&'static str),
+            Sub(&'static str),
+            Weak(&'static str),
+            Multi,
+            Other,
+        }
+        let mut tags: Vec<Tag> = Vec::new();
+        let mut in_subtitle_list = false;
+        for token in release_tokens(name) {
+            let token = token.as_str();
+            self.dub_word |= is_dub_word(token);
+            if let Some((language, bare)) = subtitle_marker(token) {
+                if bare {
+                    match tags.last_mut() {
+                        Some(tag @ (Tag::Audio(_) | Tag::Weak(_))) => {
+                            let (Tag::Audio(l) | Tag::Weak(l)) = *tag else {
+                                unreachable!()
+                            };
+                            *tag = Tag::Sub(l);
+                        }
+                        // `Multi Subs`: several subtitle tracks, not several audio ones.
+                        Some(tag @ Tag::Multi) => *tag = Tag::Other,
+                        _ => {}
+                    }
+                }
+                tags.push(language.map_or(Tag::Other, Tag::Sub));
+                in_subtitle_list = true;
+                continue;
+            }
+            if in_subtitle_list {
+                if let Some(language) = listed_subtitle_language(token) {
+                    tags.push(Tag::Sub(language));
+                    continue;
+                }
+                in_subtitle_list = false;
+            }
+            tags.push(if let Some(language) = release_language_marker(token) {
+                Tag::Audio(language)
+            } else if let Some(language) = weak_language_code(token) {
+                Tag::Weak(language)
+            } else if is_multi_language_marker(token) {
+                Tag::Multi
+            } else {
+                Tag::Other
+            });
+        }
+        for tag in tags {
+            match tag {
+                Tag::Audio(l) => self.audio.push(l),
+                Tag::Sub(l) => self.subs.push(l),
+                Tag::Weak(l) => self.weak.push(l),
+                Tag::Multi => self.multi = true,
+                Tag::Other => {}
+            }
+        }
+    }
+}
+
+/// How a release's languages fit the title's own.
+pub(crate) struct LanguageFit {
+    /// Lower is better.
+    ///
+    ///   0 → clean: no foreign language named, or the title's OWN language named
+    ///        (a `FRENCH` tag on a French film is the right release)
+    ///   1 → multi-language packaging: original audio usually present, foreign subs
+    ///   2 → FOR another language: a dub, or the original with foreign subtitles
+    pub bucket: u32,
+    /// `Some` when the release is a dub: the languages it is tagged for, upper
+    /// case, empty when it says only `DUBBED`. See `TorrentResult::dub`.
+    pub dub: Option<Vec<String>>,
+}
+
+/// Judge one search result. Reads three things: the file name, the torrent's
+/// own title, and Torrentio's language line.
+pub(crate) fn language_fit(r: &TorrentResult, original_language: Option<&str>) -> LanguageFit {
+    language_fit_of(&r.title, &r.torrent_title, &r.languages, original_language)
+}
+
+/// The language tier for a bare release name. `original_language` is TMDB's
+/// `original_language` for the title. `None` falls back to `"en"` — nearly
+/// everything watched here is English-original, and a bare `rank_results_mut`
+/// call (CLI, tests) has no show context.
+#[cfg_attr(not(test), allow(dead_code))] // the ranker reads `language_fit` whole
+pub(crate) fn language_fit_bucket(title: &str, original_language: Option<&str>) -> u32 {
+    language_fit_of(title, "", &[], original_language).bucket
+}
+
+/// 2026-10-06 anchor: Play on Babylon Berlin S05E01 opened a Russian dub.
+/// `Babylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv` named its language with a tag
+/// the table did not hold, so it counted as clean and won on size against the
+/// German broadcaster's own `...1080p.ARD.WEB-DL.mp4`. Torrentio had printed a
+/// Russian flag on that very result; the line was parsed for seeds and size and
+/// the rest of it dropped.
+///
+/// A release is a DUB when all four hold:
+///
+///   - the title's original language is known (`original_language` is `Some`);
+///   - that language is named nowhere: not as audio, not by a flag, not by a
+///     three-letter code;
+///   - nothing says the file carries several audio tracks (`MULTI`, `DUAL`,
+///     Torrentio's `Multi Audio` / `Dual Audio`), which usually means the dub
+///     PLUS the original;
+///   - another language is named as AUDIO or flagged, or the release says
+///     `DUBBED` outright. A language that the name itself explains as a subtitle
+///     language does not count, flag or no flag.
+///
+/// Measured on 573 real releases across 14 titles in six original languages
+/// (2026-10-06): 90 marked. Known to mark too much in one case, and accepted:
+/// a flag is Torrentio's reading of the torrent's page, so a Russian-tracker
+/// remux that also carries the original track is marked when its title names
+/// only Russian. A marked release is still listed and still plays on a tap; an
+/// unmarked dub plays by itself, which is the failure that was reported.
+fn language_fit_of(
+    name: &str,
+    torrent_title: &str,
+    torrentio: &[String],
+    original_language: Option<&str>,
+) -> LanguageFit {
+    let orig = original_language.unwrap_or("en").to_ascii_lowercase();
+    let mut scan = LanguageScan::default();
+    scan.read(name);
+    scan.read(torrent_title);
+    let mut flags: Vec<&str> = Vec::new();
+    for tag in torrentio {
+        match tag.as_str() {
+            "dubbed" => scan.dub_word = true,
+            "multi-audio" | "dual-audio" => scan.multi = true,
+            "multi-subs" => {}
+            code => flags.push(code),
+        }
+    }
+    let foreign = |l: &&str| !same_language(l, &orig);
+    let has_orig = scan
+        .audio
+        .iter()
+        .chain(&scan.weak)
+        .chain(&flags)
+        .any(|l| same_language(l, &orig));
+    // Named as a subtitle language and never as audio: a flag for it is
+    // explained, and is no sign of a dub.
+    let subtitle_only = |l: &&str| scan.subs.contains(l) && !scan.audio.contains(l);
+    let mut foreign_audio: Vec<&str> = scan
+        .audio
+        .iter()
+        .copied()
+        .chain(flags.iter().copied().filter(|l| !subtitle_only(l)))
+        .filter(foreign)
+        .collect();
+    foreign_audio.sort_unstable();
+    foreign_audio.dedup();
+    let names_a_foreign_language = scan
+        .audio
+        .iter()
+        .chain(&scan.subs)
+        .chain(&flags)
+        .any(foreign);
+
     // A foreign marker ALONGSIDE the show's own language is a dual-language
     // release — `...DDP5.1.ENG.Atmos.ITA.H265...` names English Atmos AND
     // Italian — so the original audio is documented as present, spela's audio
@@ -2621,11 +3031,24 @@ pub(crate) fn language_fit_bucket(title: &str, original_language: Option<&str>) 
     // documents the original as present — and a French `MULTI` reaching the
     // screen with six French subtitle tracks and no English one is the incident
     // this whole tier was forged from.
-    match (has_foreign, has_orig, has_multi) {
-        (true, false, _) => 2,    // a foreign dub, original not named
-        (_, _, true) => 1,        // MULTI: unnamed languages
-        (true, true, false) => 0, // dual-language, original explicitly present
-        (false, _, false) => 0,   // clean
+    let for_another_language = !has_orig && (names_a_foreign_language || scan.dub_word);
+    let bucket = match (for_another_language, scan.multi) {
+        (true, _) => 2,      // a dub, or foreign subtitles, original not named
+        (false, true) => 1,  // MULTI: unnamed languages
+        (false, false) => 0, // clean, or dual-language with the original named
+    };
+    let is_dub = original_language.is_some()
+        && for_another_language
+        && !scan.multi
+        && (!foreign_audio.is_empty() || scan.dub_word);
+    LanguageFit {
+        bucket,
+        dub: is_dub.then(|| {
+            foreign_audio
+                .iter()
+                .map(|l| l.to_ascii_uppercase())
+                .collect()
+        }),
     }
 }
 
@@ -2887,24 +3310,6 @@ pub(crate) fn size_tier(r: &TorrentResult) -> u32 {
         // nothing about it, and there is always another candidate.
         _ => WORST,
     }
-}
-
-/// Language fit as a plain ranker tier.
-///
-/// Deliberately carries NO seed-viability term, unlike `effective_res_tier`.
-/// The first draft baked viability in here and it was wrong twice over: it
-/// duplicated work the resolution tier already does, and — because it ran
-/// first — it turned into a seed filter BETWEEN two equally-clean releases,
-/// silently overriding the codec tier's own tuned 30x seed-disparity rule
-/// (caught by `test_ranking_h264_over_hevc_with_enough_seeds`).
-///
-/// Running BELOW resolution instead gives the dead-swarm guard for free:
-/// `effective_res_tier` demotes an unseeded release to buckets 3-5, so a
-/// 3-seed clean release loses to a 400-seed MULTI before language is ever
-/// consulted, and language then only ever reorders releases already equal on
-/// resolution and viability.
-pub(crate) fn effective_lang_tier(r: &TorrentResult, original_language: Option<&str>) -> u32 {
-    language_fit_bucket(&r.title, original_language)
 }
 
 /// Classify a torrent title into a RAW resolution bucket. This is a pure
@@ -4176,6 +4581,9 @@ mod tests {
             partial_pct: None,
             cam: false,
             other_year: None,
+            torrent_title: String::new(),
+            languages: Vec::new(),
+            dub: None,
         }
     }
 
@@ -4310,6 +4718,435 @@ mod tests {
             ),
             2
         );
+    }
+
+    /// Torrentio's list for Babylon Berlin S05E01, recorded from the live API on
+    /// 2026-10-06: all 5 streams, hashes removed. The series is German (TMDB
+    /// `original_language: de`).
+    const F_TORRENTIO_BABYLON_BERLIN_S05E01: &str =
+        include_str!("../tests/fixtures/torrentio/babylon_berlin_s05e01.json");
+
+    /// A recorded Torrentio list through the parser the live search uses.
+    fn recorded(fixture: &str) -> Vec<TorrentResult> {
+        let resp: Value = serde_json::from_str(fixture).unwrap();
+        torrent_results_from_streams(&resp)
+    }
+    fn opts_for(transcoding: bool, original_language: &str) -> RankOpts<'_> {
+        RankOpts {
+            transcoding,
+            original_language: Some(original_language),
+            pref: QualityPref::Auto,
+            runtime_min: None,
+        }
+    }
+
+    /// 2026-10-06 anchor. Play on Babylon Berlin S05E01 opened a Russian release:
+    /// `...1080p.Ru.Ultradox.mkv` (1.48 GB) led `...1080p.ARD.WEB-DL.mp4` (909 MB),
+    /// the German broadcaster's own copy, at 17 seeds each.
+    #[test]
+    fn test_a_russian_dub_does_not_lead_a_german_series() {
+        for transcoding in [false, true] {
+            let r = ranked(
+                recorded(F_TORRENTIO_BABYLON_BERLIN_S05E01),
+                opts_for(transcoding, "de"),
+            );
+            assert!(
+                r[0].title.contains("ARD.WEB-DL"),
+                "transcoding={transcoding}: the German release leads; got{}",
+                top(&r, 5)
+            );
+        }
+    }
+
+    const F_TORRENTIO_SILO_S03E01: &str =
+        include_str!("../tests/fixtures/torrentio/silo_s03e01.json");
+    const F_TORRENTIO_THE_PROMISED_LAND: &str =
+        include_str!("../tests/fixtures/torrentio/the_promised_land_2023.json");
+
+    /// Counted by eye on the recorded lists, release by release. Silo: six Polish
+    /// AI dubs, four Russian, one Czech, one French. The Promised Land: four from
+    /// a Russian tracker, one Italian, one Spanish; the 67 GB UHD remux among them
+    /// very likely carries the Danish track too, and is marked on its Russian flag
+    /// alone (see `language_fit_of`).
+    const SILO_DUBS: usize = 12;
+    const PROMISED_LAND_DUBS: usize = 6;
+
+    /// Torrentio's own words about a release's languages, on real titles: the
+    /// last line, which spela used to parse for seeds and size and then drop.
+    #[test]
+    fn test_torrentio_language_line_is_read() {
+        let (title, languages) = parse_torrentio_languages(
+            "Babylon.Berlin.S05.1080p.Ru.Ultradox\nBabylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv\n👤 17 💾 1.48 GB ⚙️ EXT\n🇷🇺",
+        );
+        assert_eq!(
+            title,
+            "Babylon.Berlin.S05.1080p.Ru.Ultradox Babylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv"
+        );
+        assert_eq!(languages, ["ru"]);
+        // No language line at all: the German broadcaster's own copy.
+        let (_, none) = parse_torrentio_languages(
+            "Babylon.Berlin.S05.1080p.ARD.WEB-DL\nBabylon.Berlin.S05E01.1080p.ARD.WEB-DL.mp4\n👤 17 💾 909.14 MB ⚙️ EXT",
+        );
+        assert!(none.is_empty(), "{none:?}");
+        // The four labels Torrentio prints beside the flags.
+        let languages_of = |t: &str| parse_torrentio_languages(t).1;
+        assert_eq!(
+            languages_of("Kleo S01 DUBBED WEBRip x265-ION265\nKleo.S01E01.DUBBED.WEBRip.x265-ION265[eztv.re].mp4\n👤 2 💾 360.56 MB ⚙️ EZTV\nDubbed"),
+            ["dubbed"]
+        );
+        assert_eq!(
+            languages_of("Silo.S03E01.2026.WEB-DL.1080p-Dual-Lat\n👤 5 💾 2.19 GB ⚙️ Cinecalidad\nDual Audio / 🇲🇽"),
+            ["dual-audio", "es"],
+            "a Mexican flag is Spanish"
+        );
+        assert_eq!(
+            languages_of("[moon] La casa de papel - Money Heist Season 1 1080p WEBRip x264 AC3 DualAudio MultiSubs\nE01 Episode 1.mp4\n👤 5 💾 1.3 GB ⚙️ 1337x\nMulti Subs / Dual Audio / 🇪🇸"),
+            ["multi-subs", "dual-audio", "es"]
+        );
+        // A web release's subtitle list: 26 flags, English first.
+        let many = languages_of(
+            "Silo S03E01 1080p WEB h264-ETHEL EZTV\n👤 2271 💾 3.91 GB ⚙️ EZTV\n🇬🇧 / 🇯🇵 / 🇷🇺 / 🇮🇹 / 🇵🇹 / 🇪🇸 / 🇰🇷 / 🇨🇳 / 🇫🇷 / 🇩🇪 / 🇳🇱 / 🇮🇳 / 🇵🇱 / 🇨🇿 / 🇭🇺 / 🇧🇬 / 🇺🇦 / 🇩🇰 / 🇸🇪 / 🇳🇴 / 🇹🇷 / 🇸🇦 / 🇮🇱 / 🇮🇩 / 🇲🇾 / 🇹🇭",
+        );
+        assert_eq!((many.len(), many[0].as_str()), (26, "en"), "{many:?}");
+        // Seeds, size and source still come off the same title.
+        assert_eq!(
+            parse_torrentio_title(
+                "Babylon.Berlin.S05.1080p.Ru.Ultradox\nBabylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv\n👤 17 💾 1.48 GB ⚙️ EXT\n🇷🇺"
+            ),
+            (17, "1.48 GB".to_string(), "EXT".to_string())
+        );
+    }
+
+    /// What is a dub and what is not, on releases copied from 14 live Torrentio
+    /// lists (2026-10-06): the file name, Torrentio's whole title for it, and the
+    /// title's original language from TMDB.
+    #[test]
+    fn test_a_dub_is_told_from_subtitles_and_from_a_named_original() {
+        let cases: [(&str, &str, &str, Option<&[&str]>, u32); 26] = [
+            // the anchor: a two-letter tag and a Russian flag
+            (
+                "Babylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv",
+                "Babylon.Berlin.S05.1080p.Ru.Ultradox\nBabylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv\n👤 17 💾 1.48 GB ⚙️ EXT\n🇷🇺",
+                "de",
+                Some(&["RU"]),
+                2,
+            ),
+            // named twice over
+            (
+                "Babylon.Berlin.s05e01.HD1080p.WEBRip.Rus.RuDub.tv.mkv",
+                "Babylon.Berlin.s05.HD1080p.WEBRip.Rus\nBabylon.Berlin.s05e01.HD1080p.WEBRip.Rus.RuDub.tv.mkv\n👤 4 💾 2.15 GB ⚙️ EXT\n🇷🇺",
+                "de",
+                Some(&["RU"]),
+                2,
+            ),
+            // says DUBBED and names no language
+            (
+                "Kleo.S01E01.DUBBED.WEBRip.x265-ION265[eztv.re].mp4",
+                "Kleo S01 DUBBED WEBRip x265-ION265\nKleo.S01E01.DUBBED.WEBRip.x265-ION265[eztv.re].mp4\n👤 2 💾 360.56 MB ⚙️ EZTV\nDubbed",
+                "de",
+                Some(&[]),
+                2,
+            ),
+            // an English dub of a Korean series
+            (
+                "Squid.Game.S01E01.DUBBED.720p.NF.WEBRip.x264-GalaxyTV.mkv",
+                "Squid.Game.S01.COMPLETE.DUBBED.720p.NF.WEBRip.x264-GalaxyTV\nSquid.Game.S01E01.DUBBED.720p.NF.WEBRip.x264-GalaxyTV.mkv\n👤 31 💾 431.14 MB ⚙️ ThePirateBay\nDubbed",
+                "ko",
+                Some(&[]),
+                2,
+            ),
+            // two dubs and no German
+            (
+                "Dark.1x01.Segreti.ITA.ENG.1080p.WEBMux.DD5.1.x264-Morpheus.mkv",
+                "Dark.1x01.Segreti.ITA.ENG.1080p.WEBMux.DD5.1.x264-Morpheus.mkv\n👤 5 💾 1.38 GB ⚙️ 1337x\n🇬🇧 / 🇮🇹",
+                "de",
+                Some(&["EN", "IT"]),
+                2,
+            ),
+            // the Polish AI dub of an English series
+            (
+                "Silo.S03E01.PL.Ai.1080p.ATVP.WEB-DL.DDPA5.1.H.264-XuploaD.mkv",
+                "Silo.Sezon03.PL.Ai.1080p.ATVP.WEB-DL.DDPA5.1.H.264-XuploaD\nSilo.S03E01.PL.Ai.1080p.ATVP.WEB-DL.DDPA5.1.H.264-XuploaD.mkv\n👤 146 💾 3.86 GB ⚙️ BestTorrents\n🇵🇱",
+                "en",
+                Some(&["PL"]),
+                2,
+            ),
+            // a Russian studio dub
+            (
+                "Silo.S03E01.1080p.rus.LostFilm.TV.mkv",
+                "Silo.S03E01.1080p.rus\n👤 26 💾 2.84 GB ⚙️ EXT\n🇷🇺",
+                "en",
+                Some(&["RU"]),
+                2,
+            ),
+            // a French dub
+            (
+                "Slow.Horses.S05E01.FRENCH.WEBRip.x264.mp4",
+                "Slow.Horses.S05E01.FRENCH.WEBRip.x264.mp4\n👤 9 💾 338.48 MB ⚙️ Torrent9\n🇫🇷",
+                "en",
+                Some(&["FR"]),
+                2,
+            ),
+            // English audio on a Norwegian film; the Italian is a subtitle
+            (
+                "The ugly stepsister (2025) ENG Ac3 5.1 sub Ita WEBDL 720p H264 [ArMor] iDN_CreW.mkv",
+                "The ugly stepsister (2025) ENG Ac3 5.1 sub Ita WEBDL 720p H264 [ArMor] iDN_CreW\n👤 81 💾 2.62 GB ⚙️ 1337x\n🇬🇧 / 🇮🇹",
+                "no",
+                Some(&["EN"]),
+                2,
+            ),
+            // a Russian flag and nothing else: marked, knowingly
+            (
+                "Bastarden.2023.1080p.BluRay.x264-SbR_EniaHD.mkv",
+                "Меч короля / Bastarden / The Promised Land (2023) BDRip 1080p от EniaHD | D | Пифагор\n👤 5 💾 13.89 GB ⚙️ Rutor\n🇷🇺",
+                "da",
+                Some(&["RU"]),
+                2,
+            ),
+            // Hindi and English, no Spanish
+            (
+                "Money.Heist.S01E01.1080p.NF.WEB-DL.HIN-ENG.DD+5.1.x264-Telly.mkv",
+                "Money Heist S01 1080p NF WEB-DL Hindi - English DD 5.1 x264 - Telly\nMoney.Heist.S01E01.1080p.NF.WEB-DL.HIN-ENG.DD+5.1.x264-Telly.mkv\n👤 3 💾 1.76 GB ⚙️ 1337x\n🇬🇧 / 🇮🇳",
+                "es",
+                Some(&["EN", "HI"]),
+                2,
+            ),
+            // German audio with French subtitles is not a dub
+            (
+                "Babylon.Berlin.S05e01.Fansub.Vostfr.Web.H264.mp4",
+                "Babylon.Berlin.S05e01.Fansub.Vostfr.Web.H264\n👤 51 💾 308.79 MB ⚙️ Torrent9\n🇫🇷",
+                "de",
+                None,
+                2,
+            ),
+            // English audio; the Polish flag is the pack's subtitles
+            (
+                "Silo.S03E01.HDR.2160p.WEB.h265-ETHEL.mkv",
+                "Silo (2026) (S03 Complete) 2160p.ATVP.WEB- DL.DDP5.1.Atmos.DV.HDR.H.265-FLUX-ETHEL / Napisy PL\nSilo.S03E01.HDR.2160p.WEB.h265-ETHEL.mkv\n👤 8 💾 8.92 GB ⚙️ BestTorrents\n🇵🇱",
+                "en",
+                None,
+                2,
+            ),
+            // Spanish audio with Swedish subtitles
+            (
+                "La.Casa.De.Papel.S01E01.mkv",
+                "La.Casa.De.Papel.(Money.Heist).S01.SweSub.1080p.x264-Justiso\nLa.Casa.De.Papel.S01E01.mkv\n👤 11 💾 779.3 MB ⚙️ ThePirateBay\n🇸🇪",
+                "es",
+                None,
+                2,
+            ),
+            // subtitled, not dubbed
+            (
+                "Silo.S03E01.VOSTFR.WEB.H264-SUPPLY.mp4",
+                "Silo.S03E01.VOSTFR.WEB.H264-SUPPLY\n👤 57 💾 302.34 MB ⚙️ Torrent9\n🇫🇷",
+                "en",
+                None,
+                2,
+            ),
+            // two audio tracks: the dub plus the original
+            (
+                "Silo.S03E01.2026.WEB-DL.1080p-Dual-Lat.mkv",
+                "Silo.S03E01.2026.WEB-DL.1080p-Dual-Lat\n👤 5 💾 2.19 GB ⚙️ Cinecalidad\nDual Audio / 🇲🇽",
+                "en",
+                None,
+                2,
+            ),
+            // DAN names the Danish original
+            (
+                "La.Terra.Promessa.2023.iTA-DAN.Bluray.1080p.x264-CYBER.mkv",
+                "La.Terra.Promessa.2023.iTA-DAN.Bluray.1080p.x264-CYBER.mkv\n👤 3 💾 11.04 GB ⚙️ 1337x\n🇮🇹",
+                "da",
+                None,
+                0,
+            ),
+            // KOR names the Korean original
+            (
+                "No.Other.Choice.2025.1080p.AMZN.WEB-DL.DDP5.1.ITA.KOR.Atmos.H264-TheBlackKing.mkv",
+                "No.Other.Choice.2025.1080p.AMZN.WEB-DL.DDP5.1.ITA.KOR.Atmos.H264-TheBlackKing\n👤 17 💾 10.77 GB ⚙️ 1337x\n🇮🇹 / 🇰🇷",
+                "ko",
+                None,
+                0,
+            ),
+            // GER names the German original
+            (
+                "Dark.S01E01.Secrets.DUAL-AUDIO.GER-ENG.1080p.10bit.WEBRip.6CH.x265.HEVC-PSA.mkv",
+                "Dark.S01.COMPLETE.DUAL-AUDIO.GER-ENG.1080p.10bit.WEBRip.6CH.x265\nDark.S01E01.Secrets.DUAL-AUDIO.GER-ENG.1080p.10bit.WEBRip.6CH.x265.HEVC-PSA.mkv\n👤 383 💾 715.1 MB ⚙️ ThePirateBay\nDual Audio / 🇬🇧 / 🇩🇪",
+                "de",
+                None,
+                1,
+            ),
+            // SPA names the Spanish original
+            (
+                "La.casa.de.papel.S01E01.SPA-ENG.1080p.10bit.WEBRip.2CH.x265.HEVC-PSA.mkv",
+                "La Casa de Papel / Money Heist 2017 Complete Seasons 1 to 5 1080p 10bit WEBRip 2CH x265 HEVC-PSA\nLa.casa.de.papel.S01.SPA-ENG.1080p.10bit.WEBRip.2CH.x265.HEVC-PSA/La.casa.de.papel.S01E01.SPA-ENG.1080p.10bit.WEBRip.2CH.x265.HEVC-PSA.mkv\n👤 6 💾 626.89 MB ⚙️ TorrentGalaxy\n🇬🇧 / 🇪🇸",
+                "es",
+                None,
+                0,
+            ),
+            // `Chi` is an Italian word here, not Chinese
+            (
+                "Silo.3x01.Chi.Sei.Tu.ITA.ENG.1080p.ATVP.WEBRip.AAC.x265-Pir8.mkv",
+                "Silo - S03 (2026) [COMPLETE] 1080p ATVP Rip x265 ita eng AAC Sub ita eng[Pir8]\nSilo.3x01.Chi.Sei.Tu.ITA.ENG.1080p.ATVP.WEBRip.AAC.x265-Pir8.mkv\n👤 336 💾 698.3 MB ⚙️ ThePirateBay\n🇬🇧 / 🇮🇹 / 🇨🇳",
+                "en",
+                None,
+                0,
+            ),
+            // `iT` is the iTunes source tag, not Italian
+            (
+                "No Other Choice 2025 1080p iT WEB-DL AAC2 0 H 264-NTb.mkv",
+                "No Other Choice 2025 1080p iT WEB-DL AAC2 0 H 264-NTb\n👤 73 💾 6.56 GB ⚙️ ThePirateBay",
+                "ko",
+                None,
+                0,
+            ),
+            // English SUBTITLES, and Torrentio flags the Korean
+            (
+                "No.Other.Choice.2025.1080p.ENG.SUB.SCREENER.WEB-DL.H265.AAC-AOC.mkv",
+                "No.Other.Choice.2025.1080p.ENG.SUB.SCREENER.WEB-DL.H265.AAC-AOC\n👤 175 💾 6.9 GB ⚙️ 1337x\n🇬🇧 / 🇰🇷",
+                "ko",
+                None,
+                0,
+            ),
+            // English subtitles on a French film
+            (
+                "Amelie 2001 English subs BluRay Rip",
+                "Amelie 2001 English subs BluRay Rip\n👤 24 💾 696.01 MB ⚙️ ThePirateBay",
+                "fr",
+                None,
+                2,
+            ),
+            // a 26-flag subtitle list that includes English
+            (
+                "Silo.S03E01.1080p.WEB.h264-ETHEL[EZTVx.to].mkv",
+                "Silo S03E01 1080p WEB h264-ETHEL EZTV\n👤 2271 💾 3.91 GB ⚙️ EZTV\n🇬🇧 / 🇯🇵 / 🇷🇺 / 🇮🇹 / 🇵🇹 / 🇪🇸 / 🇰🇷 / 🇨🇳 / 🇫🇷 / 🇩🇪 / 🇳🇱 / 🇮🇳 / 🇵🇱 / 🇨🇿 / 🇭🇺 / 🇧🇬 / 🇺🇦 / 🇩🇰 / 🇸🇪 / 🇳🇴 / 🇹🇷 / 🇸🇦 / 🇮🇱 / 🇮🇩 / 🇲🇾 / 🇹🇭",
+                "en",
+                None,
+                0,
+            ),
+            // the Italian original
+            (
+                "M.Il.Figlio.Del.Secolo.S01e01.Ita.1080p.h265.10bit.SubS-Me7alh.mkv",
+                "M Il Figlio del Secolo S01e01-08 [1080p Ita h265 10bit SubS] byMe7alh [MIRCrew]\nM.Il.Figlio.Del.Secolo.S01e01.Ita.1080p.h265.10bit.SubS-Me7alh.mkv\n👤 52 💾 999.19 MB ⚙️ ilCorSaRoNeRo\n🇮🇹",
+                "it",
+                None,
+                0,
+            ),
+        ];
+        for (file, torrentio, original, dub, bucket) in cases {
+            let (torrent_title, languages) = parse_torrentio_languages(torrentio);
+            let fit = language_fit_of(file, &torrent_title, &languages, Some(original));
+            let want = dub.map(|d| d.iter().map(|l| l.to_string()).collect::<Vec<_>>());
+            assert_eq!(fit.dub, want, "dub, for a {original} title: {file}");
+            assert_eq!(
+                fit.bucket, bucket,
+                "language tier, for a {original} title: {file}"
+            );
+            // Without the title's language nothing is called a dub: it would be a guess.
+            assert_eq!(
+                language_fit_of(file, &torrent_title, &languages, None).dub,
+                None,
+                "{file}"
+            );
+        }
+    }
+
+    /// The whole Babylon Berlin list: what is marked, and where it lands.
+    #[test]
+    fn test_dubs_are_marked_ranked_last_and_play_only_by_hand() {
+        let r = ranked(
+            recorded(F_TORRENTIO_BABYLON_BERLIN_S05E01),
+            opts_for(false, "de"),
+        );
+        let titles: Vec<&str> = r.iter().map(|x| x.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Babylon.Berlin.S05E01.1080p.ARD.WEB-DL.mp4",
+                "Babylon.Berlin.S05e01.Fansub.Vostfr.Web.H264.mp4",
+                "Babylon.Berlin.s05e01.HD1080p.WEBRip.Rus.RuDub.tv.mkv",
+                "Babylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv",
+                "Babylon.Berlin.S05E01.400p.Ru.Ultradox.avi",
+            ],
+            "the German copies first, whatever their resolution; then the dubs"
+        );
+        for (i, x) in r.iter().enumerate() {
+            let dub = i >= 2;
+            assert_eq!(x.dub.is_some(), dub, "{}", x.title);
+            assert_eq!(x.plays_only_by_hand(), dub, "{}", x.title);
+            if dub {
+                assert_eq!(x.dub.as_deref(), Some(&["RU".to_string()][..]));
+            }
+        }
+        // The mark survives the trip to the remote and back (`last_search.json`).
+        let wire = serde_json::to_value(&r[2]).unwrap();
+        assert_eq!(wire["dub"], serde_json::json!(["RU"]));
+        assert!(serde_json::to_value(&r[0]).unwrap().get("dub").is_none());
+        let back: TorrentResult = serde_json::from_value(wire).unwrap();
+        assert!(back.plays_only_by_hand());
+    }
+
+    /// An English series, where nearly everything watched here lives: 133 real
+    /// releases for Silo S03E01. The dubs are marked, and nothing that names
+    /// English is.
+    #[test]
+    fn test_an_english_series_marks_its_dubs_and_nothing_that_names_english() {
+        for transcoding in [true, false] {
+            let r = ranked(
+                filter_results_by_show_title(recorded(F_TORRENTIO_SILO_S03E01), "Silo"),
+                opts_for(transcoding, "en"),
+            );
+            let dubs: Vec<String> = r
+                .iter()
+                .filter(|x| x.dub.is_some())
+                .map(|x| format!("{:?} {}", x.dub.as_ref().unwrap(), x.title))
+                .collect();
+            assert_eq!(dubs.len(), SILO_DUBS, "marked:\n{}", dubs.join("\n"));
+            assert!(r[0].dub.is_none(), "a dub leads:{}", top(&r, 3));
+            for x in &r {
+                let names_english = x.languages.iter().any(|l| l == "en")
+                    || release_tokens(&x.title)
+                        .iter()
+                        .any(|t| t == "ENG" || t == "ENGLISH");
+                assert!(
+                    !(names_english && x.dub.is_some()),
+                    "names English and is marked a dub: {}",
+                    x.title
+                );
+            }
+            // Among releases spela can address, no dub sits above a real source.
+            let addressable: Vec<&TorrentResult> =
+                r.iter().filter(|x| x.file_index.is_some()).collect();
+            let first_dub = addressable.iter().position(|x| x.dub.is_some()).unwrap();
+            assert!(
+                addressable[first_dub..]
+                    .iter()
+                    .all(|x| x.plays_only_by_hand() || has_dolby_vision_in_title(&x.title)),
+                "transcoding={transcoding}: a real source ranks below a dub"
+            );
+        }
+    }
+
+    /// A Danish film. `iTA-DAN` names the original beside the dub, so that
+    /// release stays a real source; the releases that only carry a foreign flag
+    /// are marked.
+    #[test]
+    fn test_a_danish_film_keeps_the_releases_that_name_danish() {
+        let r = ranked(
+            recorded(F_TORRENTIO_THE_PROMISED_LAND),
+            opts_for(false, "da"),
+        );
+        let kept = r
+            .iter()
+            .find(|x| x.title.contains("iTA-DAN"))
+            .expect("the Italian+Danish release is in the list");
+        assert!(kept.dub.is_none(), "{}", kept.title);
+        let dubs: Vec<&str> = r
+            .iter()
+            .filter(|x| x.dub.is_some())
+            .map(|x| x.title.as_str())
+            .collect();
+        assert_eq!(dubs.len(), PROMISED_LAND_DUBS, "marked: {dubs:#?}");
+        assert!(r[0].dub.is_none(), "a dub leads:{}", top(&r, 3));
     }
 
     /// The language tier must not strand him on a dead swarm. It carries no seed
@@ -6349,21 +7186,26 @@ mod tests {
                     for file_index in [Some(0u32), None] {
                         // The source tag (tier 2) is an axis too, since 2026-10-04.
                         for source in ["WEB", "TELESYNC"] {
-                            id += 1;
-                            let mut r = make_sized(
-                                id as usize,
-                                &format!("Show.S01E01.{res}.{source}.{codec}-Grp.mkv"),
-                                seeds,
-                                size,
-                            );
-                            r.file_index = file_index;
-                            grid.push(r);
+                            // And the dub tier, since 2026-10-06.
+                            for language in ["", ".RUS"] {
+                                id += 1;
+                                let mut r = make_sized(
+                                    id as usize,
+                                    &format!(
+                                        "Show.S01E01.{res}.{source}{language}.{codec}-Grp.mkv"
+                                    ),
+                                    seeds,
+                                    size,
+                                );
+                                r.file_index = file_index;
+                                grid.push(r);
+                            }
                         }
                     }
                 }
             }
         }
-        assert_eq!(grid.len(), 96);
+        assert_eq!(grid.len(), 192);
 
         // The yardsticks come from the whole SET, so the context is built once —
         // comparing a pair in isolation would judge it against a different

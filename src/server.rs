@@ -2041,12 +2041,30 @@ pub(crate) fn next_fallback_source(
 pub(crate) const NO_RELEASE_YET: &str =
     "No release yet. Only cam copies exist so far, filmed in a cinema.";
 
+/// What every refused dub says, for the same reason.
+pub(crate) const ONLY_DUBBED: &str =
+    "Only dubbed copies were found, none with the original audio. Pick one from the list to play it anyway.";
+
+/// Why a marked result is not played by itself, in the words the viewer reads.
+fn why_marked(result: &crate::search::TorrentResult) -> Option<String> {
+    if let Some(year) = result.other_year {
+        return Some(format!(
+            "No release yet. The only source is a different film of the same name, from {year}."
+        ));
+    }
+    if crate::search::is_cam_source(&result.title) {
+        return Some(NO_RELEASE_YET.to_string());
+    }
+    result.dub.is_some().then(|| ONLY_DUBBED.to_string())
+}
+
 /// A marked result plays only when it was asked for BY NAME (2026-10-04).
 ///
-/// Two kinds are marked (`TorrentResult::plays_only_by_hand`): a cam copy
+/// Three kinds are marked (`TorrentResult::plays_only_by_hand`): a cam copy
 /// (Fredrik: cam and telesync "are generally not nice to watch", so a film that
-/// has nothing else is reported as not released yet), and a release of a
-/// DIFFERENT film with the same title.
+/// has nothing else is reported as not released yet), a release of a DIFFERENT
+/// film with the same title, and a DUB (2026-10-06, Fredrik: "If it's dubbed it
+/// should not be auto played").
 ///
 /// The gate is here, on the server, because every client plays "result 1"
 /// without looking at it: the remote's play button, the one-tap rows, the CLI,
@@ -2060,16 +2078,12 @@ fn refusal_for_marked(
     if req.allow_marked == Some(true) {
         return None;
     }
-    let result = search?
-        .results
-        .iter()
-        .find(|r| Some(r.id) == req.result_id)?;
-    if let Some(year) = result.other_year {
-        return Some(format!(
-            "No release yet. The only source is a different film of the same name, from {year}."
-        ));
-    }
-    crate::search::is_cam_source(&result.title).then(|| NO_RELEASE_YET.to_string())
+    why_marked(
+        search?
+            .results
+            .iter()
+            .find(|r| Some(r.id) == req.result_id)?,
+    )
 }
 
 /// The Chromecast a finished `do_play` is streaming to, read from its success value
@@ -6689,8 +6703,8 @@ async fn navigate_episode(state: &SharedState, direction: i32) -> Json<Value> {
     let best = &result.results[0];
     // This path plays a magnet directly, so the result-id gate in `play_request`
     // never sees it. Same answer, same words.
-    if crate::search::is_cam_source(&best.title) {
-        return Json(json!({"error": NO_RELEASE_YET, "no_release_yet": true}));
+    if let Some(why) = why_marked(best) {
+        return Json(json!({"error": why, "no_release_yet": true}));
     }
     let target_parts: Vec<&str> = current.target.splitn(2, ':').collect();
 
@@ -12082,6 +12096,9 @@ mod tests {
             partial_pct: None,
             cam: false,
             other_year: None,
+            torrent_title: String::new(),
+            languages: Vec::new(),
+            dub: None,
         }
     }
 
@@ -12197,6 +12214,23 @@ mod tests {
         // A release of a different film is refused too, and says which year.
         let why = refused(&play(Some(5), None)).expect("another film is not played");
         assert!(why.contains("1994"), "{why}");
+        // A dub is refused the same way (2026-10-06), in its own words, and plays
+        // on the same deliberate tap. Name from the live Babylon Berlin list.
+        let mut dubbed = search.clone();
+        let mut dub = ranked_source(6, "magnet:?xt=urn:btih:b");
+        dub.title = "Babylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv".into();
+        dub.dub = Some(vec!["RU".into()]);
+        dubbed.results.push(dub);
+        assert_eq!(
+            refusal_for_marked(&play(Some(6), None), Some(&dubbed)).as_deref(),
+            Some(ONLY_DUBBED)
+        );
+        assert_eq!(
+            refusal_for_marked(&play(Some(6), Some(true)), Some(&dubbed)),
+            None
+        );
+        // The walk steps over it: after the last real source there is nothing.
+        assert_eq!(next_fallback_source(&dubbed.results, 2), None);
         // The marked row, tapped on purpose.
         assert_eq!(refused(&play(Some(3), Some(true))), None);
         assert_eq!(refused(&play(Some(5), Some(true))), None);
@@ -14078,6 +14112,9 @@ mod tests {
             partial_pct: None,
             cam: false,
             other_year: None,
+            torrent_title: String::new(),
+            languages: Vec::new(),
+            dub: None,
         };
 
         let pct = result_partial_pct(dir.path(), &four_k)
@@ -14130,6 +14167,9 @@ mod tests {
             partial_pct: None,
             cam: false,
             other_year: None,
+            torrent_title: String::new(),
+            languages: Vec::new(),
+            dub: None,
         };
         assert_eq!(
             result_partial_pct(dir.path(), &four_k),
@@ -14154,6 +14194,9 @@ mod tests {
             partial_pct: None,
             cam: false,
             other_year: None,
+            torrent_title: String::new(),
+            languages: Vec::new(),
+            dub: None,
         };
         let dir = tempfile::tempdir().unwrap();
         // ~32%-downloaded sparse partial named like a real release (the Pantheon

@@ -229,6 +229,16 @@ const mkPoll = (answer, S, onRender) =>
   eq(camNotice(null), null, "a missing list must not throw");
   eq(/1994/.test(camNotice([{ id: 1, other_year: 1994 }]) || ""), true,
      "the only source is another film: the notice names its year");
+  // A dub, as the server sends it: `dub` lists the languages it is tagged for, and is an
+  // EMPTY list for a release that says only DUBBED. An empty list is still a mark.
+  eq(/^Only dubbed copies/.test(camNotice([{ id: 1, dub: ["RU"] }, { id: 2, dub: [] }]) || ""), true,
+     "only dubs: the play button is withheld and the card says why");
+  eq(/^Only dubbed copies/.test(camNotice([{ id: 1, dub: [] }]) || ""), true,
+     "a release that says only DUBBED is a dub too");
+  eq(camNotice([{ id: 1 }, { id: 2, dub: ["RU"] }]), null, "the original leads: nothing to say");
+  const isMarked = new Function(extract("isMarked") + "\nreturn isMarked;")();
+  eq([isMarked({ dub: ["RU"] }), isMarked({ dub: [] }), isMarked({}), isMarked(null)],
+     [true, true, false, false], "a dub is marked whether or not its language is named");
 
   // A film that is not out yet. The date is Street Fighter's, as TMDB gave it on 2026-10-04.
   const unreleasedNote = new Function(extract("fmtDate") + extract("unreleasedNote") + "\nreturn unreleasedNote;")();
@@ -251,6 +261,8 @@ const mkPoll = (answer, S, onRender) =>
   eq(next(shot, 3, true), 4, "a rotation that started on a cam may try the next one");
   eq(next([{ id: 1 }, { id: 2, other_year: 1994 }, { id: 3 }], 1, false), 3,
      "a release of a different film is stepped over like a cam");
+  eq(next([{ id: 1 }, { id: 2, dub: ["RU"] }, { id: 3, dub: [] }, { id: 4 }], 1, false), 4,
+     "a dub is stepped over like a cam, with or without a named language");
   eq(next(null, 1, false), null, "a missing list must not throw");
 }
 
