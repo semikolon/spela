@@ -27,13 +27,22 @@ smallest sufficient one. Two things would move the levels:
   non-DV copy outranks a 6-seed DV one (Wonder Woman 1984). Seeds before the DV
   preference would restore the intent.
 
-- **A Russian release leads a German series (seen 2026-10-06).** For Babylon Berlin
-  S05E01 the top source is `Babylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv` (1.48 GB), above
-  `Babylon.Berlin.S05E01.1080p.ARD.WEB-DL.mp4` (909 MB), the German original; both have 17
-  seeds. `release_language_marker` knows `RUS` and `RUSSIAN` but not the two-letter `RU`,
-  so the release counts as clean and wins on size. Whether its audio is a dub was not
-  checked. Two-letter tokens were kept out on purpose (`DL` in `WEB-DL`), so adding `RU`
-  wants the same care: exact token, and a look at what else carries it.
+- **A thin swarm leads once its original-language tag is read (seen 2026-10-06).** Kleo
+  S01E01 now leads with `...ITA.GER.1080p.NF.WEB-DL...MeM.GP.mkv` (3.28 GB, 1 seed) over
+  `...GERMAN.1080p.WEBRip.x265-RARBG` (860 MB, 19 seeds). `GER` is now read as German, so
+  the release is the original with a second track rather than a foreign one, and the
+  fatter file wins on the size tier before seeds are looked at. The
+  language reading is right; the pick is the size-above-seeds rule. Same question as the
+  lean-copy item above: when the fattest copy has one seed, should seeds weigh sooner?
+- **English subtitles on a foreign film count against a release.** `Amelie 2001 English
+  subs BluRay Rip` lands in language tier 2 with the French-subtitled copies of other
+  titles, since it names a foreign language and not the original. For a viewer who reads
+  English subtitles it is the right release. A ruling could make "the original with
+  English subtitles" a clean release.
+- **A cam is read from the file name only.** The dub check also reads the torrent's own
+  title and Torrentio's language line (`torrent_title`, `languages`). `is_cam_source`
+  does not, so a pack whose title says `TS` and whose file name does not would pass. Not
+  seen in a real list; check one before building.
 
 **Not built, and not proposed yet:** AV1 is counted as H.264 (no efficiency weight), and
 HDR is not a ranked axis, so an SDR 4K can lead an HDR one on thirteen seeds.
@@ -136,7 +145,7 @@ it is a **failed start that leaves litter behind**, which is the same subsystem 
 the kind of thing a future size- or name-based check could trip over. Not investigated.
 
 ### 🔓 OPEN — the ranker has no idea what the VIEWER'S LINK can carry (2026-09-11)
-Ranking is addressability → Dolby Vision → resolution → language → codec → bitrate → seeds (README §
+Ranking is right film → addressability → Dolby Vision → cam → dub → resolution → language → codec → bitrate → seeds (README §
 *How sources are ranked*). Nothing expresses **bytes per
 second available to the person watching**, so the same #1 pick is served to a Chromecast
 on gigabit LAN and to VLC on a phone hotspot two hundred km away over WireGuard. On

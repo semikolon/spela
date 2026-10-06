@@ -2041,9 +2041,17 @@ pub(crate) fn next_fallback_source(
 pub(crate) const NO_RELEASE_YET: &str =
     "No release yet. Only cam copies exist so far, filmed in a cinema.";
 
-/// What every refused dub says, for the same reason.
-pub(crate) const ONLY_DUBBED: &str =
-    "Only dubbed copies were found, none with the original audio. Pick one from the list to play it anyway.";
+/// What a refused dub says. About THAT copy, not about the list: a client can
+/// ask for a dub by number while the original sits two rows above it.
+fn dub_refusal(languages: &[String]) -> String {
+    let tagged = match languages {
+        [] => String::new(),
+        named => format!(" ({})", named.join("+")),
+    };
+    format!(
+        "That copy is a dub{tagged}, not the original audio, so it does not play by itself. Pick it from the list to play it anyway."
+    )
+}
 
 /// Why a marked result is not played by itself, in the words the viewer reads.
 fn why_marked(result: &crate::search::TorrentResult) -> Option<String> {
@@ -2055,7 +2063,7 @@ fn why_marked(result: &crate::search::TorrentResult) -> Option<String> {
     if crate::search::is_cam_source(&result.title) {
         return Some(NO_RELEASE_YET.to_string());
     }
-    result.dub.is_some().then(|| ONLY_DUBBED.to_string())
+    result.dub.as_deref().map(dub_refusal)
 }
 
 /// A marked result plays only when it was asked for BY NAME (2026-10-04).
@@ -12221,9 +12229,13 @@ mod tests {
         dub.title = "Babylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv".into();
         dub.dub = Some(vec!["RU".into()]);
         dubbed.results.push(dub);
-        assert_eq!(
-            refusal_for_marked(&play(Some(6), None), Some(&dubbed)).as_deref(),
-            Some(ONLY_DUBBED)
+        let why = refusal_for_marked(&play(Some(6), None), Some(&dubbed)).expect("a dub");
+        assert!(why.contains("a dub (RU)"), "{why}");
+        // A release that says only DUBBED names no language, and none is invented.
+        assert!(
+            dub_refusal(&[]).contains("is a dub, not"),
+            "{}",
+            dub_refusal(&[])
         );
         assert_eq!(
             refusal_for_marked(&play(Some(6), Some(true)), Some(&dubbed)),

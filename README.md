@@ -49,7 +49,8 @@ assistant should be able to play something when you ask nicely.
   track, and cached per episode so the second open is instant rather than forty seconds.
 - **Never a dub.** The audio track is chosen by the title's original language, so a
   Danish film plays Danish and a Korean one Korean, even when the release labels the dub
-  as default.
+  as default. A release that is itself a dub is marked, ranked below every real source
+  and never played by itself.
 - **Local files first.** If a copy is already on disk it is served straight from there,
   fully seekable, with no torrent involved — including files a separate library daemon
   serves from an external drive, and a season pack opens an episode chooser rather than
@@ -127,7 +128,14 @@ function, so a rule that looks at the other candidate cannot be written.
    removed, and it never plays by itself: when cams are all there is, the remote says
    there is no release yet, and the fallback and the race step over them. A cam plays
    only from a deliberate tap on its marked row.
-4. **Resolution, scoped to the target.** A Chromecast is a 1080p screen fed by a
+4. **The original audio before a dub.** A release is a dub when it is tagged for another
+   language and the title's own language is named nowhere: not in the file name, not in
+   the torrent's title, not on the tracker's own language line. Subtitle tags are read
+   apart from audio tags, so the original with French subtitles is not a dub, and a
+   release that says it carries two audio tracks is not one either. A dub sinks below
+   every real source whatever its resolution, is marked with its language, and plays
+   only from a deliberate tap, like a cam.
+5. **Resolution, scoped to the target.** A Chromecast is a 1080p screen fed by a
    transcoder, so `1080p > 720p > 480p > 2160p`. A 4K monitor decoding natively is the
    other way round, `2160p > 1080p > 720p > 480p`, because a 1080p source upscaled twice
    reads as soft at close distance whatever its bitrate. The one thing that can still
@@ -137,12 +145,12 @@ function, so a rule that looks at the other candidate cannot be written.
    not itself a remux look starved. That comparison is
    weighted by codec, since HEVC gets substantially more picture out of the same byte
    than H.264 does, and ignoring that refused legitimate 4K releases by a hair.
-5. **Language fit** against the show's original language: a clean release, then a
-   multi-market or dual-language one, then a foreign dub.
-6. **H.264 over HEVC**, but only for targets that re-encode through NVENC, where H.264
+6. **Language fit** against the show's original language: a clean release, then a
+   multi-market one, then the original packaged with another market's subtitles.
+7. **H.264 over HEVC**, but only for targets that re-encode through NVENC, where H.264
    plays instantly, and not when the best-seeded HEVC has thirty times its seeds. Skipped
    entirely for native decoding.
-7. **Bitrate, via file size, up to "good enough".** Every candidate in one search is the
+8. **Bitrate, via file size, up to "good enough".** Every candidate in one search is the
    same minutes, so size *is* bitrate, in logarithmic bands. That holds only while the
    size is one file, which is what the first tier is there to guarantee. With the runtime
    from TMDB the size becomes megabits per second, and each resolution has a level past
@@ -152,7 +160,7 @@ function, so a rule that looks at the other candidate cannot be written.
    then within the rest. A disc remux at 65 Mbps costs three times the download, the wait
    and the cache of a 20 Mbps streaming copy for a difference few screens show, so it
    stays in the list without leading it, however well seeded it is.
-8. **More seeds**, as the final tiebreak.
+9. **More seeds**, as the final tiebreak.
 
 **Seeds prefer; they do not exclude.** A viability bar used to demote thin swarms
 outright, which is a prediction about delivery in a system that measures delivery: a
