@@ -27,6 +27,14 @@ smallest sufficient one. Two things would move the levels:
   non-DV copy outranks a 6-seed DV one (Wonder Woman 1984). Seeds before the DV
   preference would restore the intent.
 
+- **A Russian release leads a German series (seen 2026-10-06).** For Babylon Berlin
+  S05E01 the top source is `Babylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv` (1.48 GB), above
+  `Babylon.Berlin.S05E01.1080p.ARD.WEB-DL.mp4` (909 MB), the German original; both have 17
+  seeds. `release_language_marker` knows `RUS` and `RUSSIAN` but not the two-letter `RU`,
+  so the release counts as clean and wins on size. Whether its audio is a dub was not
+  checked. Two-letter tokens were kept out on purpose (`DL` in `WEB-DL`), so adding `RU`
+  wants the same care: exact token, and a look at what else carries it.
+
 **Not built, and not proposed yet:** AV1 is counted as H.264 (no efficiency weight), and
 HDR is not a ranked axis, so an SDR 4K can lead an HDR one on thirteen seeds.
 
