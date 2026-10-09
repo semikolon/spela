@@ -1298,7 +1298,11 @@ async function vlcWaitReady(id, gen, pin){
   const q = pinQuery(pin, "?");
   for(let i=0;i<600;i++){   // ~15 min cap at 1.5s/poll
     if(gen!=null && S.vlcGen!==gen) return "superseded";  // a newer VLC source took over — stop this loop silently
-    let d; try{ d=await api("/vlc/"+id+"/ready"+q); }catch(e){ S.now.vlcErr="spela unreachable"; return false; }
+    let d; try{ d=await api("/vlc/"+id+"/ready"+q); }catch(e){
+      if(gen!=null && S.vlcGen!==gen) return "superseded";
+      S.now.vlcErr="spela unreachable"; return false;
+    }
+    if(gen!=null && S.vlcGen!==gen) return "superseded";
     // The ffprobe of the file lands here first, while the loading panel is still
     // up — so what you are about to watch is stated BEFORE the wait, not after it.
     if(d && d.quality) S.now.q = d.quality;
@@ -1360,6 +1364,9 @@ async function openInVlc(id,title,poster){
   // torrent never opens to a hung player, and the user always sees progress.
   beginWarming(title||"Opening in VLC…", poster); stopWarmupPoll();  // /progress isn't the VLC source; vlcWaitReady drives the screen
   S.now.vlcErr=null;
+  resetSourceQuality(shot.find(x => x.id === id));
+  S.now.warmup={active:true,vlc:true,pct:0};
+  renderWarmPanel();
   let rdy = await vlcWaitReady(id, gen, pinOf(id));
   // Rotate past dead sources until one delivers, the ranked list ends or five minutes
   // have passed: the same bounds as the server's walk on the Chromecast path
@@ -1383,6 +1390,7 @@ async function openInVlc(id,title,poster){
       id = next;
     }
     skipped += 1;
+    resetSourceQuality(shot.find(x => x.id === id));
     if(S.now.warming) renderWarmPanel();
     rdy = await vlcWaitReady(id, gen, pinOf(id));
   }
@@ -2674,7 +2682,16 @@ function iconizeStatic(){ document.querySelectorAll("[data-ic]").forEach(e=>{
    #/now themselves (now-playing is a full view, loading is not). */
 function showWarmPanel(){ const p=$("#warmpanel"); if(p) p.classList.add("on"); }
 function hideWarmPanel(){ const p=$("#warmpanel"); if(p){ p.classList.remove("on"); p.classList.remove("wperr"); } }
+// Quality belongs to one source, never to the previous player or buffer attempt.
+function resetSourceQuality(source){
+  S.qualityGen=(S.qualityGen||0)+1;
+  S.now.q=null; S.now.vres=null; S.now.vcodec=null;
+  S.now.sourceQuality=source&&source.quality||"";
+  S.now.openPct=null; S.now.runway=null; S.now.warmDur=null;
+  S.now.speed=null; S.now.peers=null;
+}
 function beginWarming(title,poster){
+  resetSourceQuality();
   S.now.error=null;   // a fresh attempt clears any prior failure surface
   S.now.note=null;    // and any source-walk note left by the previous one
   S.now.warming=true; S.now.warmup=null; S.now.warmupData={title:title||"Playing",poster:poster||""};
@@ -3264,11 +3281,14 @@ function vlcEnded(title){
 
 async function pollVlc(){
   if(!S.now.vlc){ stopVlcPoll(); return; }
+  const qualityGen=S.qualityGen;
   let s={}; try{ s=await api("/status"); }catch{}
+  if(!S.now.vlc || S.qualityGen!==qualityGen) return;
   if(s.vlc_active && s.title){ S.now.vlcTitle=s.title; if(s.imdb_id&&S.now.data) S.now.data.imdb_id=s.imdb_id; }
   const title=S.now.vlcTitle;
   if(title){
     try{ const p=await api(`/api/position?title=${encodeURIComponent(title)}`);
+      if(!S.now.vlc || S.qualityGen!==qualityGen) return;
       if(p){ if(typeof p.t==="number"&&p.t>=0){ S.now.posAbs=p.t; S.now.lastSync=Date.now(); }
              if(p.dur>0) S.now.dur=p.dur;
              // How much is watchable AHEAD of the playhead, and whether the picture is
@@ -3467,7 +3487,7 @@ function renderWarmPanel(){
   let label, barPct=null, sub="";
   // What the file actually IS, as soon as it is known — the point of a loading
   // panel is to answer "is this the one I wanted" before the wait, not after.
-  const ql=qualityLabel(null);
+  const ql=qualityLabel(null) || (S.now.sourceQuality ? S.now.sourceQuality+" source" : "");
   if(w.vlc){
     // Progress toward OPENING, not fraction of the file. See open_progress_pct on
     // the server: a torrent four-fifths of the way to openable used to draw 12%.

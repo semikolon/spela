@@ -403,5 +403,46 @@ const mkPoll = (answer, S, onRender) =>
   }
 }
 
+// A new 4K buffer must not inherit a previous player's 1080p decoder report.
+{
+  const S = {vlcGen: 1, now: {vlc: true, q: {width: 1920, height: 1080},
+    vres: "1920x1080", vcodec: "h264", openPct: 90}};
+  const reset = new Function("S", extract("resetSourceQuality")+";return resetSourceQuality;")(S);
+  const label = new Function("S", ["qualityLabel", "resLabel", "shortCodec", "mbps"].map(extract).join("\n")+
+    ";return qualityLabel;")(S);
+  reset({quality: "2160p"});
+  eq([label(null), S.now.sourceQuality, S.now.openPct], ["", "2160p", null],
+    "new source clears old measured quality and progress, retaining only its own release label");
+  S.now.q = {width: 3840, height: 2160, codec: "hevc"};
+  eq(label(null).includes("4K") || label(null).includes("2160p"), true,
+    "fresh file probe replaces provisional source quality");
+  reset({quality: "1080p"});
+  eq([label(null), S.now.sourceQuality], ["", "1080p"], "rotation also clears the previous source probe");
+
+  let finish;
+  const ready = new Function("S", "api", "pinQuery", extractFrom("async function vlcWaitReady")+
+    ";return vlcWaitReady;")(S, () => new Promise(resolve => {finish=resolve;}), () => "");
+  const pending = ready(1, 1, null);
+  S.vlcGen=2;
+  finish({quality:{width:1920}, ready:true, open_pct:95});
+  eq(await pending, "superseded", "an old readiness response is discarded");
+  eq([S.now.q, S.now.openPct], [null, null], "discarded readiness cannot restore stale quality or progress");
+
+  for(const delayed of ["/status", "/api/position"]){
+    S.now.vlc=true; S.now.vlcTitle="Example";
+    let resolvePoll;
+    const poll = new Function("S", "api", extractFrom("async function pollVlc")+";return pollVlc;")(
+      S, url => url.startsWith(delayed) ? new Promise(resolve => {resolvePoll=resolve;}) :
+      Promise.resolve({vlc_active:true, title:"Example"}));
+    const oldPoll=poll();
+    await Promise.resolve();
+    reset({quality:"2160p"});
+    resolvePoll({quality:{width:1920},video_resolution:"1920x1080",video_codec:"h264"});
+    await oldPoll;
+    eq([S.now.q,S.now.vres,S.now.vcodec], [null,null,null],
+      "old VLC "+delayed+" response cannot overwrite a new source");
+  }
+}
+
 console.log(failed === 0 ? "ALL PASS" : `${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);
