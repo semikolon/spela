@@ -1920,6 +1920,9 @@ struct RankCtx<'a> {
     /// releases the size tier chooses between (same bucket, same codec tier).
     /// The yardstick `LEAN_FACTOR` is applied to. Empty when no ceiling applies.
     smallest_enough: std::collections::HashMap<(RankBucket, u32), u64>,
+    /// Similar-sized alternatives share their best size priority. Computed for
+    /// the whole set, never pairwise (which would make the sort non-transitive).
+    comparable_sizes: std::collections::HashMap<(RankBucket, u32, u64), u32>,
 }
 
 impl<'a> RankCtx<'a> {
@@ -1938,6 +1941,7 @@ impl<'a> RankCtx<'a> {
             best_hevc_seeds: std::collections::HashMap::new(),
             ceiling_secs,
             smallest_enough: std::collections::HashMap::new(),
+            comparable_sizes: std::collections::HashMap::new(),
         };
         if ctx.prefer_h264 {
             let mut best = std::collections::HashMap::new();
@@ -1960,6 +1964,42 @@ impl<'a> RankCtx<'a> {
                 *least = (*least).min(bytes);
             }
             ctx.smallest_enough = smallest;
+        }
+        if matches!(ctx.pref, QualityPref::Auto | QualityPref::CapHd) {
+            let mut groups = std::collections::HashMap::<_, Vec<_>>::new();
+            for r in results {
+                let Some(bytes) = crate::server::parse_size_to_bytes(&r.size).filter(|b| *b > 0)
+                else {
+                    continue;
+                };
+                let bucket = rank_bucket(r, &ctx);
+                let codec = codec_key(r, bucket, &ctx);
+                groups
+                    .entry((bucket, codec))
+                    .or_default()
+                    .push((bytes, base_size_key(r, &ctx)));
+            }
+            for ((bucket, codec), mut sizes) in groups {
+                sizes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                let mut start = 0;
+                while start < sizes.len() {
+                    // Largest-anchored groups: 10, 9.5 and 9 GB must not chain
+                    // together merely because each neighbouring pair is close.
+                    let largest = sizes[start].0;
+                    let mut end = start + 1;
+                    while end < sizes.len()
+                        && u128::from(largest) * 100 <= u128::from(sizes[end].0) * 110
+                    {
+                        end += 1;
+                    }
+                    let priority = sizes[start..end].iter().map(|(_, key)| *key).min().unwrap();
+                    for &(bytes, _) in &sizes[start..end] {
+                        ctx.comparable_sizes
+                            .insert((bucket, codec, bytes), priority);
+                    }
+                    start = end;
+                }
+            }
         }
         ctx
     }
@@ -2284,6 +2324,31 @@ fn codec_tier(r: &TorrentResult, best_hevc_seeds: Option<u32>) -> u32 {
     }
 }
 
+/// Original size preference, before nearby sizes share a priority. Explicit
+/// Saver and 4K keep this exact preference; Auto and 1080p balance close copies.
+fn base_size_key(r: &TorrentResult, ctx: &RankCtx<'_>) -> u32 {
+    let bucket = rank_bucket(r, ctx);
+    let codec = codec_key(r, bucket, ctx);
+    if ctx.pref.is_saver() {
+        u32::MAX - size_tier(r) // smallest wins — the quota is the scarce thing
+    } else if ctx.ceiling_secs.is_some_and(|secs| is_enough(r, secs)) {
+        let lean = match (
+            ctx.smallest_enough.get(&(bucket, codec)),
+            crate::server::parse_size_to_bytes(&r.size),
+        ) {
+            (Some(&smallest), Some(bytes)) => bytes as f64 <= smallest as f64 * LEAN_FACTOR,
+            _ => true,
+        };
+        if lean {
+            0
+        } else {
+            1
+        }
+    } else {
+        size_tier(r) + 2 // 0 and 1 are the two "enough" values, so they outrank any size
+    }
+}
+
 fn rank_key(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankKey {
     let bucket = rank_bucket(r, ctx);
 
@@ -2331,24 +2396,12 @@ fn rank_key(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankKey {
     // one in the same group. A tie on "enough" alone let seeds pick a 78 GB
     // remux over a 22 GB encode whenever the remux was the copy people kept
     // seeding (Blade Runner 2049: 211 seeds against 6). See `LEAN_FACTOR`.
-    let size = if ctx.pref.is_saver() {
-        u32::MAX - size_tier(r) // smallest wins — the quota is the scarce thing
-    } else if ctx.ceiling_secs.is_some_and(|secs| is_enough(r, secs)) {
-        let lean = match (
-            ctx.smallest_enough.get(&(bucket, codec)),
-            crate::server::parse_size_to_bytes(&r.size),
-        ) {
-            (Some(&smallest), Some(bytes)) => bytes as f64 <= smallest as f64 * LEAN_FACTOR,
-            _ => true,
-        };
-        if lean {
-            0
-        } else {
-            1
-        }
-    } else {
-        size_tier(r) + 2 // 0 and 1 are the two "enough" values, so they outrank any size
-    };
+    // A small size difference cannot outweigh a healthier swarm. The set-wide
+    // bands also prevent an omitted codec tag from demoting an otherwise
+    // comparable release below a named HEVC encode (2026-10-11).
+    let size = crate::server::parse_size_to_bytes(&r.size)
+        .and_then(|bytes| ctx.comparable_sizes.get(&(bucket, codec, bytes)).copied())
+        .unwrap_or_else(|| base_size_key(r, ctx));
 
     // NO PACK PENALTY. It was tier 1 until 2026-09-05 — ahead of resolution,
     // language, codec and bitrate together — so a single episode taken from a
@@ -6724,6 +6777,94 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn test_comparable_size_east_of_eden_prefers_healthier_4k_swarm() {
+        let list: Vec<TorrentResult> = serde_json::from_str(include_str!(
+            "../tests/fixtures/torrentio/east_of_eden_s01e05_ranked.json"
+        ))
+        .unwrap();
+        let opts = RankOpts {
+            transcoding: false,
+            original_language: Some("en"),
+            pref: QualityPref::Auto,
+            runtime_min: Some(57),
+        };
+        let before = RankCtx::for_set(&list, opts);
+        assert!(
+            base_size_key(&list[0], &before) < base_size_key(&list[4], &before),
+            "omitted codec tag penalized the larger source before seeds were considered"
+        );
+        for reverse in [false, true] {
+            let mut input = list.clone();
+            if reverse {
+                input.reverse();
+            }
+            let result = ranked(input, opts);
+            assert_eq!(
+                (result[0].size.as_str(), result[0].seeds),
+                ("8.43 GB", 52),
+                "{}",
+                top(&result, 10)
+            );
+            assert!(result[0].title.contains("RGzsRutracker"));
+            assert_eq!(result.len(), list.len(), "all choices stay available");
+        }
+    }
+
+    #[test]
+    fn test_comparable_size_bands_do_not_chain_or_cross_quality_groups() {
+        let make = |id, size: &str, seeds| {
+            let mut r = make_result(id, "Example.2160p.WEB-DL.HEVC.mkv", seeds, Some(0));
+            r.size = size.into();
+            r.quality = "4k".into();
+            r
+        };
+        let mut list = vec![
+            make(1, "10 GB", 2),
+            make(2, "9.1 GB", 50),
+            make(3, "8.4 GB", 500),
+            make(4, "3 GB", 5000),
+        ];
+        let opts = RankOpts {
+            transcoding: false,
+            original_language: Some("en"),
+            pref: QualityPref::Auto,
+            runtime_min: None,
+        };
+        let ctx = RankCtx::for_set(&list, opts);
+        assert_eq!(rank_key(&list[0], &ctx).size, rank_key(&list[1], &ctx).size);
+        assert!(
+            rank_key(&list[2], &ctx).size > rank_key(&list[1], &ctx).size,
+            "8.4 GB cannot join 10 GB through the intermediate 9.1 GB copy"
+        );
+        assert_eq!(ranked(list.clone(), opts)[0].seeds, 50);
+        // A tiny heavily compressed copy does not gain enough size priority.
+        assert_eq!(ranked(list.clone(), opts).last().unwrap().size, "3 GB");
+        for pref in [QualityPref::ForceUhd, QualityPref::Saver] {
+            let explicit = RankCtx::for_set(&list, RankOpts { pref, ..opts });
+            assert!(
+                explicit.comparable_sizes.is_empty(),
+                "explicit size preference is unchanged"
+            );
+        }
+        let mut dub = make(5, "10 GB", 10000);
+        dub.title = "Example.2160p.RUS.DUBBED.HEVC.mkv".into();
+        list.push(dub);
+        let mut hd = make(6, "9.5 GB", 20000);
+        hd.title = "Example.1080p.HEVC.mkv".into();
+        hd.quality = "1080p".into();
+        list.push(hd);
+        let result = ranked(
+            list,
+            RankOpts {
+                runtime_min: Some(57),
+                ..opts
+            },
+        );
+        assert_eq!(resolution_tier(&result[0].title), 3);
+        assert!(!result[0].plays_only_by_hand());
     }
 
     /// 2026-10-04, "big enough but not too fat". With no ceiling the native pick

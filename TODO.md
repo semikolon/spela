@@ -16,6 +16,12 @@ smallest sufficient one. Two things would move the levels:
   likely case is a Netflix or Amazon 4K series, whose own streams run about 13–16 Mbps
   HEVC and are therefore below the 2160p level today.
 
+**11 October refinement:** Auto/1080p now give releases in the same quality/language group
+and within a largest-anchored 10% size band the same size priority, so seeds can choose
+between close alternatives. This addresses East of Eden S01E05 (8.43 GB / 52 seeds versus
+8.17 GB / 17); the codec omission had made the bitrate estimate too decisive. The
+large size differences and Dolby Vision preference discussed below remain separate.
+
 **Seen on the live lists 4 October, working as ruled but worth his eye:**
 - **A lean pick can have a very thin swarm.** Blade Runner 2049 on VLC now leads with a
   22.2 GB copy that has 6 seeds, the 211-seed remux next. Accepted on 4 October ("one is

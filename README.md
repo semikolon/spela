@@ -160,6 +160,11 @@ function, so a rule that looks at the other candidate cannot be written.
    then within the rest. A disc remux at 65 Mbps costs three times the download, the wait
    and the cache of a 20 Mbps streaming copy for a difference few screens show, so it
    stays in the list without leading it, however well seeded it is.
+   In Auto and 1080p modes, similar-sized sources share size priority: within each
+   quality/language/codec-preference group, largest-first bands span at most 10%.
+   Each band takes its best size score, so a missing codec tag or a small difference
+   across a size threshold cannot alone defeat a healthier swarm. This is a ranking
+   tolerance, not a claim that the files have the same codec or picture quality.
 9. **More seeds**, as the final tiebreak.
 
 **Seeds prefer; they do not exclude.** A viability bar used to demote thin swarms
