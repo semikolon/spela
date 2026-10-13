@@ -36,6 +36,8 @@ function M.start(base)
         if not ok then hs.urlevent.openURLWithBundle(url, "com.google.Chrome") end
     end
     bindings = {
+        hs.hotkey.new({}, "n", function() open("next") end),
+        hs.hotkey.new({}, "h", function() open("home") end),
         hs.hotkey.new({"ctrl", "alt"}, "n", function() open("next") end),
         hs.hotkey.new({"ctrl", "alt"}, "h", function() open("home") end),
     }

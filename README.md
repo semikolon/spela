@@ -61,6 +61,7 @@ assistant should be able to play something when you ask nicely.
   and recent followed series. Next episode and Stop & home are also in the player HUD;
   Ctrl+Alt+N / Ctrl+Alt+H work in the remote and, with the
   [Hammerspoon integration](integrations/hammerspoon/README.md), while VLC has focus.
+  In VLC you can also simply press **N** or **H**.
   Episode metadata loads ahead; torrent downloads start when you choose to play.
 
 **Keeping track**
