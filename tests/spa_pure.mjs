@@ -444,5 +444,47 @@ const mkPoll = (answer, S, onRender) =>
   }
 }
 
+
+// Handoff offers use the real reported playhead, not a guessed credits marker.
+const nearEnd = new Function(extract("nearPlaybackEnd")+";return nearPlaybackEnd;")();
+eq(nearEnd(3480,3600),true,"offer during the last two minutes");
+eq(nearEnd(3400,3600),false,"do not cover the main episode");
+eq(nearEnd(0,0),false,"unknown duration cannot trigger an offer");
+eq(nearEnd(100,120),false,"short clips do not trigger episode offers");
+const shortcut = new Function(extract("handoffShortcut")+";return handoffShortcut;")();
+const key={ctrlKey:true,altKey:true,code:"KeyN"};
+eq(shortcut(key),"next","next key supports VLC's native binding");
+eq(shortcut({...key,code:"KeyH"}),"home","home shortcut is distinct");
+eq(shortcut({...key,repeat:true}),"","held keys cannot skip multiple episodes");
+eq(shortcut({...key,target:{closest:()=>true}}),"","editing text never triggers playback");
+
+// Starting the next item must wait for the bridge's gone acknowledgement.
+for(const scenario of ["gone","timeout","error"]){
+  const calls=[], S={now:{vlc:true,vlcTitle:"Example S01E01",data:{},playing:true}};
+  const handoff={};
+  const stop = new Function("S","handoff","api","$","setTimeout","stopVlcPoll","startVlcPoll","renderHandoff",
+    extractFrom("async function stopPlayback")+";return stopPlayback;")(
+    S,handoff,async path=>{calls.push(path); if(scenario==="error") return {error:"offline"};
+      return path.startsWith("/api/position")?{gone:scenario==="gone"}:{ok:true};},
+    ()=>({classList:{remove(){}}}),resolve=>resolve(),()=>{},()=>{},()=>{});
+  const ok=await stop({stay:true});
+  eq(ok,scenario==="gone","stop succeeds only after acknowledgement: "+scenario);
+  eq(!!S.now.data,scenario!=="gone","failed stop preserves current playback controls: "+scenario);
+  eq(S.now.stopping,false,"stop lock released: "+scenario);
+}
+{
+  const calls=[], handoff={data:{next:{query:"Example S01E02"}}}, S={now:{data:{}}};
+  let acknowledge;
+  const advance=new Function("handoff","S","prepareHandoff","renderHandoff","stopPlayback","resetHandoff","fastPlay",
+    extractFrom("async function advancePlayback")+";return advancePlayback;")(
+    handoff,S,async()=>{},()=>{},()=>new Promise(r=>{acknowledge=r;}),()=>{},async()=>calls.push("play"));
+  const pending=advance(handoff.data.next);
+  eq(calls.length,0,"next does not launch while the old VLC is closing");
+  await advance(handoff.data.next);
+  eq(calls.length,0,"double-click cannot launch a second handoff");
+  acknowledge(true); await pending;
+  eq(calls,["play"],"one next launch after confirmed stop");
+}
+
 console.log(failed === 0 ? "ALL PASS" : `${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

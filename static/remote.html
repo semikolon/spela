@@ -892,6 +892,21 @@
       transition-delay:0s!important}
   }
 </style>
+
+<style>
+#upnextPanel[hidden]{display:none}
+#upnextPanel{position:fixed;z-index:34;bottom:0;left:0;right:0;margin:0 auto;max-width:1100px;max-height:70vh;overflow:auto;padding:28px 36px;background:#171922;border:1px solid #353a50;border-radius:24px 24px 0 0;box-shadow:0 -16px 80px #0009}
+#upnextPanel h2{margin:8px 0;font-size:32px}
+#upnextPanel p{margin:10px 0 18px}
+#upnextPanel .eyebrow{color:#a9b9ff;text-transform:uppercase;letter-spacing:.12em;font-weight:750;font-size:14px}
+.handoff-actions,.handoff-alternatives{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}
+.handoff-actions .srcbtn{min-height:58px;padding:14px 22px;font-size:18px}
+.handoff-actions .primary{background:#3963dc;color:white}
+.handoff-error{color:#ffca85}
+#nowbar .srcbtn{min-height:48px;white-space:nowrap}
+button:disabled{opacity:.45;cursor:default}
+@media(max-width:560px){#upnextPanel{padding:22px 18px;max-height:72vh}#upnextPanel h2{font-size:25px}.handoff-actions .srcbtn{flex:1 1 auto}#nowbar{flex-wrap:wrap}#nowbar .nt{min-width:120px}#nowbar #nbNext{font-size:14px;padding:10px}.transport{flex-wrap:wrap}}
+</style>
 </head>
 <body>
 <div class="banner" id="banner"><span id="bannerMsg">spela unreachable</span><button id="bannerRetry">Retry</button></div>
@@ -955,11 +970,13 @@
 <div id="nowbar">
   <img class="mp" id="nbPoster" alt="">
   <div class="nt"><div class="a" id="nbTitle">—</div><div class="b" id="nbState">—</div></div>
-  <button class="tbtn" id="nbRestart" title="Restart from start" aria-label="Restart from start" data-ic="restart"></button>
+  <button class="srcbtn" id="nbNext" disabled title="Next episode (Ctrl+Alt+N)">Next episode</button>
+  <button class="tbtn" id="nbHome" title="Stop & go home (Ctrl+Alt+H)" aria-label="Stop & go home" data-ic="home"></button>
   <button class="tbtn" id="nbPlay" title="Play/Pause" aria-label="Play/Pause" data-ic="pause"></button>
   <button class="tbtn" id="nbExpand" title="Open player" aria-label="Open player" data-ic="expand"></button>
 </div>
 
+<section id="upnextPanel" aria-label="Up next" hidden></section>
 <div id="warmpanel"></div>
 
 <div class="toast" id="toast"></div>
@@ -1519,6 +1536,7 @@ function rememberSearchInUrl(q){
 }
 function route(){
   stopTrailers();
+  consumeHandoffAction();
   const v=(location.hash.replace(/^#\//,"")||"home").split("?")[0];
   const known=["home","search","library","now","towatch","rewatch"].includes(v)?v:"home";
   $$(".view").forEach(s=>s.classList.toggle("on",s.id==="v-"+known));
@@ -2691,6 +2709,8 @@ function resetSourceQuality(source){
   S.now.speed=null; S.now.peers=null;
 }
 function beginWarming(title,poster){
+  S.now.posAbs=0; S.now.dur=0;
+  resetHandoff();
   resetSourceQuality();
   S.now.error=null;   // a fresh attempt clears any prior failure surface
   S.now.note=null;    // and any source-walk note left by the previous one
@@ -3254,6 +3274,117 @@ function openSheet(){
   }).catch(()=>{ list.innerHTML=`<div class="state">spela unreachable — can’t list targets.</div>`; });
 }
 
+/* A handoff belongs to the current playback, never to the mutable search view. */
+let handoff={key:"",data:null,pending:null,ended:false,dismissed:false,busy:false,error:""};
+function nearPlaybackEnd(position,duration){
+  return duration>=300 && position>=duration-Math.min(120,duration*.04);
+}
+function handoffTitle(){
+  const title=S.now.vlcTitle || S.now.data?.title || "";
+  return /(?:s\d+e\d+|\d+x\d+)/i.test(title) ? title : title+(S.now.epShort?" "+S.now.epShort:"");
+}
+function resetHandoff(){
+  handoff={key:"",data:null,pending:null,ended:false,dismissed:false,busy:false,error:""};
+  renderHandoff();
+}
+async function prepareHandoff(){
+  const title=handoffTitle();
+  if(!title || S.now.warming || S.now.stopping) return;
+  const key=title+"|"+(S.now.data?.imdb_id||"");
+  if(handoff.key===key && (handoff.pending||handoff.data)) return handoff.pending;
+  const owner=handoff={key,data:null,pending:null,ended:false,dismissed:false,busy:false,error:""};
+  owner.pending=(async()=>{
+    try{
+      const data=await api("/up-next?title="+encodeURIComponent(title)+"&imdb_id="+encodeURIComponent(S.now.data?.imdb_id||""));
+      if(handoff!==owner) return;
+      if(!data || data.error || data.failed) throw new Error("Couldn’t load what’s next. Try again.");
+      owner.data=data;
+    }catch(e){ if(handoff===owner) owner.error=e.message; }
+    finally{ owner.pending=null; if(handoff===owner) renderHandoff(); }
+  })();
+  return owner.pending;
+}
+function handoffButton(label,action,primary=false){
+  const b=el("button",{className:"srcbtn"+(primary?" primary":""),textContent:label});
+  b.disabled=handoff.busy; b.onclick=action; return b;
+}
+function renderHandoff(){
+  const root=$("#upnextPanel"); if(!root) return;
+  const show=handoff.busy || handoff.requested || handoff.error || (!handoff.dismissed && (handoff.ended || nearPlaybackEnd(S.now.posAbs,S.now.dur)));
+  root.hidden=!show || S.now.warming;
+  const next=handoff.data?.next;
+  const nb=$("#nbNext"); if(nb){nb.disabled=!next||handoff.busy; nb.title=next?"Play "+next.query+" (Ctrl+Alt+N)":"No next episode available";}
+  const fb=$("#tNext"); if(fb) fb.disabled=!next||handoff.busy;
+  // Polling must not replace a focused button or announce the same content repeatedly.
+  const signature=JSON.stringify([handoff.key,handoff.data,handoff.ended,handoff.busy,handoff.error,!!handoff.pending]);
+  if(root.dataset.rendered===signature) return;
+  root.dataset.rendered=signature; root.replaceChildren();
+  root.appendChild(el("div",{className:"eyebrow",textContent:handoff.busy?"Stopping current playback…":handoff.ended?"Playback ended":"Up next"}));
+  root.appendChild(el("h2",{textContent:next?.title || "What would you like to watch?"}));
+  root.appendChild(el("p",{textContent:next ? [next.episode_label,next.name].filter(Boolean).join(" · ") : (handoff.pending?"Finding your next episode…":"No next episode available yet.")}));
+  const actions=el("div",{className:"handoff-actions"});
+  if(next) actions.appendChild(handoffButton(handoff.busy?"Switching…":"Play next episode",()=>advancePlayback(next),true));
+  actions.appendChild(handoffButton(handoff.ended?"Home":"Stop & go home",stopAndHome));
+  if(!handoff.ended) actions.appendChild(handoffButton("Keep watching",()=>{handoff.dismissed=true;handoff.requested=false;handoff.error="";renderHandoff();}));
+  root.appendChild(actions);
+  if(handoff.error){
+    root.appendChild(el("p",{className:"handoff-error",textContent:handoff.error}));
+    actions.appendChild(handoffButton("Retry",()=>{handoff.error=""; if(handoff.retry) handoff.retry(); else prepareHandoff();}));
+  }
+  if(handoff.data?.alternatives?.length){
+    root.appendChild(el("p",{className:"sub",textContent:"Or return to a series you’ve been watching"}));
+    const others=el("div",{className:"handoff-alternatives"});
+    for(const item of handoff.data.alternatives) others.appendChild(handoffButton(item.title+" · "+item.episode_label,()=>advancePlayback(item)));
+    root.appendChild(others);
+  }
+  root.appendChild(el("div",{className:"sub",textContent:"Ctrl+Alt+N · Next episode     Ctrl+Alt+H · Stop & home"}));
+}
+async function advancePlayback(choice){
+  if(handoff.busy || S.now.warming) return;
+  if(!choice){
+    const generation=S.qualityGen;
+    const preparing=prepareHandoff(), owner=handoff;
+    owner.dismissed=false;owner.requested=true;renderHandoff();
+    await preparing;
+    if(handoff!==owner || owner.dismissed || handoff.busy || S.now.warming || S.qualityGen!==generation) return;
+    owner.requested=false;
+    choice=handoff.data?.next;
+  }
+  if(!choice){ handoff.dismissed=false; handoff.error=handoff.error||"No next episode available. You can choose another series or go home."; renderHandoff(); return; }
+  handoff.busy=true; handoff.error=""; handoff.retry=()=>advancePlayback(choice); renderHandoff();
+  if(S.now.data && !await stopPlayback({stay:true})){handoff.busy=false;renderHandoff();return;}
+  resetHandoff();
+  await fastPlay(choice.query,true,choice.poster_url);
+}
+async function stopAndHome(){
+  if(handoff.busy || S.now.stopping) return;
+  if(S.now.warming){
+    const cancel=$("#wCancel"); if(cancel?.onclick) await cancel.onclick();
+  }
+  handoff.busy=true; handoff.retry=stopAndHome; renderHandoff();
+  if(S.now.data && !await stopPlayback({stay:true})){handoff.busy=false;renderHandoff();return;}
+  resetHandoff(); location.hash="#/home";
+}
+function handoffShortcut(e){
+  if(e.repeat || !e.ctrlKey || !e.altKey || e.metaKey || e.shiftKey || e.target?.closest?.("input,textarea,select,[contenteditable=true]")) return "";
+  return e.code==="KeyN"?"next":e.code==="KeyH"?"home":"";
+}
+document.addEventListener("keydown",e=>{
+  const action=handoffShortcut(e); if(!action) return;
+  e.preventDefault(); if(action==="next") advancePlayback(); else stopAndHome();
+});
+async function consumeHandoffAction(){
+  const params=new URLSearchParams(location.hash.split("?")[1]||"");
+  const action=params.get("action"), stamp=Number(params.get("at"));
+  if(!["next","home"].includes(action)) return;
+  history.replaceState(null,"","#/now");
+  // Native shortcuts are one-shot intents; old bookmarks/reloads cannot replay one.
+  if(!stamp || Math.abs(Date.now()-stamp)>15000) return;
+  await pollNow(true);
+  if(!S.now.vlc && !handoff.ended) return;
+  if(action==="next") await advancePlayback(); else await stopAndHome();
+}
+
 /* ---------- now-playing: status poll (visibility+active gated) ---------- */
 function startPolling(){ if(S.pollTimer)return; S.pollTimer=setInterval(()=>pollNow(false),3000); }
 function stopPolling(){ clearInterval(S.pollTimer); S.pollTimer=null; }
@@ -3272,23 +3403,22 @@ function stopVlcPoll(){ clearInterval(S.vlcTimer); S.vlcTimer=null; }
 function vlcEnded(title){
   stopVlcPoll();
   S.now.vlc=false; S.now.data=null; S.now.playing=false; S.now.stopping=false;
-  S.now.vlcTitle=null; S.now.posAbs=0; S.now.dur=0; S.now.stalled=false; S.now.runway=null;
+  S.now.vlcTitle=null; S.now.stalled=false; S.now.runway=null;
+  handoff.ended=true; handoff.dismissed=false;
   $("#nowbar").classList.remove("on");
-  toast(title ? "Finished · "+title : "Playback ended");
-  leaveNowViewAfterStop();
-  renderNowFull();
+  renderNowFull(); renderHandoff();
 }
 
 async function pollVlc(){
   if(!S.now.vlc){ stopVlcPoll(); return; }
   const qualityGen=S.qualityGen;
   let s={}; try{ s=await api("/status"); }catch{}
-  if(!S.now.vlc || S.qualityGen!==qualityGen) return;
+  if(!S.now.vlc || S.now.stopping || S.qualityGen!==qualityGen) return;
   if(s.vlc_active && s.title){ S.now.vlcTitle=s.title; if(s.imdb_id&&S.now.data) S.now.data.imdb_id=s.imdb_id; }
   const title=S.now.vlcTitle;
   if(title){
     try{ const p=await api(`/api/position?title=${encodeURIComponent(title)}`);
-      if(!S.now.vlc || S.qualityGen!==qualityGen) return;
+      if(!S.now.vlc || S.now.stopping || S.qualityGen!==qualityGen) return;
       if(p){ if(typeof p.t==="number"&&p.t>=0){ S.now.posAbs=p.t; S.now.lastSync=Date.now(); }
              if(p.dur>0) S.now.dur=p.dur;
              // How much is watchable AHEAD of the playhead, and whether the picture is
@@ -3310,6 +3440,7 @@ async function pollVlc(){
              // finished; tear it down and go back where the play came from.
              if(p.gone){ vlcEnded(title); return; } } }catch{}
   }
+  prepareHandoff(); renderHandoff();
   $("#nowbar").classList.add("on"); updateNowBar();
   if(currentView()==="now" && !S.now.seekDrag) renderNowFull();
 }
@@ -3319,10 +3450,13 @@ document.addEventListener("visibilitychange",()=>{
 });
 
 async function pollNow(force){
+  if(S.now.stopping) return;
   if(S.now.vlc) return;       // 2026-08-04: VLC-on-this-Mac has its own poll (pollVlc); /status has no `current` for it
   if(S.now.warming) return;   // 2026-07-04: the warmup poll owns the screen until /play resolves
   if(document.visibilityState!=="visible"&&!force) return;
+  const generation=S.qualityGen;
   let s; try{ s=await api("/status"); }catch{ return; }
+  if(S.now.stopping || S.now.warming || S.qualityGen!==generation) return;
   // REHYDRATE a VLC now-view after a page reload (2026-09-06). `S.now.vlc` is
   // client state, set only by the play flow, so a refresh or a cold open on
   // #/now loses it — and a VLC play creates no `CurrentStream`, so `!s.current`
@@ -3351,6 +3485,7 @@ async function pollNow(force){
     return;
   }
   if(!s||s.status==="idle"||!s.current){
+    if(S.now.data){handoff.ended=true;handoff.dismissed=false;renderHandoff();}
     S.now.data=null; S.now.playing=false; S.now.phone=false; stopPolling();
     $("#nowbar").classList.remove("on"); renderNowFull(); return;
   }
@@ -3359,6 +3494,7 @@ async function pollNow(force){
   // signal a fresh stream.
   const newStream = !was || was.title!==c.title || was.started_at!==c.started_at;
   S.now.data=c; S.now.dur=c.duration||0;
+  prepareHandoff();
   if(newStream){
     S.now.frontier=0; S.now.endlist=false; S.now.posAbs=0;
     S.now.everRan=false; S.now.playing=true;   // a fresh stream starts playing
@@ -3627,7 +3763,7 @@ function renderNowFull(){
   if(S.now.warming){ root.innerHTML=`<div class="state"><div class="big">Starting…</div>Progress is shown in the panel below.</div>`; return; }
   if(S.now.error){ root.innerHTML=`<div class="state"><div class="big">Couldn’t start</div>${esc(S.now.error.msg||"")} — see the panel below.</div>`; return; }
   const c=S.now.data;
-  if(!c){ root.innerHTML=`<div class="state"><div class="big">Nothing playing</div>Start something from Search.</div>`; return; }
+  if(!c){ root.innerHTML=`<div class="state"><div class="big">${handoff.ended?"Playback ended":"Nothing playing"}</div>${handoff.ended?"Choose what’s next below, or return home.":"Start something from Home or Search."}</div>`; return; }
   if(S.now.phone){
     if($("#phvid")) return;   // built once — poll re-renders must NOT rebuild the playing <video>
     root.innerHTML=`<div class="nowfull">
@@ -3684,6 +3820,8 @@ function renderNowFull(){
       <button class="tbtn" id="tRestart" title="Restart from start" aria-label="Restart from start">${ic("restart")}</button>
       <button class="tbtn big" id="tPlay" aria-label="Play/Pause">${ic(S.now.playing?"pause":"play")}</button>
       <button class="tbtn" id="tStop" title="Stop" aria-label="Stop">${ic("stop")}</button>
+      <button class="srcbtn" id="tNext" ${handoff.data?.next&&!handoff.busy?"":"disabled"}>Next episode</button>
+      <button class="srcbtn" id="tHome">Stop & go home</button>
     </div>
     ${!S.now.endlist&&S.now.frontier?`<div class="sub">Seekable up to ${fmt(S.now.frontier)} (still transcoding)</div>`:""}
     ${runwayLine()}
@@ -3722,7 +3860,9 @@ function renderNowFull(){
     }
   });
   $("#tRestart").onclick=restart;
-  $("#tStop").onclick=stopPlayback;
+  $("#tStop").onclick=()=>stopPlayback();
+  $("#tNext").onclick=()=>advancePlayback();
+  $("#tHome").onclick=stopAndHome;
   $("#tPlay").onclick=togglePlay;
 }
 
@@ -3761,30 +3901,52 @@ function leaveNowViewAfterStop(){
   location.hash = back ? "#/"+back : "#/home";
 }
 
-async function stopPlayback(){
+async function stopPlayback(options){
+  const stay=!!options?.stay;
+  if(S.now.stopping) return false;
   S.playGen=(S.playGen||0)+1;
-  if(S.now.stopping) return;
-  if(S.now.vlc){   // VLC: tell the Mac watcher to stop VLC, clear the now-view
-    S.now.stopping=true; stopVlcPoll();
-    await api("/vlc/control",{method:"POST",body:{cmd:"stop"}}).catch(()=>{});
-    toast("Stopped VLC");
-    S.now.vlc=false; S.now.data=null; S.now.playing=false; S.now.stopping=false;
-    $("#nowbar").classList.remove("on"); renderNowFull(); leaveNowViewAfterStop(); return;
+  S.now.stopping=true;
+  if(!stay){handoff.busy=true;renderHandoff();}
+  handoff.error="";
+  const wasVlc=S.now.vlc, title=S.now.vlcTitle;
+  try{
+    if(wasVlc){
+      if(!title) throw new Error("VLC is still connecting. Try again in a moment.");
+      stopVlcPoll();
+      const r=await api("/vlc/control",{method:"POST",body:{cmd:"stop",title},signal:AbortSignal.timeout(5000)});
+      if(!r || r.error || r.failed) throw new Error("Couldn’t reach VLC. Try stopping again.");
+      // A queued command is not an acknowledgement. Wait before opening another
+      // stream so the old stop/gone cleanup cannot tear down the new episode.
+      let gone=false;
+      for(let attempt=0;attempt<24;attempt++){
+        await new Promise(resolve=>setTimeout(resolve,500));
+        const p=await api("/api/position?title="+encodeURIComponent(title),{signal:AbortSignal.timeout(2500)});
+        if(p?.gone){gone=true;break;}
+      }
+      if(!gone) throw new Error("VLC hasn’t confirmed it closed. Try again before starting the next episode.");
+    }else{
+      const r=await api("/stop",{method:"POST"});
+      if(!r || r.error || r.failed) throw new Error("Couldn’t stop playback. Try again.");
+      const v=$("#phvid"); if(v){v.pause();v.remove();}
+      stopPolling(); stopPhoneFrontierPoll();
+    }
+    S.now.vlc=false; S.now.data=null; S.now.phone=false; S.now.playing=false; S.now.error=null;
+    S.now.vlcTitle=null; S.now.posAbs=0; S.now.dur=0;
+    $("#nowbar").classList.remove("on","fading");
+    if(!stay){resetHandoff();renderNowFull();leaveNowViewAfterStop();toast("Stopped");}
+    return true;
+  }catch(e){
+    handoff.retry=handoff.retry||(()=>stopPlayback(options));
+    handoff.error=e.message||"Couldn’t stop playback. Try again.";
+    handoff.dismissed=false;renderHandoff();return false;
+  }finally{
+    S.now.stopping=false;
+    if(!stay){handoff.busy=false;renderHandoff();}
+    if(wasVlc&&S.now.vlc) startVlcPoll();
   }
-  S.now.stopping=true; stopPolling();
-  const nf=$("#nowFull");
-  if(nf){ nf.style.transition="opacity .28s ease"; nf.style.opacity=".28"; }
-  $("#nowbar").classList.add("fading");
-  const v=$("#phvid"); if(v){ try{ v.pause(); }catch(e){} }   // phone-direct: silence local playback immediately
-  await api("/stop",{method:"POST"}).catch(()=>{});
-  toast("Stopped");
-  S.now.data=null; S.now.phone=false; S.now.playing=false; S.now.stopping=false; S.now.error=null;
-  $("#nowbar").classList.remove("on","fading");
-  if(nf) nf.style.opacity="";
-  renderNowFull();
-  leaveNowViewAfterStop();
 }
 async function togglePlay(){
+  if(S.now.stopping) return;
   const toPause=S.now.playing;
   S.now.playing=!toPause;
   if(!toPause){ S.now.lastSync=Date.now(); }   // resuming: restart interpolation clock
@@ -3797,6 +3959,7 @@ async function togglePlay(){
   setTimeout(()=>pollNow(true),900);           // re-sync position only; never play-state
 }
 async function restart(){
+  if(S.now.stopping) return;
   S.now.posAbs=0; S.now.lastSync=Date.now(); S.now.playing=true;
   updateNowBar(); if(currentView()==="now") renderNowFull();
   if(S.now.vlc){   // VLC: seek to 0 via the relay
@@ -3807,7 +3970,8 @@ async function restart(){
   const r=await api("/seek",{method:"POST",body:{seconds:0}}).catch(()=>({error:"unreachable"}));
   if(r&&r.error) toast("Restart failed: "+r.error); else toast("Rewound to the start");
 }
-$("#nbRestart").onclick=restart;
+$("#nbNext").onclick=()=>advancePlayback();
+$("#nbHome").onclick=stopAndHome;
 $("#nbPlay").onclick=()=>{ if(!S.now.cold) togglePlay(); };
 $("#nbExpand").onclick=()=>{ S.now.returnTo=null; location.hash="#/now"; };
 // Tap anywhere on the now-bar (poster/title) opens the full player;
@@ -3817,7 +3981,7 @@ $("#nowbar").addEventListener("click",e=>{ if(e.target.closest("button")) return
 
 /* tick the now-bar/full view between polls so interpolation stays smooth */
 setInterval(()=>{ if(S.now.data&&!S.now.cold&&!S.now.seekDrag){
-  updateNowBar(); if(currentView()==="now"){ const f=$("#fFill"),cu=$("#fCur"),sl=$("#fSeek");
+  renderHandoff(); updateNowBar(); if(currentView()==="now"){ const f=$("#fFill"),cu=$("#fCur"),sl=$("#fSeek");
     if(f&&cu&&sl){ const p=livePos(),m=seekMax(); f.style.width=(m?Math.min(100,p/m*100):0)+"%";
       cu.textContent=fmt(p); if(!S.now.seekDrag) sl.value=Math.round(p); } } } },1000);
 

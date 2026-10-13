@@ -678,6 +678,8 @@ impl SearchEngine {
             // The IMDb id makes every LATER lookup for this title ID-first, which is the
             // mismatch-proof path — a caller that stores it never re-runs the ambiguous
             // title search that resolved Station Eleven to an unrelated 2013 film.
+            "tmdb_id": id,
+            "title": d["name"].as_str().or_else(|| d["title"].as_str()),
             "imdb_id": d["external_ids"]["imdb_id"].as_str(),
             "trailer_key": trailer_key,
             "poster_url": poster,

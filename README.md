@@ -57,8 +57,11 @@ assistant should be able to play something when you ask nicely.
   guessing.
 - **Repeat plays start instantly.** A completed Chromecast transcode is kept in a
   size-capped cache, so watching the same thing again skips the transcode entirely.
-- **The next episode is lined up inside the running VLC** as you approach the end, so it
-  continues with no relaunch and no gap.
+- **Choose what plays next.** Near the end, the remote offers the next aired episode
+  and recent followed series. Next episode and Stop & home are also in the player HUD;
+  Ctrl+Alt+N / Ctrl+Alt+H work in the remote and, with the
+  [Hammerspoon integration](integrations/hammerspoon/README.md), while VLC has focus.
+  Episode metadata loads ahead; torrent downloads start when you choose to play.
 
 **Keeping track**
 
@@ -310,7 +313,7 @@ The CLI and the remote are both clients of the same HTTP API. Grouped, not exhau
 | Streaming | `/hls/master.m3u8` `/hls/playlist.m3u8` `/hls/{segment}` `/hls/init.mp4` `/hls_cache/{key}/{file}` `/stream/transcode` `/torrent/{id}/stream/{file_idx}` (loopback only) |
 | Library | `/library` `/library/files` `/library/vlc.m3u` |
 | Watch tracking | `/watched` `/watched-add` `/watched-remove` `/watched-rate` `/watched-backfill-ids` `/following` `/following/add` `/following/mark` `/following/remove` `/following/seen-seasons` `/continue/remove` `/pending-watched` `/pending-watched/resolve` |
-| Queue and picks | `/watchlist` `/recommendations` `/show-notes` `/queue` |
+| Queue and picks | `/watchlist` `/recommendations` `/show-notes` `/queue` `/up-next` |
 | Chromecast | `/targets` `/cast-info` `/api/cast-config` `/api/position` `/api/position/reset` `/api/retry` `/api/seek-restart` `/cast-receiver.html` |
 | Other | `/history` `/config` |
 

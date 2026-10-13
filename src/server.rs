@@ -688,6 +688,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
             get(handle_recommendations).post(handle_recommendations_set),
         )
         .route("/following", get(handle_following))
+        .route("/up-next", get(handle_up_next))
         .route("/following/mark", post(handle_following_mark))
         .route("/following/add", post(handle_following_add))
         .route("/following/remove", post(handle_following_remove))
@@ -5930,6 +5931,156 @@ async fn handle_following(State(state): State<SharedState>) -> Json<Value> {
     Json(json!({ "shows": shows, "total_new": total_new }))
 }
 
+/// A read-only handoff: metadata can load during playback without changing the
+/// positional search list, starting another torrent, or touching VLC's playlist.
+#[derive(Deserialize)]
+struct UpNextParams {
+    title: String,
+    imdb_id: Option<String>,
+}
+
+fn same_series(id: Option<&str>, title: &str, other_id: Option<&str>, other: &str) -> bool {
+    match (
+        id.filter(|s| !s.is_empty()),
+        other_id.filter(|s| !s.is_empty()),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => title.eq_ignore_ascii_case(other),
+    }
+}
+
+async fn handle_up_next(
+    State(state): State<SharedState>,
+    Query(params): Query<UpNextParams>,
+) -> Json<Value> {
+    let canonical = ledger_title_for_release(&params.title);
+    let (title, season, episode) = crate::search::parse_episode_markers(&canonical);
+    let following = crate::following::load();
+    let last_search = AppState::load_last_search(&state.state_dir);
+    let mut identity = following
+        .shows
+        .iter()
+        .find(|s| {
+            same_series(
+                params.imdb_id.as_deref(),
+                &title,
+                s.imdb_id.as_deref(),
+                &s.title,
+            )
+        })
+        .map(|s| (s.tmdb_id, s.imdb_id.clone(), s.title.clone()))
+        .or_else(|| {
+            last_search
+                .as_ref()
+                .and_then(|s| s.show.as_ref())
+                .filter(|s| {
+                    same_series(
+                        params.imdb_id.as_deref(),
+                        &title,
+                        s.imdb_id.as_deref(),
+                        &s.title,
+                    )
+                })
+                .map(|s| (s.tmdb_id, s.imdb_id.clone(), s.title.clone()))
+        });
+    if identity.is_none() && season.is_some() && episode.is_some() {
+        let meta = state
+            .search_engine
+            .title_meta(
+                &title,
+                true,
+                false,
+                None,
+                params.imdb_id.as_deref().filter(|s| !s.is_empty()),
+                None,
+            )
+            .await;
+        if let Some(id) = meta["tmdb_id"].as_u64() {
+            identity = Some((
+                id,
+                meta["imdb_id"].as_str().map(str::to_owned),
+                meta["title"].as_str().unwrap_or(&title).to_string(),
+            ));
+        }
+    }
+    let mut next = Value::Null;
+    if let (Some((id, imdb, name)), Some(s), Some(e)) = (&identity, season, episode) {
+        if let Some(st) = state.search_engine.tv_status(*id).await {
+            if let Some((ls, le, _, _)) = st.last_aired {
+                if let Some((ns, ne)) = next_unwatched_skipping((s, e), (ls, le), &st.seasons, &[])
+                {
+                    let (episode_name, _) = state
+                        .search_engine
+                        .episode_air(*id, imdb.as_deref(), name, ns, ne)
+                        .await;
+                    let marker = crate::following::fmt_se(ns, ne);
+                    next = json!({"title":name, "query":format!("{name} {marker}"),
+                        "episode_label":marker, "name":episode_name, "poster_url":st.poster_url});
+                }
+            }
+        }
+    }
+    let app = AppState::load(&state.state_dir);
+    let (shows, _) = compute_following_shows(&state, &app).await;
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+    let mut alternatives = Vec::new();
+    for show in shows {
+        let name = show["title"].as_str().unwrap_or("");
+        if identity
+            .as_ref()
+            .is_some_and(|(id, _, _)| show["tmdb_id"].as_u64() == Some(*id))
+        {
+            continue;
+        }
+        let Some(followed) = following
+            .shows
+            .iter()
+            .find(|f| Some(f.tmdb_id) == show["tmdb_id"].as_u64())
+        else {
+            continue;
+        };
+        let recent = app
+            .watched
+            .iter()
+            .filter(|w| {
+                !w.seed
+                    && same_series(
+                        followed.imdb_id.as_deref(),
+                        &followed.title,
+                        w.imdb_id.as_deref(),
+                        w.show.as_deref().unwrap_or(&w.title),
+                    )
+            })
+            .map(|w| w.watched_at)
+            .chain(
+                app.in_progress
+                    .values()
+                    .filter(|w| {
+                        same_series(
+                            followed.imdb_id.as_deref(),
+                            &followed.title,
+                            w.imdb_id.as_deref(),
+                            w.show.as_deref().unwrap_or(&w.title),
+                        )
+                    })
+                    .map(|w| w.updated_at),
+            )
+            .max();
+        let Some(recent) = recent.filter(|t| *t >= cutoff) else {
+            continue;
+        };
+        let Some(marker) = show["next_unwatched"].as_str() else {
+            continue;
+        };
+        alternatives.push((recent, json!({"title":name, "query":format!("{name} {marker}"),
+            "episode_label":marker, "name":show["next_unwatched_name"], "poster_url":show["poster_url"]})));
+    }
+    alternatives.sort_by(|a, b| b.0.cmp(&a.0));
+    Json(
+        json!({"next":next, "alternatives":alternatives.into_iter().take(3).map(|(_,v)| v).collect::<Vec<_>>()}),
+    )
+}
+
 /// Shared New-Episodes derivation for `/following` and the unified `/queue`.
 /// Returns (per-show JSON, most-new-first, total new-episode count). Progress
 /// DERIVES from the ledger (`app`), never a stored field.
@@ -6391,23 +6542,10 @@ async fn handle_position(
         req.seconds,
         req.duration,
     );
-    // Did THIS report record the completion? The latch makes that observable exactly
-    // once per playback, which is the natural hook: it fires at the WATCHED mark rather
-    // than at the very end, so the remaining minutes double as buffer for the next
-    // episode. Compared before and after rather than changing the signature.
-    let just_completed = app.completion_latched.contains(&key);
+    // Completion records progress; advancing is an explicit viewer action.
+    // Queuing VLC's next item here bypassed the remote's end-of-playback offer.
     if changed {
         let _ = app.save(&state.state_dir);
-    }
-    if just_completed && state.config.vlc_autoqueue_next {
-        if let Some(t) = req.title.as_deref() {
-            let r = enqueue_next_episode(&state, t);
-            if r.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                // Not a failure worth surfacing: most often simply "the next episode is
-                // not downloaded", which is the ordinary case mid-season.
-                tracing::debug!("vlc autoqueue skipped: {}", r);
-            }
-        }
     }
     // 2026-08-04: the Mac-side VLC watcher POSTs VLC's true playhead here every
     // poll. Mirror it into the live cell (non-max, unlike the HWM) so the
@@ -8140,7 +8278,7 @@ async fn handle_title_meta(
     // with a bespoke `has_backdrop` check; versioning replaces it, so the NEXT field
     // added to `title_meta` costs one bumped integer instead of another one-off probe.
     // BUMP THIS whenever title_meta's response shape gains or changes a field.
-    const PAYLOAD_V: u64 = 5;
+    const PAYLOAD_V: u64 = 6;
     if let Some(hit) = cache.get(&cache_key) {
         let fresh = hit
             .get("_ts")
@@ -10022,31 +10160,29 @@ async fn handle_vlc_gone(State(state): State<SharedState>, Json(body): Json<Valu
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // A stale bridge report must not clear a newer stream or reap its torrents.
+    let active_title = lock_recover(&state.live_position)
+        .as_ref()
+        .map(|lp| lp.title.clone());
+    if !vlc_gone_matches(&title, active_title.as_deref()) {
+        return Json(json!({"ok":true, "flagged":false, "torrents_stopped":0}));
+    }
+    lock_recover(&state.vlc_commands).clear();
+    *lock_recover(&state.vlc_activity) = None;
+    *lock_recover(&state.serving_path) = None;
+    // Publish gone only AFTER cleanup, so Stop -> Next can safely reuse a season
+    // pack. Fire-and-forget cleanup could otherwise pause the newly opened file.
+    let stopped = reap_all_vlc_torrents(&state).await;
     let mut flagged = false;
     {
         let mut g = lock_recover(&state.live_position);
         if let Some(lp) = g.as_mut() {
-            // Title-guarded so a stale report cannot tear down a DIFFERENT stream
-            // that started in the meantime.
-            if title.is_empty() || lp.title == title {
+            if Some(&lp.title) == active_title.as_ref() {
                 lp.gone = true;
                 flagged = true;
-                // The stream is over, so anything still queued for it is stale and must
-                // never reach whatever plays next. See the stamping note in
-                // `handle_vlc_control` for what a stale command cost.
-                let dropped = std::mem::take(&mut *lock_recover(&state.vlc_commands)).len();
-                if dropped > 0 {
-                    tracing::info!(
-                        "vlc: dropped {} queued command(s) for the stream that just ended",
-                        dropped
-                    );
-                }
             }
         }
     }
-    *lock_recover(&state.vlc_activity) = None;
-    *lock_recover(&state.serving_path) = None;
-    let stopped = reap_all_vlc_torrents(&state);
     tracing::info!(
         "VLC gone (title={:?}) — now-view flagged={}, {} torrent(s) stopped",
         title,
@@ -10059,22 +10195,21 @@ async fn handle_vlc_gone(State(state): State<SharedState>, Json(body): Json<Valu
 /// Stop every torrent started for the VLC path. Unlike
 /// `reap_previous_vlc_torrents` this keeps none — the player is gone, so there
 /// is nothing left for any of them to feed.
-fn reap_all_vlc_torrents(state: &SharedState) -> usize {
+fn vlc_gone_matches(reported: &str, active: Option<&str>) -> bool {
+    reported.is_empty() || active.is_none() || active == Some(reported)
+}
+
+async fn reap_all_vlc_torrents(state: &SharedState) -> usize {
     let to_stop: Vec<u32> = {
         let mut g = lock_recover(&state.vlc_torrents);
-        let all: Vec<u32> = g.iter().copied().collect();
-        g.clear();
-        all
+        std::mem::take(&mut *g)
     };
     let n = to_stop.len();
     for tid in to_stop {
-        let st = state.clone();
-        tokio::spawn(async move {
-            match st.torrent_engine.stop(tid, false).await {
-                Ok(()) => tracing::info!("vlc-torrent reap: stopped {} (VLC quit)", tid),
-                Err(e) => tracing::warn!("vlc-torrent reap: stop {} failed: {}", tid, e),
-            }
-        });
+        match state.torrent_engine.stop(tid, false).await {
+            Ok(()) => tracing::info!("vlc-torrent reap: stopped {} (VLC quit)", tid),
+            Err(e) => tracing::warn!("vlc-torrent reap: stop {} failed: {}", tid, e),
+        }
     }
     n
 }
@@ -12112,6 +12247,28 @@ mod tests {
 
     fn dead_source() -> Value {
         source_error("Torrent has no active seeds (0% after 12s)".into()).0
+    }
+
+    #[test]
+    fn handoff_identity_and_season_boundary() {
+        assert!(!vlc_gone_matches("Old S01E01", Some("New S01E02")));
+        assert!(vlc_gone_matches("Example S01E01", Some("Example S01E01")));
+        assert!(!same_series(Some("tt1"), "Example", Some("tt2"), "Example"));
+        assert!(same_series(
+            Some("tt1"),
+            "Localized",
+            Some("tt1"),
+            "Original"
+        ));
+        assert!(same_series(None, "Example", None, "example"));
+        assert_eq!(
+            next_unwatched_skipping((1, 8), (2, 1), &[(1, 8), (2, 6)], &[]),
+            Some((2, 1))
+        );
+        assert_eq!(
+            next_unwatched_skipping((2, 1), (2, 1), &[(1, 8), (2, 6)], &[]),
+            None
+        );
     }
 
     #[test]
