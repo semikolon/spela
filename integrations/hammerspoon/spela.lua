@@ -1,8 +1,11 @@
 -- VLC-only shortcuts. The remote owns stop acknowledgement and episode choice.
 -- Usage: require("spela").start("http://your-spela-host:7890")
 local M = {}
-local bindings, watcher = {}, nil
+local bindings, watcher, timer = {}, nil, nil
+local generation = 0
 function M.stop()
+    generation = generation + 1
+    if timer then timer:stop(); timer = nil end
     if watcher then watcher:stop(); watcher = nil end
     for _, key in ipairs(bindings) do key:delete() end
     bindings = {}
@@ -41,15 +44,53 @@ function M.start(base)
         hs.hotkey.new({"ctrl", "alt"}, "n", function() open("next") end),
         hs.hotkey.new({"ctrl", "alt"}, "h", function() open("home") end),
     }
-    local function update()
+    local nearEnd, sampledAt, trackedTitle = false, 0, nil
+    local function focused()
         local app = hs.application.frontmostApplication()
-        local enabled = app and app:bundleID() == "org.videolan.vlc"
-        for _, key in ipairs(bindings) do
-            if enabled then key:enable() else key:disable() end
+        return app and app:bundleID() == "org.videolan.vlc"
+    end
+    local function update()
+        local active = focused()
+        local fresh = hs.timer.secondsSinceEpoch() - sampledAt < 6
+        for i, key in ipairs(bindings) do
+            -- Modified shortcuts remain available throughout VLC playback.
+            if active and (i > 2 or (nearEnd and fresh)) then key:enable() else key:disable() end
         end
     end
-    watcher = hs.application.watcher.new(update):start()
-    update()
+    local function decode(status, body)
+        if status ~= 200 then return nil end
+        local ok, value = pcall(hs.json.decode, body)
+        if ok and type(value) == "table" then return value end
+    end
+    local function poll()
+        generation = generation + 1
+        local request = generation
+        update() -- Expire eligibility even if an HTTP request never answers.
+        if not focused() then nearEnd=false; trackedTitle=nil; return end
+        hs.http.asyncGet(base .. "/status", nil, function(status, body)
+            if request ~= generation then return end
+            local state = decode(status, body)
+            local title = state and state.vlc_stream_title
+            if type(title) ~= "string" or title == "" then nearEnd=false; update(); return end
+            if title ~= trackedTitle then nearEnd=false; trackedTitle=title; update() end
+            hs.http.asyncGet(base .. "/api/position?title=" .. hs.http.encodeForQuery(title), nil, function(code, data)
+                if request ~= generation then return end
+                local position = decode(code, data)
+                local t = position and tonumber(position.t)
+                local duration = position and tonumber(position.dur)
+                -- Same reported-position threshold as the remote's Up next panel.
+                nearEnd = not not (position and not position.gone and t and duration
+                    and duration >= 300 and t >= duration - math.min(120, duration * .04))
+                sampledAt = hs.timer.secondsSinceEpoch()
+                update()
+            end)
+        end)
+    end
+    watcher = hs.application.watcher.new(function()
+        nearEnd=false; update(); poll()
+    end):start()
+    timer = hs.timer.doEvery(2, poll)
+    poll()
     return M
 end
 return M
