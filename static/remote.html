@@ -3316,7 +3316,8 @@ function renderHandoff(){
   const nb=$("#nbNext"); if(nb){nb.disabled=!next||handoff.busy; nb.title=next?"Play "+next.query+" (Ctrl+Alt+N)":"No next episode available";}
   const fb=$("#tNext"); if(fb) fb.disabled=!next||handoff.busy;
   // Polling must not replace a focused button or announce the same content repeatedly.
-  const signature=JSON.stringify([handoff.key,handoff.data,handoff.ended,handoff.busy,handoff.error,!!handoff.pending]);
+  const plainKeys=plainHandoffKeys();
+  const signature=JSON.stringify([handoff.key,handoff.data,handoff.ended,handoff.busy,handoff.error,!!handoff.pending,plainKeys]);
   if(root.dataset.rendered===signature) return;
   root.dataset.rendered=signature; root.replaceChildren();
   root.appendChild(el("div",{className:"eyebrow",textContent:handoff.busy?"Stopping current playback…":handoff.ended?"Playback ended":"Up next"}));
@@ -3337,7 +3338,7 @@ function renderHandoff(){
     for(const item of handoff.data.alternatives) others.appendChild(handoffButton(item.title+" · "+item.episode_label,()=>advancePlayback(item)));
     root.appendChild(others);
   }
-  root.appendChild(el("div",{className:"sub",textContent:"Ctrl+Alt+N · Next episode     Ctrl+Alt+H · Stop & home"}));
+  root.appendChild(el("div",{className:"sub",textContent:plainKeys ? (next?"N · Next episode   ·   ":"")+(handoff.ended?"H · Home":"H · Stop & home") : "Ctrl+Alt+N · Next episode   ·   Ctrl+Alt+H · Stop & home"}));
 }
 async function advancePlayback(choice){
   if(handoff.busy || S.now.warming) return;
@@ -3365,12 +3366,19 @@ async function stopAndHome(){
   if(S.now.data && !await stopPlayback({stay:true})){handoff.busy=false;renderHandoff();return;}
   resetHandoff(); location.hash="#/home";
 }
-function handoffShortcut(e){
-  if(e.repeat || !e.ctrlKey || !e.altKey || e.metaKey || e.shiftKey || e.target?.closest?.("input,textarea,select,[contenteditable=true]")) return "";
+function plainHandoffKeys(){
+  return !S.now.warming && !handoff.busy && !handoff.dismissed &&
+    (handoff.ended || nearPlaybackEnd(S.now.posAbs,S.now.dur));
+}
+function handoffShortcut(e,allowPlain=false){
+  if(e.repeat || e.isComposing || e.metaKey || e.shiftKey || e.target?.isContentEditable || e.target?.closest?.("input,textarea,select,[contenteditable]")) return "";
+  const modified=e.ctrlKey && e.altKey;
+  const plain=allowPlain && !e.ctrlKey && !e.altKey;
+  if(!modified && !plain) return "";
   return e.code==="KeyN"?"next":e.code==="KeyH"?"home":"";
 }
 document.addEventListener("keydown",e=>{
-  const action=handoffShortcut(e); if(!action) return;
+  const action=handoffShortcut(e,plainHandoffKeys()); if(!action) return;
   e.preventDefault(); if(action==="next") advancePlayback(); else stopAndHome();
 });
 async function consumeHandoffAction(){

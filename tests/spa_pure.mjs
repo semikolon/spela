@@ -458,6 +458,26 @@ eq(shortcut({...key,code:"KeyH"}),"home","home shortcut is distinct");
 eq(shortcut({...key,repeat:true}),"","held keys cannot skip multiple episodes");
 eq(shortcut({...key,target:{closest:()=>true}}),"","editing text never triggers playback");
 
+eq(shortcut({code:"KeyN"},true),"next","plain N works in the end panel");
+eq(shortcut({code:"KeyH"},true),"home","plain H works in the end panel");
+eq(shortcut({code:"KeyN"}),"","plain keys do nothing outside the end panel");
+eq(shortcut({code:"KeyH",target:{isContentEditable:true}},true),"","editable content keeps single keys");
+eq(shortcut({code:"KeyN",isComposing:true},true),"","IME composition cannot start playback");
+eq(shortcut({code:"KeyN",altKey:true},true),"","Alt alone is not a handoff shortcut");
+{
+  const S={now:{posAbs:3500,dur:3600}},handoff={};
+  const enabled=new Function("S","handoff",extract("nearPlaybackEnd")+extract("plainHandoffKeys")+";return plainHandoffKeys;")(S,handoff);
+  eq(enabled(),true,"near-end plain keys enabled");
+  S.now.posAbs=10;
+  eq(enabled(),false,"seeking earlier disables plain keys");
+  handoff.ended=true;
+  eq(enabled(),true,"plain keys remain available after playback ends");
+  handoff.dismissed=true;
+  eq(enabled(),false,"dismissing the offer disables plain keys");
+  handoff.dismissed=false;S.now.warming=true;
+  eq(enabled(),false,"starting media disables plain keys");
+}
+
 // Starting the next item must wait for the bridge's gone acknowledgement.
 for(const scenario of ["gone","timeout","error"]){
   const calls=[], S={now:{vlc:true,vlcTitle:"Example S01E01",data:{},playing:true}};
