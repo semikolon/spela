@@ -1596,7 +1596,6 @@ impl BufferProgress {
         if initializing
             || now.duration_since(self.polled_at).as_secs() > 15
             || bytes > self.high_water
-            || bytes < self.high_water
         {
             *self = Self::new(bytes, now);
         }
@@ -10881,10 +10880,6 @@ async fn handle_vlc_ready(
     // buffering nothing is playing yet so `live_position` has none. The file itself does:
     // the container header downloads first, so ffprobe reads it off the partial. Cached
     // per torrent — it never changes, and the probe is the only non-trivial cost here.
-    // Runway needs a DURATION to be expressed in minutes, and while a stream is still
-    // buffering nothing is playing yet so `live_position` has none. The file itself does:
-    // the container header downloads first, so ffprobe reads it off the partial. Cached
-    // per torrent — it never changes, and the probe is the only non-trivial cost here.
     //
     // Every guard is read into a plain value and DROPPED before the await: holding a
     // std::sync MutexGuard across an await makes the future non-Send, which axum rejects
@@ -16532,7 +16527,9 @@ mod opening_progress_tests {
             assert!(!p.stalled(9_000_000, false, start + Duration::from_secs(seconds)));
         }
         assert!(p.stalled(9_000_000, false, start + Duration::from_secs(90)));
-        assert!(!p.stalled(10_000_000, false, start + Duration::from_secs(91)));
+        // A slower probe returning fewer bytes is not new download progress.
+        assert!(p.stalled(8_000_000, false, start + Duration::from_secs(91)));
+        assert!(!p.stalled(10_000_000, false, start + Duration::from_secs(92)));
     }
     #[test]
     fn retries_and_initialization_get_fresh_grace() {
