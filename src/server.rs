@@ -7401,6 +7401,12 @@ fn local_bypass_file_is_healthy(
     top_level_file_is_healthy(path, 0)
 }
 
+// Allocation is a conservative prerequisite, not a checksum. Do not relax it
+// for compression: compressed files need independent completion evidence.
+fn allocation_covers_file(physical_bytes: u64, logical_bytes: u64) -> bool {
+    logical_bytes > 0 && physical_bytes >= logical_bytes
+}
+
 fn is_physically_full(path: &std::path::Path, expected_bytes: u64) -> bool {
     if let Ok(meta) = std::fs::metadata(path) {
         let logical_size = meta.len();
@@ -7410,9 +7416,10 @@ fn is_physically_full(path: &std::path::Path, expected_bytes: u64) -> bool {
         }
         // Physical blocks check (Unix only): blocks() are 512-byte units.
         // Sparse files have blocks() * 512 < logical_size.
-        // We allow a small margin for filesystem overhead/compression.
+        // Missing allocation is not filesystem overhead. A percentage allowance
+        // lets near-complete torrents bypass piece-aware streaming and serve zeros.
         let physical_size = meta.blocks() * 512;
-        if physical_size < (logical_size as f64 * 0.95) as u64 {
+        if !allocation_covers_file(physical_size, logical_size) {
             tracing::warn!(
                 "Local Bypass: File is sparse (physical {} < logical {}). Rejecting.",
                 physical_size,
@@ -7475,7 +7482,7 @@ fn top_level_file_is_healthy(path: &std::path::Path, _expected_bytes: u64) -> bo
             return false;
         }
         let physical_size = meta.blocks() * 512;
-        if physical_size < (logical_size as f64 * 0.95) as u64 {
+        if !allocation_covers_file(physical_size, logical_size) {
             tracing::warn!(
                 "Local Bypass: Top-level file is sparse (physical {} < logical {}). Rejecting.",
                 physical_size,
@@ -14186,10 +14193,10 @@ mod tests {
     }
 
     #[test]
-    fn test_top_level_file_is_healthy_rejects_sparse_below_95pct() {
+    fn test_top_level_file_is_healthy_rejects_sparse_file() {
         // Sparse file: logical 200 MB, physical near-zero (just the inode).
         // Pre-fix Local Bypass would happily probe this, ffmpeg reads zeros,
-        // cast hangs at blue-icon. Pin the 0.95 sparse-detection threshold.
+        // cast hangs at blue-icon. Sparse allocation must never be treated as complete.
         let dir = tempfile::tempdir().unwrap();
         let sparse = dir.path().join("sparse.mkv");
         let f = std::fs::File::create(&sparse).unwrap();
@@ -15854,8 +15861,36 @@ fn title_tokens_match(candidate: &str, title: &str) -> bool {
 
 #[cfg(test)]
 mod vlc_readiness_completeness_tests {
-    use super::is_physically_full;
+    use super::{allocation_covers_file, is_physically_full};
     use std::fs::File;
+
+    #[test]
+    fn allocation_requires_every_byte_not_a_percentage() {
+        assert!(!allocation_covers_file(1_402_781_696, 1_455_730_221));
+        assert!(!allocation_covers_file(999_999, 1_000_000));
+        assert!(!allocation_covers_file(0, 0));
+        assert!(allocation_covers_file(1_000_000, 1_000_000));
+        assert!(allocation_covers_file(1_003_520, 1_000_000)); // block rounding
+    }
+
+    #[test]
+    fn near_complete_sparse_file_is_not_a_completed_download() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("near-complete.mkv");
+        // Only 1 MiB is written; extending creates a missing tail smaller than 5%.
+        std::fs::write(&path, vec![7u8; 1024 * 1024]).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(1024 * 1024 + 32 * 1024).unwrap();
+        file.sync_all().unwrap();
+        let meta = file.metadata().unwrap();
+        assert!(
+            meta.blocks() * 512 >= meta.len() * 95 / 100,
+            "fixture must pass the old allowance"
+        );
+        assert!(!is_physically_full(&path, 0));
+        assert!(!is_physically_full(&path, meta.len()));
+    }
 
     /// The VLC readiness short-circuit used to accept whatever the LENIENT local-file
     /// resolver returned, and that resolver deliberately passes a sparse partial. It
