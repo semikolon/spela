@@ -800,6 +800,21 @@ impl TorrentEngine {
         });
     }
 
+    /// Verify the opening cushion through the same piece-aware reader as playback.
+    /// Reads are bounded and cancelled on return; repeated polls never leave detached
+    /// waiters accumulating at a missing piece. Memory usage is one 64 KiB chunk.
+    pub async fn startup_buffer(&self, id: u32, file_idx: usize) -> (u64, u64) {
+        let Some(handle) = self.handle(id) else {
+            return (0, 0);
+        };
+        let Ok(stream) = handle.stream(file_idx) else {
+            return (0, 0);
+        };
+        let target = stream.len().min(64 * 1024 * 1024);
+        let present = read_available_prefix(stream, target, Duration::from_millis(750)).await;
+        (present, target)
+    }
+
     /// True only if BOTH the file's head (container header / track info) AND its
     /// tail (the MKV Cues / MP4 moov seek-index) are actually downloaded — the two
     /// regions a player probes before playback. A `FileStream` read blocks until
@@ -849,6 +864,28 @@ impl TorrentEngine {
             false
         }
     }
+}
+
+/// A timed-out read retains the verified prefix count, not a guessed disk percentage.
+async fn read_available_prefix<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    target: u64,
+    timeout: Duration,
+) -> u64 {
+    use tokio::io::AsyncReadExt;
+    let mut present = 0;
+    let _ = tokio::time::timeout(timeout, async {
+        let mut chunk = [0u8; 64 * 1024];
+        while present < target {
+            let want = (target - present).min(chunk.len() as u64) as usize;
+            match reader.read(&mut chunk[..want]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => present += n as u64,
+            }
+        }
+    })
+    .await;
+    present
 }
 
 /// Reject anything that isn't a magnet URI. Apr 30, 2026 — security audit
@@ -1279,5 +1316,31 @@ mod tests {
         let prog = stats_to_progress(&stats);
         assert!(prog.finished);
         assert_eq!(prog.bytes_downloaded, prog.bytes_total);
+    }
+}
+
+#[cfg(test)]
+mod startup_buffer_tests {
+    use super::*;
+    #[tokio::test]
+    async fn missing_piece_blocks_readiness_even_when_later_bytes_exist() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        writer.write_all(&[1; 512]).await.unwrap();
+        assert_eq!(
+            read_available_prefix(reader, 1024, Duration::from_millis(20)).await,
+            512
+        );
+    }
+    #[tokio::test]
+    async fn complete_prefix_and_short_eof_are_distinguished() {
+        assert_eq!(
+            read_available_prefix(&[1u8; 1024][..], 512, Duration::from_secs(1)).await,
+            512
+        );
+        assert_eq!(
+            read_available_prefix(&[1u8; 256][..], 512, Duration::from_secs(1)).await,
+            256
+        );
     }
 }

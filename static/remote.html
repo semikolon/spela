@@ -1403,7 +1403,7 @@ async function openInVlc(id,title,poster){
     }else{
       const next = nextVlcSource(shot, id, startedOnMarked);
       if(next == null) break;
-      S.now.vlcNote = "Source " + id + " had no peers — trying source " + next + "…";
+      S.now.vlcNote = "Source " + id + " stopped delivering — trying source " + next + "…";
       id = next;
     }
     skipped += 1;
@@ -1411,7 +1411,7 @@ async function openInVlc(id,title,poster){
     if(S.now.warming) renderWarmPanel();
     rdy = await vlcWaitReady(id, gen, pinOf(id));
   }
-  if(rdy && (rdy.rotate || rdy.switchTo)){ S.now.vlcErr="No source for this episode had reachable peers."; rdy=false; }
+  if(rdy && (rdy.rotate || rdy.switchTo)){ S.now.vlcErr="None of the tried sources could build a playable buffer."; rdy=false; }
   S.now.vlcNote=null;
   if(rdy==="superseded") return;   // a newer VLC source took over this screen — don't clobber it with an error
   if(rdy!==true){

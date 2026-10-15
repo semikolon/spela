@@ -65,6 +65,7 @@ pub struct ServerState {
     /// buffering nothing is playing yet so `live_position` has none.
     pub media_dur: Mutex<HashMap<u32, f64>>,
     pub vlc_first_poll: Mutex<HashMap<u32, Instant>>,
+    pub vlc_buffer_progress: Mutex<HashMap<(u32, u32), BufferProgress>>,
     /// A VLC play in flight owns a COPY of the result list it was chosen from,
     /// keyed by the chosen release's infohash.
     ///
@@ -538,6 +539,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         warmup: Mutex::new(None),
         media_dur: Mutex::new(HashMap::new()),
         vlc_first_poll: Mutex::new(HashMap::new()),
+        vlc_buffer_progress: Mutex::new(HashMap::new()),
         vlc_intents: Mutex::new(HashMap::new()),
         vlc_raced: Mutex::new(HashSet::new()),
         starts: Mutex::new(HashMap::new()),
@@ -1574,6 +1576,35 @@ pub fn vlc_source_is_stalled(
 
 /// 12s normally, 30s for a large source — the same split do_play uses, because a big
 /// release legitimately takes longer to get its first pieces moving.
+#[derive(Debug)]
+pub struct BufferProgress {
+    high_water: u64,
+    advanced_at: Instant,
+    polled_at: Instant,
+}
+impl BufferProgress {
+    fn new(bytes: u64, now: Instant) -> Self {
+        Self {
+            high_water: bytes,
+            advanced_at: now,
+            polled_at: now,
+        }
+    }
+    fn stalled(&mut self, bytes: u64, initializing: bool, now: Instant) -> bool {
+        // A new attempt after polling stopped gets its own grace period. Peers and
+        // old cached bytes cannot keep an unchanging opening buffer alive forever.
+        if initializing
+            || now.duration_since(self.polled_at).as_secs() > 15
+            || bytes > self.high_water
+            || bytes < self.high_water
+        {
+            *self = Self::new(bytes, now);
+        }
+        self.polled_at = now;
+        now.duration_since(self.advanced_at).as_secs() >= 90
+    }
+}
+
 pub fn vlc_stall_gate_secs(total_bytes: u64) -> u64 {
     if total_bytes > 8_000_000_000 {
         30
@@ -10708,9 +10739,8 @@ async fn handle_vlc_ready(
     // death spiral where nothing ever buffers (2026-08-05 regression from the FD-leak
     // reap). Supersession is committed at the /stream serve (the source VLC actually
     // opens, handle_vlc_stream); the SPA also polls only one source at a time.
-    state
-        .torrent_engine
-        .prefetch_ends(tid, file_index.unwrap_or(0) as usize);
+    // The bounded readiness reads below prioritize head and tail without spawning
+    // a new indefinitely blocked prefetch task on every poll.
     let (bytes, total, finished, peers, speed, initializing) = state
         .torrent_engine
         .progress(tid)
@@ -10802,14 +10832,44 @@ async fn handle_vlc_ready(
     } else {
         false
     };
-    let ready = finished || (gates >= 1.0 && ends_ok);
+    let (opening_bytes, opening_target) = if finished {
+        (1, 1)
+    } else {
+        state
+            .torrent_engine
+            .startup_buffer(tid, file_index.unwrap_or(0) as usize)
+            .await
+    };
+    let opening_ok = opening_target > 0 && opening_bytes >= opening_target;
+    let ready = finished || (gates >= 1.0 && ends_ok && opening_ok);
+    let stalled = {
+        let now = Instant::now();
+        let mut progress = lock_recover(&state.vlc_buffer_progress);
+        progress.retain(|_, p| now.duration_since(p.polled_at).as_secs() < 600);
+        progress
+            .entry((tid, file_index.unwrap_or(0)))
+            .or_insert_with(|| BufferProgress::new(opening_bytes, now))
+            .stalled(opening_bytes, initializing, now)
+    };
+    if !ready && !initializing && stalled {
+        return Json(json!({"ready": false, "dead": true,
+            "phase": "source stopped delivering", "pct": (frac * 100.0) as u32}));
+    }
     // Progress toward OPENING, which is not progress toward 100% downloaded and was
     // being drawn as though it were. VLC opens at 15% + 64 MB + both ends present,
     // so a bar reading 12% of the file was in fact four-fifths of the way there and
     // looked like it had eight times as long to go. The last tenth is the ends gate,
     // so the bar physically cannot fill until the tail lands — which is the thing
     // that actually holds up a play that looks finished (Silo S03E04, Aug 3).
-    let open_pct = open_progress_pct(frac, bytes, MIN_FRAC, MIN_BUFFER, ends_ok, finished);
+    let open_pct = open_progress_pct(frac, bytes, MIN_FRAC, MIN_BUFFER, ends_ok, finished).min(
+        if opening_ok {
+            100
+        } else if opening_target > 0 {
+            (opening_bytes.saturating_mul(100) / opening_target).min(99) as u32
+        } else {
+            0
+        },
+    );
     // RUNWAY, not percent. Percent-downloaded is the number that told Fredrik "32%" while
     // he had seven minutes of watchable video, and playback stalled exactly at the seven.
     // The contiguous run from the playhead is what he can actually act on.
@@ -10829,14 +10889,10 @@ async fn handle_vlc_ready(
     // Every guard is read into a plain value and DROPPED before the await: holding a
     // std::sync MutexGuard across an await makes the future non-Send, which axum rejects
     // at compile time with a Handler trait error that names nothing useful.
-    let live_dur = {
-        let g = lock_recover(&state.live_position);
-        g.as_ref().map(|lp| lp.dur).filter(|d| *d > 0.0)
-    };
     let cached_dur = { lock_recover(&state.media_dur).get(&tid).copied() };
-    let dur = match (live_dur, cached_dur) {
-        (Some(d), _) | (None, Some(d)) => Some(d),
-        (None, None) => match (&file_path, bytes > 0) {
+    let dur = match cached_dur {
+        Some(d) => Some(d),
+        None => match (&file_path, bytes > 0) {
             (Some(p), true) => {
                 let probed = crate::transcode::detect_codecs(&p.to_string_lossy(), None)
                     .await
@@ -10851,17 +10907,13 @@ async fn handle_vlc_ready(
             _ => None,
         },
     };
-    let playhead = {
-        let g = lock_recover(&state.live_position);
-        g.as_ref().map(|lp| lp.abs_secs).unwrap_or(0.0)
-    };
-    let runway = file_path.as_ref().zip(dur).and_then(|(p, d)| {
-        let from_byte = if total > 0 {
-            (playhead / d * total as f64) as u64
-        } else {
-            0
-        };
-        disk::runway_secs(p.as_path(), from_byte, total, d)
+    // Partial files currently start at zero; a prior VLC session's playhead must
+    // not describe this new source's opening buffer.
+    let runway = dur.filter(|d| *d > 0.0).and_then(|d| {
+        file_path.as_ref().and_then(|p| {
+            let file_size = std::fs::metadata(p).ok()?.len();
+            disk::runway_secs(p.as_path(), 0, file_size, d)
+        })
     });
     Json(json!({
         "ready": ready,
@@ -16465,5 +16517,31 @@ mod client_location_tests {
             effective_client_ip(ip("127.0.0.1"), Some("")),
             ip("127.0.0.1")
         );
+    }
+}
+
+#[cfg(test)]
+mod opening_progress_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn cached_bytes_do_not_mask_a_stalled_opening_buffer() {
+        let start = Instant::now();
+        let mut p = BufferProgress::new(9_000_000, start);
+        for seconds in 1..90 {
+            assert!(!p.stalled(9_000_000, false, start + Duration::from_secs(seconds)));
+        }
+        assert!(p.stalled(9_000_000, false, start + Duration::from_secs(90)));
+        assert!(!p.stalled(10_000_000, false, start + Duration::from_secs(91)));
+    }
+    #[test]
+    fn retries_and_initialization_get_fresh_grace() {
+        let start = Instant::now();
+        let mut p = BufferProgress::new(0, start);
+        assert!(!p.stalled(0, false, start + Duration::from_secs(120)));
+        for seconds in 121..250 {
+            assert!(!p.stalled(0, true, start + Duration::from_secs(seconds)));
+        }
+        assert!(!p.stalled(0, false, start + Duration::from_secs(250)));
     }
 }
