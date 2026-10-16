@@ -10769,6 +10769,9 @@ async fn handle_vlc_ready(
     // alone would kill exactly the sources f30fdca taught us to wait for.
     let first = {
         let mut m = lock_recover(&state.vlc_first_poll);
+        if initializing {
+            m.insert(tid, Instant::now());
+        }
         *m.entry(tid).or_insert_with(Instant::now)
     };
     let gate_secs = vlc_stall_gate_secs(total);
@@ -10793,7 +10796,10 @@ async fn handle_vlc_ready(
     // Race the top candidates once the pick has been given a fair chance and is
     // delivering NOTHING. Runs at most once per source; the winner is returned as a
     // switch so the remote can move to it using the same rotation plumbing.
-    if !finished && race_switch_is_warranted(bytes, peers, speed, first.elapsed().as_secs()) {
+    if !finished
+        && !initializing
+        && race_switch_is_warranted(bytes, peers, speed, first.elapsed().as_secs())
+    {
         if let Some(winner) = maybe_race_sources_for_vlc(&state, id).await {
             if winner != id {
                 return Json(json!({

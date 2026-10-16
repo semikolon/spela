@@ -305,6 +305,17 @@ impl TorrentEngine {
             .sum()
     }
 
+    /// The engine may put a multi-file torrent under its own output directory.
+    /// Metadata paths are relative to THAT directory, not to the media root.
+    fn output_folders(&self) -> HashMap<usize, PathBuf> {
+        librqbit::Api::new(self.session.clone(), None)
+            .api_torrent_list()
+            .torrents
+            .into_iter()
+            .filter_map(|t| Some((t.id?, PathBuf::from(t.output_folder))))
+            .collect()
+    }
+
     /// Put the session in a safe state after a restart.
     ///
     /// Two things are owed here, and both exist because persistence is now on.
@@ -323,7 +334,7 @@ impl TorrentEngine {
     /// exists, at full logical size, holding nothing. Exactly zero blocks across every
     /// file is the only condition that deletes, so there is nothing to lose when it does.
     async fn settle_restored_torrents(&self) {
-        let root = self.media_dir.clone();
+        let folders = self.output_folders();
         // PAUSE FIRST, and pause everything — including torrents whose metadata has not
         // resolved yet. Pausing needs no knowledge of the files; measuring does. Gating
         // the pause on metadata therefore left a race in which a torrent restored
@@ -360,6 +371,9 @@ impl TorrentEngine {
                 let Some(meta) = t.metadata.load_full() else {
                     // Metadata unresolved: no evidence about what is on disk, so leave
                     // it. It is paused above, which is the half that matters.
+                    continue;
+                };
+                let Some(root) = folders.get(&id) else {
                     continue;
                 };
                 let bytes = Self::physical_bytes(
@@ -454,10 +468,13 @@ impl TorrentEngine {
     /// goes, which is what streaming from a partial torrent does anyway.
     pub fn owner_of(&self, path: &Path) -> Option<(u32, usize)> {
         let target = std::fs::canonicalize(path).ok()?;
-        let root = self.media_dir.clone();
+        let folders = self.output_folders();
         self.session.with_torrents(|it| {
             for (id, t) in it {
                 let Some(meta) = t.metadata.load_full() else {
+                    continue;
+                };
+                let Some(root) = folders.get(&id) else {
                     continue;
                 };
                 for (idx, fi) in meta.file_infos.iter().enumerate() {
@@ -739,15 +756,20 @@ impl TorrentEngine {
     /// Needed because the runway measurement reads the FILE (one `lseek(SEEK_HOLE)`)
     /// rather than a piece bitmap — librqbit's `TorrentStats` exposes no bitmap, and the
     /// file is the ground truth anyway.
-    /// RELATIVE path — librqbit's output folder lives on a crate-private options struct,
-    /// so the caller joins this with the media dir it already knows.
+    /// Relative to the media root, including the torrent-specific output directory.
+    /// The public librqbit API supplies that directory; metadata alone omits it.
     pub fn file_relative_path(&self, id: u32, file_idx: usize) -> Option<PathBuf> {
         let handle = self.handle(id)?;
+        let folders = self.output_folders();
+        let output = folders.get(&handle.id())?;
         handle
             .with_metadata(|m| {
-                m.file_infos
-                    .get(file_idx)
-                    .map(|fi| fi.relative_filename.clone())
+                let relative = &m.file_infos.get(file_idx)?.relative_filename;
+                output
+                    .join(relative)
+                    .strip_prefix(&self.media_dir)
+                    .ok()
+                    .map(Path::to_path_buf)
             })
             .ok()?
     }
