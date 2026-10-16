@@ -1579,28 +1579,44 @@ pub fn vlc_source_is_stalled(
 #[derive(Debug)]
 pub struct BufferProgress {
     high_water: u64,
+    downloaded_high_water: u64,
+    healthy_since: Option<(Instant, u64)>,
     advanced_at: Instant,
     polled_at: Instant,
 }
 impl BufferProgress {
-    fn new(bytes: u64, now: Instant) -> Self {
+    fn new(bytes: u64, downloaded: u64, now: Instant) -> Self {
         Self {
             high_water: bytes,
+            downloaded_high_water: downloaded,
+            healthy_since: None,
             advanced_at: now,
             polled_at: now,
         }
     }
-    fn stalled(&mut self, bytes: u64, initializing: bool, now: Instant) -> bool {
-        // A new attempt after polling stopped gets its own grace period. Peers and
-        // old cached bytes cannot keep an unchanging opening buffer alive forever.
-        if initializing
-            || now.duration_since(self.polled_at).as_secs() > 15
-            || bytes > self.high_water
-        {
-            *self = Self::new(bytes, now);
+    fn stalled(&mut self, bytes: u64, downloaded: u64, initializing: bool, now: Instant) -> bool {
+        // Cached bytes establish a baseline, not evidence of current delivery.
+        // New pieces anywhere count: rarest-first downloads need not extend the
+        // opening prefix on every poll. Readiness still requires that prefix.
+        if initializing || now.duration_since(self.polled_at).as_secs() > 15 {
+            *self = Self::new(bytes, downloaded, now);
+        } else if bytes > self.high_water || downloaded > self.downloaded_high_water {
+            self.high_water = self.high_water.max(bytes);
+            self.downloaded_high_water = self.downloaded_high_water.max(downloaded);
+            self.advanced_at = now;
         }
         self.polled_at = now;
         now.duration_since(self.advanced_at).as_secs() >= 90
+    }
+    fn healthy(&mut self, downloaded: u64, speed: u64, bitrate: u64, now: Instant) -> bool {
+        let needed = bitrate as f64 / 8.0 * 1.2;
+        if bitrate == 0 || (speed as f64) < needed {
+            self.healthy_since = None;
+            return false;
+        }
+        let (since, baseline) = *self.healthy_since.get_or_insert((now, downloaded));
+        let elapsed = now.duration_since(since).as_secs_f64();
+        elapsed >= 6.0 && downloaded.saturating_sub(baseline) as f64 / elapsed >= needed
     }
 }
 
@@ -10828,7 +10844,7 @@ async fn handle_vlc_ready(
     // The ends gate is BOOLEAN and usually last, so it cannot be a fraction — it
     // gets the final tenth of the bar. Evaluated only once the fractional gates
     // are met, as before: it costs a head+tail read, and this runs on a ~1.5s poll.
-    let ends_ok = if finished || gates >= 1.0 {
+    let ends_ok = if finished || bytes >= 16 * 1024 * 1024 {
         finished
             || state
                 .torrent_engine
@@ -10846,16 +10862,23 @@ async fn handle_vlc_ready(
             .await
     };
     let opening_ok = opening_target > 0 && opening_bytes >= opening_target;
-    let ready = finished || (gates >= 1.0 && ends_ok && opening_ok);
-    let stalled = {
+    let bitrate = probed.as_ref().map(|q| q.bitrate_bps).unwrap_or(0);
+    let (stalled, healthy) = {
         let now = Instant::now();
         let mut progress = lock_recover(&state.vlc_buffer_progress);
         progress.retain(|_, p| now.duration_since(p.polled_at).as_secs() < 600);
-        progress
+        let sample = progress
             .entry((tid, file_index.unwrap_or(0)))
-            .or_insert_with(|| BufferProgress::new(opening_bytes, now))
-            .stalled(opening_bytes, initializing, now)
+            .or_insert_with(|| BufferProgress::new(opening_bytes, bytes, now));
+        let stalled = sample.stalled(opening_bytes, bytes, initializing, now);
+        let healthy = !initializing && sample.healthy(bytes, speed, bitrate, now);
+        (stalled, healthy)
     };
+    // Proven delivery may launch with at least 20 seconds / 16 MiB contiguous.
+    // It must still have the container ends; claimed seed counts never qualify.
+    let optimistic =
+        healthy && opening_bytes >= (bitrate / 8).saturating_mul(20).max(16 * 1024 * 1024);
+    let ready = finished || (ends_ok && ((gates >= 1.0 && opening_ok) || optimistic));
     if !ready && !initializing && stalled {
         return Json(json!({"ready": false, "dead": true,
             "phase": "source stopped delivering", "pct": (frac * 100.0) as u32}));
@@ -10866,15 +10889,17 @@ async fn handle_vlc_ready(
     // looked like it had eight times as long to go. The last tenth is the ends gate,
     // so the bar physically cannot fill until the tail lands — which is the thing
     // that actually holds up a play that looks finished (Silo S03E04, Aug 3).
-    let open_pct = open_progress_pct(frac, bytes, MIN_FRAC, MIN_BUFFER, ends_ok, finished).min(
-        if opening_ok {
+    let open_pct = if ready {
+        100
+    } else {
+        open_progress_pct(frac, bytes, MIN_FRAC, MIN_BUFFER, ends_ok, finished).min(if opening_ok {
             100
         } else if opening_target > 0 {
             (opening_bytes.saturating_mul(100) / opening_target).min(99) as u32
         } else {
             0
-        },
-    );
+        })
+    };
     // RUNWAY, not percent. Percent-downloaded is the number that told Fredrik "32%" while
     // he had seven minutes of watchable video, and playback stalled exactly at the seven.
     // The contiguous run from the playhead is what he can actually act on.
@@ -16528,23 +16553,90 @@ mod opening_progress_tests {
     #[test]
     fn cached_bytes_do_not_mask_a_stalled_opening_buffer() {
         let start = Instant::now();
-        let mut p = BufferProgress::new(9_000_000, start);
+        let mut p = BufferProgress::new(9_000_000, 1_400_000_000, start);
         for seconds in 1..90 {
-            assert!(!p.stalled(9_000_000, false, start + Duration::from_secs(seconds)));
+            assert!(!p.stalled(
+                9_000_000,
+                1_400_000_000,
+                false,
+                start + Duration::from_secs(seconds)
+            ));
         }
-        assert!(p.stalled(9_000_000, false, start + Duration::from_secs(90)));
+        assert!(p.stalled(
+            9_000_000,
+            1_400_000_000,
+            false,
+            start + Duration::from_secs(90)
+        ));
         // A slower probe returning fewer bytes is not new download progress.
-        assert!(p.stalled(8_000_000, false, start + Duration::from_secs(91)));
-        assert!(!p.stalled(10_000_000, false, start + Duration::from_secs(92)));
+        assert!(p.stalled(
+            8_000_000,
+            1_400_000_000,
+            false,
+            start + Duration::from_secs(91)
+        ));
+        assert!(!p.stalled(
+            10_000_000,
+            1_400_000_000,
+            false,
+            start + Duration::from_secs(92)
+        ));
     }
     #[test]
     fn retries_and_initialization_get_fresh_grace() {
         let start = Instant::now();
-        let mut p = BufferProgress::new(0, start);
-        assert!(!p.stalled(0, false, start + Duration::from_secs(120)));
+        let mut p = BufferProgress::new(0, 1_400_000_000, start);
+        assert!(!p.stalled(0, 1_400_000_000, false, start + Duration::from_secs(120)));
         for seconds in 121..250 {
-            assert!(!p.stalled(0, true, start + Duration::from_secs(seconds)));
+            assert!(!p.stalled(0, 1_400_000_000, true, start + Duration::from_secs(seconds)));
         }
-        assert!(!p.stalled(0, false, start + Duration::from_secs(250)));
+        assert!(!p.stalled(0, 1_400_000_000, false, start + Duration::from_secs(250)));
+    }
+    #[test]
+    fn pieces_outside_opening_buffer_keep_source_alive() {
+        let start = Instant::now();
+        let mut p = BufferProgress::new(9_000_000, 400_000_000, start);
+        for seconds in 1..=300 {
+            assert!(!p.stalled(
+                9_000_000,
+                400_000_000 + seconds * 1024,
+                false,
+                start + Duration::from_secs(seconds)
+            ));
+        }
+        for seconds in 301..390 {
+            assert!(!p.stalled(
+                9_000_000,
+                400_000_000 + 300 * 1024,
+                false,
+                start + Duration::from_secs(seconds)
+            ));
+        }
+        assert!(p.stalled(
+            9_000_000,
+            400_000_000 + 300 * 1024,
+            false,
+            start + Duration::from_secs(390)
+        ));
+    }
+    #[test]
+    fn optimistic_launch_requires_measured_delivery_not_cached_bytes() {
+        let now = Instant::now();
+        let mut p = BufferProgress::new(0, 1_000_000_000, now);
+        assert!(!p.healthy(1_000_000_000, 1_200_000, 8_000_000, now));
+        assert!(!p.healthy(
+            1_000_000_000,
+            1_200_000,
+            8_000_000,
+            now + Duration::from_secs(6)
+        ));
+        assert!(p.healthy(
+            1_007_200_000,
+            1_200_000,
+            8_000_000,
+            now + Duration::from_secs(6)
+        ));
+        assert!(!p.healthy(1_007_200_000, 0, 8_000_000, now + Duration::from_secs(7)));
+        assert!(!p.healthy(1_007_200_000, 1_200_000, 0, now + Duration::from_secs(8)));
     }
 }
