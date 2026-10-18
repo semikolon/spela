@@ -200,44 +200,15 @@ fn cached_media_quality(
     lock_recover(&state.media_probe).get(&key).cloned()
 }
 
-/// How close a buffering torrent is to being OPENABLE, as 0..100.
-///
-/// NOT the fraction of the file downloaded, which is what the loading bar drew
-/// until 2026-09-06 and which reads as far more remaining than there is: VLC opens
-/// at 15% AND 64 MB AND both ends present, so a bar showing 12%-of-file was in fact
-/// four-fifths of the way there and looked like it had eight times as long to go.
-///
-/// The two fractional gates each contribute their own completion and the BINDING
-/// one decides, because a torrent can be past 15% while short of 64 MB or the
-/// reverse. The ends gate is boolean and usually last, so it owns the final tenth:
-/// the bar physically cannot fill until the tail lands, which is the thing that
-/// actually holds up a play that looks finished (Silo S03E04, 2026-08-03).
-pub(crate) fn open_progress_pct(
-    frac: f64,
-    bytes: u64,
-    min_frac: f64,
-    min_bytes: u64,
-    ends_ok: bool,
-    finished: bool,
-) -> u32 {
-    if finished {
+/// Opening progress follows verified contiguous bytes, never whole-file percent.
+fn opening_progress_pct(bytes: u64, target: u64, ends_ok: bool, ready: bool) -> u32 {
+    if ready {
         return 100;
     }
-    let gate_frac = if min_frac > 0.0 {
-        (frac / min_frac).clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    let gate_bytes = if min_bytes > 0 {
-        (bytes as f64 / min_bytes as f64).clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    let gates = gate_frac.min(gate_bytes);
-    if gates >= 1.0 && ends_ok {
-        return 100;
+    if target == 0 {
+        return 0;
     }
-    ((gates * 90.0) + if ends_ok { 10.0 } else { 0.0 }) as u32
+    (bytes.saturating_mul(90) / target).min(90) as u32 + if ends_ok { 9 } else { 0 }
 }
 
 /// Is this client reaching spela from OUTSIDE the home LAN, and therefore possibly
@@ -1576,6 +1547,15 @@ pub fn vlc_source_is_stalled(
 
 /// 12s normally, 30s for a large source — the same split do_play uses, because a big
 /// release legitimately takes longer to get its first pieces moving.
+fn vlc_opening_ready(
+    finished: bool,
+    ends_present: bool,
+    opening_complete: bool,
+    healthy_cushion: bool,
+) -> bool {
+    finished || (ends_present && (opening_complete || healthy_cushion))
+}
+
 #[derive(Debug)]
 pub struct BufferProgress {
     high_water: u64,
@@ -6268,6 +6248,26 @@ fn boot_resume_device(
     Some(device)
 }
 
+// Completion and resume storage have different purposes. Keep the saved place
+// available for explicit replay, but do not advertise a watched item as unfinished.
+fn continue_entry_is_watched(app: &AppState, e: &InProgressEntry) -> bool {
+    let (_, season, episode) = crate::search::parse_episode_markers(&e.title);
+    let title = crate::search::clean_title_for_tmdb(&e.title).to_lowercase();
+    app.watched.iter().any(|w| {
+        if w.key == e.key {
+            return true;
+        }
+        let (_, ws, we) = crate::search::parse_episode_markers(&w.title);
+        // Historical VLC identities could change when an unrelated search ran.
+        // Exact show + episode reconciles those aliases; never use show-level
+        // "has_seen", which would hide every subsequent episode.
+        season.is_some()
+            && episode.is_some()
+            && (season, episode) == (ws, we)
+            && crate::search::clean_title_for_tmdb(&w.title).to_lowercase() == title
+    })
+}
+
 async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
     let app = AppState::load(&state.state_dir);
 
@@ -6307,7 +6307,12 @@ async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
     // A match against a New-Episodes next-unwatched folds in (annotate + skip);
     // everything else (movies, non-followed, older episodes) stays a Continue row.
     let mut cont: Vec<Value> = Vec::new();
-    for e in dedup_continue_furthest(app.in_progress_list()) {
+    for e in dedup_continue_furthest(
+        app.in_progress_list()
+            .into_iter()
+            .filter(|e| !continue_entry_is_watched(&app, e))
+            .collect(),
+    ) {
         let pct = match e.duration {
             Some(d) if d > 0.0 => Some(((e.position / d) * 100.0).clamp(0.0, 100.0).round() as u64),
             _ => None,
@@ -10495,10 +10500,10 @@ async fn handle_vlc_stream(
     let id = remap_id_by_infohash(&state, id, VlcPin::from_query(&pin));
     // 2026-07-28: stamp VLC activity so /status can report vlc_active — this path
     // serves VLC directly and never creates a CurrentStream.
-    if let Some((_, _, name, _, _)) = resolve_result_for_vlc(&state, id, VlcPin::from_query(&pin)) {
-        let imdb = AppState::load_last_search(&state.state_dir)
-            .and_then(|s| s.show)
-            .and_then(|sh| sh.imdb_id);
+    if let Some((_, _, name, _, imdb)) =
+        resolve_result_for_vlc(&state, id, VlcPin::from_query(&pin))
+    {
+        // The name and IMDb ID must come from the SAME pinned source snapshot.
         *lock_recover(&state.vlc_activity) = Some((Instant::now(), name, imdb));
     }
     // Name the bytes, and probe them. Both are cheap and idempotent: the probe
@@ -10829,21 +10834,9 @@ async fn handle_vlc_ready(
     } else {
         0.0
     };
-    const MIN_BUFFER: u64 = 64 * 1024 * 1024;
-    const MIN_FRAC: f64 = 0.15;
-    // Byte-fraction is necessary but NOT sufficient: VLC probes the head + the MKV
-    // tail (Cues) before playback, and a torrent can hit 15%+64MB with the tail
-    // still missing → VLC opens and hangs probing hundreds of MB deep (Silo S03E04,
-    // Aug 3). Only declare ready once both ends are actually downloaded.
-    // The two fractional gates, each as its own 0..1 completion. The BINDING one is
-    // the minimum: a torrent can be past 15% and still short of 64 MB, or the
-    // reverse, and the bar must follow whichever is actually holding it up.
-    let gate_frac = (frac / MIN_FRAC).min(1.0);
-    let gate_bytes = (bytes as f64 / MIN_BUFFER as f64).min(1.0);
-    let gates = gate_frac.min(gate_bytes);
-    // The ends gate is BOOLEAN and usually last, so it cannot be a fraction — it
-    // gets the final tenth of the bar. Evaluated only once the fractional gates
-    // are met, as before: it costs a head+tail read, and this runs on a ~1.5s poll.
+    // Readiness is about contiguous playable bytes and the container index,
+    // not a percentage of the whole movie. A large encode must not wait for
+    // 15% (often >1 GiB) when its verified opening cushion is already present.
     let ends_ok = if finished || bytes >= 16 * 1024 * 1024 {
         finished
             || state
@@ -10878,27 +10871,20 @@ async fn handle_vlc_ready(
     // It must still have the container ends; claimed seed counts never qualify.
     let optimistic =
         healthy && opening_bytes >= (bitrate / 8).saturating_mul(20).max(16 * 1024 * 1024);
-    let ready = finished || (ends_ok && ((gates >= 1.0 && opening_ok) || optimistic));
+    let ready = vlc_opening_ready(finished, ends_ok, opening_ok, optimistic);
     if !ready && !initializing && stalled {
         return Json(json!({"ready": false, "dead": true,
             "phase": "source stopped delivering", "pct": (frac * 100.0) as u32}));
     }
-    // Progress toward OPENING, which is not progress toward 100% downloaded and was
-    // being drawn as though it were. VLC opens at 15% + 64 MB + both ends present,
-    // so a bar reading 12% of the file was in fact four-fifths of the way there and
-    // looked like it had eight times as long to go. The last tenth is the ends gate,
-    // so the bar physically cannot fill until the tail lands — which is the thing
-    // that actually holds up a play that looks finished (Silo S03E04, Aug 3).
-    let open_pct = if ready {
-        100
+    let open_pct = opening_progress_pct(opening_bytes, opening_target, ends_ok, ready);
+    let wait_reason = if ready {
+        None
+    } else if !opening_ok {
+        Some("Filling the opening buffer")
+    } else if !ends_ok {
+        Some("Waiting for the video seek index")
     } else {
-        open_progress_pct(frac, bytes, MIN_FRAC, MIN_BUFFER, ends_ok, finished).min(if opening_ok {
-            100
-        } else if opening_target > 0 {
-            (opening_bytes.saturating_mul(100) / opening_target).min(99) as u32
-        } else {
-            0
-        })
+        Some("Preparing playback")
     };
     // RUNWAY, not percent. Percent-downloaded is the number that told Fredrik "32%" while
     // he had seven minutes of watchable video, and playback stalled exactly at the seven.
@@ -10943,6 +10929,7 @@ async fn handle_vlc_ready(
     });
     Json(json!({
         "ready": ready,
+        "wait_reason": wait_reason,
         "pct": (frac * 100.0) as u32,
         // Progress toward being OPENABLE. `pct` stays as the raw
         // fraction-of-file for anything that wants it, but this is the honest
@@ -12906,6 +12893,22 @@ mod tests {
             poster_url: None,
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn continue_hides_completed_episode_aliases_without_hiding_next_episode() {
+        let mut app = AppState::default();
+        app.mark_watched(
+            "tt_old_s01e04",
+            Some("tt_old".into()),
+            Some("Example Show S01E04".into()),
+        );
+        let mut entry = ip("tt_correct", "Example Show", Some(1), Some(4), 2400.0);
+        entry.title = "Example Show S01E04".into();
+        assert!(continue_entry_is_watched(&app, &entry));
+        entry.title = "Example Show S01E05".into();
+        entry.episode = Some(5);
+        assert!(!continue_entry_is_watched(&app, &entry));
     }
 
     #[test]
@@ -16391,86 +16394,14 @@ mod bypass_downgrade_floor_tests {
 
 #[cfg(test)]
 mod loading_progress_tests {
-    use super::open_progress_pct;
-
-    const MIN_FRAC: f64 = 0.15;
-    const MIN_BYTES: u64 = 64 * 1024 * 1024;
-
-    /// The bug this replaced: the bar drew fraction-of-FILE, so a torrent that was
-    /// four-fifths of the way to openable showed 12% and read as eight times the
-    /// remaining wait. 2026-09-06.
+    use super::opening_progress_pct;
     #[test]
-    fn twelve_percent_of_the_file_is_most_of_the_way_to_opening() {
-        let bytes = (0.12 * 3_000_000_000.0) as u64; // 360 MB, well past the 64 MB gate
-        let p = open_progress_pct(0.12, bytes, MIN_FRAC, MIN_BYTES, false, false);
-        assert!(
-            p >= 65,
-            "0.12/0.15 is four-fifths of the byte-fraction gate; got {p}"
-        );
-        assert!(p <= 90, "the ends gate owns the last tenth; got {p}");
-    }
-
-    /// The BINDING gate decides. A tiny file can be past 15% while nowhere near
-    /// 64 MB, and the bar must follow whichever is actually holding it up.
-    #[test]
-    fn the_binding_gate_decides_not_the_generous_one() {
-        // 50% of a 100 MB file: byte-fraction gate long satisfied, absolute gate not.
-        let p = open_progress_pct(0.50, 50 * 1024 * 1024, MIN_FRAC, MIN_BYTES, false, false);
-        assert!(
-            p < 90,
-            "50 MB of the 64 MB minimum is not nearly ready; got {p}"
-        );
-        // The reverse: plenty of bytes, barely any of the file.
-        let q = open_progress_pct(0.02, 500 * 1024 * 1024, MIN_FRAC, MIN_BYTES, false, false);
-        assert!(q < 20, "2% of a large file is barely started; got {q}");
-    }
-
-    /// The ends gate is boolean and usually last, so it owns the final tenth: the
-    /// bar cannot fill while the tail is missing, which is exactly the state that
-    /// looks finished and does not play (Silo S03E04, 2026-08-03).
-    #[test]
-    fn the_bar_cannot_fill_until_the_tail_lands() {
-        let full = open_progress_pct(0.99, 2_000_000_000, MIN_FRAC, MIN_BYTES, false, false);
-        assert_eq!(full, 90, "both fractional gates met, tail missing");
-        let done = open_progress_pct(0.99, 2_000_000_000, MIN_FRAC, MIN_BYTES, true, false);
-        assert_eq!(done, 100);
-    }
-
-    #[test]
-    fn a_finished_torrent_is_a_hundred_regardless() {
-        assert_eq!(
-            open_progress_pct(0.0, 0, MIN_FRAC, MIN_BYTES, false, true),
-            100
-        );
-    }
-
-    #[test]
-    fn nothing_downloaded_is_zero_and_never_negative() {
-        assert_eq!(
-            open_progress_pct(0.0, 0, MIN_FRAC, MIN_BYTES, false, false),
-            0
-        );
-    }
-
-    /// Monotonic: more bytes can never move the bar backwards, which is what makes
-    /// it readable as progress at all.
-    #[test]
-    fn progress_never_goes_backwards() {
-        let total = 3_000_000_000u64;
-        let mut prev = 0;
-        for step in 0..=40 {
-            let bytes = total / 40 * step;
-            let p = open_progress_pct(
-                bytes as f64 / total as f64,
-                bytes,
-                MIN_FRAC,
-                MIN_BYTES,
-                false,
-                false,
-            );
-            assert!(p >= prev, "went backwards at step {step}: {prev} -> {p}");
-            prev = p;
-        }
+    fn bar_tracks_verified_opening_bytes_and_never_claims_ready_early() {
+        assert_eq!(opening_progress_pct(8, 64, true, false), 20);
+        assert_eq!(opening_progress_pct(64, 64, false, false), 90);
+        assert_eq!(opening_progress_pct(64, 64, true, false), 99);
+        assert_eq!(opening_progress_pct(64, 64, true, true), 100);
+        assert_eq!(opening_progress_pct(0, 0, false, false), 0);
     }
 }
 
@@ -16550,6 +16481,16 @@ mod client_location_tests {
 mod opening_progress_tests {
     use super::*;
     use std::time::Duration;
+    #[test]
+    fn opening_buffer_does_not_require_a_fraction_of_the_whole_file() {
+        // A 64 MiB prefix of an 8 GiB movie is below 1%, yet is a real buffer.
+        assert!(64.0 / 8192.0 < 0.01);
+        assert!(vlc_opening_ready(false, true, true, false));
+        assert!(!vlc_opening_ready(false, false, true, true)); // missing seek index
+        assert!(!vlc_opening_ready(false, true, false, false)); // opening gap
+        assert!(vlc_opening_ready(false, true, false, true)); // measured fast path
+    }
+
     #[test]
     fn cached_bytes_do_not_mask_a_stalled_opening_buffer() {
         let start = Instant::now();

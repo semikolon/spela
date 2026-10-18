@@ -1348,7 +1348,7 @@ async function vlcWaitReady(id, gen, pin){
     // Drive the loading surface (not a transient toast) — matches the Chromecast warmup.
     // Runway, not percent: "32%" said nothing while seven minutes were left, and
     // playback stalled at exactly seven. Minutes are what a viewer can act on.
-    S.now.warmup={active:true, vlc:true, pct:(d&&d.pct!=null)?d.pct:0,
+    S.now.warmup={active:true, vlc:true, waitReason:d&&d.wait_reason, pct:(d&&d.pct!=null)?d.pct:0,
       runway:(d&&d.runway_secs!=null)?d.runway_secs:null};
     if(S.now.warming) renderWarmPanel();
     await new Promise(r=>setTimeout(r,1500));
@@ -3638,8 +3638,8 @@ function renderWarmPanel(){
     label="Buffering for VLC…";
     barPct=(S.now.openPct!=null)?S.now.openPct:((w.pct!=null)?w.pct:null);
     sub = (w.runway!=null && w.runway>0)
-      ? fmtRunway(w.runway)+" ready · opens automatically"
-      : "opens automatically when ready";
+      ? fmtRunway(w.runway)+" buffered · "+(w.waitReason||"preparing playback")
+      : (w.waitReason||"opens automatically when ready");
     if(ql) sub = ql + " · " + sub;
     // Say it out loud when a dead source is skipped. A play that silently switches
     // source is indistinguishable from one that ignored what you picked.
