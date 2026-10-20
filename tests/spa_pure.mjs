@@ -40,7 +40,7 @@ function extract(name) {
   throw new Error(`unbalanced braces extracting ${name}()`);
 }
 
-const NAMES = ["searchQueryFor", "statusTone", "noteAgeDays", "fmtRuntime", "prettyEp"];
+const NAMES = ["episodeUnaired", "episodeWaitNote", "searchQueryFor", "statusTone", "noteAgeDays", "fmtRuntime", "prettyEp"];
 const bodies = NAMES.map(extract).join("\n");
 const api = new Function(`${bodies}\nreturn {${NAMES.join(",")}};`)();
 
@@ -506,5 +506,12 @@ for(const scenario of ["gone","timeout","error"]){
   eq(calls,["play"],"one next launch after confirmed stop");
 }
 
+const midnight=Date.parse("2026-10-20T22:43:00Z");
+eq(api.episodeUnaired({air_date:"2026-10-21",unaired:false},midnight),false,"server release verdict wins over UTC date");
+eq(api.episodeUnaired({air_date:"2026-10-21",unaired:true},midnight),true,"same-day future timestamp remains unaired");
+eq(api.episodeUnaired({air_date:"2026-10-21"},midnight),false,"old-server fallback uses Stockholm date");
+eq(api.episodeWaitNote({searching:{air_date:"2026-10-21",unaired:true},results:[]},midnight),"Not released yet · airs 2026-10-21","quick play explains upcoming release without retry");
+eq(api.episodeWaitNote({searching:{unaired:false},results:[]},midnight),"No sources available yet for this episode. Check again later.","released episode without sources is not a playback failure");
+eq(api.episodeWaitNote({searching:{unaired:false},results:[{id:1}]},midnight),null,"available episode can play");
 console.log(failed === 0 ? "ALL PASS" : `${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

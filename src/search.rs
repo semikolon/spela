@@ -141,6 +141,8 @@ pub struct EpisodeRef {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub air_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unaired: Option<bool>,
 }
 
 /// One TVmaze episode with its air date resolved to Fredrik's local (Europe/
@@ -153,6 +155,7 @@ struct TvEp {
     name: Option<String>,
     /// YYYY-MM-DD in Europe/Stockholm (from `airstamp`, else raw `airdate`).
     date: Option<String>,
+    airstamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -921,10 +924,8 @@ impl SearchEngine {
             .await;
         if let Some(eps) = &tvmaze {
             let (last, next) = tvmaze_pick(eps, &today);
-            if last.is_some() {
-                show_info.latest_episode = last; // e.g. Star Trek S04E03 while TMDB still says E02
-            }
-            if next.is_some() {
+            if eps.iter().any(|ep| ep.date.is_some()) {
+                show_info.latest_episode = last;
                 show_info.next_episode = next;
             }
         }
@@ -958,7 +959,14 @@ impl SearchEngine {
                 }
             }
         }
-        let unaired = is_future_date(&ep_air);
+        let unaired = tvmaze
+            .as_ref()
+            .and_then(|eps| {
+                eps.iter()
+                    .find(|ep| ep.season == s && ep.episode == e && ep.date.is_some())
+            })
+            .map(|ep| episode_is_future(ep, &sthlm_today(), chrono::Utc::now().timestamp()))
+            .unwrap_or_else(|| is_future_date(&ep_air));
 
         // Step 3: Torrentio lookup (filtered by show title to drop spurious
         // cross-show results — the Apr 15 "French Chef for The Boys S05E03"
@@ -977,6 +985,7 @@ impl SearchEngine {
                 episode: e,
                 name: (!ep_name.is_empty()).then_some(ep_name),
                 air_date: (!ep_air.is_empty()).then_some(ep_air),
+                unaired: Some(unaired),
             }),
             error: None,
             torrent_available: !results.is_empty(),
@@ -1286,11 +1295,9 @@ impl SearchEngine {
                     r.air_date.unwrap_or_default(),
                 )
             };
-            if let Some(r) = last {
-                last_aired = Some(to_tuple(r));
-            }
-            if let Some(r) = next {
-                next_episode = Some(to_tuple(r));
+            if eps.iter().any(|ep| ep.date.is_some()) {
+                last_aired = last.map(&to_tuple);
+                next_episode = next.map(&to_tuple);
             }
         }
         Some(TvStatus {
@@ -1464,6 +1471,7 @@ impl SearchEngine {
                     episode,
                     name,
                     date: tvmaze_local_date(e),
+                    airstamp: e["airstamp"].as_str().map(String::from),
                 })
             })
             .collect();
@@ -2492,7 +2500,7 @@ pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) 
 ///   filter applied, returns the full list.
 /// - Filter drops everything: returns the full list with a warning,
 ///   because "some spurious results" is less bad than "no results at all".
-/// True if `air_date` (TMDB "YYYY-MM-DD") is strictly after today (UTC). Empty /
+/// True if `air_date` (TMDB "YYYY-MM-DD") is strictly after today (Europe/Stockholm). Empty /
 /// unparseable → false (fail open: treat as aired). Lexicographic comparison is
 /// valid for zero-padded ISO dates.
 fn is_future_date(air_date: &str) -> bool {
@@ -2535,21 +2543,38 @@ fn tvmaze_local_date(e: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// From a TVmaze episode list, the latest-AIRED (date ≤ today, highest S/E) and
-/// the next-UPCOMING (date > today, lowest S/E) episodes — the accurate answers
-/// TMDB's stale `last/next_episode_to_air` miss. Episodes with no date are ignored.
+/// Prefer the release instant; use the local calendar date only when it is absent.
+fn episode_is_future(ep: &TvEp, today: &str, now: i64) -> bool {
+    if let Some(instant) = ep
+        .airstamp
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+    {
+        return instant.timestamp() > now;
+    }
+    ep.date.as_deref().is_some_and(|date| date > today)
+}
+
+/// Latest aired and next upcoming, evaluated on every call even for cached schedules.
 fn tvmaze_pick(eps: &[TvEp], today: &str) -> (Option<EpisodeRef>, Option<EpisodeRef>) {
+    tvmaze_pick_at(eps, today, chrono::Utc::now().timestamp())
+}
+
+fn tvmaze_pick_at(eps: &[TvEp], today: &str, now: i64) -> (Option<EpisodeRef>, Option<EpisodeRef>) {
     let to_ref = |e: &TvEp| EpisodeRef {
         season: e.season,
         episode: e.episode,
         name: e.name.clone(),
         air_date: e.date.clone(),
+        unaired: Some(episode_is_future(e, today, now)),
     };
     let mut last: Option<&TvEp> = None;
     let mut next: Option<&TvEp> = None;
     for e in eps {
-        let Some(d) = e.date.as_deref() else { continue };
-        if d <= today {
+        if e.date.is_none() {
+            continue;
+        }
+        if !episode_is_future(e, today, now) {
             if last.is_none_or(|l| (e.season, e.episode) > (l.season, l.episode)) {
                 last = Some(e);
             }
@@ -3494,6 +3519,7 @@ fn extract_episode(val: &Value) -> Option<EpisodeRef> {
         episode: val["episode_number"].as_u64()? as u32,
         name: val["name"].as_str().map(String::from),
         air_date: val["air_date"].as_str().map(String::from),
+        unaired: None,
     })
 }
 
@@ -4221,7 +4247,31 @@ mod tests {
             episode,
             name: None,
             date: (!date.is_empty()).then(|| date.to_string()),
+            airstamp: None,
         }
+    }
+
+    #[test]
+    fn release_instant_keeps_same_day_episode_upcoming_until_drop() {
+        let mut scheduled = ep(6, 6, "2026-10-21");
+        scheduled.airstamp = Some("2026-10-21T12:00:00+00:00".into());
+        let drop = chrono::DateTime::parse_from_rfc3339(scheduled.airstamp.as_deref().unwrap())
+            .unwrap()
+            .timestamp();
+        let episodes = vec![ep(6, 5, "2026-10-14"), scheduled.clone()];
+        let midnight = chrono::DateTime::parse_from_rfc3339("2026-10-20T22:43:00Z")
+            .unwrap()
+            .timestamp();
+        let (last, next) = tvmaze_pick_at(&episodes, "2026-10-21", midnight);
+        assert_eq!(last.unwrap().episode, 5);
+        assert_eq!(next.unwrap().unaired, Some(true));
+        assert!(episode_is_future(&scheduled, "2026-10-21", drop - 1));
+        let (last, next) = tvmaze_pick_at(&episodes, "2026-10-21", drop);
+        assert_eq!(last.unwrap().episode, 6);
+        assert!(next.is_none());
+        scheduled.airstamp = Some("invalid".into());
+        assert!(!episode_is_future(&scheduled, "2026-10-21", midnight));
+        assert!(episode_is_future(&scheduled, "2026-10-20", midnight));
     }
 
     #[test]
@@ -7935,6 +7985,7 @@ mod tests {
             episode: 8,
             name: None,
             air_date: None,
+            unaired: None,
         };
         assert_eq!(
             episode_to_search(None, None, TvEpisodeIntent::LatestEpisode, Some(&latest)),
@@ -7949,6 +8000,7 @@ mod tests {
             episode: 8,
             name: None,
             air_date: None,
+            unaired: None,
         };
         assert_eq!(
             episode_to_search(
@@ -7968,6 +8020,7 @@ mod tests {
             episode: 8,
             name: None,
             air_date: None,
+            unaired: None,
         };
         assert_eq!(
             episode_to_search(

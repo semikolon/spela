@@ -6280,7 +6280,10 @@ async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
     // they're filtered out of New Episodes below; without this a show you're caught up
     // on (e.g. Silo waiting on tomorrow's episode) appears NOWHERE on the landing page.
     // Soonest air first.
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono_tz::Europe::Stockholm)
+        .format("%Y-%m-%d")
+        .to_string();
     let mut upcoming: Vec<Value> = all_following
         .iter()
         .filter(|s| s["new_count"].as_u64().unwrap_or(0) == 0)
