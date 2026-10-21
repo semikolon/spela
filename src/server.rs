@@ -581,6 +581,30 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         });
     }
 
+    // Release checks run without a browser open. The shared per-episode cache
+    // enforces 15 minutes on release day, hourly for two days, then stops. This
+    // only queries source metadata: no torrent is added and playback is untouched.
+    {
+        let release_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let app = AppState::load(&release_state.state_dir);
+                for show in crate::following::load().shows {
+                    let watched = app
+                        .derive_watched_through(show.imdb_id.as_deref(), &show.title)
+                        .unwrap_or((0, 0));
+                    release_state.search_engine.tv_status_sources(
+                        show.tmdb_id, crate::search::SourceCheckMode::Background,
+                        watched, &show.seen_seasons,
+                    ).await;
+                }
+            }
+        });
+    }
+
     // 2026-07-13 (slice 5): background watch tracker — polls house Chromecasts,
     // stages near-complete non-spela sessions for Fredrik to confirm on load.
     spawn_chromecast_tracker(state.clone());
@@ -6115,13 +6139,13 @@ async fn compute_following_shows(state: &SharedState, app: &AppState) -> (Vec<Va
     let mut shows = Vec::new();
     let mut total_new: u32 = 0;
     for show in &following.shows {
-        let Some(st) = state.search_engine.tv_status(show.tmdb_id).await else {
-            continue;
-        };
-        // Progress DERIVES from the ledger (single source of truth) — never a stored
-        // field — so unfollow/re-follow can't lose the place.
         let watched_opt = app.derive_watched_through(show.imdb_id.as_deref(), &show.title);
         let watched = watched_opt.unwrap_or((0, 0));
+        let Some(st) = state.search_engine.tv_status_sources(
+            show.tmdb_id, crate::search::SourceCheckMode::Home, watched, &show.seen_seasons,
+        ).await else {
+            continue;
+        };
         let (new_count, next_se) = match st.last_aired {
             Some((ls, le, _, _)) => {
                 let nc = unseen_after(watched, (ls, le), &st.seasons, &show.seen_seasons);
@@ -6167,6 +6191,7 @@ async fn compute_following_shows(state: &SharedState, app: &AppState) -> (Vec<Va
             "next_unwatched_name": (!nu_name.is_empty()).then_some(nu_name),
             "next_unwatched_air": (!nu_air.is_empty()).then_some(nu_air),
             "next_air": next_air,
+            "source_wait": st.source_wait,
             // For the per-season "seen" toggles UI: the show's real season numbers
             // (specials/S0 dropped) + which ones are marked seen.
             "season_numbers": st.seasons.iter().filter(|(s, _)| *s != 0).map(|(s, _)| *s).collect::<Vec<u32>>(),
@@ -6291,7 +6316,7 @@ async fn handle_home(State(state): State<SharedState>) -> Json<Value> {
             s.get("next_air")
                 .and_then(|na| na.get("air_date"))
                 .and_then(|a| a.as_str())
-                .is_some_and(|air| air >= today.as_str())
+                .is_some_and(|air| air >= today.as_str() || s["source_wait"].is_string())
         })
         .cloned()
         .collect();

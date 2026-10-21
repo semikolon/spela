@@ -2238,7 +2238,7 @@ function upcomingItem(s){
   const se=s.next_air?esc(s.next_air.se):"";
   const when=s.next_air?fmtRelDate(s.next_air.air_date):"";
   tap.innerHTML=`<span class="fotitle">${esc(s.title)}</span>`
-    +`<span class="fometa">${se?se+" · ":""}airs <b>${when}</b></span>`;
+    +`<span class="fometa">${se?se+" · ":""}${s.source_wait==="check_failed"?"Couldn’t check sources":s.source_wait==="awaiting_sources"?"Awaiting sources":"airs <b>"+when+"</b>"}</span>`;
   // Tap → search the SPECIFIC upcoming episode (e.g. "Silo S03E06"), NOT just the show
   // (which defaults to S01E01). TV mode sends no movie param, so the show resolves right;
   // spela parses the SxxExx and lands on that episode (0 sources until it releases).

@@ -156,6 +156,7 @@ struct TvEp {
     /// YYYY-MM-DD in Europe/Stockholm (from `airstamp`, else raw `airdate`).
     date: Option<String>,
     airstamp: Option<String>,
+    explicit_airtime: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +233,42 @@ impl TorrentResult {
     }
 }
 
+/// Lookup cadence is separate from schedule metadata. Positive evidence is sticky
+/// for Home/background; an explicit search refreshes the actual source list.
+#[derive(Clone, Copy)]
+pub enum SourceCheckMode {
+    Background,
+    Home,
+    Search,
+}
+
+#[derive(Default)]
+struct EpisodeSources {
+    checked: Option<Instant>,
+    result: Option<std::result::Result<Vec<TorrentResult>, String>>,
+    found: bool,
+    last_found: Vec<TorrentResult>,
+}
+
+type SourceSlot = std::sync::Arc<tokio::sync::Mutex<EpisodeSources>>;
+
+fn source_check_interval(mode: SourceCheckMode, age_days: i64) -> Option<Duration> {
+    match mode {
+        SourceCheckMode::Search => Some(Duration::from_secs(60)),
+        SourceCheckMode::Home => Some(Duration::from_secs(300)),
+        SourceCheckMode::Background => match age_days {
+            0 => Some(Duration::from_secs(900)),
+            1..=2 => Some(Duration::from_secs(3600)),
+            _ => None,
+        },
+    }
+}
+
+fn release_age(date: &str, today: &str) -> Option<i64> {
+    let parse = |s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok();
+    Some((parse(today)? - parse(date)?).num_days())
+}
+
 pub struct SearchEngine {
     client: reqwest::Client,
     tmdb_key: String,
@@ -241,6 +278,8 @@ pub struct SearchEngine {
     /// every request — the caller keeps TMDB dates).
     tvmaze_cache: Mutex<HashMap<String, (Instant, Option<Vec<TvEp>>)>>,
     tvmaze_status_cache: Mutex<HashMap<String, (Instant, Option<String>)>>,
+    episode_sources: Mutex<HashMap<String, SourceSlot>>,
+    tv_details: Mutex<HashMap<u64, (Instant, Value)>>,
 }
 
 /// TMDB air-date snapshot for a followed series (slice 2b, the followed-shows
@@ -259,6 +298,7 @@ pub struct TvStatus {
     /// (season, episode, name, air_date) of the next upcoming episode.
     pub next_episode: Option<(u32, u32, String, String)>,
     pub seasons: Vec<(u32, u32)>,
+    pub source_wait: Option<String>,
 }
 
 impl SearchEngine {
@@ -269,7 +309,67 @@ impl SearchEngine {
             mdblist_key,
             tvmaze_cache: Mutex::new(HashMap::new()),
             tvmaze_status_cache: Mutex::new(HashMap::new()),
+            episode_sources: Mutex::new(HashMap::new()),
+            tv_details: Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn episode_sources(
+        &self,
+        imdb: &str,
+        show: &ShowInfo,
+        season: u32,
+        episode: u32,
+        mode: SourceCheckMode,
+        age: i64,
+    ) -> Result<Vec<TorrentResult>> {
+        let key = format!("{imdb}:{season}:{episode}");
+        let slot = {
+            let mut cache = self.episode_sources.lock().unwrap();
+            if cache.len() >= 512 && !cache.contains_key(&key) {
+                // Never evict an in-flight lookup (single flight per episode).
+                if let Some(old) = cache
+                    .iter()
+                    .find(|(_, v)| std::sync::Arc::strong_count(v) == 1)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&old);
+                }
+            }
+            cache.entry(key).or_default().clone()
+        };
+        let mut entry = slot.lock().await;
+        if !matches!(mode, SourceCheckMode::Search) && entry.found {
+            return Ok(entry.last_found.clone());
+        }
+        let Some(interval) = source_check_interval(mode, age) else {
+            return Ok(Vec::new());
+        };
+        if entry.checked.is_none_or(|at| at.elapsed() >= interval) {
+            let result = self
+                .torrentio_streams(imdb, show, Some(season), Some(episode))
+                .await;
+            tracing::info!(
+                season,
+                episode,
+                sources = result.as_ref().ok().map(|r| r.len()),
+                failed = result.is_err(),
+                "episode source availability checked"
+            );
+            entry.checked = Some(Instant::now());
+            if let Ok(results) = &result {
+                if results.iter().any(|r| !r.plays_only_by_hand()) {
+                    entry.found = true;
+                    entry.last_found = results.clone();
+                }
+            }
+            entry.result = Some(result.map_err(|e| e.to_string()));
+        }
+        entry
+            .result
+            .clone()
+            .unwrap_or(Ok(Vec::new()))
+            .map_err(|e| anyhow!(e))
     }
 
     /// 2026-07-14: live Rotten Tomatoes scores via MDBList (the de-facto RT-for-TV
@@ -959,7 +1059,7 @@ impl SearchEngine {
                 }
             }
         }
-        let unaired = tvmaze
+        let mut unaired = tvmaze
             .as_ref()
             .and_then(|eps| {
                 eps.iter()
@@ -970,13 +1070,45 @@ impl SearchEngine {
 
         // Step 3: Torrentio lookup (filtered by show title to drop spurious
         // cross-show results — the Apr 15 "French Chef for The Boys S05E03"
-        // incident). Skipped entirely for an unaired episode.
-        let results = if unaired {
+        // incident). Future dates are gated; release-day timestamps never prevent
+        // checking for sources that may already exist.
+        let results = if is_future_date(&ep_air) {
             Vec::new()
         } else {
-            self.torrentio_streams(&imdb_id, &show_info, Some(s), Some(e))
-                .await?
+            self.episode_sources(
+                &imdb_id,
+                &show_info,
+                s,
+                e,
+                SourceCheckMode::Search,
+                release_age(&ep_air, &today).unwrap_or(0),
+            )
+            .await?
         };
+        if results.iter().any(|r| !r.plays_only_by_hand()) {
+            unaired = false;
+        }
+        if let Some(eps) = &tvmaze {
+            let mut evidence = HashMap::new();
+            if !is_future_date(&ep_air)
+                && release_age(&ep_air, &today).is_some_and(|age| (0..=2).contains(&age))
+            {
+                evidence.insert(
+                    (s, e),
+                    if results.iter().any(|r| !r.plays_only_by_hand()) {
+                        "available"
+                    } else {
+                        "awaiting_sources"
+                    },
+                );
+            }
+            let (last, next) =
+                tvmaze_pick_with_sources(eps, &today, chrono::Utc::now().timestamp(), &evidence);
+            if eps.iter().any(|ep| ep.date.is_some()) {
+                show_info.latest_episode = last;
+                show_info.next_episode = next;
+            }
+        }
         Ok(SearchResult {
             query: query.into(),
             show: Some(show_info),
@@ -1160,11 +1292,11 @@ impl SearchEngine {
                     let status = r.status();
                     let body = r.text().await.unwrap_or_default();
                     match serde_json::from_str::<Value>(&body) {
-                        Ok(v) => {
+                        Ok(v) if status.is_success() && v["streams"].is_array() => {
                             parsed = Some(v);
                             break;
                         }
-                        Err(_) => {
+                        _ => {
                             last_status = format!("HTTP {}", status.as_u16());
                             tracing::warn!(
                                 "torrentio non-JSON (attempt {}/{}, {}): {:.80}",
@@ -1240,6 +1372,17 @@ impl SearchEngine {
     /// network error — the caller treats the show as unknown rather than failing
     /// the whole /following response.
     pub async fn tv_status(&self, tmdb_id: u64) -> Option<TvStatus> {
+        self.tv_status_sources(tmdb_id, SourceCheckMode::Home, (0, 0), &[])
+            .await
+    }
+
+    pub async fn tv_status_sources(
+        &self,
+        tmdb_id: u64,
+        mode: SourceCheckMode,
+        watched: (u32, u32),
+        seen_seasons: &[u32],
+    ) -> Option<TvStatus> {
         if self.tmdb_key.is_empty() {
             return None;
         }
@@ -1247,9 +1390,33 @@ impl SearchEngine {
             "https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={}&append_to_response=external_ids",
             self.tmdb_key
         );
-        let resp = self.client.get(&url).send().await.ok()?;
-        let d: serde_json::Value = resp.json().await.ok()?;
-        d.get("id")?; // absent → not a valid show payload
+        let cached = self
+            .tv_details
+            .lock()
+            .unwrap()
+            .get(&tmdb_id)
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(300))
+            .map(|(_, d)| d.clone());
+        let d = if let Some(d) = cached {
+            d
+        } else {
+            let resp = self
+                .client
+                .get(&url)
+                .timeout(Duration::from_secs(8))
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            let d: Value = resp.json().await.ok()?;
+            d.get("id")?;
+            self.tv_details
+                .lock()
+                .unwrap()
+                .insert(tmdb_id, (Instant::now(), d.clone()));
+            d
+        };
         let ep = |v: &serde_json::Value| -> Option<(u32, u32, String, String)> {
             let o = v.as_object()?;
             Some((
@@ -1277,6 +1444,7 @@ impl SearchEngine {
                     .collect()
             })
             .unwrap_or_default();
+        let mut source_wait = None;
         let mut last_aired = ep(&d["last_episode_to_air"]);
         let mut next_episode = ep(&d["next_episode_to_air"]);
         // TVmaze correction (accurate dates + a just-aired episode TMDB lags on) —
@@ -1286,7 +1454,57 @@ impl SearchEngine {
         let imdb = d["external_ids"]["imdb_id"].as_str();
         if let Some(eps) = self.tvmaze_episodes(name, imdb).await {
             let today = sthlm_today();
-            let (last, next) = tvmaze_pick(&eps, &today);
+            let show: ShowInfo = serde_json::from_value(json!({
+                "tmdb_id": tmdb_id, "title": name, "imdb_id": imdb,
+                "original_language": d["original_language"]
+            }))
+            .ok()?;
+            let mut available = HashMap::new();
+            if let Some(imdb) = imdb {
+                for e in &eps {
+                    let age = e.date.as_deref().and_then(|date| release_age(date, &today));
+                    if (e.season, e.episode) <= watched || seen_seasons.contains(&e.season) {
+                        continue;
+                    }
+                    // Recent releases only; never crawl the backlog on every Home load.
+                    // Retain already tracked missing releases for on-demand rechecks.
+                    let tracked = self
+                        .episode_sources
+                        .lock()
+                        .unwrap()
+                        .contains_key(&format!("{imdb}:{}:{}", e.season, e.episode));
+                    if !age.is_some_and(|age| (0..=2).contains(&age) || (age > 2 && tracked)) {
+                        continue;
+                    }
+                    if matches!(mode, SourceCheckMode::Background)
+                        && source_check_interval(mode, age.unwrap()).is_none()
+                    {
+                        continue;
+                    }
+                    let result = self
+                        .episode_sources(imdb, &show, e.season, e.episode, mode, age.unwrap())
+                        .await;
+                    let status = match result {
+                        Ok(results) => {
+                            if results.iter().any(|r| !r.plays_only_by_hand()) {
+                                "available"
+                            } else {
+                                "awaiting_sources"
+                            }
+                        }
+                        Err(_) => "check_failed",
+                    };
+                    available.insert((e.season, e.episode), status);
+                }
+            }
+            let (last, next) =
+                tvmaze_pick_with_sources(&eps, &today, chrono::Utc::now().timestamp(), &available);
+            if let Some(next) = &next {
+                source_wait = available
+                    .get(&(next.season, next.episode))
+                    .filter(|s| **s != "available")
+                    .map(|s| s.to_string());
+            }
             let to_tuple = |r: EpisodeRef| {
                 (
                     r.season,
@@ -1308,6 +1526,7 @@ impl SearchEngine {
             last_aired,
             next_episode,
             seasons,
+            source_wait,
         })
     }
 
@@ -1472,6 +1691,7 @@ impl SearchEngine {
                     name,
                     date: tvmaze_local_date(e),
                     airstamp: e["airstamp"].as_str().map(String::from),
+                    explicit_airtime: e["airtime"].as_str().is_some_and(|s| !s.is_empty()),
                 })
             })
             .collect();
@@ -1503,7 +1723,13 @@ impl SearchEngine {
             "https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}/episode/{episode}?api_key={}",
             self.tmdb_key
         );
-        let resp = self.client.get(&url).send().await.ok()?;
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+            .ok()?;
         let d: serde_json::Value = resp.json().await.ok()?;
         d.get("id")?;
         Some((
@@ -2520,12 +2746,12 @@ fn sthlm_today() -> String {
         .to_string()
 }
 
-/// TVmaze episode -> local air DATE. Prefer `airstamp` (offset-aware instant →
-/// Europe/Stockholm date, correct for a global streaming drop in Fredrik's tz),
-/// fall back to the raw `airdate` field.
+/// Use the announced date for global streaming (no explicit airtime). Only
+/// convert an actual scheduled instant into the Stockholm calendar date.
 fn tvmaze_local_date(e: &Value) -> Option<String> {
     if let Some(ts) = e
         .get("airstamp")
+        .filter(|_| e["airtime"].as_str().is_some_and(|s| !s.is_empty()))
         .and_then(|x| x.as_str())
         .filter(|s| !s.is_empty())
     {
@@ -2543,11 +2769,13 @@ fn tvmaze_local_date(e: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Prefer the release instant; use the local calendar date only when it is absent.
+/// Only a populated airtime makes airstamp an explicit release instant.
+/// Global streaming channels have synthetic airstamps, not announced release hours.
 fn episode_is_future(ep: &TvEp, today: &str, now: i64) -> bool {
     if let Some(instant) = ep
         .airstamp
         .as_deref()
+        .filter(|_| ep.explicit_airtime)
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
     {
         return instant.timestamp() > now;
@@ -2561,12 +2789,30 @@ fn tvmaze_pick(eps: &[TvEp], today: &str) -> (Option<EpisodeRef>, Option<Episode
 }
 
 fn tvmaze_pick_at(eps: &[TvEp], today: &str, now: i64) -> (Option<EpisodeRef>, Option<EpisodeRef>) {
+    tvmaze_pick_with_sources(eps, today, now, &HashMap::new())
+}
+
+fn tvmaze_pick_with_sources(
+    eps: &[TvEp],
+    today: &str,
+    now: i64,
+    sources: &HashMap<(u32, u32), &str>,
+) -> (Option<EpisodeRef>, Option<EpisodeRef>) {
+    let pending = |e: &TvEp| {
+        sources
+            .get(&(e.season, e.episode))
+            .map(|s| *s != "available")
+            .unwrap_or_else(|| episode_is_future(e, today, now))
+    };
     let to_ref = |e: &TvEp| EpisodeRef {
         season: e.season,
         episode: e.episode,
         name: e.name.clone(),
         air_date: e.date.clone(),
-        unaired: Some(episode_is_future(e, today, now)),
+        unaired: Some(
+            episode_is_future(e, today, now)
+                && sources.get(&(e.season, e.episode)) != Some(&"available"),
+        ),
     };
     let mut last: Option<&TvEp> = None;
     let mut next: Option<&TvEp> = None;
@@ -2574,7 +2820,7 @@ fn tvmaze_pick_at(eps: &[TvEp], today: &str, now: i64) -> (Option<EpisodeRef>, O
         if e.date.is_none() {
             continue;
         }
-        if !episode_is_future(e, today, now) {
+        if !pending(e) {
             if last.is_none_or(|l| (e.season, e.episode) > (l.season, l.episode)) {
                 last = Some(e);
             }
@@ -4248,13 +4494,152 @@ mod tests {
             name: None,
             date: (!date.is_empty()).then(|| date.to_string()),
             airstamp: None,
+            explicit_airtime: false,
         }
+    }
+
+    #[test]
+    fn release_check_cadence_and_cutoff() {
+        assert_eq!(
+            source_check_interval(SourceCheckMode::Background, 0),
+            Some(Duration::from_secs(900))
+        );
+        for day in [1, 2] {
+            assert_eq!(
+                source_check_interval(SourceCheckMode::Background, day),
+                Some(Duration::from_secs(3600))
+            );
+        }
+        for day in [-1, 3, 90] {
+            assert_eq!(
+                source_check_interval(SourceCheckMode::Background, day),
+                None
+            );
+        }
+        assert_eq!(
+            source_check_interval(SourceCheckMode::Home, 3),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            source_check_interval(SourceCheckMode::Search, 0),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(release_age("2026-10-31", "2026-11-01"), Some(1));
+    }
+
+    #[test]
+    fn streaming_placeholder_is_not_a_release_hour_and_sources_decide_home() {
+        let mut episode = ep(1, 2, "2026-10-21");
+        episode.airstamp = Some("2026-10-21T12:00:00Z".into());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-21T07:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert!(!episode_is_future(&episode, "2026-10-21", now));
+        assert!(episode_is_future(&episode, "2026-10-20", now));
+        let episodes = vec![ep(1, 1, "2026-10-14"), episode];
+        for status in ["awaiting_sources", "check_failed"] {
+            let (last, next) = tvmaze_pick_with_sources(
+                &episodes,
+                "2026-10-21",
+                now,
+                &HashMap::from([((1, 2), status)]),
+            );
+            assert_eq!(last.unwrap().episode, 1);
+            assert_eq!(next.unwrap().unaired, Some(false)); // Unknown availability is not unreleased.
+        }
+        let (last, next) = tvmaze_pick_with_sources(
+            &episodes,
+            "2026-10-21",
+            now,
+            &HashMap::from([((1, 2), "available")]),
+        );
+        assert_eq!(last.unwrap().episode, 2);
+        assert!(next.is_none());
+        let global =
+            json!({"airdate":"2026-10-21", "airtime":"", "airstamp":"2026-10-21T23:30:00Z"});
+        assert_eq!(tvmaze_local_date(&global).as_deref(), Some("2026-10-21"));
+    }
+
+    #[tokio::test]
+    async fn release_checks_reuse_errors_without_turning_them_into_empty_results() {
+        let engine = SearchEngine::new(String::new(), String::new());
+        let show: ShowInfo =
+            serde_json::from_value(json!({"tmdb_id":1,"title":"Example"})).unwrap();
+        let entry = EpisodeSources {
+            checked: Some(Instant::now()),
+            result: Some(Err("provider unavailable".into())),
+            ..Default::default()
+        };
+        engine.episode_sources.lock().unwrap().insert(
+            "test:1:2".into(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(entry)),
+        );
+        for mode in [
+            SourceCheckMode::Home,
+            SourceCheckMode::Search,
+            SourceCheckMode::Background,
+        ] {
+            let error = engine
+                .episode_sources("test", &show, 1, 2, mode, 0)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "provider unavailable");
+        }
+    }
+
+    #[tokio::test]
+    async fn release_checks_stop_after_discovery_but_search_uses_fresh_result() {
+        let engine = SearchEngine::new(String::new(), String::new());
+        let show: ShowInfo =
+            serde_json::from_value(json!({"tmdb_id":1,"title":"Example"})).unwrap();
+        let result = make_result(1, "Example.S01E02.1080p", 10, Some(0));
+        let entry = EpisodeSources {
+            // Simulate a later explicit search failing after discovery.
+            checked: Some(Instant::now()),
+            result: Some(Err("offline".into())),
+            found: true,
+            last_found: vec![result],
+        };
+        engine.episode_sources.lock().unwrap().insert(
+            "test:1:2".into(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(entry)),
+        );
+        for mode in [SourceCheckMode::Home, SourceCheckMode::Background] {
+            assert_eq!(
+                engine
+                    .episode_sources("test", &show, 1, 2, mode, 0)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert!(engine
+            .episode_sources("test", &show, 1, 2, SourceCheckMode::Search, 0)
+            .await
+            .is_err());
+        // Empty is cached too; it does not trigger another lookup on every render.
+        let entry = EpisodeSources {
+            checked: Some(Instant::now()),
+            result: Some(Ok(vec![])),
+            ..Default::default()
+        };
+        engine.episode_sources.lock().unwrap().insert(
+            "test:1:3".into(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(entry)),
+        );
+        assert!(engine
+            .episode_sources("test", &show, 1, 3, SourceCheckMode::Search, 0)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn release_instant_keeps_same_day_episode_upcoming_until_drop() {
         let mut scheduled = ep(6, 6, "2026-10-21");
         scheduled.airstamp = Some("2026-10-21T12:00:00+00:00".into());
+        scheduled.explicit_airtime = true;
         let drop = chrono::DateTime::parse_from_rfc3339(scheduled.airstamp.as_deref().unwrap())
             .unwrap()
             .timestamp();
@@ -4309,7 +4694,7 @@ mod tests {
         let v = serde_json::json!({"airstamp":"2026-08-07T12:00:00+00:00","airdate":"2026-08-07"});
         assert_eq!(tvmaze_local_date(&v).as_deref(), Some("2026-08-07"));
         // A late-UTC instant rolls into the next Stockholm day.
-        let v2 = serde_json::json!({"airstamp":"2026-08-06T23:30:00+00:00","airdate":"2026-08-06"});
+        let v2 = serde_json::json!({"airstamp":"2026-08-06T23:30:00+00:00","airdate":"2026-08-06","airtime":"23:30"});
         assert_eq!(tvmaze_local_date(&v2).as_deref(), Some("2026-08-07"));
         // No airstamp → fall back to airdate.
         let v3 = serde_json::json!({"airdate":"2026-08-06"});
