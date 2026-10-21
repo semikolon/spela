@@ -10680,9 +10680,9 @@ async fn handle_vlc_stream(
 /// fresh 4K torrent buffers (2026-08-03). Ready when: (a) a complete on-disk file
 /// exists (static serve, instant), or (b) the torrent is fully downloaded, or (c) a
 /// healthy head-start buffer is present — the prefetch (fired here) primes the
-/// head+tail Cues, so ≥15% + ≥64MB means the container is probeable + there's a
-/// playback cushion. Heuristic; a head/tail-present verify + rate-vs-bitrate gate for
-/// slow 4K swarms are TODO refinements.
+/// head+tail Cues, while a verified opening prefix or measured healthy-delivery
+/// cushion gates launch. No whole-file percentage threshold is used. See
+/// docs/PLAYBACK_READINESS.md for thresholds, tradeoffs and remaining limits.
 async fn handle_vlc_ready(
     State(state): State<SharedState>,
     axum::extract::Path(id): axum::extract::Path<usize>,

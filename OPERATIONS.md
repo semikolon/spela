@@ -1,5 +1,22 @@
 # spela Operations
 
+## Availability and playback checks
+
+Source monitoring is an in-process, metadata-only task, independent of open browser
+sessions. Inspect Home before Search to verify independent discovery; a search can
+otherwise warm the shared cache and hide a broken monitor. An indexed source is not
+proof of a healthy swarm. See [availability diagnostics](docs/EPISODE_AVAILABILITY.md#verification-and-diagnosis).
+
+For VLC stalls, inspect the pinned torrent/file identity, initialization, container ends,
+verified opening prefix and new-byte delivery together. Do not use aggregate percent
+as readiness or permit sparse holes in a static file. See
+[readiness and identity](docs/PLAYBACK_READINESS.md).
+
+Deploy with `bin/deploy-server.sh <ssh-host> --restart` from a clean committed checkout;
+it checks `/status` and `/progress` before restarting. Preserve active playback.
+Documentation/frontend-only changes can be staged without a binary restart; frontend
+changes become visible on page reload. Do not call a staged binary deployed/running.
+
 ## Worker Safety
 
 Since v3.3.0 (Apr 29, 2026), `spela` runs the BitTorrent client in-process via

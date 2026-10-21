@@ -3289,6 +3289,20 @@ function openSheet(){
 
 /* A handoff belongs to the current playback, never to the mutable search view. */
 let handoff={key:"",data:null,pending:null,ended:false,dismissed:false,busy:false,error:""};
+let handoffExpiryTimer=null;
+function endedOfferExpired(offer,now){
+  return !!(offer.ended && offer.endedAt && !offer.busy && !offer.error && now-offer.endedAt>=5*60*1000);
+}
+function markHandoffEnded(){
+  handoff.ended=true; handoff.dismissed=false;
+  handoff.endedAt=handoff.endedAt||Date.now();
+  clearTimeout(handoffExpiryTimer);
+  const owner=handoff;
+  handoffExpiryTimer=setTimeout(()=>{
+    if(handoff!==owner) return;
+    renderHandoff();
+  },Math.max(0,owner.endedAt+5*60*1000-Date.now()));
+}
 function nearPlaybackEnd(position,duration){
   return duration>=300 && position>=duration-Math.min(120,duration*.04);
 }
@@ -3297,6 +3311,7 @@ function handoffTitle(){
   return /(?:s\d+e\d+|\d+x\d+)/i.test(title) ? title : title+(S.now.epShort?" "+S.now.epShort:"");
 }
 function resetHandoff(){
+  clearTimeout(handoffExpiryTimer); handoffExpiryTimer=null;
   handoff={key:"",data:null,pending:null,ended:false,dismissed:false,busy:false,error:""};
   renderHandoff();
 }
@@ -3322,6 +3337,10 @@ function handoffButton(label,action,primary=false){
   b.disabled=handoff.busy; b.onclick=action; return b;
 }
 function renderHandoff(){
+  if(endedOfferExpired(handoff,Date.now())){
+    handoff.ended=false; handoff.dismissed=true; handoff.requested=false;
+    if(!S.now.data) renderNowFull();
+  }
   const root=$("#upnextPanel"); if(!root) return;
   const show=handoff.busy || handoff.requested || handoff.error || (!handoff.dismissed && (handoff.ended || nearPlaybackEnd(S.now.posAbs,S.now.dur)));
   root.hidden=!show || S.now.warming;
@@ -3339,6 +3358,7 @@ function renderHandoff(){
   const actions=el("div",{className:"handoff-actions"});
   if(next) actions.appendChild(handoffButton(handoff.busy?"Switching…":"Play next episode",()=>advancePlayback(next),true));
   actions.appendChild(handoffButton(handoff.ended?"Home":"Stop & go home",stopAndHome));
+  if(handoff.ended) actions.appendChild(handoffButton("Dismiss",()=>{resetHandoff();renderNowFull();}));
   if(!handoff.ended) actions.appendChild(handoffButton("Keep watching",()=>{handoff.dismissed=true;handoff.requested=false;handoff.error="";renderHandoff();}));
   root.appendChild(actions);
   if(handoff.error){
@@ -3425,7 +3445,7 @@ function vlcEnded(title){
   stopVlcPoll();
   S.now.vlc=false; S.now.data=null; S.now.playing=false; S.now.stopping=false;
   S.now.vlcTitle=null; S.now.stalled=false; S.now.runway=null;
-  handoff.ended=true; handoff.dismissed=false;
+  markHandoffEnded();
   $("#nowbar").classList.remove("on");
   renderNowFull(); renderHandoff();
 }
@@ -3466,7 +3486,7 @@ async function pollVlc(){
   if(currentView()==="now" && !S.now.seekDrag) renderNowFull();
 }
 document.addEventListener("visibilitychange",()=>{
-  if(document.visibilityState==="visible"){ pollNow(true); }
+  if(document.visibilityState==="visible"){ renderHandoff(); pollNow(true); }
   else stopPolling();
 });
 
@@ -3506,7 +3526,7 @@ async function pollNow(force){
     return;
   }
   if(!s||s.status==="idle"||!s.current){
-    if(S.now.data){handoff.ended=true;handoff.dismissed=false;renderHandoff();}
+    if(S.now.data){markHandoffEnded();renderHandoff();}
     S.now.data=null; S.now.playing=false; S.now.phone=false; stopPolling();
     $("#nowbar").classList.remove("on"); renderNowFull(); return;
   }

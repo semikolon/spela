@@ -513,5 +513,13 @@ eq(api.episodeUnaired({air_date:"2026-10-21"},midnight),false,"old-server fallba
 eq(api.episodeWaitNote({searching:{air_date:"2026-10-21",unaired:true},results:[]},midnight),"Not released yet · airs 2026-10-21","quick play explains upcoming release without retry");
 eq(api.episodeWaitNote({searching:{unaired:false},results:[]},midnight),"No sources available yet for this episode. Check again later.","released episode without sources is not a playback failure");
 eq(api.episodeWaitNote({searching:{unaired:false},results:[{id:1}]},midnight),null,"available episode can play");
+const endedOfferExpired=new Function(extract("endedOfferExpired")+"; return endedOfferExpired;")();
+const ended={ended:true,endedAt:1000,busy:false,error:""};
+eq(endedOfferExpired(ended,300999),false,"end offer allows five minutes to choose");
+eq(endedOfferExpired(ended,301000),true,"end offer expires at five minutes");
+eq(endedOfferExpired(ended,7201000),true,"returning to a suspended tab expires an hours-old offer");
+eq(endedOfferExpired({...ended,busy:true},7201000),false,"expiry never interrupts a handoff");
+eq(endedOfferExpired({...ended,error:"stop failed"},7201000),false,"actionable failure remains visible");
+eq(endedOfferExpired({...ended,ended:false},7201000),false,"credits offer is not aged out before playback ends");
 console.log(failed === 0 ? "ALL PASS" : `${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

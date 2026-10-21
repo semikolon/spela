@@ -51,10 +51,11 @@ assistant should be able to play something when you ask nicely.
   Danish film plays Danish and a Korean one Korean, even when the release labels the dub
   as default. A release that is itself a dub is marked, ranked below every real source
   and never played by itself.
-- **Local files first.** If a copy is already on disk it is served straight from there,
+- **Local files first.** If a complete, healthy copy is already on disk it is served straight from there,
   fully seekable, with no torrent involved — including files a separate library daemon
   serves from an external drive, and a season pack opens an episode chooser rather than
-  guessing.
+  guessing. Incomplete owned files use piece-aware streaming to fill missing gaps;
+  [download percentage alone does not establish readiness](docs/PLAYBACK_READINESS.md).
 - **Repeat plays start instantly.** A completed Chromecast transcode is kept in a
   size-capped cache, so watching the same thing again skips the transcode entirely.
 - **Choose what plays next.** Near the end, the remote offers the next aired episode
@@ -70,8 +71,10 @@ assistant should be able to play something when you ask nicely.
   follow, what airs next and when, and recommendations.
 - **A watch ledger** as the single record of both progress and what you have seen, with
   loved / not-for-me ratings and a Rewatch shelf that reads it from the other side.
-- **Air dates from TVmaze**, falling back to TMDB, because TMDB lags the real platform
-  drop by about a day.
+- **Schedules plus source availability.** TVmaze supplies verified episode dates, with
+  TMDB as fallback; neither a date nor a synthetic streaming timestamp proves availability.
+  Release-day source checks run without an open browser and never start downloads.
+  [Cadence, evidence and limits](docs/EPISODE_AVAILABILITY.md).
 - **Enough to decide with**: a Rotten Tomatoes score, a click-to-load trailer, and for a
   series a status badge (returning, undecided, ended, cancelled) merged from two sources
   that disagree usefully — one of them has a word for "aired but undecided" and the other

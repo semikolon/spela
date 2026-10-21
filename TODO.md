@@ -230,16 +230,26 @@ roll over. Detail: CLAUDE.md Hard-Won "Next-episode ENQUEUE".
 ### Netflix viewing-activity import — OPEN, blocked on Fredrik (2026-08-26)
 The structural cure for the lifetime-history gap (see § Watch tracker for why it matters — it produced five already-seen recommendations in one session). **Blocked**: the Bitwarden vault is logged OUT (`status: unauthenticated`, `lastSync: null`), so the Netflix credentials cannot be looked up. **Fredrik runs `bw login` then `bwu`** (master password + 2FA, human-only); then Claude searches the vault, pulls the PER-PROFILE CSV from `netflix.com/viewingactivity` (never the account-level GDPR export — it pulls every family profile), and builds the importer.
 
-### 4K / partial-torrent VLC "buffer then AUTO-play" (2026-08-03)
-**✅ MOSTLY SHIPPED (v3.21):** `TorrentEngine::prefetch_ends` (first+last-piece prefetch) + `GET /vlc/{id}/ready` + SPA `vlcWaitReady` (poll readiness, auto-fire `vlc://` when buffered, no re-click) are live. **Remaining refinements:** (a) ✅ SHIPPED (v3.22 `ends_present` — a short-timeout head+tail present-check, ANDed with the `≥15% + ≥64MB` proxy in `/vlc/ready`); (b) **rate-vs-bitrate gate — now the TOP open item, and the missing input exists as of 2026-09-06.** The gate is a fixed FRACTION (`MIN_FRAC` 0.15 + `MIN_BYTES` 64 MB + both ends), so wait time scales with FILE SIZE when what actually matters is RUNWAY IN SECONDS against the rate the bytes arrive. Measured 2026-09-14, Terminator 3 4K HDR: 21.89 GB at 29 Mbps, arriving at **82 Mbit/s** — 2.8x realtime, so the frontier can never be caught — yet the 15% gate demanded **3.28 GB = 20.4 minutes of runway** and about 5.5 minutes of waiting for a film that was safe to open in well under one. The clean gate, with `r` = download bytes/s, `b` = playback bytes/s, `D` = duration: **`runway_secs >= D * (1 - r/b)`, floored at ~20-30 s.** It degrades correctly in both directions — surplus rate collapses it to the floor, half-rate demands half the film — and it subsumes the slow-4K case this item was originally filed for. `b` comes from `probe_media_quality` (already computed and already on screen in the quality label); `r` from `TorrentProgress`; (c) dedup `prefetch_ends` (currently fires per /ready poll — harmless pile-up of fire-and-forget tasks, but wasteful); (d) de-prioritise DV profile-5 4K for the VLC target (renders poorly). Design + why below:
+### VLC readiness follow-ups
 
-**Why VLC hangs on a fresh 4K torrent** (research-confirmed): a player must PROBE the container before playback — track headers (front) + the seek index (MKV **Cues** / MP4 **moov**), and MKV Cues sit at the **END** of the file. Torrents download rarest-first, so the tail (Cues) + sometimes the head aren't present yet; VLC's end-probe (a Range request for the index) blocks on the not-yet-downloaded tail → hangs. "Enough data" isn't quantity, it's the RIGHT pieces (head + tail-index + a sequential lead buffer). webtorrent/peerflix/Popcorn/qBittorrent all solve it identically: **sequential download + "download first AND last pieces first" + buffer-a-threshold-then-launch-the-player** (peerflix's `--vlc` auto-opens VLC when ready).
-**Fix (reuse spela's existing `/progress` warmup + SPA loading screen, already built for Chromecast):**
-1. VLC path on a PARTIAL torrent: sequential download + **PREFETCH first + last pieces** — seek the librqbit FileStream to `end-1MB` and read (forces librqbit to fetch the Cues pieces), same for the head → VLC's probe succeeds.
-2. **Buffer-gate**: don't fire the `vlc://` launch until head+tail present + a lead buffer sized by download-rate-vs-bitrate.
-3. **AUTO-launch**: SPA shows the `/progress` screen on a VLC play, polls, and auto-fires `vlc://` when spela signals "ready" — no manual quit + re-click.
-4. **4K on a slow swarm** (rate < bitrate → can't stream live regardless): gate to FULL (or rate-safe) download, THEN auto-launch the static serve (smooth + seekable). User never re-clicks; it "starts when ready."
-Check librqbit for a sequential / first-last-piece priority API; else the FileStream head+tail read is the primer. Ranker note: DV profile-5 4K renders poorly in VLC anyway — consider de-prioritising DV for the VLC target.
+- Evaluate sustained slow-swarm behavior using measured delivery and contiguous runway.
+  The old 15% gate is removed; do not implement it again. The full-duration runway
+  formula is an unimplemented alternative, not the live fast-start policy. Current
+  thresholds and preserved rationale: [playback readiness](docs/PLAYBACK_READINESS.md).
+- Investigate DV profile-5 rendering on VLC before changing target-specific ranking;
+  missing codec metadata alone must not penalize an otherwise comparable source.
+- Audit detached `prefetch_ends` / `prefetch_at` cancellation and repeated invocation
+  under stalled swarms; `startup_buffer` itself is bounded and cancels reads on return.
+
+### Release-availability robustness
+
+- Extend automatic availability reconciliation to the TMDB fallback when no verified
+  TVmaze schedule is available, without accepting mismatched show identities.
+- Preserve pending/positive availability across restarts if older missing episodes
+  need reliable Home rechecks; the current in-memory cache loses that evidence.
+- Model batch-release holes separately from latest-episode high-water marks before
+  promising per-episode availability for every counted new episode.
+  Constraints and current cadence: [episode availability](docs/EPISODE_AVAILABILITY.md).
 
 ### VLC audio/seek reliability
 - **Away-from-home playback — `spela-vlc` shipped on MERIAN 2026-08-13; fleet-ify it.** One-command watch on a VPN'd Mac: `~/.local/bin/spela-vlc "<title>" [--movie]` searches spela + opens the top source in VLC (`…/open.m3u`, subs+resume) → HDMI/Cast to a foreign TV (spela can't cast to a non-home-LAN TV). Currently MERIAN-only + UNTRACKED → weave into dotfiles/`~/.local/bin` so every Mac gets it + it survives reprovision. Optional upgrade: install the `vlc://` handler on MERIAN (fussy on Big Sur over SSH) so the web remote's "Open in VLC" button works one-tap there. Full: CLAUDE.md Hard-Won "Watching AWAY from home".

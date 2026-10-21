@@ -8,8 +8,9 @@ replaces the external-tracker migration entirely.
 
 **Data placement (public-repo rule):** the spela repo is PUBLIC. All personal
 watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
-`taste_profile.md`, `tvtime_watchlist_2026-07-13.md`, and (future) `watchlist.json`
-/ `watched.json`. Only non-personal feature design lives in the repo.
+`taste_profile.md`, `tvtime_watchlist_2026-07-13.md`, and `watchlist.json`.
+The watched ledger and resume positions live in `state.json`, not a separate
+`watched.json`. Only non-personal feature design lives in the repo.
 
 ## Slices
 
@@ -52,8 +53,11 @@ watch/taste data is user-local under `~/.config/spela/` (like `config.toml`):
    `~/.config/spela/following.json` (user-local: {title, tmdb_id, imdb_id} — a
    MEMBERSHIP set; progress DERIVES from the watch-ledger via
    `AppState::derive_watched_through`, not stored here). `GET /following` joins it
-   with TMDB air-dates (`tv_status` = /tv/{id} last/next-aired + per-season
-   episode_count; `episode_detail` = next-unwatched ep name+air-date) → per show:
+   with TVmaze-corrected schedules and cached source evidence (`tv_status_sources`),
+   retaining TMDB as schedule fallback; `episode_air` resolves the next-unwatched
+   episode's name/date through the same schedule source. See
+   [release availability](EPISODE_AVAILABILITY.md) for cadence, errors and fallback limits.
+   The response gives, per show:
    new-episode count (season-aware), next-unwatched (SxxExx + title + aired-date),
    next upcoming air-date. UI: a "New Episodes" landing row + subtle header count
    badge + the same section atop To-Watch (poster-bg rows, ep title, air dates;

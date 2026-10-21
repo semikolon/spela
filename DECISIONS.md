@@ -1,5 +1,22 @@
 # Architectural Decisions - spela
 
+## Availability evidence and bounded startup
+
+**Decision:** Treat schedules, indexed sources, verified bytes, and watched history as
+separate facts. A synthetic global-streaming timestamp must not hide available sources;
+a mostly downloaded file must not be served as though every byte is valid.
+
+**Reasoning:** False precision in metadata caused unavailable Play actions and delayed
+real releases; aggregate download percentages hid sparse gaps and imposed unnecessary
+startup waits. Prefer explicit evidence, visible uncertainty, and bounded checks.
+
+**Status:** Release-day metadata polling and measured VLC startup gates are implemented.
+Persistence/fallback coverage and sustained slow-swarm protection retain explicit limits.
+Canonical detail: [episode availability](docs/EPISODE_AVAILABILITY.md) and
+[playback readiness](docs/PLAYBACK_READINESS.md). The viewer's choices remain explicit:
+no background downloads, optimistic startup only with measured delivery, and single-key
+handoff overrides only near the end.
+
 ## 2026-04-18: Symptoms Are Signals — Nine Principles of System Intervention
 **Decision ID**: d_2026_04_18_36D949B2
 **Category**: governance

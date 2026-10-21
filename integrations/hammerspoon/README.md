@@ -13,3 +13,8 @@ The integration checks Spela every two seconds while VLC is frontmost, using the
 The shortcut reuses a Chrome remote tab (or opens one), with an expiring, one-shot action. The remote waits for the VLC bridge to confirm that the old player has closed before launching the next episode. It shows a persistent error if the bridge cannot confirm the stop. Hammerspoon may ask for macOS permission to control Chrome on first use.
 
 The large Up next panel is in the web remote. It does not overlay fullscreen VLC or automatically skip credits. Metadata is prepared during playback; media downloads begin on an explicit play action. The existing `spela-vlc-bridge` must be running for VLC control.
+
+The completed-playback offer expires after five minutes and has a Dismiss button.
+Expiry hides the overlay and disables its plain-key actions; it neither launches media
+nor navigates away from the current page. Returning from a suspended/background tab
+rechecks the wall-clock deadline. In-flight handoffs and actionable errors are retained.
