@@ -521,5 +521,26 @@ eq(endedOfferExpired(ended,7201000),true,"returning to a suspended tab expires a
 eq(endedOfferExpired({...ended,busy:true},7201000),false,"expiry never interrupts a handoff");
 eq(endedOfferExpired({...ended,error:"stop failed"},7201000),false,"actionable failure remains visible");
 eq(endedOfferExpired({...ended,ended:false},7201000),false,"credits offer is not aged out before playback ends");
+const taste=new Function(["tasteSortValue","compareTasteItems","applyTasteBoost"].map(extract).join("\n")+";return {compareTasteItems,applyTasteBoost};")();
+const picks=[{title:"Strong",media_type:"tv",rank:1,rt_score:94},{title:"Other",media_type:"tv",rank:10,rt_score:96}];
+const ranked=picks.map(p=>taste.applyTasteBoost({...p},picks,true)).sort(taste.compareTasteItems);
+eq(ranked.map(p=>p.title),["Strong","Other"],"small RT gap can yield to curated taste preference");
+eq([{title:"Higher",rt:100,tasteBoost:0},{title:"Lower",rt:90,tasteBoost:5}].sort(taste.compareTasteItems)[0].title,"Higher","RT remains dominant across a substantial score gap");
+eq([{title:"Unknown",rt:null,tasteBoost:5},{title:"Known",rt:20}].sort(taste.compareTasteItems)[0].title,"Known","missing RT is not fabricated from taste rank");
+eq(taste.applyTasteBoost({title:"Strong"},picks,true).tasteBoost,5,"watchlist overlap inherits the same taste signal");
+eq(taste.applyTasteBoost({title:"Strong"},picks,false).tasteBoost,0,"same-named movie does not inherit a series preference");
+{
+  const pending=[],calls=[];
+  const loader=new Function("api","titleMetaQS",`const toWatchMetaCache=new Map(),toWatchMetaQueue=[];let toWatchMetaActive=0;${extract("pumpToWatchMeta")} ${extract("loadToWatchMeta")} return loadToWatchMeta;`)(
+    key=>{calls.push(key);return new Promise(resolve=>pending.push(resolve));},x=>x.title);
+  const first=loader({title:"0"},true);
+  eq(loader({title:"0"},true)===first,true,"overlapping rows share a metadata request");
+  const jobs=[first,...Array.from({length:6},(_,i)=>loader({title:String(i+1)},true))];
+  eq(calls.length,4,"prefetch starts at most four metadata requests");
+  pending.splice(0).forEach(resolve=>resolve({rt:95}));
+  await new Promise(resolve=>setTimeout(resolve,0));
+  eq(calls.length,7,"queued rows load without waiting to scroll");
+  pending.splice(0).forEach(resolve=>resolve({rt:95})); await Promise.all(jobs);
+}
 console.log(failed === 0 ? "ALL PASS" : `${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

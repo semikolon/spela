@@ -891,6 +891,9 @@
     nav a:hover,.seg button:hover,.toast button:hover,.banner button:hover{
       transition-delay:0s!important}
   }
+/* To-Watch suggestions share the saved-list desktop width; phones stay single-column. */
+@media(min-width:641px){#towatchOut .recgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.45rem}}
+#towatchOut .recgrid>.foitem{min-width:0}
 </style>
 
 <style>
@@ -1560,11 +1563,71 @@ function route(){
 // /watchlist (seeded from the RT import; curated by the Claude harness). Series
 // + movies as tappable rows (RT critic score shown); already-watched are hidden.
 // Tap → search that title. 2026-07-13.
+// RT dominates; curated rank is a weak taste proxy, worth at most five points.
+function tasteSortValue(item){
+  const rt=item.rt??item.rt_score;
+  return typeof rt==="number"&&Number.isFinite(rt) ? rt+(item.tasteBoost||0) : -1;
+}
+function compareTasteItems(a,b){
+  return tasteSortValue(b)-tasteSortValue(a) || (b.tasteBoost||0)-(a.tasteBoost||0)
+    || (a.title||"").localeCompare(b.title||"");
+}
+function applyTasteBoost(item,picks,isTV){
+  const match=picks.find(p=>p.title.toLowerCase()===item.title.toLowerCase()
+    && (p.media_type==="tv")===isTV && (!p.year||!item.year||p.year===item.year));
+  const ranks=picks.map(p=>p.rank).filter(Number.isFinite);
+  const min=Math.min(...ranks), max=Math.max(...ranks);
+  if(match){ for(const field of ["year","tmdb_id","imdb_id"]) if(!item[field]&&match[field]) item[field]=match[field]; }
+  item.tasteBoost=match ? (max>min?1+4*(max-match.rank)/(max-min):5) : 0;
+  return item;
+}
+function sortTasteRows(box){
+  if(!box || !box.classList.contains("taste-sorted")) return;
+  const rows=[...box.children];
+  const sorted=rows.slice().sort((a,b)=>compareTasteItems(a.__sortItem||{},b.__sortItem||{}));
+  if(rows.every((r,i)=>r===sorted[i])) return;
+  sorted.forEach(r=>box.appendChild(r));
+}
+function refreshTasteRow(row,item,rt){
+  if(typeof rt==="number") item.rt=rt;
+  row.__sortItem=item;
+  const box=row.parentElement;
+  if(!box?.classList.contains("taste-sorted")) return;
+  clearTimeout(box.__sortTimer);
+  box.__sortTimer=setTimeout(()=>{
+    if(box.contains(document.activeElement)){
+      box.addEventListener("focusout",()=>setTimeout(()=>sortTasteRows(box),0),{once:true});
+    }else sortTasteRows(box);
+  },120);
+}
+const toWatchMetaCache=new Map(), toWatchMetaQueue=[];
+let toWatchMetaActive=0;
+function pumpToWatchMeta(){
+  while(toWatchMetaActive<4 && toWatchMetaQueue.length){
+    const run=toWatchMetaQueue.shift(); toWatchMetaActive++;
+    run().finally(()=>{toWatchMetaActive--;pumpToWatchMeta();});
+  }
+}
+function loadToWatchMeta(item,isTV){
+  const key=titleMetaQS(item,isTV), old=toWatchMetaCache.get(key);
+  if(old && Date.now()-old.at<300000) return old.promise;
+  const promise=new Promise(resolve=>{
+    toWatchMetaQueue.push(async()=>{
+      try{const m=await api(key); if(!m||m.failed||m.error) toWatchMetaCache.delete(key); resolve(m);}
+      catch{toWatchMetaCache.delete(key);resolve(null);}
+    });
+  });
+  if(toWatchMetaCache.size>=256) toWatchMetaCache.delete(toWatchMetaCache.keys().next().value);
+  toWatchMetaCache.set(key,{at:Date.now(),promise}); pumpToWatchMeta(); return promise;
+}
 async function renderToWatch(){
   const out=$("#towatchOut"); if(!out) return;
   out.innerHTML=`<div class="state">Loading…</div>`;
+  const recommendations=api("/recommendations").catch(()=>null);
+  const following=api("/following").catch(()=>null);
   let d; try{ d=await api("/watchlist"); }catch(e){ out.innerHTML=`<div class="state"><div class="big">spela unreachable</div></div>`; return; }
-  const mk=(arr,isTV)=>(arr||[]).filter(x=>!x.watched).map(x=>{
+  const rd=await recommendations, picks=(rd&&rd.picks)||[];
+  const mk=(arr,isTV)=>(arr||[]).filter(x=>!x.watched).map(x=>applyTasteBoost(x,picks,isTV)).sort(compareTasteItems).map(x=>{
     const r=el("button",{className:"src"});
     r.appendChild(el("span",{className:"q",textContent:x.title}));
     // year + real TMDB genre are filled in by enrichToWatchRow (the old hand-
@@ -1572,25 +1635,34 @@ async function renderToWatch(){
     if(x.rt!=null) r.appendChild(el("span",{className:"s "+(x.rt>=88?"":"low"),textContent:"🍅 "+x.rt}));
     r.onclick=()=>{ setMode(isTV?"tv":"movie"); const q=searchQueryFor(x);
       $("#q").value=q; S.search.q=q; location.hash="#/search?q="+encodeURIComponent(q); runSearch(q); };
-    enrichWhenVisible(r,()=>enrichToWatchRow(r,x,isTV));
+    r.__sortItem=x;
+    // Start bounded prefetch immediately, even for rows below the fold.
+    enrichToWatchRow(r,x,isTV);
     return r;
   });
-  const series=mk(d.series,true), movies=mk(d.movies,false);
   out.innerHTML="";
   const wrap=el("div",{className:"detail"});
-  // New episodes of followed shows at the top — same section as the search landing.
-  try{ const fd=await api("/following"); const fc=el("div",{className:"following"});
-    if(fillFollowing(fc,(fd&&fd.shows)||[],refreshFollowing)>0){ fc.classList.add("on"); wrap.appendChild(fc); }
+  const fc=el("div",{className:"following"}); wrap.appendChild(fc);
+  // Slow schedule lookup must not hold back recommendations or artwork.
+  following.then(fd=>{
+    const shows=((fd&&fd.shows)||[]).filter(x=>x.new_count>0);
+    if(fillFollowing(fc,shows,refreshFollowing)>0){
+      fc.classList.add("on"); const list=fc.querySelector(".folist"); list.classList.add("taste-sorted");
+      [...list.children].forEach((row,i)=>{
+        const item=applyTasteBoost(shows[i],picks,true); row.__sortItem=item;
+        loadToWatchMeta(item,true).then(m=>{if(m) refreshTasteRow(row,item,m.rt);});
+      });
+    }
+  }).catch(()=>{});
+  // Curated suggestions remain separate from the saved watchlist.
+  try{ const rc=el("div",{className:"following"});
+    fillRecommended(rc,picks); if(rc.classList.contains("on")) wrap.appendChild(rc);
   }catch{}
-  // Claude-curated recommendations — the smart, ranked top of your to-watch pool.
-  // Lives here (not the landing): it IS the to-watch list, just curated.
-  try{ const rd=await api("/recommendations"); const rc=el("div",{className:"following"});
-    fillRecommended(rc,(rd&&rd.picks)||[]); if(rc.classList.contains("on")) wrap.appendChild(rc);
-  }catch{}
+  const series=mk(d.series,true), movies=mk(d.movies,false);
   if(series.length){ wrap.appendChild(el("div",{className:"twhead",textContent:`Series · ${series.length}`}));
-    const box=el("div",{className:"sources open"}); series.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
+    const box=el("div",{className:"sources open taste-sorted"}); series.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
   if(movies.length){ wrap.appendChild(el("div",{className:"twhead",textContent:`Movies · ${movies.length}`}));
-    const box=el("div",{className:"sources open"}); movies.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
+    const box=el("div",{className:"sources open taste-sorted"}); movies.forEach(r=>box.appendChild(r)); wrap.appendChild(box); }
   if(!series.length&&!movies.length) wrap.appendChild(el("div",{className:"state",textContent:"To-watch list is empty."}));
   // The Watched archive moved to its own #/rewatch view (2026-08-27); keeping a
   // second copy here made To-Watch a list of both what he has not seen AND what he
@@ -1813,7 +1885,7 @@ function titleMetaQS(it,isTV){
   return qs;
 }
 async function enrichToWatchRow(row,x,isTV){
-  let m; try{ m=await api(titleMetaQS(x,isTV)); }catch{ return; }
+  let m; try{ m=await loadToWatchMeta(x,isTV); }catch{ return; }
   if(!m) return;
   // The server reports what it actually RESOLVED. When we asked it to auto-detect we
   // must label from that, not from our guess — otherwise a series gets a film's
@@ -1825,6 +1897,7 @@ async function enrichToWatchRow(row,x,isTV){
   if(x){ x.resolvedTV = isTV;
          if(m.year && !x.year) x.year = m.year;
          if(m.imdb_id && !x.imdb_id) x.imdb_id = m.imdb_id; }
+  refreshTasteRow(row,x,m.rt);
   const q=row.querySelector(".q");
   // live RT (MDBList) overrides the static curated score when present; also
   // gives a score to entries that had none.
@@ -1852,7 +1925,7 @@ async function enrichToWatchRow(row,x,isTV){
     if(st){ const sx=el("span",{className:"stx"+(st==="Returning"||st==="Upcoming"?" on":""),textContent:st});
       (row.querySelector(".mx")||row.querySelector(".gx")||row.querySelector(".ty")||q).after(sx); }
   }
-  const bgsrc=m.backdrop_url||m.poster_url;
+  const bgsrc=(m.backdrop_url||m.poster_url||"").replace("/w1280/","/w780/");
   if(bgsrc){ const ps=posterSrc(bgsrc); const img=new Image();
     img.onload=()=>{ row.style.backgroundImage=`linear-gradient(90deg,rgba(15,15,20,.88),rgba(15,15,20,.62)),url('${ps}')`;
       row.style.backgroundSize="cover"; row.style.backgroundPosition=m.backdrop_url?"center 30%":"center 20%"; };
@@ -2349,8 +2422,8 @@ function fillRecommended(container, items){
   if(!container) return; container.innerHTML="";
   if(!items.length){ container.classList.remove("on"); return; }
   container.appendChild(el("div",{className:"rlab",textContent:"Recommended for you"}));
-  const list=el("div",{className:"folist"});
-  items.forEach(it=>list.appendChild(recItem(it)));
+  const list=el("div",{className:"folist recgrid taste-sorted"});
+  items.map(it=>applyTasteBoost(it,items,it.media_type==="tv")).sort(compareTasteItems).forEach(it=>list.appendChild(recItem(it)));
   container.appendChild(list); container.classList.add("on");
 }
 function recItem(it){
@@ -2366,7 +2439,8 @@ function recItem(it){
     const q=searchQueryFor(it);
     $("#q").value=q; S.search.q=q; location.hash="#/search?q="+encodeURIComponent(q); runSearch(q); };
   if(it.poster_url) paintPoster(tap,it.poster_url);
-  enrichWhenVisible(tap,()=>enrichRec(tap,it));
+  item.__sortItem=it;
+  enrichRec(tap,it);
   item.appendChild(tap);
   // Quick "I've already seen this" ✓ — marks watched (→ ledger, dropped from recs
   // next load) WITHOUT clicking into the title. Optimistically removes the row.
@@ -2393,9 +2467,10 @@ function recItem(it){
 // (a curated score can be months stale; live is the truth spela shows elsewhere).
 async function enrichRec(tap, it){
   const isTV=it.media_type==="tv";
-  let m; try{ m=await api(titleMetaQS(it,isTV)); }catch{ return; }
+  let m; try{ m=await loadToWatchMeta(it,isTV); }catch{ return; }
   if(!m) return;
-  if(m.poster_url||m.backdrop_url) paintPoster(tap, m.poster_url, m.backdrop_url);
+  if(tap.parentElement) refreshTasteRow(tap.parentElement,it,m.rt);
+  if(m.poster_url||m.backdrop_url) paintPoster(tap, m.poster_url, (m.backdrop_url||"").replace("/w1280/","/w780/"));
   if(m.year){ const t=tap.querySelector(".fotitle"); if(t && !t.querySelector(".ep")) t.appendChild(el("span",{className:"ep",textContent:String(m.year)})); }
   if(m.rt!=null){ const r=tap.querySelector(".rrt"); if(r) r.textContent=" · 🍅 "+m.rt; }
 }

@@ -327,3 +327,25 @@ The watched ledger and resume positions live in `state.json`, not a separate
   the foot of `taste_profile.md` (user-local, Darwin).
 - Future spela iOS app (if built) is for playing/remote, not re-tracking — the tracker
   lives in the shared backend + the existing web-remote PWA.
+
+## To-Watch presentation
+
+Recommended for you is the curated suggestion set (`recommendations.json`), with
+reasons and curator rank; Series/Movies are the broader saved pool (`watchlist.json`).
+Neither is an alias for the other. Overlap is intentional; keep the sections separate.
+
+Within each To-Watch section, RT critic score is the main ordering input. Curated
+rank supplies a bounded 1–5-point taste boost (top rank gets five), also applied to
+matching saved titles; absent curation contributes zero. This is a weak proxy for
+personal fit, not a newly computed taste model. Unknown RT goes below known scores;
+updated metadata scores update the ordering. Recommendation cards use the same
+two-column desktop breakpoint as saved rows (641px), single-column below it.
+
+To-Watch starts metadata/artwork loading at page load, including below-fold rows.
+The shared request queue permits four concurrent metadata lookups, reuses in-flight
+and five-minute cached requests, and retries failed lookups on a subsequent load.
+Matching recommendation identities enrich saved entries to improve request reuse.
+Recommendation requests enter the queue before the lower shelves; following metadata
+does not block the rest of the page. Row backdrops request w780 rather than w1280.
+Other shelves retain viewport-based enrichment; do not generalize eager unbounded
+loading to the whole app. This prefetch downloads metadata/artwork only, never media.
