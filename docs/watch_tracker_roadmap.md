@@ -37,12 +37,11 @@ The watched ledger and resume positions live in `state.json`, not a separate
    films, explicit whole-show marks and migrated `seed` baselines still hide on
    one. The threshold is deliberately forgiving: a to-watch list holds CANDIDATES,
    so a half-abandoned show costs one row while a barely-sampled one costs the
-   whole recommendation. The ledger also stopped being append-only —
-   `POST /watched-remove {title}` plus a rec-row Undo toast and a collapsed
-   "Watched · N" section on To-Watch. That section is the load-bearing half: a
-   wrongly-hidden title was previously invisible AND unfixable, so there was no
-   way to even notice it had gone. Detail: CLAUDE.md Hard-Won "To-Watch hides a
-   SERIES only past 3 distinct watched episodes".
+   whole recommendation. The ledger also supports removal through `POST /watched-remove {title}`,
+   with a rec-row Undo toast and a separate Rewatch shelf for finding and correcting
+   seen titles. The former collapsed Watched section on To-Watch has moved to Rewatch;
+   keeping seen titles discoverable is what makes mistaken marks recoverable.
+   Detail: CLAUDE.md Hard-Won "To-Watch hides a SERIES only past 3 distinct watched episodes".
 
 2b. **Followed-shows "New Episodes" tracker — ✅ SHIPPED (2026-07-28→29, v3.19).**
    **Progress model reworked v3.20 (2026-08-02): unified into the watch-ledger as the
@@ -114,17 +113,14 @@ The watched ledger and resume positions live in `state.json`, not a separate
    option if a VERBATIM RT consensus quote is wanted — then (a)/(b) are the
    tradeoff. Fredrik: *"Maybe an LLM-written (and cached) blurb from a bunch of
    critics/reviews, in the future."*
-   **The LLM harness IS Claude/CC now (Phase 1), exactly like DIM** (Fredrik: "the
-   LLM is YOU until I say otherwise"). So spela builds the ARSENAL (the to-watch
-   store + endpoints + a "To Watch" UI view + the tools: `/search`+TMDB, critics
-   scores, `/watched` seen-check, `taste_profile.md`) and Claude is the reasoning
-   harness that curates/ranks the list — NOT an external LLM API wired into spela.
-   Keep it model-swappable (Phase 2 = a `claude -p` / Gemini harness) per the
-   arsenal-and-harness doc; `claude -p` CC-wrap is not the long-term multi-user
-   harness (ToS). Meta-rules (from `~/.config/spela/taste_profile.md`): RT ≥88%
-   gate (with genre-override exceptions), mood/bandwidth match, tone-first,
-   exclude-already-watched (watched-ledger + the taste profile's "watched & loved"
-   list).
+   **The interactive assistant is the recommendation harness** (Fredrik: "the
+   LLM is YOU until I say otherwise"). Spela provides the store, endpoints, metadata
+   lookup and ledger; Codex or Claude supplies the reasoning. No model API or autonomous
+   curation runs inside Spela. A future automated harness should use the same contract;
+   it is an idea, not a deployed background job. Taste preferences and discovery criteria
+   live in the user-local `taste_profile.md`; they are not server-enforced score gates.
+   Distinguish discovery criteria from the bounded RT-plus-taste **display sort**
+   described in [To-Watch presentation](#to-watch-presentation).
 
 4. **RT watchlist import — ✅ DONE (2026-07-13, manual paste).** RT has no public
    API, so Fredrik pasted his watchlist → `~/.config/spela/rt_watchlist_2026-07-13.md`
@@ -206,12 +202,10 @@ The watched ledger and resume positions live in `state.json`, not a separate
    `extract_metadata_title(&Metadata)` (cast.rs:560) pulls the title;
    `Metadata::TvShow{series_title, episode_title, season, episode}` carries S/E.
 
-7. **Unified home queue + recommender harness — ✅ SHIPPED + LIVE (2026-08-03):
-   backend + home UI + first curated pass all deployed on Darwin.** Fredrik: *"I want
-   both Claude to be able to wisely recommend, and a unified queue in the UI... Weave
-   it in naturally with what already exists."* Verified end-to-end: `/home` returns the
-   three sections; a 13-pick harness POST surfaced as 12 (Fargo auto-excluded — already
-   in the ledger, proving `has_seen`). Two pieces, arsenal-and-harness:
+7. **Unified home queue + recommender — implemented.** The backend owns progress,
+   followed-show availability and seen filtering; the interactive assistant curates
+   suggestions. The UI gives continuing and newly available episodes priority, while
+   discovery lives on To Watch. Two pieces, arsenal-and-harness:
    - **Recommender arsenal** (`recommendations.rs` + `~/.config/spela/recommendations.json`,
      user-local): `GET /recommendations` (serve, excludes already-seen via
      `AppState::has_seen`, case-insensitive) + `POST /recommendations` (the harness writes
@@ -225,13 +219,10 @@ The watched ledger and resume positions live in `state.json`, not a separate
      duration + position for the %), cleared on completion / `reset_position`. Needed because
      `resume_positions` holds only seconds — no duration/title/poster to render a Continue row.
    - **Unified home** `GET /home` (NOT `/queue` — that route is the play-FIFO auto-fire list):
-     three priority-ordered sections — **Continue** (in-progress, % + poster) → **New Episodes**
-     (reuses `compute_following_shows`, the shared `/following` derivation, refactored out) →
-     **Recommended** (harness picks, de-duped against Continue + New-Episodes + already-seen so
-     the queue never repeats a title).
-   - **UI decision** (Fredrik, 2026-08-03, via mockup pick): priority-sectioned **home screen**
-     (Continue → New Episodes → Recommended); the queue BECOMES the landing view, absorbing the
-     Recently-watched chip row + the New-Episodes row; Search moves one tap away.
+     returns `continue`, `new_episodes`, `upcoming`, `total_new`, and `recommended`.
+     Recommendations are de-duplicated against Continue, New Episodes and seen titles
+     in this response. The endpoint's recommendation field is retained even though
+     the Home UI does not currently render it.
    - **Home UI** (`static/remote.html`, `loadHome`): Continue → New Episodes →
      Coming Soon. Home is the default landing; Continue tap re-searches and resumes.
      The backend still returns `recommended`, but the current Home renderer does not
