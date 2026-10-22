@@ -216,9 +216,10 @@ The watched ledger and resume positions live in `state.json`, not a separate
      user-local): `GET /recommendations` (serve, excludes already-seen via
      `AppState::has_seen`, case-insensitive) + `POST /recommendations` (the harness writes
      the full ranked list; replace semantics; capped 100). Each `RecEntry` carries a one-line
-     **`why`** — the rationale IS the value. The HARNESS = Claude/CC (Phase 1): reads
-     `taste_profile.md` + `/watched` + `/watchlist` + air-dates, ranks, POSTs. Model-swappable
-     later (a Phase-2 autonomous harness writes the same file).
+     **`why`** — the rationale IS the value. The harness is the interactive assistant
+     (Codex or Claude): it reads
+     `taste_profile.md` + `/watched` + `/watchlist` + air-dates, ranks, and writes picks.
+     There is no autonomous recommendation refresh in the server.
    - **Continue store** (`AppState.in_progress`, keyed like `resume_positions`): upserted in
      `save_position_smart`'s HWM branch (title/show/S·E/poster from the live `CurrentStream`;
      duration + position for the %), cleared on completion / `reset_position`. Needed because
@@ -231,19 +232,15 @@ The watched ledger and resume positions live in `state.json`, not a separate
    - **UI decision** (Fredrik, 2026-08-03, via mockup pick): priority-sectioned **home screen**
      (Continue → New Episodes → Recommended); the queue BECOMES the landing view, absorbing the
      Recently-watched chip row + the New-Episodes row; Search moves one tap away.
-   - **Home UI** (`static/remote.html`, `#v-home`, LIVE): three poster-bg sections
-     (`fillContinue`/`fillFollowing`/`fillRecommended`); Home is the default landing (Search one
-     tap away); Continue tap re-searches → auto-resumes from HWM, rec tap → search, the `why`
-     line shown; pending-watched + New-Episodes moved off Search onto Home; new Home nav tab.
-   - **First curated pass** (LIVE): 13 picks POSTed from `taste_profile.md` + `watchlist.json`,
-     RT≥89, tone-first `why` lines, the watched-loved excluded. Re-run any time by POSTing a new
-     list to `/recommendations` (replace semantics).
-   - **Poster + live-score enrichment on rec rows — ✅ SHIPPED (2026-08-03).** `enrichRec`
-     lazy-fetches `/title-meta` per row (server-cached, same as To-Watch): poster-bg + year +
-     OVERRIDES the curated 🍅 with the LIVE MDBList score (a curated score goes stale — Outer
-     Range read 92 curated vs 85 live; Home now matches the search card everywhere). Verified in
-     Chrome: 10 rec posters 200, Outer Range→85. Also: inline SVG favicon (quiets the
-     `/favicon.ico` probe). Continue verified live too (HotD S03E07 @ 73% + progress bar).
+   - **Home UI** (`static/remote.html`, `loadHome`): Continue → New Episodes →
+     Coming Soon. Home is the default landing; Continue tap re-searches and resumes.
+     The backend still returns `recommended`, but the current Home renderer does not
+     display it; curated recommendations live on To Watch. Do not infer visible sections
+     from the `/home` payload alone.
+   - **Poster + live-score enrichment** (`enrichRec`): To-Watch eagerly queues
+     `/title-meta` through the shared bounded loader; numeric live RT overrides the
+     stored curated score. The rationale remains stored prose. See
+     [To-Watch presentation](#to-watch-presentation) for current behavior and limits.
    - **Continue/New-Eps dedup + mark-seen + non-linear counting — ✅ SHIPPED (2026-08-03).**
      (i) A Continue episode that IS a followed show's next-unwatched folds into its New-Eps row as
      "▸ NN% into SxxExx" (parses SE from the title, since a VLC-tracked play leaves the struct
@@ -347,5 +344,45 @@ and five-minute cached requests, and retries failed lookups on a subsequent load
 Matching recommendation identities enrich saved entries to improve request reuse.
 Recommendation requests enter the queue before the lower shelves; following metadata
 does not block the rest of the page. Row backdrops request w780 rather than w1280.
-Other shelves retain viewport-based enrichment; do not generalize eager unbounded
+Rewatch retains viewport-based enrichment; do not generalize eager unbounded
 loading to the whole app. This prefetch downloads metadata/artwork only, never media.
+
+### Curation and maintenance boundaries
+
+`why` is stored assistant-written prose, not generated or revised by the page. Metadata
+refresh updates artwork and scores, but cannot repair a weak rationale or stale claims
+inside it. Explain the work's concrete appeal; comparisons must name a different work
+and be grounded in the taste profile. Do not imply the user has seen a suggestion merely
+because it appears among taste anchors. Prefer durable descriptions over claims such as
+“highest-rated on your list,” which become false as scores or the list change.
+
+Keep `title`, `media_type`, year and known TMDB/IMDb IDs together: artwork and score
+lookup use these identities, and ambiguous titles without them can resolve incorrectly.
+Check duplicate identities within a curated list; overlap *between* recommendations
+and saved shelves is intentional. Personal picks and taste data stay in the server's
+user-local config directory, never the public repository.
+
+`GET /recommendations` is a seen-filtered view, not a lossless export of the store.
+`POST /recommendations` replaces the entire list (maximum 100) and stamps generation
+provenance. For a single-copy repair, preserve the full stored set and its provenance,
+back up first, and atomically replace the user-local file; do not round-trip the filtered
+GET response as though it were the complete list. Read back through the endpoint to
+verify. A data-only edit is visible on the next page load without a service restart.
+
+### Scope and limits
+
+The RT-plus-taste ordering is a **To-Watch presentation rule**, including its New
+Episodes section. It neither rewrites curator ranks nor changes Home's section priority,
+backend recommendation order, or torrent-source ranking. The taste adjustment is relative
+to the ranks in the currently returned recommendation set; it is not a stable personal
+rating. Live numeric RT replaces the stored score for display and sorting; absent live
+scores retain any stored score. With neither available, the title sorts below rated ones.
+
+The four-request limit covers metadata lookups; subsequent image downloads use normal
+browser scheduling and caching. The five-minute/256-entry cache is in this page's memory,
+not persistent storage or a server cache change. Prefetch removes the scroll trigger and
+w780 reduces image size, but cold upstream lookups can still take time. No measured
+end-to-end latency improvement is promised. Recommendation metadata is queued before
+saved shelves; `/following` no longer blocks those shelves, but initial rendering still
+awaits `/watchlist` and `/recommendations`. These are deliberate limits, not claims that
+every image is ready immediately when the page opens.

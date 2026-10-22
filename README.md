@@ -69,6 +69,10 @@ assistant should be able to play something when you ask nicely.
 
 - **A queue that knows where you are.** Continue watching, new episodes of shows you
   follow, what airs next and when, and recommendations.
+- **Suggestions and saved titles stay separate.** To Watch keeps curated recommendations
+  alongside the saved Series/Movies shelves, ordered mainly by RT with a small taste
+  adjustment. Artwork loads ahead through a bounded queue.
+  [How curation, sorting and loading differ](docs/watch_tracker_roadmap.md#to-watch-presentation).
 - **A watch ledger** as the single record of both progress and what you have seen, with
   loved / not-for-me ratings and a Rewatch shelf that reads it from the other side.
 - **Schedules plus source availability.** TVmaze supplies verified episode dates, with
