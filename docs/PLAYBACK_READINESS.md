@@ -119,8 +119,8 @@ Panel shortcut labels show N/H throughout the end offer, including while busy;
 modifier shortcuts remain available outside that window.
 
 On the Mac, the VLC bridge publishes play/pause state every second and wakes the
-existing `monitor-brightness` launchd job when viewing starts or ends. Paused counts
-as viewing; the five-minute daylight timer remains a fallback. Waking uses kickstart
+existing `monitor-brightness` launchd job when playback starts, pauses, resumes or ends. Pause returns to the
+sun-driven baseline; resume restores viewing brightness; the five-minute daylight timer remains a fallback. Waking uses kickstart
 without `-k`, preserving the single DDC writer, goodnight exclusion and hardware
 verification. The viewing level remains 90, not 100. Implementation and machine
 policy live in the user-local bridge/controller and dotfiles monitor-brightness doc.
