@@ -3378,6 +3378,9 @@ function markHandoffEnded(){
     renderHandoff();
   },Math.max(0,owner.endedAt+5*60*1000-Date.now()));
 }
+function activeEndWindow(now){
+  return !!now.data && nearPlaybackEnd(now.posAbs,now.dur);
+}
 function nearPlaybackEnd(position,duration){
   return duration>=300 && position>=duration-Math.min(120,duration*.04);
 }
@@ -3417,13 +3420,13 @@ function renderHandoff(){
     if(!S.now.data) renderNowFull();
   }
   const root=$("#upnextPanel"); if(!root) return;
-  const show=handoff.busy || handoff.requested || handoff.error || (!handoff.dismissed && (handoff.ended || nearPlaybackEnd(S.now.posAbs,S.now.dur)));
+  const show=handoff.busy || handoff.requested || handoff.error || (!handoff.dismissed && (handoff.ended || activeEndWindow(S.now)));
   root.hidden=!show || S.now.warming;
   const next=handoff.data?.next;
-  const nb=$("#nbNext"); if(nb){nb.disabled=!next||handoff.busy; nb.title=next?"Play "+next.query+" (Ctrl+Alt+N)":"No next episode available";}
+  const nb=$("#nbNext"); if(nb){nb.disabled=!next||handoff.busy; nb.title=next?"Play "+next.query+((handoff.ended||activeEndWindow(S.now))?" (N)":" (Ctrl+Alt+N)"):"No next episode available";}
   const fb=$("#tNext"); if(fb) fb.disabled=!next||handoff.busy;
   // Polling must not replace a focused button or announce the same content repeatedly.
-  const plainKeys=plainHandoffKeys();
+  const plainKeys=!handoff.dismissed && (handoff.ended || activeEndWindow(S.now));
   const signature=JSON.stringify([handoff.key,handoff.data,handoff.ended,handoff.busy,handoff.error,!!handoff.pending,plainKeys]);
   if(root.dataset.rendered===signature) return;
   root.dataset.rendered=signature; root.replaceChildren();
@@ -3476,7 +3479,7 @@ async function stopAndHome(){
 }
 function plainHandoffKeys(){
   return !S.now.warming && !handoff.busy && !handoff.dismissed &&
-    (handoff.ended || nearPlaybackEnd(S.now.posAbs,S.now.dur));
+    (handoff.ended || activeEndWindow(S.now));
 }
 function handoffShortcut(e,allowPlain=false){
   if(e.repeat || e.isComposing || e.metaKey || e.shiftKey || e.target?.isContentEditable || e.target?.closest?.("input,textarea,select,[contenteditable]")) return "";
@@ -4029,17 +4032,20 @@ async function stopPlayback(options){
     if(wasVlc){
       if(!title) throw new Error("VLC is still connecting. Try again in a moment.");
       stopVlcPoll();
-      const r=await api("/vlc/control",{method:"POST",body:{cmd:"stop",title},signal:AbortSignal.timeout(5000)});
-      if(!r || r.error || r.failed) throw new Error("Couldn’t reach VLC. Try stopping again.");
-      // A queued command is not an acknowledgement. Wait before opening another
-      // stream so the old stop/gone cleanup cannot tear down the new episode.
-      let gone=false;
-      for(let attempt=0;attempt<24;attempt++){
-        await new Promise(resolve=>setTimeout(resolve,500));
-        const p=await api("/api/position?title="+encodeURIComponent(title),{signal:AbortSignal.timeout(2500)});
-        if(p?.gone){gone=true;break;}
+      const before=await api("/api/position?title="+encodeURIComponent(title),{signal:AbortSignal.timeout(2500)});
+      let gone=!!before?.gone;
+      if(!gone){
+        const r=await api("/vlc/control",{method:"POST",body:{cmd:"stop",title},signal:AbortSignal.timeout(5000)});
+        if(!r || r.error || r.failed) throw new Error("Couldn’t reach VLC. Try stopping again.");
+        // A queued command is not an acknowledgement. Wait before opening another
+        // stream so the old stop/gone cleanup cannot tear down the new episode.
+        for(let attempt=0;attempt<24;attempt++){
+          await new Promise(resolve=>setTimeout(resolve,500));
+          const p=await api("/api/position?title="+encodeURIComponent(title),{signal:AbortSignal.timeout(2500)});
+          if(p?.gone){gone=true;break;}
+        }
+        if(!gone) throw new Error("VLC hasn’t confirmed it closed. Try again before starting the next episode.");
       }
-      if(!gone) throw new Error("VLC hasn’t confirmed it closed. Try again before starting the next episode.");
     }else{
       const r=await api("/stop",{method:"POST"});
       if(!r || r.error || r.failed) throw new Error("Couldn’t stop playback. Try again.");

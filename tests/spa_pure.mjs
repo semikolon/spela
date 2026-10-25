@@ -465,9 +465,12 @@ eq(shortcut({code:"KeyH",target:{isContentEditable:true}},true),"","editable con
 eq(shortcut({code:"KeyN",isComposing:true},true),"","IME composition cannot start playback");
 eq(shortcut({code:"KeyN",altKey:true},true),"","Alt alone is not a handoff shortcut");
 {
-  const S={now:{posAbs:3500,dur:3600}},handoff={};
-  const enabled=new Function("S","handoff",extract("nearPlaybackEnd")+extract("plainHandoffKeys")+";return plainHandoffKeys;")(S,handoff);
+  const S={now:{data:{},posAbs:3500,dur:3600}},handoff={};
+  const enabled=new Function("S","handoff",extract("nearPlaybackEnd")+extract("activeEndWindow")+extract("plainHandoffKeys")+";return plainHandoffKeys;")(S,handoff);
   eq(enabled(),true,"near-end plain keys enabled");
+  S.now.data=null;
+  eq(enabled(),false,"closed player with stale end position cannot reopen the offer or bind keys");
+  S.now.data={};
   S.now.posAbs=10;
   eq(enabled(),false,"seeking earlier disables plain keys");
   handoff.ended=true;
@@ -491,6 +494,7 @@ for(const scenario of ["gone","timeout","error"]){
   eq(ok,scenario==="gone","stop succeeds only after acknowledgement: "+scenario);
   eq(!!S.now.data,scenario!=="gone","failed stop preserves current playback controls: "+scenario);
   eq(S.now.stopping,false,"stop lock released: "+scenario);
+  if(scenario==="gone") eq(calls.some(p=>p==="/vlc/control"),false,"already closed VLC needs no queued stop");
 }
 {
   const calls=[], handoff={data:{next:{query:"Example S01E02"}}}, S={now:{data:{}}};

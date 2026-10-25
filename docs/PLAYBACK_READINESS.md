@@ -110,3 +110,17 @@ The completed-playback offer expires after five minutes and has a Dismiss button
 Expiry hides the overlay and disables its plain-key actions; it neither launches media
 nor navigates away from the current page. Returning from a suspended/background tab
 rechecks the wall-clock deadline. In-flight handoffs and actionable errors are retained.
+
+The end-window predicate requires an active playback object. A retained near-end
+playhead after VLC closes must not reopen an offer after Home, Dismiss or expiry.
+Stop checks the title-scoped `gone` acknowledgement before queuing a command; an
+already-closed player is a successful stop. Active-player stops still await cleanup.
+Panel shortcut labels show N/H throughout the end offer, including while busy;
+modifier shortcuts remain available outside that window.
+
+On the Mac, the VLC bridge publishes play/pause state every second and wakes the
+existing `monitor-brightness` launchd job when viewing starts or ends. Paused counts
+as viewing; the five-minute daylight timer remains a fallback. Waking uses kickstart
+without `-k`, preserving the single DDC writer, goodnight exclusion and hardware
+verification. The viewing level remains 90, not 100. Implementation and machine
+policy live in the user-local bridge/controller and dotfiles monitor-brightness doc.
