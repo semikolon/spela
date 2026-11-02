@@ -2,6 +2,104 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+/// The H.264 encoder this machine's ffmpeg actually has, best first.
+///
+/// 2026-11-03: every re-encode path was written for Darwin's GTX 1650 and
+/// hard-codes `h264_nvenc`. A spela on a Mac has no NVENC, so any play that
+/// needed a re-encode (subtitle burn-in, intro clip, a seek, any Chromecast
+/// play) produced zero segments and fell through to the next source — which
+/// is why a Mac-local spela kept picking 720p over a perfectly good 1080p.
+/// The call sites keep their NVENC arguments; `adapt_h264_encoder_args`
+/// rewrites them for whatever encoder `ffmpeg -encoders` lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum H264Encoder {
+    Nvenc,
+    VideoToolbox,
+    X264,
+}
+
+/// Pick from the text of `ffmpeg -hide_banner -encoders`.
+pub fn pick_h264_encoder(encoders_listing: &str) -> H264Encoder {
+    let has = |name: &str| {
+        encoders_listing
+            .lines()
+            .any(|l| l.split_whitespace().nth(1) == Some(name))
+    };
+    if has("h264_nvenc") {
+        H264Encoder::Nvenc
+    } else if has("h264_videotoolbox") {
+        H264Encoder::VideoToolbox
+    } else {
+        H264Encoder::X264
+    }
+}
+
+/// Probed once per process. A failed probe keeps NVENC, the historical
+/// behaviour, so a broken `ffmpeg -encoders` cannot change Darwin's output.
+pub fn h264_encoder() -> H264Encoder {
+    static ENCODER: std::sync::OnceLock<H264Encoder> = std::sync::OnceLock::new();
+    *ENCODER.get_or_init(|| {
+        let picked = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .ok()
+            .map(|o| pick_h264_encoder(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or(H264Encoder::Nvenc);
+        tracing::info!("H.264 encoder for re-encodes: {:?}", picked);
+        picked
+    })
+}
+
+/// Rewrite NVENC arguments for `enc`. NVENC-only options are `-preset pN`
+/// (and its per-stream form `-preset:v:N`) and `-cq N`; VideoToolbox rejects
+/// `-cq` outright ("Unrecognized option"), so it becomes `-q:v 65`, and
+/// libx264 takes `-crf` with the same scale. Profile, level, bitrate, GOP and
+/// pixel-format options are shared by all three and pass through untouched.
+pub fn adapt_h264_encoder_args(args: Vec<String>, enc: H264Encoder) -> Vec<String> {
+    if enc == H264Encoder::Nvenc {
+        return args;
+    }
+    let mut out = Vec::with_capacity(args.len());
+    let mut it = args.into_iter().peekable();
+    while let Some(a) = it.next() {
+        if a == "h264_nvenc" {
+            out.push(match enc {
+                H264Encoder::VideoToolbox => "h264_videotoolbox".into(),
+                _ => "libx264".into(),
+            });
+        } else if a == "-preset" || a.starts_with("-preset:") {
+            let value = it.next().unwrap_or_default();
+            let nvenc_preset = value.len() == 2 && value.starts_with('p');
+            match (enc, nvenc_preset) {
+                (H264Encoder::VideoToolbox, true) => {} // no presets; drop the pair
+                (H264Encoder::X264, true) => {
+                    out.push(a);
+                    out.push("veryfast".into());
+                }
+                _ => {
+                    out.push(a);
+                    out.push(value);
+                }
+            }
+        } else if a == "-cq" {
+            let value = it.next().unwrap_or_default();
+            match enc {
+                H264Encoder::VideoToolbox => {
+                    out.push("-q:v".into());
+                    out.push("65".into());
+                }
+                _ => {
+                    out.push("-crf".into());
+                    out.push(value);
+                }
+            }
+        } else {
+            out.push(a);
+        }
+    }
+    out
+}
+
 /// Apr 30, 2026: scan ffmpeg's stderr log for symptoms of source-file
 /// corruption (Hijack S02E05 MeGusta incident class). Returns Some(reason)
 /// if any of three signals is present, None if the log is clean.
@@ -62,6 +160,12 @@ pub fn inspect_ffmpeg_log_for_corruption(log: &str) -> Option<&'static str> {
 /// Best-effort: any rename/remove failure is logged but doesn't stop the
 /// caller — log preservation is a debugging aid, not a correctness path.
 pub fn rotate_ffmpeg_log(current: &Path) {
+    // A fresh host has no `~/.spela/`; without it File::create fell back to
+    // /tmp/spela-ffmpeg.log, which no rotation reaches, so each play erased
+    // the last one's evidence (the Mac's failed 1080p plays, 2026-11-02).
+    if let Some(dir) = current.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     if !current.exists() {
         return;
     }
@@ -882,6 +986,7 @@ pub async fn transcode(
     });
     tracing::info!("FFmpeg stderr → {:?}", ffmpeg_log_path);
 
+    let args = adapt_h264_encoder_args(args, h264_encoder());
     let mut child = Command::new("ffmpeg")
         .args(&args)
         .stdout(std::process::Stdio::null())
@@ -1252,11 +1357,13 @@ pub async fn transcode_hls(
         .and_then(|_| dirs::home_dir())
         .map(|h| h.join(".spela").join("ffmpeg.log"))
         .unwrap_or_else(|| media_dir.join("ffmpeg.log"));
+    rotate_ffmpeg_log(&ffmpeg_log_path);
     let stderr_file = std::fs::File::create(&ffmpeg_log_path).unwrap_or_else(|_| {
         std::fs::File::create("/tmp/spela-ffmpeg.log").expect("Cannot create any log file")
     });
     tracing::info!("FFmpeg HLS stderr → {:?}", ffmpeg_log_path);
 
+    let args = adapt_h264_encoder_args(args, h264_encoder());
     let mut child = Command::new("ffmpeg")
         .args(&args)
         .stdout(std::process::Stdio::null())
@@ -1399,6 +1506,124 @@ pub async fn transcode_hls_passthrough(
         primary_segment_prefix: "seg_".into(),
         fmp4: true,
     })
+}
+
+#[cfg(test)]
+mod encoder_tests {
+    use super::*;
+
+    // Copied from `ffmpeg -hide_banner -encoders` on the Mac Mini (Homebrew
+    // ffmpeg, 2026-11-03): VideoToolbox and libx264, no NVENC.
+    const MAC_LISTING: &str = " V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)\n V....D libx264rgb           libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 RGB (codec h264)\n V....D h264_videotoolbox    VideoToolbox H.264 Encoder (codec h264)\n V....D libx265              libx265 H.265 / HEVC (codec hevc)\n";
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn mac_listing_picks_videotoolbox() {
+        assert_eq!(pick_h264_encoder(MAC_LISTING), H264Encoder::VideoToolbox);
+    }
+
+    #[test]
+    fn nvenc_wins_when_listed() {
+        // Darwin's listing was not reachable when this was written; only the
+        // name column matters, and FFmpeg names the encoder `h264_nvenc`.
+        let darwin = format!(
+            "{MAC_LISTING} V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)\n"
+        );
+        assert_eq!(pick_h264_encoder(&darwin), H264Encoder::Nvenc);
+    }
+
+    #[test]
+    fn a_description_mentioning_nvenc_is_not_the_encoder() {
+        let only_desc = " V....D libx264              mentions h264_nvenc in text (codec h264)\n";
+        assert_eq!(pick_h264_encoder(only_desc), H264Encoder::X264);
+    }
+
+    #[test]
+    fn nvenc_args_are_untouched_on_nvenc() {
+        let a = s(&["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"]);
+        assert_eq!(adapt_h264_encoder_args(a.clone(), H264Encoder::Nvenc), a);
+    }
+
+    #[test]
+    fn videotoolbox_drops_presets_and_maps_cq() {
+        let a = s(&[
+            "-vf",
+            "format=yuv420p",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-cq",
+            "23",
+            "-profile:v",
+            "high",
+            "-level:v",
+            "4.0",
+        ]);
+        assert_eq!(
+            adapt_h264_encoder_args(a, H264Encoder::VideoToolbox),
+            s(&[
+                "-vf",
+                "format=yuv420p",
+                "-c:v",
+                "h264_videotoolbox",
+                "-q:v",
+                "65",
+                "-profile:v",
+                "high",
+                "-level:v",
+                "4.0",
+            ])
+        );
+    }
+
+    #[test]
+    fn per_stream_ladder_args_are_adapted() {
+        let a = s(&[
+            "-c:v:0",
+            "h264_nvenc",
+            "-preset:v:0",
+            "p4",
+            "-b:v:0",
+            "5000k",
+        ]);
+        assert_eq!(
+            adapt_h264_encoder_args(a.clone(), H264Encoder::VideoToolbox),
+            s(&["-c:v:0", "h264_videotoolbox", "-b:v:0", "5000k"])
+        );
+        assert_eq!(
+            adapt_h264_encoder_args(a, H264Encoder::X264),
+            s(&[
+                "-c:v:0",
+                "libx264",
+                "-preset:v:0",
+                "veryfast",
+                "-b:v:0",
+                "5000k"
+            ])
+        );
+    }
+
+    #[test]
+    fn x264_maps_cq_to_crf() {
+        let a = s(&["-c:v", "h264_nvenc", "-cq", "23"]);
+        assert_eq!(
+            adapt_h264_encoder_args(a, H264Encoder::X264),
+            s(&["-c:v", "libx264", "-crf", "23"])
+        );
+    }
+
+    #[test]
+    fn copy_paths_are_untouched_everywhere() {
+        let a = s(&["-c:v", "copy", "-c:a", "aac", "-hls_flags", "temp_file"]);
+        assert_eq!(
+            adapt_h264_encoder_args(a.clone(), H264Encoder::VideoToolbox),
+            a
+        );
+    }
 }
 
 #[cfg(test)]

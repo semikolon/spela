@@ -125,6 +125,9 @@ pub struct ServerState {
     /// ONLY the scrubber consumes) returns truth. Resume semantics are
     /// untouched — auto-resume + no-arg seek call `get_position` directly.
     pub live_position: Mutex<Option<LivePosition>>,
+    /// 2026-11-03: when an HLS segment (live or cached) was last served. The
+    /// reaper reads it so a viewer still fetching is never cleaned up mid-play.
+    pub last_segment_hit: Mutex<Option<std::time::Instant>>,
     /// 2026-07-28: last Open-in-VLC stream activity (Instant + title). The
     /// `/vlc/{id}/stream` path serves VLC directly and never registers a
     /// CurrentStream, so `/status` was blind to VLC playback. Each stream
@@ -519,6 +522,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         media_probe: Mutex::new(HashMap::new()),
         serving_path: Mutex::new(None),
         live_position: Mutex::new(None),
+        last_segment_hit: Mutex::new(None),
         vlc_activity: Mutex::new(None),
         vlc_commands: Mutex::new(Vec::new()),
         vlc_torrents: Mutex::new(Vec::new()),
@@ -596,10 +600,15 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
                     let watched = app
                         .derive_watched_through(show.imdb_id.as_deref(), &show.title)
                         .unwrap_or((0, 0));
-                    release_state.search_engine.tv_status_sources(
-                        show.tmdb_id, crate::search::SourceCheckMode::Background,
-                        watched, &show.seen_seasons,
-                    ).await;
+                    release_state
+                        .search_engine
+                        .tv_status_sources(
+                            show.tmdb_id,
+                            crate::search::SourceCheckMode::Background,
+                            watched,
+                            &show.seen_seasons,
+                        )
+                        .await;
                 }
             }
         });
@@ -2850,6 +2859,12 @@ async fn do_play(
         .and_then(parse_size_to_bytes)
         .unwrap_or(0);
     let corrupt_files = AppState::load(&state.state_dir).corrupt_files;
+    let target = req
+        .target
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&AppState::load(&state.state_dir).preferences.default_target)
+        .to_string();
 
     // v3.7.9 HLS cache HIT short-circuit. Compute the play's cache key
     // ONCE here from REQUEST INTENT (the only inputs available before the
@@ -2879,7 +2894,8 @@ async fn do_play(
         subs_intent,
         intro_intent,
         Some(title.as_str()),
-    );
+    )
+    .map(|key| crate::hls_cache::scope_key_to_target(&key, &target));
     let cache_hit_key: Option<String> = play_cache_key
         .as_deref()
         .filter(|k| crate::hls_cache::is_cache_hit(&media_dir, k))
@@ -3052,12 +3068,6 @@ async fn do_play(
     // Without this filter, a caller passing `{"target": ""}` would
     // bypass the cast block AND skip cast_health_monitor spawn AND
     // save `current.target = ":<cast_name>"` — silent broken-state.
-    let target = req
-        .target
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&app_state.preferences.default_target)
-        .to_string();
     let cast_name = req
         .cast_name
         .clone()
@@ -3922,6 +3932,9 @@ async fn do_play(
     // origin before saving. The cast metadata is fetched by the
     // Chromecast directly, so an attacker-controlled URL becomes a
     // probe vector via the TV's request log.
+    // The reaper below identifies its play by (pid, started_at): pid alone is
+    // 0 for every cache hit and Local Bypass play.
+    let play_started_at = Utc::now();
     app_state.current = Some(CurrentStream {
         // Empty when this is a library / remote-origin bridge play (no
         // torrent fallback) — consistent with the `pid == 0` Local-Bypass
@@ -3934,7 +3947,7 @@ async fn do_play(
         imdb_id: req.imdb_id.clone(),
         target: format!("{}:{}", target, cast_name),
         url: final_url.clone(),
-        started_at: Utc::now(),
+        started_at: play_started_at,
         pid,
         has_subtitles,
         subtitle_lang: if has_subtitles {
@@ -4006,12 +4019,9 @@ async fn do_play(
 
                 // Check if this stream is still the current one (user may have started another)
                 let app_state = AppState::load(&state.state_dir);
-                match &app_state.current {
-                    Some(c) if c.pid == torrent_pid => {} // Still our stream
-                    _ => {
-                        tracing::debug!("Reaper: stream replaced or stopped, exiting");
-                        break;
-                    }
+                if !reaper_owns_current(app_state.current.as_ref(), torrent_pid, play_started_at) {
+                    tracing::debug!("Reaper: stream replaced or stopped, exiting");
+                    break;
                 }
 
                 // "Is the torrent worker still alive?" check.
@@ -4061,17 +4071,31 @@ async fn do_play(
                     );
                     tokio::time::sleep(tokio::time::Duration::from_secs(grace_secs)).await;
 
+                    // A viewer still fetching segments is still watching (a long
+                    // pause, a rewind): the grace period is an estimate, the
+                    // segment requests are the observation. Wait it out.
+                    while viewer_recently_fetched(
+                        *lock_recover(&state.last_segment_hit),
+                        std::time::Instant::now(),
+                    ) && reaper_owns_current(
+                        AppState::load(&state.state_dir).current.as_ref(),
+                        torrent_pid,
+                        play_started_at,
+                    ) {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                    }
+
                     // Re-check we're still the active stream
                     let app_state = AppState::load(&state.state_dir);
-                    match &app_state.current {
-                        Some(c) if c.pid == torrent_pid => {
-                            tracing::info!(
-                                "Reaper: cleaning up torrent + media for '{}'",
-                                title_for_log
-                            );
-                            do_cleanup(&state);
-                        }
-                        _ => tracing::debug!("Reaper: stream changed during grace period"),
+                    if reaper_owns_current(app_state.current.as_ref(), torrent_pid, play_started_at)
+                    {
+                        tracing::info!(
+                            "Reaper: cleaning up torrent + media for '{}'",
+                            title_for_log
+                        );
+                        do_cleanup(&state);
+                    } else {
+                        tracing::debug!("Reaper: stream changed during grace period");
                     }
                     break;
                 }
@@ -4355,9 +4379,8 @@ fn do_cleanup(state: &SharedState) {
 ///     identifiable plays)
 ///   - the play was an offset-zero transcode (`ss_offset == 0.0`) — resumed
 ///     plays produce partial output that can't seed the cache
-///   - ffmpeg actually completed the transcode: the media playlist file
-///     contains `#EXT-X-ENDLIST` (this is the cheapest "did it finish?"
-///     signal; partial transcodes never have the marker)
+///   - every advertised H.264/AAC MPEG-TS variant covers the known source
+///     duration, ends cleanly, and has all referenced segments on disk
 ///   - the cache dir for this key doesn't already exist (avoid clobbering
 ///     a previous successful cache fill; LRU handles staleness over time)
 ///
@@ -4389,26 +4412,10 @@ fn try_promote_to_hls_cache(
         return;
     };
 
-    // ENDLIST gate: ffmpeg writes `#EXT-X-ENDLIST` only when its input EOFs
-    // naturally. SIGTERM'd / crashed ffmpegs leave the playlist without it.
-    // We check both variant playlists (multi-variant ladder) AND the
-    // synthetic master location (single-variant legacy). Either marker
-    // present = transcode completed for that variant.
-    let candidate_playlists = [
-        hls_dir.join("stream_0.m3u8"),
-        hls_dir.join("stream_1.m3u8"),
-        hls_dir.join("playlist.m3u8"),
-    ];
-    let endlist_seen = candidate_playlists.iter().any(|p| {
-        std::fs::read_to_string(p)
-            .map(|s| s.contains("#EXT-X-ENDLIST"))
-            .unwrap_or(false)
-    });
-    if !endlist_seen {
-        tracing::debug!(
-            "HLS cache fill skipped for key {:?}: no #EXT-X-ENDLIST in any candidate playlist (transcode incomplete or user-stopped early)",
-            key
-        );
+    // ffmpeg also writes ENDLIST on an interrupted input. Validate every
+    // advertised variant against the known source duration and its segment files.
+    if !crate::hls_cache::validate_complete_output(hls_dir) {
+        tracing::info!("HLS cache fill skipped: incomplete or incompatible output for {key}");
         return;
     }
 
@@ -4532,6 +4539,28 @@ pub fn compute_reaper_grace_secs(duration: Option<f64>, ss_offset: f64) -> u64 {
         }
         _ => UNKNOWN_DURATION_DEFAULT_SECS,
     }
+}
+
+/// Whether the reaper spawned for the play (`pid`, `started_at`) still owns
+/// `current`. pid is 0 for every cache hit and Local Bypass play, so it cannot
+/// identify a play on its own; `started_at` is set once per play.
+pub fn reaper_owns_current(
+    current: Option<&CurrentStream>,
+    pid: u32,
+    started_at: chrono::DateTime<Utc>,
+) -> bool {
+    matches!(current, Some(c) if c.pid == pid && c.started_at == started_at)
+}
+
+/// How recently a served HLS segment counts as someone watching.
+pub const REAPER_ACTIVITY_WINDOW_SECS: u64 = 300;
+
+pub fn viewer_recently_fetched(
+    last_hit: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    last_hit
+        .is_some_and(|t| now.saturating_duration_since(t).as_secs() < REAPER_ACTIVITY_WINDOW_SECS)
 }
 
 /// Sanity check for cast_health_monitor position saves.
@@ -6141,9 +6170,16 @@ async fn compute_following_shows(state: &SharedState, app: &AppState) -> (Vec<Va
     for show in &following.shows {
         let watched_opt = app.derive_watched_through(show.imdb_id.as_deref(), &show.title);
         let watched = watched_opt.unwrap_or((0, 0));
-        let Some(st) = state.search_engine.tv_status_sources(
-            show.tmdb_id, crate::search::SourceCheckMode::Home, watched, &show.seen_seasons,
-        ).await else {
+        let Some(st) = state
+            .search_engine
+            .tv_status_sources(
+                show.tmdb_id,
+                crate::search::SourceCheckMode::Home,
+                watched,
+                &show.seen_seasons,
+            )
+            .await
+        else {
             continue;
         };
         let (new_count, next_se) = match st.last_aired {
@@ -11528,6 +11564,7 @@ async fn handle_hls_segment(
         ua,
         range
     );
+    *lock_recover(&state.last_segment_hit) = Some(std::time::Instant::now());
     let path = resolve_media_dir(&state)
         .join("transcoded_hls")
         .join(&segment);
@@ -12236,6 +12273,9 @@ async fn handle_hls_cache_file(
             .header("Content-Type", "text/plain")
             .body(axum::body::Body::from("Forbidden"))
             .unwrap();
+    }
+    if !file.ends_with(".m3u8") {
+        *lock_recover(&state.last_segment_hit) = Some(std::time::Instant::now());
     }
     let content_type: &'static str = if file.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"
@@ -14942,6 +14982,67 @@ mod tests {
         // conservative 45-minute fallback — better than zero.
         assert_eq!(compute_reaper_grace_secs(None, 0.0), 2700);
         assert_eq!(compute_reaper_grace_secs(None, 1800.0), 2700);
+    }
+
+    // --- Reaper ownership (2026-11-03) ---
+    // Every cache hit, Local Bypass and Mac-local play has pid 0, so pid alone
+    // cannot tell two plays apart. A reaper left over from an earlier play
+    // cleaned up the next play mid-episode (Search Party S03E10, 2 November):
+    // it saw `current.pid == 0 == its own pid` and moved the live HLS dir away.
+    fn reaper_test_stream(pid: u32, started_at: chrono::DateTime<chrono::Utc>) -> CurrentStream {
+        CurrentStream {
+            magnet: String::new(),
+            title: "Search Party S03E10".into(),
+            show: None,
+            season: Some(3),
+            episode: Some(10),
+            imdb_id: Some("tt5460226".into()),
+            target: "vlc:VLC".into(),
+            url: "http://127.0.0.1:7890/hls/master.m3u8".into(),
+            started_at,
+            pid,
+            has_subtitles: true,
+            subtitle_lang: Some("eng".into()),
+            duration: Some(1503.0),
+            quality: Some("1080p".into()),
+            size: None,
+            poster_url: None,
+            ss_offset: 0.0,
+            smooth: false,
+            prepared_hls: false,
+            cache_key: None,
+        }
+    }
+
+    #[test]
+    fn reaper_does_not_own_a_later_play_with_the_same_pid() {
+        let first = chrono::Utc::now() - chrono::Duration::minutes(4);
+        let second = first + chrono::Duration::minutes(4);
+        let current = reaper_test_stream(0, second);
+        assert!(!reaper_owns_current(Some(&current), 0, first));
+    }
+
+    #[test]
+    fn reaper_owns_its_own_play() {
+        let started = chrono::Utc::now();
+        let current = reaper_test_stream(7, started);
+        assert!(reaper_owns_current(Some(&current), 7, started));
+        assert!(!reaper_owns_current(Some(&current), 8, started));
+        assert!(!reaper_owns_current(None, 7, started));
+    }
+
+    #[test]
+    fn a_viewer_fetching_segments_is_still_watching() {
+        let now = std::time::Instant::now();
+        assert!(viewer_recently_fetched(
+            Some(now - std::time::Duration::from_secs(8)),
+            now
+        ));
+        assert!(!viewer_recently_fetched(
+            Some(now - std::time::Duration::from_secs(REAPER_ACTIVITY_WINDOW_SECS + 1)),
+            now
+        ));
+        assert!(!viewer_recently_fetched(None, now));
     }
 
     #[test]

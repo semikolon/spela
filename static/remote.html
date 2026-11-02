@@ -1003,22 +1003,17 @@ const fmt=s=>{ s=Math.max(0,Math.round(s||0)); const h=s/3600|0,m=(s%3600)/60|0,
 
 /* ---------- state ---------- */
 const TKEY="spela_target", MKEY="spela_mode", PKEY="spela_pref";
-/* Default target is DEVICE-AWARE (2026-08-31). It used to be a flat {kind:"vlc"}
-   for everyone, which is right at the desk — the Mac monitor is the main watch
-   surface — and wrong in the hand: opening the remote on the phone silently
-   aimed ▶ at the Mac's desktop VLC, so a tap did nothing you could see on the
-   phone you were holding. The target lives in sessionStorage, so every fresh
-   phone visit landed back on that same wrong default.
-
-   A handheld is identified the way the hover-gleam block already splits the two
-   worlds: no hover + coarse pointer. That is a capability test, not UA sniffing,
-   so it survives new devices and iPadOS's desktop-class UA. On a handheld the
-   browser IS the screen in your hand, so "This device" is the honest default;
-   the desk keeps VLC. Either is one tap away on the target chip. */
+/* A phone is a remote as well as a screen: ask on each fresh page load.
+   Only an explicit choice on this page may route its first play. Desktop keeps VLC. */
 function defaultTarget(){
   const handheld = window.matchMedia
     && window.matchMedia("(hover: none) and (pointer: coarse)").matches;
-  return handheld ? {kind:"phone",name:"This device"} : {kind:"vlc",name:"VLC"};
+  return handheld ? null : {kind:"vlc",name:"VLC"};
+}
+function initialTarget(saved){
+  const fallback=defaultTarget();
+  if(!fallback) return null; // Do not resurrect a legacy implicit phone target.
+  try { return JSON.parse(saved||"null")||fallback; } catch { return fallback; }
 }
 /* ---------- FRUGAL MODE — shift-click a play button for the small file ----------
    Bandwidth costs money on a hotspot or on mobile data, and the ranker is tuned
@@ -1045,7 +1040,7 @@ addEventListener("keyup",   e=>{ if(e.key==="Shift") document.body.classList.rem
 addEventListener("blur",    ()=> document.body.classList.remove("frugalhint"));
 
 const S={
-  target:JSON.parse(sessionStorage.getItem(TKEY)||"null")||defaultTarget(),   // {kind:'chromecast'|'phone'|'vlc'|'shannon', name}; the pick lasts the session.
+  target:initialTarget(sessionStorage.getItem(TKEY)),   // {kind:'chromecast'|'phone'|'vlc'|'shannon', name}; the pick lasts the session.
   mode:sessionStorage.getItem(MKEY)||"movie",                 // 'movie' | 'tv'
   // 'auto' | 'uhd' | 'hd' | 'saver'. Session-scoped like the target, because it
   // answers a question about THIS sitting — which screen, which connection —

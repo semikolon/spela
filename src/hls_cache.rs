@@ -268,12 +268,106 @@ pub fn cached_duration(media_dir: &Path, key: &str) -> Option<f64> {
     }
 }
 
-/// Cache hit if BOTH the complete-marker AND the master manifest exist.
-/// Either alone is treated as miss (defensive — handles partial-fill
-/// failure modes and migration from older cache schemas).
+/// Cache hit if the complete-marker exists AND the set passes
+/// [`validate_complete_output`]. The marker alone was trusted until
+/// 2026-11-03, and ffmpeg writes `#EXT-X-ENDLIST` on an interrupted input
+/// too, so a 4-minute fragment of a 25-minute episode was promoted, marked
+/// and then served as the whole episode. Checking at hit time also retires
+/// every fragment promoted before the check existed.
 pub fn is_cache_hit(media_dir: &Path, key: &str) -> bool {
     let dir = cache_dir_for_key(media_dir, key);
-    dir.join(COMPLETE_MARKER).exists() && dir.join(MANIFEST_NAME).exists()
+    dir.join(COMPLETE_MARKER).exists() && validate_complete_output(&dir)
+}
+
+/// Fraction of the probed source duration a set must cover to count as the
+/// whole episode. Segment durations sum a few seconds short of ffprobe's
+/// container duration (1503 s of segments against 1508 s measured on a real
+/// set), so exact equality would reject every complete transcode.
+pub const MIN_COVERAGE: f64 = 0.98;
+
+/// Chromecast plays always get a canonical H.264 ladder; every other target
+/// may get an HEVC stream copy (fMP4) that a Chromecast cannot decode. One key
+/// for both let a phone's HEVC set be served to the TV (2026-10-28), so the
+/// Chromecast's sets live under their own key.
+pub fn scope_key_to_target(key: &str, target: &str) -> String {
+    if target == "chromecast" {
+        format!("{key}_cast")
+    } else {
+        key.to_string()
+    }
+}
+
+/// Whether `dir` holds a whole transcode: every variant the master lists has
+/// `#EXT-X-ENDLIST`, every segment and init file it references exists and is
+/// non-empty, and its segments add up to at least [`MIN_COVERAGE`] of the
+/// source duration recorded in `.source_duration`. An unknown source
+/// duration fails: the cache is an optimisation, and one more transcode
+/// costs less than serving a fragment as an episode.
+pub fn validate_complete_output(dir: &Path) -> bool {
+    let Some(source) = std::fs::read_to_string(dir.join(".source_duration"))
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|d| *d > 0.0)
+    else {
+        return false;
+    };
+    let Ok(master) = std::fs::read_to_string(dir.join(MANIFEST_NAME)) else {
+        return false;
+    };
+    let variants: Vec<&str> = master
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    if variants.is_empty() {
+        return false;
+    }
+    let non_empty = |name: &str| {
+        safe_name(name)
+            && std::fs::metadata(dir.join(name))
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+    };
+    variants.iter().all(|variant| {
+        if !safe_name(variant) {
+            return false;
+        }
+        let Ok(pl) = std::fs::read_to_string(dir.join(variant)) else {
+            return false;
+        };
+        if !pl.contains("#EXT-X-ENDLIST") {
+            return false;
+        }
+        let mut sum = 0.0_f64;
+        for line in pl.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("#EXTINF:") {
+                sum += rest
+                    .split(',')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .parse::<f64>()
+                    .unwrap_or(0.0);
+            } else if let Some(rest) = line.strip_prefix("#EXT-X-MAP:") {
+                let uri = rest
+                    .split("URI=\"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .unwrap_or("");
+                if !non_empty(uri) {
+                    return false;
+                }
+            } else if !line.is_empty() && !line.starts_with('#') && !non_empty(line) {
+                return false;
+            }
+        }
+        sum >= source * MIN_COVERAGE
+    })
+}
+
+/// A file name inside the cache dir: no separators, no parent references.
+fn safe_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && !name.contains("..")
 }
 
 /// Atomically mark a cache dir as complete by writing the sentinel marker.
@@ -660,6 +754,97 @@ mod tests {
         );
     }
 
+    // --- Whole-set validation (2026-11-03) ---
+
+    /// A set shaped like the real Mac fMP4 set (`master.m3u8` pointing at
+    /// `playlist.m3u8`, `#EXT-X-MAP:URI="init.mp4"`, `seg_NNNNN.m4s`), with
+    /// the given segment durations.
+    fn write_set(dir: &Path, source: f64, segs: &[f64], endlist: bool) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(".source_duration"), source.to_string()).unwrap();
+        fs::write(
+            dir.join(MANIFEST_NAME),
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=11129494,AVERAGE-BANDWIDTH=3694996,RESOLUTION=1920x1080\nplaylist.m3u8\n\n",
+        )
+        .unwrap();
+        fs::write(dir.join("init.mp4"), b"init").unwrap();
+        let mut pl = String::from(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:13\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-MAP:URI=\"init.mp4\"\n",
+        );
+        for (i, d) in segs.iter().enumerate() {
+            let name = format!("seg_{i:05}.m4s");
+            fs::write(dir.join(&name), b"seg").unwrap();
+            pl.push_str(&format!("#EXTINF:{d:.6},\n{name}\n"));
+        }
+        if endlist {
+            pl.push_str("#EXT-X-ENDLIST\n");
+        }
+        fs::write(dir.join("playlist.m3u8"), pl).unwrap();
+    }
+
+    #[test]
+    fn a_fragment_with_endlist_is_not_whole() {
+        // The 2 November set: ffmpeg was stopped 285 s into a 1503 s episode
+        // and still wrote #EXT-X-ENDLIST.
+        let tmp = TempDir::new().unwrap();
+        write_set(tmp.path(), 1503.0, &[95.0, 95.0, 94.87], true);
+        assert!(!validate_complete_output(tmp.path()));
+    }
+
+    #[test]
+    fn a_whole_set_a_few_seconds_short_of_ffprobe_is_whole() {
+        let tmp = TempDir::new().unwrap();
+        write_set(tmp.path(), 1508.0, &[750.0, 753.0], true);
+        assert!(validate_complete_output(tmp.path()));
+    }
+
+    #[test]
+    fn missing_endlist_segment_init_or_duration_fails() {
+        let tmp = TempDir::new().unwrap();
+        write_set(tmp.path(), 100.0, &[50.0, 50.0], false);
+        assert!(!validate_complete_output(tmp.path()), "no ENDLIST");
+
+        write_set(tmp.path(), 100.0, &[50.0, 50.0], true);
+        fs::remove_file(tmp.path().join("seg_00001.m4s")).unwrap();
+        assert!(!validate_complete_output(tmp.path()), "missing segment");
+
+        write_set(tmp.path(), 100.0, &[50.0, 50.0], true);
+        fs::remove_file(tmp.path().join("init.mp4")).unwrap();
+        assert!(!validate_complete_output(tmp.path()), "missing init");
+
+        write_set(tmp.path(), 100.0, &[50.0, 50.0], true);
+        fs::remove_file(tmp.path().join(".source_duration")).unwrap();
+        assert!(
+            !validate_complete_output(tmp.path()),
+            "unknown source duration"
+        );
+    }
+
+    #[test]
+    fn every_variant_must_be_whole() {
+        let tmp = TempDir::new().unwrap();
+        write_set(tmp.path(), 100.0, &[50.0, 50.0], true);
+        fs::write(
+            tmp.path().join(MANIFEST_NAME),
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nplaylist.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2\nstream_1.m3u8\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("stream_1.m3u8"),
+            "#EXTM3U\n#EXTINF:10.0,\nseg_00000.m4s\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        assert!(!validate_complete_output(tmp.path()));
+    }
+
+    #[test]
+    fn chromecast_sets_get_their_own_key() {
+        let k = "tt5460226_s03e10_eng_nointro_v1";
+        assert_eq!(scope_key_to_target(k, "chromecast"), format!("{k}_cast"));
+        assert_eq!(scope_key_to_target(k, "vlc"), k);
+        assert_eq!(scope_key_to_target(k, "phone"), k);
+    }
+
     // --- Cache hit detection ---
 
     #[test]
@@ -695,9 +880,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let key = "tt1234567_s01e01_eng_intro_v1";
         let dir = cache_dir_for_key(tmp.path(), key);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(MANIFEST_NAME), b"#EXTM3U\n").unwrap();
+        write_set(&dir, 1503.0, &[7.209, 4.875], true);
         mark_complete(&dir).unwrap();
+        // Two short segments do not cover 1503 s: a fragment, not a hit.
+        assert!(!is_cache_hit(tmp.path(), key));
+        write_set(&dir, 1503.0, &[750.0, 750.0], true);
         assert!(is_cache_hit(tmp.path(), key));
     }
 
@@ -834,8 +1021,7 @@ mod tests {
         assert!(!is_cache_hit(tmp.path(), &key));
         // Build the cache entry as the reaper would: create dir, write
         // manifest, mark complete.
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(MANIFEST_NAME), b"#EXTM3U\n").unwrap();
+        write_set(&dir, 3000.0, &[1500.0, 1500.0], true);
         mark_complete(&dir).unwrap();
         // Post-fill: hit.
         assert!(is_cache_hit(tmp.path(), &key));

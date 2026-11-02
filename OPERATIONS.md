@@ -284,7 +284,11 @@ When the server host is offline, a desktop can run its own instance for VLC play
 folders of its own (a config with `server` and `stream_host` on `127.0.0.1` and `media_dir`
 on a disk with room; the 100 GB media cap and its pruning apply there too), plus the VLC
 bridge started with `SPELA_URL=http://127.0.0.1:7890`. The two instances share nothing:
-history and resume positions on the desktop stay there. VLC needs no transcode, so no GPU.
+history and resume positions on the desktop stay there. A play still re-encodes when subtitles
+are burned in, an intro is joined or it starts at a seek; spela picks the H.264 encoder ffmpeg
+lists at start (NVENC, then VideoToolbox, then libx264, logged as `H.264 encoder for
+re-encodes`). Before 2026-11-03 it always asked for NVENC, so on a Mac every such play produced
+no segments and the 1080p sources failed over to 720p.
 `media_dir` must be on a filesystem with sparse files (APFS, ext4): on HFS+ the torrent's
 preallocated file has its full size and full allocation at once, passes the local-file
 completeness check, and VLC is served zeros (seen 2026-11-02). An APFS sparse bundle on an
