@@ -285,6 +285,10 @@ folders of its own (a config with `server` and `stream_host` on `127.0.0.1` and 
 on a disk with room; the 100 GB media cap and its pruning apply there too), plus the VLC
 bridge started with `SPELA_URL=http://127.0.0.1:7890`. The two instances share nothing:
 history and resume positions on the desktop stay there. VLC needs no transcode, so no GPU.
+`media_dir` must be on a filesystem with sparse files (APFS, ext4): on HFS+ the torrent's
+preallocated file has its full size and full allocation at once, passes the local-file
+completeness check, and VLC is served zeros (seen 2026-11-02). An APFS sparse bundle on an
+HFS+ disk works and caps the size.
 
 ## Build Note
 
