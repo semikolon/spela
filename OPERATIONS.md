@@ -277,6 +277,15 @@ restart waits out `TimeoutStopSec` and is then SIGKILLed — expected, and the j
 `stop-sigterm timed out, Killing` line is normal. Reconnection, not draining, is what
 carries a stream across the gap.
 
+## A Second Instance on a Desktop
+
+When the server host is offline, a desktop can run its own instance for VLC playback alone:
+`spela server --host 127.0.0.1` with `SPELA_CONFIG_DIR` and `SPELA_STATE_DIR` pointing at
+folders of its own (a config with `server` and `stream_host` on `127.0.0.1` and `media_dir`
+on a disk with room; the 100 GB media cap and its pruning apply there too), plus the VLC
+bridge started with `SPELA_URL=http://127.0.0.1:7890`. The two instances share nothing:
+history and resume positions on the desktop stay there. VLC needs no transcode, so no GPU.
+
 ## Build Note
 
 spela builds against a **fork of librqbit**, pinned by commit in `Cargo.toml`, for one
