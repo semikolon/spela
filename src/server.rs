@@ -64,7 +64,8 @@ pub struct ServerState {
     /// meaningful in seconds-of-video, which needs a duration, and while a stream is still
     /// buffering nothing is playing yet so `live_position` has none.
     pub media_dur: Mutex<HashMap<u32, f64>>,
-    pub vlc_first_poll: Mutex<HashMap<u32, Instant>>,
+    /// Per torrent: when readiness polling began after hashing, and the bytes it had then.
+    pub vlc_first_poll: Mutex<HashMap<u32, (Instant, u64)>>,
     pub vlc_buffer_progress: Mutex<HashMap<(u32, u32), BufferProgress>>,
     /// A VLC play in flight owns a COPY of the result list it was chosen from,
     /// keyed by the chosen release's infohash.
@@ -1576,6 +1577,31 @@ pub fn vlc_source_is_stalled(
     }
     let gate = vlc_stall_gate_secs(total_bytes);
     bytes == 0 && peers == 0 && speed_bps == 0 && elapsed_secs >= gate
+}
+
+/// Record a readiness poll and return when the clock started and how many bytes
+/// have arrived since.
+///
+/// Both gates above take bytes DELIVERED, never bytes present: librqbit's
+/// progress_bytes counts everything the torrent has, so a torrent resumed from disk
+/// starts with bytes > 0 and was never judged dead however long it sat with no peers
+/// (Search Party S03E10, 2026-11-03: 508 MB on disk, zero peers for four minutes).
+/// The clock and the baseline start when hashing ends, because progress_bytes climbs
+/// while existing data is verified and a baseline taken then would read the end of
+/// hashing as a delivery.
+pub fn mark_vlc_first_poll(
+    polls: &mut HashMap<u32, (Instant, u64)>,
+    tid: u32,
+    bytes: u64,
+    initializing: bool,
+    now: Instant,
+) -> (Instant, u64) {
+    if initializing {
+        polls.remove(&tid);
+        return (now, 0);
+    }
+    let (first, baseline) = *polls.entry(tid).or_insert((now, bytes));
+    (first, bytes.saturating_sub(baseline))
 }
 
 /// 12s normally, 30s for a large source — the same split do_play uses, because a big
@@ -10852,22 +10878,23 @@ async fn handle_vlc_ready(
     // sits at 0 bytes for ~30s and then flows (measured, HotD S03E04) — it has PEERS
     // throughout, so it survives this gate and gets its breakthrough. Gating on bytes
     // alone would kill exactly the sources f30fdca taught us to wait for.
-    let first = {
+    //
+    // Both gates count bytes DELIVERED since the first poll (mark_vlc_first_poll): a
+    // torrent resumed from disk starts with bytes > 0 and used to pass as alive forever.
+    // A torrent with nothing on disk is judged here, at once, as before. One resumed from
+    // disk is judged after the readiness check below, so an opening already on disk
+    // still plays instead of being thrown away.
+    let (first, delivered) = {
         let mut m = lock_recover(&state.vlc_first_poll);
-        if initializing {
-            m.insert(tid, Instant::now());
-        }
-        *m.entry(tid).or_insert_with(Instant::now)
+        mark_vlc_first_poll(&mut m, tid, bytes, initializing, Instant::now())
     };
+    let elapsed = first.elapsed().as_secs();
     let gate_secs = vlc_stall_gate_secs(total);
-    if vlc_source_is_stalled(
-        bytes,
-        peers,
-        speed,
-        first.elapsed().as_secs(),
-        total,
-        initializing,
-    ) {
+    let no_delivery = vlc_source_is_stalled(delivered, peers, speed, elapsed, total, initializing);
+    let race_due =
+        !finished && !initializing && race_switch_is_warranted(delivered, peers, speed, elapsed);
+    let judge_now = bytes == 0;
+    if judge_now && no_delivery {
         tracing::warn!(
             "vlc: torrent {} has no bytes, peers or speed after {}s — treating source as dead",
             tid,
@@ -10881,10 +10908,7 @@ async fn handle_vlc_ready(
     // Race the top candidates once the pick has been given a fair chance and is
     // delivering NOTHING. Runs at most once per source; the winner is returned as a
     // switch so the remote can move to it using the same rotation plumbing.
-    if !finished
-        && !initializing
-        && race_switch_is_warranted(bytes, peers, speed, first.elapsed().as_secs())
-    {
+    if judge_now && race_due {
         if let Some(winner) = maybe_race_sources_for_vlc(&state, id).await {
             if winner != id {
                 return Json(json!({
@@ -10936,6 +10960,29 @@ async fn handle_vlc_ready(
     let optimistic =
         healthy && opening_bytes >= (bitrate / 8).saturating_mul(20).max(16 * 1024 * 1024);
     let ready = vlc_opening_ready(finished, ends_ok, opening_ok, optimistic);
+    // The resumed-from-disk half of the two gates above: same verdicts, applied only
+    // when what is on disk cannot open the episode.
+    if !judge_now && !ready {
+        if race_due {
+            if let Some(winner) = maybe_race_sources_for_vlc(&state, id).await {
+                if winner != id {
+                    return Json(json!({
+                        "ready": false, "pct": 0, "switch_to": winner, "phase": "better source found",
+                    }));
+                }
+            }
+        }
+        if no_delivery {
+            tracing::warn!(
+                "vlc: resumed torrent {} received nothing and has no peers after {}s, and its opening is not on disk — treating source as dead",
+                tid,
+                gate_secs
+            );
+            return Json(json!({
+                "ready": false, "pct": 0, "dead": true, "phase": "no seeds",
+            }));
+        }
+    }
     if !ready && !initializing && stalled {
         return Json(json!({"ready": false, "dead": true,
             "phase": "source stopped delivering", "pct": (frac * 100.0) as u32}));
@@ -16141,10 +16188,11 @@ mod vlc_readiness_completeness_tests {
 #[cfg(test)]
 mod vlc_stall_gate_tests {
     use super::{
-        decide_start, ledger_title_for_release, race_switch_is_warranted, vlc_source_is_stalled,
-        vlc_stall_gate_secs, StartState, START_FAILURE_MEMORY,
+        decide_start, ledger_title_for_release, mark_vlc_first_poll, race_switch_is_warranted,
+        vlc_source_is_stalled, vlc_stall_gate_secs, StartState, START_FAILURE_MEMORY,
     };
-    use std::time::Duration;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn a_poisoned_swarm_survives_because_it_has_peers() {
@@ -16326,6 +16374,83 @@ mod vlc_stall_gate_tests {
     fn an_unknown_total_uses_the_short_gate() {
         // Metadata resolved but size unknown → treat as ordinary, not as large.
         assert_eq!(vlc_stall_gate_secs(0), 12);
+    }
+
+    // librqbit's progress_bytes counts every verified byte the torrent HAS, so a torrent
+    // resumed from disk starts the readiness poll with bytes > 0. The gates must count
+    // bytes delivered since the first poll, or a resumed source with no peers is never
+    // judged dead (Search Party S03E10, 2026-11-03: 508 MB on disk, zero peers).
+    const ON_DISK: u64 = 508_194_816;
+    const TOTAL: u64 = 1_622_091_358;
+
+    #[test]
+    fn a_resumed_torrent_with_no_peers_is_dead_past_the_gate() {
+        let mut m = HashMap::new();
+        let t0 = Instant::now();
+        let (_, d0) = mark_vlc_first_poll(&mut m, 1, ON_DISK, false, t0);
+        assert_eq!(d0, 0);
+        let (first, d) =
+            mark_vlc_first_poll(&mut m, 1, ON_DISK, false, t0 + Duration::from_secs(13));
+        assert_eq!(first, t0);
+        assert_eq!(d, 0);
+        assert!(vlc_source_is_stalled(d, 0, 0, 13, TOTAL, false));
+        assert!(race_switch_is_warranted(d, 0, 0, 13));
+    }
+
+    #[test]
+    fn a_resumed_torrent_that_receives_bytes_stays_alive() {
+        let mut m = HashMap::new();
+        let t0 = Instant::now();
+        mark_vlc_first_poll(&mut m, 1, ON_DISK, false, t0);
+        let (_, d) = mark_vlc_first_poll(
+            &mut m,
+            1,
+            ON_DISK + 16_384,
+            false,
+            t0 + Duration::from_secs(13),
+        );
+        assert_eq!(d, 16_384);
+        assert!(!vlc_source_is_stalled(d, 0, 0, 13, TOTAL, false));
+        assert!(!race_switch_is_warranted(d, 0, 0, 13));
+    }
+
+    #[test]
+    fn the_baseline_and_the_clock_start_when_hashing_ends() {
+        // While hashing, progress_bytes climbs as existing data is verified. A baseline
+        // taken then would read the end of hashing as a delivery.
+        let mut m = HashMap::new();
+        let t0 = Instant::now();
+        mark_vlc_first_poll(&mut m, 1, 100_000_000, true, t0);
+        mark_vlc_first_poll(&mut m, 1, 300_000_000, true, t0 + Duration::from_secs(2));
+        let t_live = t0 + Duration::from_secs(4);
+        let (first, d0) = mark_vlc_first_poll(&mut m, 1, ON_DISK, false, t_live);
+        assert_eq!(first, t_live);
+        assert_eq!(d0, 0);
+        let (_, d) =
+            mark_vlc_first_poll(&mut m, 1, ON_DISK, false, t_live + Duration::from_secs(12));
+        assert_eq!(d, 0);
+    }
+
+    #[test]
+    fn a_fresh_torrent_counts_from_zero_as_before() {
+        let mut m = HashMap::new();
+        let t0 = Instant::now();
+        mark_vlc_first_poll(&mut m, 1, 0, false, t0);
+        let (_, d) = mark_vlc_first_poll(&mut m, 1, 0, false, t0 + Duration::from_secs(12));
+        assert!(vlc_source_is_stalled(d, 0, 0, 12, 1_000_000_000, false));
+        let (_, d) = mark_vlc_first_poll(&mut m, 1, 1, false, t0 + Duration::from_secs(12));
+        assert!(!vlc_source_is_stalled(d, 0, 0, 12, 1_000_000_000, false));
+    }
+
+    #[test]
+    fn each_torrent_keeps_its_own_baseline() {
+        let mut m = HashMap::new();
+        let t0 = Instant::now();
+        mark_vlc_first_poll(&mut m, 1, ON_DISK, false, t0);
+        let (_, d2) = mark_vlc_first_poll(&mut m, 2, 0, false, t0);
+        assert_eq!(d2, 0);
+        let (_, d1) = mark_vlc_first_poll(&mut m, 1, ON_DISK + 5, false, t0);
+        assert_eq!(d1, 5);
     }
 }
 
