@@ -18,8 +18,8 @@
 
 ## Resolved non-obvious decisions (the only things asked)
 - **D1 — v1 scope: BOTH cast-control AND in-browser phone playback are first-class.** (Constrained by single-stream backend — see US-5 + Risks.)
-- **D2 — "My Library" browse of the curated BOHR collection is in v1.** Requires a new `serve-library` `/library/list` endpoint + spela aggregation.
-- **D3 — Search UX is hybrid:** tap → plays the ranker top pick; a "more sources" affordance reveals ranked releases for when the auto-pick is wrong (the tonight HEVC-vs-BOHR failure mode).
+- **D2 — "My Library" browse of the curated library collection is in v1.** Requires a new `serve-library` `/library/list` endpoint + spela aggregation.
+- **D3 — Search UX is hybrid:** tap → plays the ranker top pick; a "more sources" affordance reveals ranked releases for when the auto-pick is wrong (the tonight HEVC-vs-the library disk failure mode).
 
 ---
 
@@ -43,9 +43,9 @@
 - **While** the stream is live (still transcoding, no `#EXT-X-ENDLIST`), **the system shall** clip the scrubber's seekable max to the transcoded frontier (derived from `/status`) and visually mark the un-seekable region; **once** the set is complete, **the system shall** allow full scrub.
 - **While** in cold-start (~20–60 s, no media session yet), **the system shall** show an explicit "starting…" progress state — never a blank/blue ambiguous state or a premature error (the tonight "blue-icon confusion" is an explicit embarrassment criterion).
 
-### US-3 — My Library (BOHR) browse — *Primary (D2)*
-**As** the viewer, **I want** to browse my curated BOHR collection as posters and tap-play, **so that** my own library is first-class, not only torrent search.
-- AC-3.1: A "My Library" view renders the aggregated curated collection (BOHR Demeter films + TV) as a poster grid.
+### US-3 — My Library (the library disk) browse — *Primary (D2)*
+**As** the viewer, **I want** to browse my curated library collection as posters and tap-play, **so that** my own library is first-class, not only torrent search.
+- AC-3.1: A "My Library" view renders the aggregated curated collection (the library disk the film archive films + TV) as a poster grid.
 - AC-3.2: Posters are best-effort TMDB-enriched from the parsed title; missing art falls back to a clean titled tile (never a broken image).
 - AC-3.3: Tapping a library item plays it via the existing remote-origin **bridge** path (do_play → serve-library match) to the current target.
 - **If** the library origin is unreachable, **the system shall** show "library offline" (distinct from "empty") and still allow Search.

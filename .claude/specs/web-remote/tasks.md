@@ -1,10 +1,10 @@
 # Tasks: spela web remote
 
-> **STATUS (v3.7, shipped + deployed Darwin) — v1 FEATURE-COMPLETE:** **ALL TASKS DONE** — T-1..T-18 ✅ (T-4 TMDB poster enrichment shipped+deployed 2026-05-18). **T-16** real-device e2e = ongoing via the user's normal use (pause/resume bug found this way + fixed). Beyond spec scope: portless `spela.home` + the now-LIVE systemic-HTTPS successor (`https://spela.fredrikbranstrom.se`, spec `~/dotfiles/docs/lan_https_dns01_wildcard_spec_2026_05_18.md`). My-Library list+posters **LIVE** (stale-`/library/list`-binary fix; 57 films + T-4 posters e2e). **T-13 tap-to-play was NOT actually e2e-verified** — "end-to-end" covered list/posters only (*Built≠Verified*); two independent bugs (do_play magnet-gate-before-bridge + SPA target-picker pending-gap) blocked every real play, fixed v3.7.1 (deploy to Darwin to land). Only open follow-up: serve-library's TCC grant is code-signature-keyed so a Mac rebuild revokes it (re-Allow needed) — stable-codesign durability fix tracked at `TODO.md` "TCC durability hardening".
+> **STATUS (v3.7, shipped + deployed the server) — v1 FEATURE-COMPLETE:** **ALL TASKS DONE** — T-1..T-18 ✅ (T-4 TMDB poster enrichment shipped+deployed 2026-05-18). **T-16** real-device e2e = ongoing via the user's normal use (pause/resume bug found this way + fixed). Beyond spec scope: portless `spela.home` + the now-LIVE systemic-HTTPS successor (`https://spela.fredrikbranstrom.se`, spec `docs/lan_https_dns01_wildcard_spec_2026_05_18.md` in the owner's dotfiles). My-Library list+posters **LIVE** (stale-`/library/list`-binary fix; 57 films + T-4 posters e2e). **T-13 tap-to-play was NOT actually e2e-verified** — "end-to-end" covered list/posters only (*Built≠Verified*); two independent bugs (do_play magnet-gate-before-bridge + SPA target-picker pending-gap) blocked every real play, fixed v3.7.1 (deploy to the server to land). Only open follow-up: serve-library's TCC grant is code-signature-keyed so a Mac rebuild revokes it (re-Allow needed) — stable-codesign durability fix tracked at `TODO.md` "TCC durability hardening".
 
 ## Overview
 - **Scope**: M (frontend is a single no-build asset; the real new backend work is `/library/list` + the `/library` aggregator).
-- **External blockers**: none for v1. Cold-BOHR latency is mitigated by reusing the v3.6.3 liveness+timeout pattern; the v3.6.3 **self-warm** deploy (tracked in `TODO.md`) makes My-Library snappier but is NOT a blocker.
+- **External blockers**: none for v1. Cold-the library disk latency is mitigated by reusing the v3.6.3 liveness+timeout pattern; the v3.6.3 **self-warm** deploy (tracked in `TODO.md`) makes My-Library snappier but is NOT a blocker.
 - **Cut-first if time-boxed**: US-5 phone-direct (D1) → ship cast-remote + Search + My-Library first; phone-direct second. Then My-Library before search "more sources" polish.
 - **Speed vs correctness**: core-correct (search/play/seek/library reliable), edges iterative.
 
@@ -14,7 +14,7 @@
 - [ ] **T-1**: Add `static/remote.html` stub + `GET /remote` route + handler via `serve_static_with_range` (copy the `/cast-receiver.html` / `RECEIVER_HTML` pattern at `server.rs:~4258`). Verify `curl :7890/remote` 200s. *(unblocks all frontend)*
 
 ## Phase 2 — Backend: My Library endpoints (US-3, the only substantial new backend)
-- [ ] **T-2**: `serve-library` `GET /library/list` — enumerate the configured roots (reuse the same root-walk as `/library/match`; include the `Demeter…/` films + `…/TV`), return `[LibraryEntry]` (title/year parsed from raw_name, size, container, raw_name). No absolute-path leakage. Depends: none (sibling of existing match).
+- [ ] **T-2**: `serve-library` `GET /library/list` — enumerate the configured roots (reuse the same root-walk as `/library/match`; include the `the film archive…/` films + `…/TV`), return `[LibraryEntry]` (title/year parsed from raw_name, size, container, raw_name). No absolute-path leakage. Depends: none (sibling of existing match).
 - [ ] **T-3**: spela `GET /library` aggregator — fan out to `config.remote_origins` `/library/list` + local `config.library_dirs`; **reuse the v3.6.3 liveness-ping (2 s, no-FS) + generous (25 s) timeout** so a cold/absent origin yields `origin_status:"offline"` not a hang/empty; merge entries. Depends: T-2.
 - [x] **T-4** ✅ (2026-05-18): `SearchEngine::movie_poster(title, year)` — fail-soft, snappy (returns at first hit; year-precise `/search/movie` then no-year then `/search/multi`, fallbacks only on miss); `clean_title_for_tmdb` strips scene-release noise at the query boundary (LibraryEntry.title untouched → play/bypass intact); `handle_library` enriches per UNIQUE (title,year) with per-scan dedupe + bounded `JoinSet`. `None` → titled fallback (AC-3.2). **Verified live: 54/57 (95%), stable, 3s cold / 0s warm.** Final pipeline: clean-title → similarity-ranked best-of token-containment (stopword-filtered, per-word fuzzy) → year-param → `/search/movie` no-year → `/search/multi` → relaxed first-word / drop-last-word tiers (miss-only). Remaining 3 = honest ceiling (fansub-group prefix, double-feature, obscure BBC-doc episode) — no cleaning/service reliably matches; →~98% would need an OMDb/Fanart key (provisioning fork, opt-in, NOT auto-added). Frontend already rendered `e.poster_url` — zero frontend change.
 
@@ -39,7 +39,7 @@
 
 ## Phase 7 — Verify & ship
 - [ ] **T-16**: Local gates — `cargo fmt --check && cargo clippy -- -D warnings (new code) && cargo test`; manual e2e on a real phone (LAN): search→hybrid-play→TV; My-Library→bridge→TV; phone-direct watch; ⏮ restart; cold-start state; spela-down state.
-- [ ] **T-17**: Commit (vX.Y) + deploy Darwin (rebuild + restart) per the established per-host pattern; smoke-test `/remote` from the phone.
+- [ ] **T-17**: Commit (vX.Y) + deploy the server (rebuild + restart) per the established per-host pattern; smoke-test `/remote` from the phone.
 - [ ] **T-18**: One-line pointer in `TODO.md` (project convention: TODO references specs); note phone 720p-profile + SSE + native-app-go/no-go as deferred follow-ups informed by real v1 usage.
 
 ---

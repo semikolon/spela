@@ -1,4 +1,4 @@
-# cross-rs config for the Shannon thin-renderer aarch64 build (kiosk Phase 7).
+# cross-rs config for the aarch64 renderer build (kiosk Phase 7).
 #
 # WHY: reqwest keeps default-tls (native-tls → openssl-sys) on Linux — the
 # rustls unification was tried (f09f083) and reverted (f08f8d6) because the

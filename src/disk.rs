@@ -44,7 +44,7 @@ fn title_matches_active(name: &str, active_title: &str) -> bool {
 /// Minimum free space (MB) on the host filesystem below which spela refuses
 /// to start new downloads, regardless of whether its own `~/media/` cap is
 /// satisfied. This is a second, independent safety floor that protects
-/// Darwin's system-critical services — kamal-proxy, Docker builds, FalkorDB,
+/// the server's system-critical services — kamal-proxy, Docker builds, FalkorDB,
 /// Graphiti, AdGuard, journald, etc. — from being starved by a runaway
 /// torrent on a machine where spela is a low-priority tenant.
 const MIN_FS_FREE_MB: u64 = 20 * 1024;
@@ -72,7 +72,7 @@ pub fn check_space(media_dir: &Path) -> Result<Option<String>> {
     if let Some(free_mb) = fs_free_mb(media_dir) {
         if free_mb < MIN_FS_FREE_MB {
             return Ok(Some(format!(
-                "Host filesystem has only {}MB free (<{}MB safety floor); spela is backing off to keep Darwin's critical services unaffected.",
+                "Host filesystem has only {}MB free (<{}MB safety floor); spela is backing off to keep the server's critical services unaffected.",
                 free_mb, MIN_FS_FREE_MB
             )));
         }
@@ -630,7 +630,7 @@ mod tests {
 ///
 /// One `lseek(SEEK_HOLE)`: the kernel returns the offset of the first hole at or after the
 /// given position, which for a sparsely-written torrent file IS the end of the contiguous
-/// run. Measured on Darwin's ext4: 3 microseconds warm, so it is free on a 1 s poll and
+/// run. Measured on the server's ext4: 3 microseconds warm, so it is free on a 1 s poll and
 /// needs no piece bitmap from the torrent engine (librqbit's TorrentStats does not expose
 /// one).
 ///
@@ -714,7 +714,7 @@ mod runway_tests {
         // `contiguous_from` correctly reports all 8MB and the assertion below failed for
         // a filesystem reason rather than a logic one. (It failed on a clean checkout of
         // HEAD too, so it was never related to the change under test.) Production runs on
-        // Darwin/ext4, where the hole is real and this test does its job.
+        // the server/ext4, where the hole is real and this test does its job.
         //
         // st_blocks is the ground truth: a genuinely sparse 8MB file allocates far fewer
         // than 8MB of 512-byte blocks. If the FS declined to make a hole, the premise

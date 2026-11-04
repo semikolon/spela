@@ -5,7 +5,7 @@
 
 const SERVER = process.env.SPELA_SERVER || (() => {
   const i = process.argv.indexOf('--server')
-  return i >= 0 ? process.argv[i + 1] : 'darwin:7890'
+  return i >= 0 ? process.argv[i + 1] : 'media-server.lan:7890'
 })()
 
 const human = process.argv.includes('--human')

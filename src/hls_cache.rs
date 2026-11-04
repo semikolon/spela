@@ -75,7 +75,7 @@
 //!   1080p+480p adaptive ladders. Currently all transcodes produce the same
 //!   ladder, so this is moot until a quality-config knob exists.
 //! - **Distributed cache**: sharing the cache across multiple spela hosts
-//!   (e.g., Mac + Darwin). Out of scope.
+//!   (e.g., Mac + server). Out of scope.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;

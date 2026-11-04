@@ -223,13 +223,13 @@ use librqbit::{ListenerOptions, ListenerMode};
 let listen = Some(ListenerOptions {
     mode: ListenerMode::TcpAndUtp,       // or TcpOnly
     listen_addr: "0.0.0.0:<port>".parse()?,   // pick a stable port
-    enable_upnp_port_forwarding: true,   // helps behind NAT (Darwin is your router though — you can also just port-forward it)
+    enable_upnp_port_forwarding: true,   // helps behind NAT (the server is your router though — you can also just port-forward it)
     ..Default::default()
 });
 let sopts = SessionOptions { listen, trackers: my_trackers, ..Default::default() };
 ```
 
-Since spela runs on Darwin (which is also the router), you can open the chosen port in nftables directly instead of / in addition to UPnP — cleaner and deterministic. **Feasibility: config knob, ~5 lines. Impact: medium on obscure swarms, near-zero cost.** Second-priority after tracker injection.
+Since spela runs on the server (which is also the router), you can open the chosen port in nftables directly instead of / in addition to UPnP — cleaner and deterministic. **Feasibility: config knob, ~5 lines. Impact: medium on obscure swarms, near-zero cost.** Second-priority after tracker injection.
 
 ---
 
@@ -258,7 +258,7 @@ Request pipeline is already deep: `DEFAULT_PEER_REQUEST_WINDOW = 128` in-flight 
 ## Bottom line for spela
 
 1. **Ship tracker injection via `SessionOptions.trackers`** (bundle ~15–20 from `ngosang/trackerslist` `trackers_best.txt`; NOT `AddTorrentOptions.trackers` — that's dropped on the magnet path; the session path auto-respects `private`). **Highest impact, ~10 lines, targets the exact symptom.**
-2. **Turn on an inbound TCP(+uTP) listener + open the port on Darwin** (`SessionOptions.listen`). ~5 lines, medium impact on obscure swarms, near-zero downside.
+2. **Turn on an inbound TCP(+uTP) listener + open the port on the server** (`SessionOptions.listen`). ~5 lines, medium impact on obscure swarms, near-zero downside.
 3. **Trust — and verify via logs — the built-ins**: `torrent.stream()` already installs a 32 MB read-head priority window (`iter_next_pieces` → `acquire_piece`), and the 10×/3× steal logic already re-assigns the critical piece away from a slow peer. DHT + PEX are on by default. Nothing to build here.
 4. **Keep the existing race-ahead pre-buffer gate** — it's the correct complement to (3), covering the weakest-protection first-N-pieces window while `average_piece_download_time()` is still `None`.
 5. **Only if 1–4 don't close the gap:** consider the one upstream patch that's genuinely on-point — **proactive end-game for the first K pieces of an active stream** (duplicate-request the head piece from all holders, cancel on first completion) — and/or expose `PER_STREAM_BUF_DEFAULT` / steal thresholds as config. **Skip web seeds** (unsupported, big feature, low real-world payoff for release torrents).

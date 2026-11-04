@@ -138,7 +138,7 @@ The watched ledger and resume positions live in `state.json`, not a separate
    Poll each house Chromecast's media status; match to TMDB; auto-mark watched —
    so shows watched on Netflix/YouTube/Disney+ (not via spela) still land in the
    tracker with zero manual effort. **Cadence: 60s** (media state changes slowly;
-   Darwin is the router so keep the poll light; configurable via
+   the server is the router so keep the poll light; configurable via
    `auto_track_poll_secs`). **Config gate:** `auto_track_chromecasts` (default
    **true** — Fredrik approved). **Self-referential-safety:** READ-ONLY polling
    (`receiver.get_status` + `media.get_status`), NO control actions, only writes
@@ -151,7 +151,7 @@ The watched ledger and resume positions live in `state.json`, not a separate
      must NOT run on the axum runtime; mirrors `connect_with_retry`'s blocking
      model). 60s loop; gated off if `auto_track_chromecasts=false`.
    - For each configured video Chromecast (reuse `Chromecast Devices` list —
-     Fredriks TV + Vardagsrum; hardcoded fallback IPs in cast.rs), connect +
+     Bedroom TV + Living Room TV; hardcoded fallback IPs in cast.rs), connect +
      `receiver.get_status()` → `applications[]`.
    - **Read media status for ANY app_id, not just CC1AD845.** The media namespace
      `urn:x-cast:com.google.cast.media` is standard, so `device.media.get_status(
@@ -169,7 +169,7 @@ The watched ledger and resume positions live in `state.json`, not a separate
    - **Match** the observed title (+ year if present) → `tmdb_auto_detect` /
      `tmdb_search` → imdb_id + season/episode; TV metadata already carries S/E.
    - **STAGE, don't auto-mark — a Chromecast observation is HEURISTIC, not proof
-     it was FREDRIK (2026-07-13, load-bearing correction).** Housemates watch the
+     it was FREDRIK (2026-07-13, load-bearing correction).** Other people in the household watch the
      house TVs too (anchor: they're mid-Euphoria — episodes Fredrik's already
      seen). So a near-complete session (`current_time/duration ≥ 0.96`) is
      appended to a **pending-confirmation queue**, NOT the watched-ledger. On
@@ -184,7 +184,7 @@ The watched ledger and resume positions live in `state.json`, not a separate
    - **Pending queue model:** `AppState.pending_watched: Vec<PendingWatch>`
      ({key, title, series/S/E, device, first_seen, last_seen}) in state.json.
      Dedup by key. **Don't re-queue** a key that's already in the watched-ledger
-     (he's seen it) OR in a `dismissed_watched` set (he said "No" — so a housemate
+     (he's seen it) OR in a `dismissed_watched` set (he said "No" — so someone else
      binge doesn't re-nag every poll; each NEW episode is a new key, so genuinely
      new episodes still surface). Endpoints: `GET /pending-watched` (list),
      `POST /pending-watched/resolve` ({key, watched:bool} → yes: mark_watched +
@@ -279,13 +279,13 @@ The watched ledger and resume positions live in `state.json`, not a separate
   filtering well-matched titles rather than unknown ones. Lane-fit outranks the number;
   the score is still always stated. Full rule + bands: `taste_profile.md` (user-local).
 
-- **⚠ Arsenal data lives on the SPELA HOST (Darwin `~/.config/spela/`), not the Mac.**
-  spela serves `watchlist.json` from the host it runs on (Darwin). Authoring these
+- **⚠ Arsenal data lives on the SPELA HOST (the server `~/.config/spela/`), not the Mac.**
+  spela serves `watchlist.json` from the host it runs on (the server). Authoring these
   files on the Mac (this repo's dev box) does NOT reach spela — `/watchlist` reads
-  Darwin's copy. Edit on Darwin, or `scp` the file over after editing. (Bit us
+  the server's copy. Edit on the server, or `scp` the file over after editing. (Bit us
   2026-07-13: wrote `watchlist.json` on the Mac, `/watchlist` returned empty until
-  scp'd to Darwin.) `taste_profile.md` + `rt_watchlist_*.md` are the Claude-harness's
-  inputs — keep a copy wherever the harness runs; canonical = Darwin.
+  scp'd to the server.) `taste_profile.md` + `rt_watchlist_*.md` are the Claude-harness's
+  inputs — keep a copy wherever the harness runs; canonical = the server.
 - **User-local personal data** (all in `~/.config/spela/`, NOT the public repo):
   `taste_profile.md` (the recommender SSoT — meta-rules + genre map + "watched &
   loved" anchors), `rt_watchlist_2026-07-13.md` (RT watchlist import → slice-3 seed),
@@ -312,7 +312,7 @@ The watched ledger and resume positions live in `state.json`, not a separate
   *reason* the ledger cannot hold), which is why the duplication is deliberate rather
   than drift. Writing one without the other is the failure mode, and it is silent.
   The rule + the one-line `POST /watched-add` that closes the chain are documented at
-  the foot of `taste_profile.md` (user-local, Darwin).
+  the foot of `taste_profile.md` (user-local, the server).
 - Future spela iOS app (if built) is for playing/remote, not re-tracking — the tracker
   lives in the shared backend + the existing web-remote PWA.
 

@@ -99,7 +99,7 @@ static/
 
 ```javascript
 {
-  contentId: "http://192.168.4.1:7890/stream/transcode",
+  contentId: "http://192.168.1.10:7890/stream/transcode",
   contentType: "video/mp4",
   streamType: "BUFFERED",  // Custom receiver handles seeking
   duration: 6907,           // From ffprobe
@@ -111,16 +111,16 @@ static/
   tracks: [{
     trackId: 1,
     type: "TEXT",
-    trackContentId: "http://192.168.4.1:7890/cast-receiver/subs.vtt",
+    trackContentId: "http://192.168.1.10:7890/cast-receiver/subs.vtt",
     trackContentType: "text/vtt",
     subtype: "SUBTITLES",
     name: "English",
     language: "en"
   }],
   customData: {
-    introUrl: "http://192.168.4.1:7890/cast-receiver/intro.mp4",
-    seekRestartUrl: "http://192.168.4.1:7890/api/seek-restart",
-    positionUrl: "http://192.168.4.1:7890/api/position",
+    introUrl: "http://192.168.1.10:7890/cast-receiver/intro.mp4",
+    seekRestartUrl: "http://192.168.1.10:7890/api/seek-restart",
+    positionUrl: "http://192.168.1.10:7890/api/position",
     imdbId: "tt10548174"
   }
 }

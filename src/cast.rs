@@ -745,7 +745,7 @@ impl CastController {
 }
 
 /// 2026-07-13 (slice 5): a media session observed on a house Chromecast by the
-/// watch tracker. Read-only snapshot; NOT proof it was Fredrik (housemates use
+/// watch tracker. Read-only snapshot; NOT proof it was Fredrik (other people in the household use
 /// these TVs) — the server stages it for confirmation.
 #[derive(Debug, Clone)]
 pub struct ObservedPlayback {
@@ -1241,7 +1241,7 @@ mod build_cast_metadata_tests {
     #[test]
     fn realistic_apr28_hijack_case_emits_tvshow() {
         // The actual case from the bug report screenshot: Hijack S2E1
-        // playing on Fredriks TV with the persistent progress bar. With
+        // playing on Bedroom TV with the persistent progress bar. With
         // metadata wired correctly this should produce TvShow metadata.
         let m = CastMetadata {
             title: Some("Hijack S02E01".into()),

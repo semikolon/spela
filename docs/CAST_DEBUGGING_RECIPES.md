@@ -36,7 +36,7 @@ class MediaListener(BaseController):
         return True
 
 ccs, browser = pychromecast.get_chromecasts(timeout=5)
-target = next(cc for cc in ccs if cc.name == "Fredriks TV")
+target = next(cc for cc in ccs if cc.name == "Bedroom TV")
 target.wait(timeout=10)
 target.register_handler(MediaListener())  # MUST be before play_media
 
@@ -58,8 +58,8 @@ When a known commit was working and a recent one is broken:
 
 ```bash
 # At the broken commit:
-ssh darwin 'curl -sI -H "Origin: https://www.gstatic.com" \
-    http://192.168.4.1:7890/hls/master.m3u8'
+ssh <server> 'curl -sI -H "Origin: https://www.gstatic.com" \
+    http://192.168.1.10:7890/hls/master.m3u8'
 
 # Checkout known-good commit, rebuild, restart, re-run curl.
 # Diff the response headers — the regression usually pops out as a
@@ -69,12 +69,12 @@ ssh darwin 'curl -sI -H "Origin: https://www.gstatic.com" \
 
 ---
 
-## Reusable Darwin diagnostic env
+## Reusable the server diagnostic env
 
 Pre-built pychromecast venv + Apple BipBop content + test scripts at `/tmp/cc-debug/` (~13MB, survives until reboot). Recreate via:
 
 ```bash
-ssh darwin 'mkdir -p /tmp/cc-debug && cd /tmp/cc-debug && uv venv && uv pip install --python /tmp/cc-debug/.venv/bin/python pychromecast'
+ssh <server> 'mkdir -p /tmp/cc-debug && cd /tmp/cc-debug && uv venv && uv pip install --python /tmp/cc-debug/.venv/bin/python pychromecast'
 ```
 
 Then download Apple's BipBop HLS subset (`master.m3u8` + `gear1/prog_index.m3u8` + first 3 `fileSequence*.ts`) into `/tmp/cc-debug/apple_hls/` if you want to test serving non-spela HLS via Python `http.server`.
@@ -97,12 +97,12 @@ Then download Apple's BipBop HLS subset (`master.m3u8` + `gear1/prog_index.m3u8`
 
 ## 4. Local-library bridge & cold-source failure modes (May 17, 2026 movie-night firefight)
 
-The night's meta-lesson: **the authoritative oracle is the Darwin SERVER journal (`ssh darwin journalctl -u spela`), NOT client `spela status` nor inference.** Every misdiagnosis came from trusting client status / a hypothesis over the journal. On any "not playing / wrong source" report, read the journal FIRST and reconcile the `Local Bypass` / `remote origin` / `race-ahead` / `PRE-CLEANUP` event lines within the reported time window.
+The night's meta-lesson: **the authoritative oracle is the server journal (`ssh <server> journalctl -u spela`), NOT client `spela status` nor inference.** Every misdiagnosis came from trusting client status / a hypothesis over the journal. On any "not playing / wrong source" report, read the journal FIRST and reconcile the `Local Bypass` / `remote origin` / `race-ahead` / `PRE-CLEANUP` event lines within the reported time window.
 
 | Symptom | Root cause | Diagnostic → fix |
 |---|---|---|
-| `pid:0` + streaming but wrong/HEVC source | `pid:0` is Local Bypass — **both** the Darwin media cache AND remote-origin bridge report it; not proof of the bridge | Journal must show `Local Bypass (remote origin http://<mac>:7891): … streaming via …/library/stream`. If it shows `Local Bypass: matched in "/mnt/hdd/spela-media"` (media cache moved off `~/media` 2026-08-23) it took a Darwin-cached copy, not BOHR |
-| Bridge "not used" for a BOHR title | A prior torrent fallback left the file in the Darwin media cache; `do_play` scans `media_dir` **before** `remote_origins`, so the leftover shadows the bridge for that title until disk-cap cleanup | `ssh darwin 'rm -rf /mnt/hdd/spela-media/<Title>*'` (transient re-downloadable cache; media cache moved off `~/media` 2026-08-23) → replay → bridge engages. Known-open: "prefer curated library over transient torrent rip" option (TODO) |
-| Won't start; `ls transcoded_hls/*.ts`=0 yet `pgrep -c ffmpeg`>1 | **NVENC-contention death-spiral**: churned restarts + cast_health_monitor recast each spawn ffmpeg (2 `h264_nvenc` each); GTX 1650 session limit → none init → 0 segments → IDLE → recast → another contending ffmpeg → ∞ | `spela stop; spela kill-workers`; loop-verify `ssh darwin pgrep ffmpeg`=0 + `nvidia-smi` encoder 0%; THEN one clean play. Never blind-retry into the spiral |
-| First play after long idle silently torrents not bridges | BOHR is a USB **HDD** spinning down ~10min idle; first `/library/match` blocks on spin-up (5-15s+) | Fixed v3.6.3 (liveness-ping + 25s timeout + serve-library self-warm). If recurs: time `curl localhost:7891/library/match` cold vs warm; `pgrep -f serve-library`; no-FS `/library/stream?h=zzz` → fast 410 = process alive, FS just cold |
+| `pid:0` + streaming but wrong/HEVC source | `pid:0` is Local Bypass — **both** the server media cache AND remote-origin bridge report it; not proof of the bridge | Journal must show `Local Bypass (remote origin http://<mac>:7891): … streaming via …/library/stream`. If it shows `Local Bypass: matched in "/mnt/hdd/spela-media"` (media cache moved off `~/media` 2026-08-23) it took a server-cached copy, not the library disk |
+| Bridge "not used" for a library-disk title | A prior torrent fallback left the file in the server media cache; `do_play` scans `media_dir` **before** `remote_origins`, so the leftover shadows the bridge for that title until disk-cap cleanup | `ssh <server> 'rm -rf /mnt/hdd/spela-media/<Title>*'` (transient re-downloadable cache; media cache moved off `~/media` 2026-08-23) → replay → bridge engages. Known-open: "prefer curated library over transient torrent rip" option (TODO) |
+| Won't start; `ls transcoded_hls/*.ts`=0 yet `pgrep -c ffmpeg`>1 | **NVENC-contention death-spiral**: churned restarts + cast_health_monitor recast each spawn ffmpeg (2 `h264_nvenc` each); GTX 1650 session limit → none init → 0 segments → IDLE → recast → another contending ffmpeg → ∞ | `spela stop; spela kill-workers`; loop-verify `ssh <server> pgrep ffmpeg`=0 + `nvidia-smi` encoder 0%; THEN one clean play. Never blind-retry into the spiral |
+| First play after long idle silently torrents not bridges | the library disk is a USB **HDD** spinning down ~10min idle; first `/library/match` blocks on spin-up (5-15s+) | Fixed v3.6.3 (liveness-ping + 25s timeout + serve-library self-warm). If recurs: time `curl localhost:7891/library/match` cold vs warm; `pgrep -f serve-library`; no-FS `/library/stream?h=zzz` → fast 410 = process alive, FS just cold |
 | Resume position unrecoverable / end-of-movie | Repeated `spela play --seek 0` clears HWM; an abandoned stream auto-plays to EOF saving end-position → `state.json` HWM useless | No log recovery once overwritten; fall back to a content/scene anchor (web-research the scene timestamp). The web-remote is the real prevention (no more `--seek 0` CLI churn) |

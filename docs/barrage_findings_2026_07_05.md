@@ -6,10 +6,10 @@ test instance. Goal (Fredrik): "make them stream as perfectly as they can."
 
 ## Test rig (representative, isolated from production)
 
-A SECOND spela instance on Darwin, port 7891, casting to "Fredriks TV" MUTED
+A SECOND spela instance on the server, port 7891, casting to "Bedroom TV" MUTED
 (volume 0 — audio leaks into the bedroom via the HDMI switch). Launched with:
 `SPELA_STATE_DIR=~/.spela-test SPELA_MEDIA_DIR=~/media-test SPELA_EPHEMERAL_DHT=1
-TMDB_API_KEY=<from prod unit> spela server --host 192.168.4.1 --port 7891`.
+TMDB_API_KEY=<from prod unit> spela server --host 192.168.1.10 --port 7891`.
 
 - **`SPELA_EPHEMERAL_DHT=1`** (added this session): DHT stays ON but skips the
   shared `~/.cache/com.rqbit.dht/dht.json`, so librqbit binds an ephemeral
@@ -18,7 +18,7 @@ TMDB_API_KEY=<from prod unit> spela server --host 192.168.4.1 --port 7891`.
   discovery (859-seed torrent saw 1 peer at t=3s) and inflated every latency
   measurement — do NOT use it for representative testing.
 - Kill the test instance ONLY by port (`fuser -k 7891/tcp`), NEVER `pkill -f`
-  (production's ExecStart is the identical `spela server --host 192.168.4.1`).
+  (production's ExecStart is the identical `spela server --host 192.168.1.10`).
 
 ## CRITICAL bug fixed — cross-instance ffmpeg kill (caused Fredrik's looping Silo)
 

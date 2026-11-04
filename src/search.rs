@@ -1761,9 +1761,9 @@ fn plausible_runtime_min(minutes: Option<u64>) -> Option<u32> {
 /// Canonical torrent-result ranker, shared between production and tests.
 /// Sorts `results` in place using the 5-tier order, then assigns 1-based ids.
 ///
-/// **Apr 15 v3.1.0 policy rework**: 1080p is the Sarpetorp sweet spot (TVs
+/// **Apr 15 v3.1.0 policy rework**: 1080p is the sweet spot for the TVs it was built for (TVs
 /// max at 1080p native; 4K is wasted) AND HEVC→H.264 transcode at 1080p is
-/// fast enough on Darwin's GTX 1650 (~6x realtime) to absorb the latency
+/// fast enough on the server's GTX 1650 (~6x realtime) to absorb the latency
 /// cost. The old v3.0.0 policy put H.264 insta-play above resolution
 /// (tier 2 dominated tier 4); the new policy inverts this because a 1080p
 /// HEVC transcode is preferable to a 720p H.264 insta-play on a 1080p TV.
@@ -1822,7 +1822,7 @@ fn plausible_runtime_min(minutes: Option<u64>) -> Option<u32> {
 ///   3 → 1080p with <50 seeds (unviable, demoted below all viable lower tiers)
 ///   4 →  720p with <50 seeds
 ///   5 →  480p with <50 seeds
-///   6 → 2160p / 4K / UHD (any seed count — Sarpetorp policy demotes 4K)
+///   6 → 2160p / 4K / UHD (any seed count — house policy demotes 4K)
 ///   7 → unknown / unclassified resolution
 ///
 /// **Generic lesson** (consider when designing other multi-criteria
@@ -1833,9 +1833,9 @@ fn plausible_runtime_min(minutes: Option<u64>) -> Option<u32> {
 /// structurally guaranteed.
 /// 2026-09-05: the resolution policy is TARGET-SCOPED, exactly as the codec
 /// preference has been since v3.19, and along the same axis — does this target
-/// re-encode through Darwin's NVENC, or decode natively?
+/// re-encode through the server's NVENC, or decode natively?
 ///
-/// `transcoding` TRUE (chromecast, shannon): the historical Sarpetorp mapping.
+/// `transcoding` TRUE (chromecast, renderer): the historical mapping.
 /// Those screens are 1080p, and 4K NVENC transcode is about 3x the work for
 /// pixels the panel cannot show, so 2160p stays demoted below everything.
 ///
@@ -2086,7 +2086,7 @@ impl QualityPref {
 /// where a caller silently swaps them and nothing complains.
 #[derive(Clone, Copy)]
 pub struct RankOpts<'a> {
-    /// This target re-encodes through Darwin's NVENC (chromecast, shannon), as
+    /// This target re-encodes through the server's NVENC (chromecast, renderer), as
     /// opposed to decoding natively (vlc, phone). Drives the codec preference,
     /// the resolution policy and the Dolby Vision gate — all three turn on the
     /// same question.
@@ -2329,7 +2329,7 @@ fn rank_bucket(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankBucket {
 
     // Tier 1: non-DV > DV — a HARD gate, but ONLY for the transcoding target.
     //
-    // The reason it exists is specific to one piece of hardware: Darwin's GTX
+    // The reason it exists is specific to one piece of hardware: the server's GTX
     // 1650 NVENC cannot parse a Dolby Vision profile 5/7 RPU, so a DV release
     // cast to a Chromecast produces no output at all. That is a genuine
     // capability wall and stays absolute.
@@ -2596,7 +2596,7 @@ fn rank_key(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankKey {
     // (Cinecalidad 99-seed Apr/May 2026 case) blocked librqbit's
     // first-piece fetch past ffmpeg's reconnect budget — 0 segments,
     // 75 s blue-cast icon, manual recovery. HEVC→H.264 NVENC transcode
-    // on Darwin's GTX 1650 adds 5-10 s of cold-start cost, strictly
+    // on the server's GTX 1650 adds 5-10 s of cold-start cost, strictly
     // cheaper than waiting for a starved swarm or failing entirely. The
     // 30× threshold is "user-tuned conservative" — at 30× the H.264
     // winner is unambiguously inferior; below 30× the codec-cost
@@ -3650,7 +3650,7 @@ pub(crate) fn size_tier(r: &TorrentResult) -> u32 {
 /// / `uhd` tags. Called on lowercased title internally.
 ///
 /// 2026-09-05, correcting a note that stood here since Apr 15: this doc used to
-/// bake the "1080p target, 4K demoted" Sarpetorp policy into the bucket numbers
+/// bake the "1080p target, 4K demoted" house policy into the bucket numbers
 /// and told the next reader that flipping them was "the only change needed" for
 /// 4K. Both halves were wrong by then. The policy is now per-target and lives in
 /// `effective_res_tier` (a Chromecast wants 1080p, the Mac monitor wants 2160p,
@@ -3733,7 +3733,7 @@ fn is_hevc_from_title(title: &str) -> bool {
 /// Detect Dolby Vision profile marker in torrent filename.
 ///
 /// Dolby Vision profiles 5 and 7 embed an RPU NAL unit that NVENC on
-/// Darwin's GTX 1650 cannot decode cleanly. ffmpeg logs "Error parsing DOVI
+/// the server's GTX 1650 cannot decode cleanly. ffmpeg logs "Error parsing DOVI
 /// NAL unit" and "RPU validation failed: 0 <= el_bit_depth_minus8 = 32 <= 8"
 /// for every frame and the transcode crawls at <1x realtime, which can't
 /// sustain a live Chromecast stream. Until/unless we get a GPU that handles
@@ -6442,7 +6442,7 @@ mod tests {
     // would have started streaming within seconds. The fix: when the HEVC
     // alternative has ≥30× the seeds of the H.264 tier-4 winner, override
     // the codec preference. Rationale: 1080p HEVC→H.264 NVENC transcode
-    // on Darwin's GTX 1650 adds 5-10 s of cold-start cost; a starved
+    // on the server's GTX 1650 adds 5-10 s of cold-start cost; a starved
     // swarm adds *minutes* (or fails entirely). The latency tradeoff
     // flips.
 
@@ -6522,7 +6522,7 @@ mod tests {
     fn test_ranking_seed_disparity_does_not_override_dv_gate() {
         // Tier 2 (non-DV > DV) is a HARD GPU gate. Even a massive seed
         // advantage on a DV release cannot promote it over a non-DV
-        // alternative (NVENC on Darwin's GTX 1650 can't decode DV RPU).
+        // alternative (NVENC on the server's GTX 1650 can't decode DV RPU).
         let mut results = vec![
             make_result(1, "Movie.1080p.DV.HEVC.mkv", 10000, Some(0)),
             make_result(2, "Movie.1080p.x264.mkv", 100, Some(0)),
@@ -6886,7 +6886,7 @@ mod tests {
     #[test]
     fn test_resolution_tier_ordering_v31_policy() {
         // v3.1.0 policy: 1080p is the sweet spot, 2160p demoted below 480p
-        // because Sarpetorp TVs can't display 2160p natively and 4K NVENC
+        // because the house TVs can't display 2160p natively and 4K NVENC
         // transcode is wasted effort + bandwidth.
         assert_eq!(resolution_tier("Movie.1080p.WEB-DL.mkv"), 0);
         assert_eq!(resolution_tier("The Boys S05E03 1080p AMZN"), 0);
@@ -7956,7 +7956,7 @@ mod tests {
         // v3.1.0 POLICY INVERSION from v3.0.0. The old tier 2 (H.264 > HEVC)
         // sat above tier 4 (resolution), so 720p H.264 won over 1080p HEVC.
         // v3.1.0 swaps them: resolution is tier 3, codec is tier 4. The
-        // reasoning: HEVC → H.264 transcode on Darwin's GTX 1650 at 1080p
+        // reasoning: HEVC → H.264 transcode on the server's GTX 1650 at 1080p
         // runs at ~6x realtime (fast enough to absorb the cold-start cost),
         // so the quality benefit of 1080p HEVC beats the insta-play benefit
         // of 720p H.264 on a 1080p TV.
@@ -7980,7 +7980,7 @@ mod tests {
     #[test]
     fn test_ranking_1080p_h264_beats_2160p_h264_v31_policy() {
         // v3.1.0: 2160p is demoted to tier 3 rank 3 (below 1080p, 720p,
-        // 480p) because Sarpetorp TVs max at 1080p native. A 1080p H.264
+        // 480p) because the house TVs max at 1080p native. A 1080p H.264
         // release with 100 seeds must beat a 2160p H.264 release with
         // 500 seeds because 2160p is wasted on a 1080p display AND the
         // 4K transcode is unnecessarily heavy.

@@ -2,7 +2,7 @@
 
 **Date discovered**: 2026-04-30 evening (Wilderpeople movie night)
 **Date resolved**: 2026-05-01 afternoon
-**Symptom**: every `spela play` to either Chromecast (Fredriks TV / Vardagsrum) ended with `idle_reason=ERROR` on the receiver and `process_dead` on spela's side. Movie was watched on Netflix as a fallback; spela was unusable.
+**Symptom**: every `spela play` to either Chromecast (Bedroom TV / Living Room TV) ended with `idle_reason=ERROR` on the receiver and `process_dead` on spela's side. Movie was watched on Netflix as a fallback; spela was unusable.
 **Resolution**: 5 commits across `master` (`2c598f4`, `27b07b3`, `af3fc41`, `3dff940`, `dcbaed7`) plus one revert (`40809e5`). Final state: cast loads in 2-4s; 287 unit tests pass; receiver returns `BUFFERING` not `LOAD_FAILED`.
 
 ---
@@ -36,7 +36,7 @@ Read `~/.spela/ffmpeg.log`:
 Error opening input file http://127.0.0.1:7890/torrent/3/stream/0.
 ```
 
-Spela's systemd unit binds via `--host 192.168.4.1` (LAN-only, intentional — Darwin is the router and `0.0.0.0` would expose 7890 on WAN). But ffmpeg's URL builder hardcodes `127.0.0.1`. Loopback wasn't bound. **Fix**: `compute_bind_addresses()` returns dual-bind when `--host` is non-loopback non-wildcard. 7 regression tests pin the WAN-not-exposed invariant.
+Spela's systemd unit binds via `--host 192.168.1.10` (LAN-only, intentional — the server is the router and `0.0.0.0` would expose 7890 on WAN). But ffmpeg's URL builder hardcodes `127.0.0.1`. Loopback wasn't bound. **Fix**: `compute_bind_addresses()` returns dual-bind when `--host` is non-loopback non-wildcard. 7 regression tests pin the WAN-not-exposed invariant.
 
 ### Phase 3 — peel off bug #2 (cold-start kill)
 
@@ -79,7 +79,7 @@ After fix #3, ffmpeg produces segments cleanly. But cast still fails. The master
 
 Discovered Apr 25 docs in CLAUDE.md showed spela was working then. Bisected against the Apr 30 v3.3.0 commits.
 
-- Pre-v3.3.0 (`17ef4c0`): wouldn't build on current Darwin (webtorrent CLI uninstalled).
+- Pre-v3.3.0 (`17ef4c0`): wouldn't build on current the server (webtorrent CLI uninstalled).
 - `7445530` (H1 SSRF only): **cast PLAYS in 2s.** ✅
 - `14671d4` (H2 Host-header + tightened CORS): **cast FAILS with ERROR.** ❌
 
@@ -95,7 +95,7 @@ H2 changed `CorsLayer::allow_origin(Any)` → `CorsLayer::allow_origin(specific_
 
 ### Phase 8 — fix #5
 
-Reverted CORS to `allow_origin(Any)`. Verified post-deploy: response now includes `access-control-allow-origin: *`; pychromecast cast → `BUFFERING` in 4s; user confirmed audible BipBop and Wilderpeople playback on Fredriks TV.
+Reverted CORS to `allow_origin(Any)`. Verified post-deploy: response now includes `access-control-allow-origin: *`; pychromecast cast → `BUFFERING` in 4s; user confirmed audible BipBop and Wilderpeople playback on Bedroom TV.
 
 ---
 

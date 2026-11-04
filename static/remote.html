@@ -275,7 +275,7 @@
   .card .dline{margin:.2rem .7rem 0}
   .detail .body>.dline{margin:.35rem 0 .1rem}
   /* 2026-07-13: Chromecast auto-track confirm prompt (slice 5). A house-TV
-     session was detected as watched — but housemates use these TVs, so ASK
+     session was detected as watched — but other people in the household use these TVs, so ASK
      before it enters Fredrik's ledger. */
   .pending{display:none;margin:.2rem 0 .6rem}
   .pending.on{display:block}
@@ -757,8 +757,8 @@
   .cardplay{cursor:pointer}
   .cardplay:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   /* ---- Hover gleam -------------------------------------------------------
-     Ported from brf-auto's dashboard queue-card refresh swoosh
-     (`~/Projects/brf-auto/frontend/src/index.css` → `.queue-card-swoosh`):
+     Ported from another project's dashboard queue-card refresh swoosh
+     (its `.queue-card-swoosh`):
      a 120deg white gradient translating -120% → 120% over 1.1s ease-out.
      Two deliberate changes for spela:
        (1) INTENSITY. The source peaks at rgba(255,255,255,.7), calibrated for
@@ -1046,7 +1046,10 @@ function defaultTarget(){
 function initialTarget(saved){
   const fallback=defaultTarget();
   if(!fallback) return null; // Do not resurrect a legacy implicit phone target.
-  try { return JSON.parse(saved||"null")||fallback; } catch { return fallback; }
+  let t;
+  try { t=JSON.parse(saved||"null")||fallback; } catch { return fallback; }
+  if(t&&t.kind==="shannon") t={...t,kind:"renderer"};  // the renderer target's older name
+  return t;
 }
 /* ---------- FRUGAL MODE — shift-click a play button for the small file ----------
    Bandwidth costs money on a hotspot or on mobile data, and the ranker is tuned
@@ -1073,7 +1076,7 @@ addEventListener("keyup",   e=>{ if(e.key==="Shift") document.body.classList.rem
 addEventListener("blur",    ()=> document.body.classList.remove("frugalhint"));
 
 const S={
-  target:initialTarget(sessionStorage.getItem(TKEY)),   // {kind:'chromecast'|'phone'|'vlc'|'shannon', name}; the pick lasts the session.
+  target:initialTarget(sessionStorage.getItem(TKEY)),   // {kind:'chromecast'|'phone'|'vlc'|'renderer', name}; the pick lasts the session.
   mode:sessionStorage.getItem(MKEY)||"movie",                 // 'movie' | 'tv'
   // 'auto' | 'uhd' | 'hd' | 'saver'. Session-scoped like the target, because it
   // answers a question about THIS sitting — which screen, which connection —
@@ -2522,7 +2525,7 @@ async function lazyBackdrop(tap, title, isTV){
 }
 
 // Chromecast auto-track confirm prompt (slice 5). The tracker detects
-// near-complete sessions on the house TVs, but housemates watch those too — so
+// near-complete sessions on the house TVs, but other people in the household watch those too — so
 // nothing enters Fredrik's watched-ledger without a "Yes". Surfaced on the
 // search/landing view; each item gets Yes (→ mark watched) / No (→ dismiss,
 // won't re-nag that episode).
@@ -2750,7 +2753,7 @@ async function playAudio(spec){
   const isPod=spec.kind==="podcast";
   const title=isPod?spec.ep.title:spec.name, sub=isPod?spec.show.title:"Audiobook", art=isPod?spec.show.artwork:"";
   const k=S.target.kind;
-  if(k==="shannon"){ toast("Shannon doesn’t play podcasts or books yet. Pick another target."); openSheet(); return; }
+  if(k==="renderer"){ toast(S.target.name+" doesn’t play podcasts or books yet. Pick another target."); openSheet(); return; }
   if(k==="vlc"){
     const path=isPod?`/podcast/vlc.m3u?id=${spec.show.id}&ep=${encodeURIComponent(spec.ep.guid)}`:`/audiobook/${spec.id}/open.m3u`;
     toast("Opening in VLC…");
@@ -2821,7 +2824,7 @@ async function runSearch(q){
   // of the same name (Furious, 2026-08-27).
   let qs="q="+encodeURIComponent(q); qs += (S.mode==="movie") ? "&movie=1" : "&tv=1";
   // Pass the selected target so the server ranks for it: native-HEVC targets
-  // (vlc/phone) rank by seeds; NVENC targets (chromecast/shannon) prefer H.264.
+  // (vlc/phone) rank by seeds; NVENC targets (chromecast/renderer) prefer H.264.
   if(S.target&&S.target.kind) qs+="&target="+encodeURIComponent(S.target.kind);
   if(S.pref&&S.pref!=="auto") qs+="&pref="+encodeURIComponent(S.pref);
   let d;
@@ -3044,20 +3047,20 @@ async function doPlay(opts,cardForSources){
 // ONE device-targeting dispatcher — search/torrent plays AND library plays both route
 // here, so target selection + memory (S.target) can never drift between them (the
 // library path used to hardcode chromecast and skip VLC entirely — 2026-08-05). spec:
-//   body     — /play POST body + phone/shannon opts (search opts, or {title,poster_url})
+//   body     — /play POST body + phone/renderer opts (search opts, or {title,poster_url})
 //   label,poster — now-view + loading labels
-//   card     — sources-card for the phone/shannon "more sources" disclosure (null for library)
+//   card     — sources-card for the phone/renderer "more sources" disclosure (null for library)
 //   resultId — search result id (torrent VLC needs it; absent for a library entry)
 //   library  — true → resolve the library file for VLC by title (no result id)
 //   vlcTitle — human title for VLC / phone-direct
 async function playToTarget(spec, retry){
   if(!S.target){ S.pending=retry; toast("Pick where to play — it starts right after"); openSheet(); return; }
   // Which episode is playing — set before dispatch so every target (VLC/cast/phone/
-  // shannon) shows it in the now-view + now-bar. Library/movie plays leave it empty.
+  // renderer) shows it in the now-view + now-bar. Library/movie plays leave it empty.
   S.now.epLabel=spec.epLabel||""; S.now.epShort=spec.epShort||"";
   const k=S.target.kind;
   if(k==="phone")   return doPhoneDirect(spec.body, spec.card||null, spec.vlcTitle||spec.label);
-  if(k==="shannon") return doShannonPlay(spec.body, spec.card||null);
+  if(k==="renderer") return doRendererPlay(spec.body, spec.card||null);
   if(k==="vlc"){
     if(spec.library)        return openLibraryInVlc(spec);
     if(spec.resultId!=null) return openInVlc(spec.resultId, spec.vlcTitle||spec.label, spec.poster);
@@ -3188,22 +3191,21 @@ async function fastPlay(query, isTV, poster){
   }
 }
 
-/* ---------- Shannon-TV playback (Phase-7 / target=shannon, 2026-05-23) ----------
-   spela /play target=shannon → server POSTs to Shannon's
-   shannon-kiosk-actions daemon /watch → Shannon's spela-local fetches
-   HLS + decodes locally (HW via v4l2slh264dec when working, SW
-   playbin3 fallback). The Darwin spela /status reflects Shannon's
-   ACTIVE stream once spela-local's own /play call lands (typically
-   within ~5s of the dispatch), so the now-playing UI populates
-   shortly. */
-async function doShannonPlay(opts,cardForSources){
+/* ---------- Renderer playback (target=renderer, since 2026-05-23) ----------
+   spela /play target=renderer → the server POSTs to the renderer's /watch
+   endpoint (`renderer_watch_url`) → the renderer asks spela for the stream
+   and decodes it on its own hardware. The server's /status shows the
+   stream once the renderer's own /play lands (typically within ~5s of the
+   dispatch), so the now-playing UI fills in shortly. */
+async function doRendererPlay(opts,cardForSources){
   S.now.error=null;
-  toast("Starting on Shannon TV…");
+  const nm=(S.target&&S.target.name)||"the renderer";
+  toast("Starting on "+nm+"…");
   let r;
-  try{ r=await api("/play",{method:"POST",body:{...opts,target:"shannon"}}); }
-  catch{ showPlayError(opts.title||"Shannon TV",opts.poster_url,"spela unreachable",()=>doShannonPlay(opts,cardForSources)); return; }
-  if(r&&r.error){ showPlayError(opts.title||"Shannon TV",opts.poster_url,r.error,()=>doShannonPlay(opts,cardForSources)); return; }
-  toast("Dispatched — Shannon will fetch + play in ~10s");
+  try{ r=await api("/play",{method:"POST",body:{...opts,target:"renderer"}}); }
+  catch{ showPlayError(opts.title||nm,opts.poster_url,"spela unreachable",()=>doRendererPlay(opts,cardForSources)); return; }
+  if(r&&r.error){ showPlayError(opts.title||nm,opts.poster_url,r.error,()=>doRendererPlay(opts,cardForSources)); return; }
+  toast("Dispatched — "+nm+" will fetch + play in ~10s");
   S.now.phone=false; S.now.cold=true; S.now.lastSync=0; S.now.playing=true; S.now.everRan=false;
   goNowView(); pollNow(true);
 }
@@ -3524,22 +3526,24 @@ function openSheet(){
       if(resume) resume();
       else toast("Tap a source (or Play best) to open it in VLC"); };
     list.appendChild(vl);
-    // "Shannon TV" — Phase-7 spela-thin-client (2026-05-23). Sends
-    // target="shannon" → spela server POSTs to Shannon's daemon /watch
-    // → Shannon's spela-local fetches HLS + decodes locally. Always
-    // shown; if Shannon is unreachable, the /play call returns an
-    // error toast (no separate discovery — Shannon's a known fleet
-    // member, not a Chromecast).
-    const sh=el("button",{className:"topt"});
-    sh.innerHTML=`<span class="ic">${ic("tv")}</span><span><span class="nm">Shannon TV</span><br><span class="md">bedroom · native HW playback</span></span>`;
-    if(S.target&&S.target.kind==="shannon") sh.classList.add("sel");
-    sh.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
-      S.target={kind:"shannon",name:"Shannon TV"};
-      sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
-      if(!resume && S.search && S.search.q && !audioModePrompt(S.mode)) runSearch(S.search.q);  // re-rank for the new target (a podcast or book list has nothing to re-rank)
-      if(resume) resume();
-      else if(moving) toast("Single stream — your next play moves it to Shannon"); };
-    list.appendChild(sh);
+    // The renderer (a small computer beside a TV that decodes on its own
+    // hardware): offered only when the server has `renderer_watch_url` set.
+    // Sends target="renderer"; the server POSTs to the renderer's /watch and
+    // the renderer fetches the stream itself. No discovery: if it is
+    // unreachable, the /play call returns an error toast.
+    if(d&&d.renderer){
+      const rn=d.renderer.name||"Renderer TV";
+      const sh=el("button",{className:"topt"});
+      sh.innerHTML=`<span class="ic">${ic("tv")}</span><span><span class="nm">${esc(rn)}</span><br><span class="md">native HW playback</span></span>`;
+      if(S.target&&S.target.kind==="renderer") sh.classList.add("sel");
+      sh.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
+        S.target={kind:"renderer",name:rn};
+        sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
+        if(!resume && S.search && S.search.q && !audioModePrompt(S.mode)) runSearch(S.search.q);  // re-rank for the new target (a podcast or book list has nothing to re-rank)
+        if(resume) resume();
+        else if(moving) toast("Single stream — your next play moves it to "+rn); };
+      list.appendChild(sh);
+    }
   }).catch(()=>{ list.innerHTML=`<div class="state">spela unreachable — can’t list targets.</div>`; });
 }
 

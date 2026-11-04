@@ -96,21 +96,21 @@ over verbatim to ffmpeg workers and any future torrent backend.
 - `stream_host` must be resolvable BY THE CHROMECAST, not just by spela.
   Chromecast devices hardcode Google DNS (8.8.8.8 / 8.8.4.4) and ignore
   both DHCP option 6 and the LAN's recursive resolver, so a hostname like
-  `darwin.home` will silently fail to resolve on the receiver even though
+  `media-server.lan` will silently fail to resolve on the receiver even though
   every other LAN client sees spela just fine — the LOAD succeeds, the
   receiver never fetches the URL, and `player_state` stays IDLE forever.
   Two acceptable configurations:
-  1. **LAN IP** (`192.168.4.1`) — always works, zero infrastructure.
+  1. **LAN IP** (`192.168.1.10`) — always works, zero infrastructure.
   2. **Hostname + router-side DNS DNAT hijack** — redirect port 53 traffic
      from each Chromecast IP to the local resolver via iptables PREROUTING
-     DNAT (see Darwin's `/etc/iptables/rules.v4`). This is what Darwin
-     runs today so `stream_host = "darwin.home"` works end-to-end.
+     DNAT (see the server's `/etc/iptables/rules.v4`). This is what the server
+     runs today so `stream_host = "media-server.lan"` works end-to-end.
   spela startup WARNs if `stream_host` looks like a hostname — the warning
   is informational and can be ignored on hosts with the DNAT hijack in
   place. Confirmed live Apr 15, 2026 via tcpdump:
-  `192.168.4.126.36919 > 8.8.8.8.53: A? www.google.com` (DNS sent to
+  `192.168.1.51.36919 > 8.8.8.8.53: A? www.google.com` (DNS sent to
   hardcoded Google DNS, intercepted by PREROUTING, rewritten to
-  `192.168.4.1:53`).
+  `192.168.1.10:53`).
 - Cast pipeline output for chromecast targets is HLS (`/hls/master.m3u8`),
   not the legacy chunked-transfer fragmented MP4 path
   (`/stream/transcode`). The HLS path uses MPEG-TS segments because

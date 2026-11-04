@@ -219,7 +219,7 @@ The addon architecture you should copy (from **Sootio**, a debrid search engine)
 
 > "Scrape All Sources → Group & Rank → Process in Tiers (cache checks highest-quality first) → Early Exit: immediately returns top-quality results once thresholds are met." — sooti/sootio README
 
-This is directly transplantable to your ranker: after your existing Sarpetorp 5-tier rank, **batch-`checkcached` the top N hashes on TorBox** and prefer a cached result even if it's a slightly lower codec tier — instant-play usually beats a marginally better encode that needs a 60 s uncached fetch.
+This is directly transplantable to your ranker: after your existing the house 5-tier rank, **batch-`checkcached` the top N hashes on TorBox** and prefer a cached result even if it's a slightly lower codec tier — instant-play usually beats a marginally better encode that needs a 60 s uncached fetch.
 
 **The uncached one-click UX pattern** (what you should build): when the user picks something uncached, most addons play a 10 s "added to your debrid, try again later" stub. The community's stated desire — and your opportunity — is the seamless version:
 
@@ -368,5 +368,5 @@ Full report persisted verbatim at
   Expanded 5 → 20 (ngosang best).
 - **Win D (needs Fredrik): enable the inbound TCP/uTP listener** (`listen: None`
   by default). ~doubles reachable peers, but needs a WAN inbound port-forward on
-  the Darwin router (nftables) — a security/shared-infra decision, deferred.
+  the server router (nftables) — a security/shared-infra decision, deferred.
 - DHT + PEX already on. Web seeds (BEP-19) not supported by librqbit (skip).

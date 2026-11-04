@@ -36,8 +36,8 @@ RETRY_DELAY = 3
 
 # Cached device IPs — bulletproof fallback when mDNS fails
 KNOWN_DEVICES = {
-    "Fredriks TV": "192.168.4.126",
-    "Vardagsrum": "192.168.4.58",
+    "Bedroom TV": "192.168.1.51",
+    "Living Room TV": "192.168.1.50",
 }
 
 def get_device(name, retries=MAX_RETRIES):

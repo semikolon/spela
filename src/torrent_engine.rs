@@ -4,7 +4,7 @@
 // the Apr 29 incident where multiple Torrentio-aggregator results reporting hundreds
 // of seeds attached to ZERO reachable peers under webtorrent-cli, while a fourth
 // magnet (FLUX 720p, 30 reported seeds) attached to 31-57 peers at 10 MB/s on the
-// same Darwin host. Pattern-matched against multiple webtorrent-cli GitHub issues
+// same server. Pattern-matched against multiple webtorrent-cli GitHub issues
 // (#175, #241): the Node implementation's peer-discovery is meaningfully weaker
 // than libtorrent-class clients across magnets with quirky tracker subsets.
 //
@@ -139,7 +139,7 @@ pub enum TorrentState {
 
 /// Upload ceiling in BYTES per second — 100 Mbit/s, Fredrik's number (2026-09-09).
 ///
-/// Darwin is the house ROUTER, so its uplink is shared with every device here and
+/// The server is the house ROUTER, so its uplink is shared with every device here and
 /// saturating it costs everyone their latency, not just this download.
 ///
 /// ⚠ librqbit's field is named `upload_bps` but the quota is spent in BYTES: the caller
@@ -177,9 +177,9 @@ impl TorrentEngine {
         let ephemeral_dht = std::env::var("SPELA_EPHEMERAL_DHT").is_ok();
         // 2026-07-05: enable the inbound TCP peer listener (off by default in
         // librqbit → outbound-only). Being connectable ~doubles reachable peers
-        // on thin/obscure swarms (Report B). Darwin IS the router, so no UPnP —
+        // on thin/obscure swarms (Report B). The server IS the router, so no UPnP —
         // the port is opened manually in nftables (WAN iface) and forwarded to
-        // this listener (spela runs on Darwin, so "forward" = a WAN INPUT accept).
+        // this listener (spela runs on the server, so "forward" = a WAN INPUT accept).
         // Deterministic single port so the firewall rule matches: production
         // 6881, test instance 6882 (SPELA_TORRENT_PORT) to avoid a collision.
         let torrent_port: u16 = std::env::var("SPELA_TORRENT_PORT")
@@ -972,7 +972,7 @@ async fn read_available_prefix<R: tokio::io::AsyncRead + Unpin>(
 /// caught that `librqbit::AddTorrent::Url` accepts `http://` / `https://`
 /// URLs and fetches them as `.torrent` files via reqwest. With spela's HTTP
 /// API unauthenticated and `default_host = "0.0.0.0"`, that turns `/play`
-/// into an SSRF pivot against Darwin's internal services (Postgres :5433,
+/// into an SSRF pivot against the server's internal services (Postgres :5433,
 /// Redis :6379, FalkorDB :6380, Temporal :7233, llama.cpp :8080,
 /// restic-rest :8001, AdGuard :3000, kamal-proxy admin). Same vector via
 /// Ruby's `run_spela` voice-tool if Gemini gets prompt-injected. Defense in
@@ -1217,7 +1217,7 @@ mod tests {
     #[test]
     fn validate_magnet_uri_rejects_http_ssrf_attempt() {
         // The canonical SSRF pivot — librqbit fetches http URLs as torrent files.
-        assert!(validate_magnet_uri("http://192.168.4.1:6379/").is_err());
+        assert!(validate_magnet_uri("http://192.168.1.10:6379/").is_err());
         assert!(validate_magnet_uri("http://localhost:80/admin").is_err());
     }
 
@@ -1304,8 +1304,8 @@ mod tests {
 
     #[test]
     fn build_stream_url_formats_known_inputs() {
-        let url = build_stream_url("192.168.4.1", 7890, 42, 0);
-        assert_eq!(url, "http://192.168.4.1:7890/torrent/42/stream/0");
+        let url = build_stream_url("192.168.1.10", 7890, 42, 0);
+        assert_eq!(url, "http://192.168.1.10:7890/torrent/42/stream/0");
     }
 
     #[test]
@@ -1315,8 +1315,8 @@ mod tests {
         // URL builder itself does not validate — that responsibility lives
         // upstream. This test pins the formatting behavior so a refactor
         // can't silently change the URL structure.
-        let url = build_stream_url("darwin.home", 7890, 1, 3);
-        assert_eq!(url, "http://darwin.home:7890/torrent/1/stream/3");
+        let url = build_stream_url("media-server.lan", 7890, 1, 3);
+        assert_eq!(url, "http://media-server.lan:7890/torrent/1/stream/3");
     }
 
     #[test]

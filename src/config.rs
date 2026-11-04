@@ -100,25 +100,26 @@ pub struct Config {
     pub vod_manifest_padded: bool,
     /// Apr 30, 2026 (security audit H2): additional Host-header values
     /// accepted by the allowlist middleware. Loopback (`localhost`,
-    /// `127.0.0.1`), the canonical fleet hostname `darwin.home`, and
+    /// `127.0.0.1`), the canonical fleet hostname `media-server.lan`, and
     /// `stream_host` (if non-empty) are always allowed; this list adds
     /// custom hostnames for non-default deployments (Tailscale IPs, custom
     /// LAN aliases, etc.). Each entry is the bare hostname or IP — port is
     /// stripped from the incoming Host header before comparison.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
-    /// 2026-05-23: URL of Shannon's `shannon-kiosk-actions` daemon `/watch`
-    /// endpoint. When a `/play` request arrives with `target="shannon"`,
-    /// spela POSTs `{title}` to this URL — Shannon's daemon then spawns
-    /// `spela-local` which does its own `/search` + `/play target=vlc` to
-    /// fetch the HLS stream + decode locally. Default
-    /// `http://192.168.4.30:8080/watch` matches the Shannon WiFi
-    /// reservation per dotfiles fleet docs; override per-host (e.g.
-    /// over WireGuard tunnel from MERIAN) by setting this in
-    /// `~/.config/spela/config.toml`. Empty string disables the
-    /// shannon target (`/play target=shannon` returns an error).
-    #[serde(default)]
-    pub shannon_watch_url: Option<String>,
+    /// URL of a renderer's `/watch` endpoint: a small computer beside a TV
+    /// that fetches the stream from spela and decodes it itself (the kiosk
+    /// daemon in the companion kiosk project is one). When set, the web remote
+    /// offers it as a play target, and `/play target=renderer` POSTs
+    /// `{title, magnet?, file_index?, library?}` here; the renderer then asks
+    /// spela for the stream with `target=vlc`. Unset or empty hides the target
+    /// and makes `/play target=renderer` return an error. The older key
+    /// `shannon_watch_url` is still read.
+    #[serde(default, alias = "shannon_watch_url")]
+    pub renderer_watch_url: Option<String>,
+    /// The name the web remote shows for the renderer target.
+    #[serde(default = "default_renderer_name")]
+    pub renderer_name: String,
     /// May 13, 2026 (v3.5.0 HLS cache): maximum bytes of transcoded HLS sets
     /// kept on disk for cache-hit fast resume. When the cache exceeds this,
     /// LRU eviction runs (`hls_cache::prune_cache_to_fit`). 20 GB = ~60
@@ -144,9 +145,7 @@ pub struct Config {
     pub library_serve_port: u16,
     /// v3.8.0 (library-host side): ntfy base URL for serve-library drive-
     /// state transition alerts (e.g. drive disappeared / came back). Empty
-    /// string disables. Default points at the fleet ntfy on Darwin under
-    /// the `spela-library-alerts` topic (the `<system>-<purpose>` naming
-    /// convention used by `brf-auto-alerts`, `router-security`, etc.).
+    /// (the default) disables alerts; set it to an ntfy topic URL to get them.
     /// Best-effort POST — if the daemon can't reach ntfy it logs WARN
     /// once and continues serving; it never crashes on a failed alert.
     #[serde(default = "default_library_ntfy_url")]
@@ -187,10 +186,10 @@ pub struct Config {
     /// 2026-07-13 (watch-tracker slice 5): auto-detect what's playing on the
     /// house Chromecasts (incl. non-spela apps) so it can be tracked. READ-ONLY
     /// polling; externally-detected sessions are STAGED for Fredrik to confirm
-    /// on his next UI load (housemates watch these TVs too), never auto-marked.
+    /// on his next UI load (other people in the household watch these TVs too), never auto-marked.
     #[serde(default = "default_true")]
     pub auto_track_chromecasts: bool,
-    /// Poll cadence in seconds (media state changes slowly; Darwin's the router,
+    /// Poll cadence in seconds (media state changes slowly; the server's the router,
     /// keep it light).
     #[serde(default = "default_auto_track_poll_secs")]
     pub auto_track_poll_secs: u64,
@@ -241,7 +240,7 @@ fn default_hls_cache_cap_mb() -> u64 {
     // worth of recent replays/resumes (~2-3 full 1080p movies or many
     // more episodes); `prune_cache_to_fit` LRU-evicts oldest beyond this
     // so it's a self-maintaining ceiling, not unbounded growth. Sized
-    // conservatively vs Darwin's documented disk-pressure sensitivity
+    // conservatively vs the server's documented disk-pressure sensitivity
     // (host also runs the 10 GB media cap + 20 GB free-space floor).
     // Tunable per-host via `hls_cache_cap_mb` in config.toml.
     12288
@@ -250,10 +249,12 @@ fn default_library_serve_port() -> u16 {
     7891
 }
 fn default_library_ntfy_url() -> String {
-    // Darwin fleet ntfy (per global service-port map). Topic name follows
-    // the `<system>-<purpose>` convention (sibling: `brf-auto-alerts`,
-    // `router-security`, `shannon-security`).
-    "http://darwin.home:8099/spela-library-alerts".into()
+    // No alerts unless configured: set `library_ntfy_url` to an ntfy topic
+    // URL (for example `http://ntfy.lan:8099/spela-library-alerts`).
+    String::new()
+}
+fn default_renderer_name() -> String {
+    "Renderer TV".into()
 }
 fn default_true() -> bool {
     true
@@ -303,7 +304,8 @@ impl Default for Config {
             // for already-complete playlists, so the movie path is untouched.
             vod_manifest_padded: true,
             allowed_hosts: Vec::new(),
-            shannon_watch_url: None,
+            renderer_watch_url: None,
+            renderer_name: default_renderer_name(),
             hls_cache_cap_mb: default_hls_cache_cap_mb(),
             library_dirs: Vec::new(),
             remote_origins: Vec::new(),
@@ -493,6 +495,26 @@ default_device = "Living Room TV"
         assert_eq!(
             config.known_devices.get("Living Room TV").unwrap(),
             "192.168.1.50"
+        );
+    }
+
+    #[test]
+    fn no_deployment_address_is_a_default() {
+        // A fresh install alerts nowhere and offers no renderer until its
+        // own config names them.
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.library_ntfy_url.is_empty());
+        assert!(config.renderer_watch_url.is_none());
+        assert_eq!(config.renderer_name, "Renderer TV");
+    }
+
+    #[test]
+    fn the_renderer_url_is_still_read_under_its_older_key() {
+        let config: Config =
+            toml::from_str(r#"shannon_watch_url = "http://192.168.1.30:8080/watch""#).unwrap();
+        assert_eq!(
+            config.renderer_watch_url.as_deref(),
+            Some("http://192.168.1.30:8080/watch")
         );
     }
 

@@ -12,7 +12,7 @@
  Phone browser (/remote, dark SPA, same-origin)
    │  fetch() JSON
    ▼
- spela server (Darwin :7890, axum)
+ spela server (the server :7890, axum)
    ├── EXISTING: /search /play /pause /resume /seek /status /targets /history /queue
    ├── EXISTING: /hls/master.m3u8        ← phone-direct <video> source (US-5)
    ├── NEW: GET /remote                  ← serve static SPA (include_str! + serve_static_with_range)
@@ -63,8 +63,8 @@ struct LibraryEntry {
 | Method | Path | New? | Purpose | Notes |
 |---|---|---|---|---|
 | GET | `/remote` | NEW | Serve the SPA | `include_str!("../static/remote.html")` via `serve_static_with_range`; mirror `/cast-receiver.html` |
-| GET | `/library` | NEW (spela) | Aggregated curated library for the My-Library grid | Fans out to `config.remote_origins` `/library/list` + local `config.library_dirs`; **reuse the v3.6.3 liveness-ping (2 s, no-FS) + generous (25 s) timeout pattern** so a cold BOHR HDD doesn't 0-list it; merge + TMDB-enrich |
-| GET | `/library/list` | NEW (serve-library) | Enumerate this host's library roots | Sibling of `/library/match`; walks the same configured roots (incl. the `Demeter…/` + `…/TV` roots); returns `[LibraryEntry]`; same security posture (no path leakage beyond root names) |
+| GET | `/library` | NEW (spela) | Aggregated curated library for the My-Library grid | Fans out to `config.remote_origins` `/library/list` + local `config.library_dirs`; **reuse the v3.6.3 liveness-ping (2 s, no-FS) + generous (25 s) timeout pattern** so a cold the library disk HDD doesn't 0-list it; merge + TMDB-enrich |
+| GET | `/library/list` | NEW (serve-library) | Enumerate this host's library roots | Sibling of `/library/match`; walks the same configured roots (incl. the `the film archive…/` + `…/TV` roots); returns `[LibraryEntry]`; same security posture (no path leakage beyond root names) |
 | GET | `/search?q=&movie=` | exists | Hybrid search | `&movie=1` from the Movies/TV toggle (the "Sleepover→TV" miss) |
 | POST | `/play` | exists | Play (top pick or chosen source) | Body carries result id + `cast` target (Chromecast name) **or** the phone path |
 | POST | `/seek` | exists | Scrub / ⏮ restart | Absolute episode secs (v3.4.3); `0` = restart (US-2 ⏮) |
@@ -90,10 +90,10 @@ Surface spela's own JSON `error` strings verbatim in a toast + offer the more-so
 | Status updates | Poll `/status` (foreground+active only) | SSE is a future nicety; polling is simplest, non-glitchy with optimistic UI |
 | Concurrency | Single stream; target switch *moves* it | Backend reality (R-1); concurrency is a separate refactor, out of v1 |
 | Library posters | Server-side best-effort TMDB enrich + clean fallback tile | Avoids broken images (embarrassment criterion); reuses existing TMDB code |
-| Cold library/bridge | Reuse v3.6.3 liveness+generous-timeout for `/library` fan-out | Don't 0-list or hang on a spun-down BOHR; consistent with the just-built robustness |
+| Cold library/bridge | Reuse v3.6.3 liveness+generous-timeout for `/library` fan-out | Don't 0-list or hang on a spun-down the library disk; consistent with the just-built robustness |
 
 ## Security
 No auth (LAN/WG boundary; matches current API + `PHONE_APP_PROJECT.md`). `/library/list` must not leak absolute paths usefully beyond what `/library/match` already does (return raw_name/meta, not full filesystem paths in the client payload; resolution stays server-side via the existing handle mechanism). Same-origin SPA → no new CORS surface.
 
 ## Performance
-LAN: API calls are ms; HLS is the existing 1080p H.264. Phone-direct over WG: 1080p H.264 is fine on modern phones; a 720p profile is explicitly deferred (R-3). Cold BOHR spin-up handled by the v3.6.3 pattern reused in `/library`.
+LAN: API calls are ms; HLS is the existing 1080p H.264. Phone-direct over WG: 1080p H.264 is fine on modern phones; a 720p profile is explicitly deferred (R-3). Cold the library disk spin-up handled by the v3.6.3 pattern reused in `/library`.

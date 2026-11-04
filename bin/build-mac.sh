@@ -6,7 +6,7 @@
 # hash. Cargo's `linker-signed` ad-hoc default identifier is content-
 # derived (e.g. `spela-56c693bdcecc486f`) — every rebuild flips it, every
 # rebuild silently revokes the FDA grant, every rebuild surprises Fredrik
-# when `serve-library`'s `read_dir(BOHR)` hangs ("this happened again").
+# when `serve-library`'s `read_dir(<library disk>)` hangs ("this happened again").
 #
 # This wrapper re-signs the freshly-built binary with a STABLE
 # identifier (`com.fredrikbranstrom.spela`) so the signature's identity

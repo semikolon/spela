@@ -140,7 +140,7 @@
 
 - [ ] **T-20**: Integration test on Chromecast
   - Play → verify intro → verify movie starts → pause → seek within buffer → seek beyond buffer → resume from position → subtitle toggle
-  - Test on both Fredriks TV and Vardagsrum
+  - Test on both Bedroom TV and Living Room TV
   - Depends on: all above + Cast SDK registration
 
 ---

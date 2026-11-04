@@ -169,7 +169,7 @@ struct StreamParams {
 // Sibling of `/library/match`: same configured roots, same no-path-leakage
 // posture (only display/identity metadata crosses the wire), but instead of
 // resolving ONE title it enumerates EVERY browsable entry so the web-remote
-// can render the curated BOHR collection as a poster grid and tap-play any
+// can render the curated library collection as a poster grid and tap-play any
 // item back through the existing `do_play` → `/library/match` bridge.
 // ---------------------------------------------------------------------------
 
@@ -235,7 +235,7 @@ fn clean_release_tokens(s: &str) -> String {
 /// Ordered strategy (robust for curated `Title (YYYY)` AND scene
 /// `Title.YYYY.1080p.GROUP`):
 ///   1. A parenthesised/bracketed `(YYYY)`/`[YYYY]` wins (the curated
-///      BOHR convention) — title is everything before it. This also
+///      library convention) — title is everything before it. This also
 ///      disambiguates a numeric title from its release year
 ///      (`2012 (2009)` → title "2012", year 2009).
 ///   2. Else the first bare 4-digit token in 1900..=2099 is the year;
@@ -246,7 +246,7 @@ fn clean_release_tokens(s: &str) -> String {
 /// best-effort limit (acceptable per spec R-2 — `raw_name`, not this
 /// parsed title, is the play key): a scene name with a year IN the
 /// title and no parens (`Blade.Runner.2049.2017.1080p`) mis-splits;
-/// the curated BOHR `Blade Runner 2049 (2017)` form parses correctly.
+/// the curated library `Blade Runner 2049 (2017)` form parses correctly.
 pub fn parse_library_name(raw: &str) -> (String, Option<u32>) {
     // Strip a trailing video extension (single-file entries pass the
     // filename; directory entries have none — harmless either way).
@@ -886,7 +886,7 @@ async fn handle_library_list(State(state): State<Shared>) -> Response {
 }
 
 /// `GET /health` — operational state snapshot for monitoring / external
-/// checks (sluss / sentinel / Darwin's `/library` aggregator). Always
+/// checks (sluss / sentinel / the server's `/library` aggregator). Always
 /// 200; the JSON `status` field tells the caller whether the drives
 /// are actually serving. Distinct from `/library/list`'s 503 because
 /// monitoring needs reachable-AND-state-aware liveness; the SPA reads
@@ -1226,7 +1226,7 @@ mod tests {
 
     #[test]
     fn canonicalize_roots_quiet_all_missing_returns_empty() {
-        // The "BOHR vanished" case — every configured root fails. The
+        // The "library disk vanished" case — every configured root fails. The
         // result drives the state machine into Waiting (verified by the
         // classify_state tests above).
         let raw = vec![
@@ -1248,7 +1248,7 @@ mod tests {
 mod pack_chooser_tests {
     use super::*;
 
-    /// Real release names copied from the BOHR library (the Game of Thrones
+    /// Real release names copied from the library disk (the Game of Thrones
     /// directory that prompted this: named "S01 S02 S03 Complete" but holding a
     /// single S03E05 file) plus a genuine multi-episode pack shape.
     /// Files large enough to clear `MIN_LIBRARY_FILE_BYTES`, written SPARSE — set the

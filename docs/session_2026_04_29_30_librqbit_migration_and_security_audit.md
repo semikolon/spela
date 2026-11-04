@@ -10,7 +10,7 @@
 
 ### Driver
 
-Apr 29 evening: three Torrentio results (`The Boys S05E05` 1080p NTb / 480p mSD / 720p NTb) reporting 419 / 79 / 39 seeds attached to **zero reachable peers** under webtorrent-cli on Darwin. The fourth result, FLUX 720p with 30 reported seeds, attached to 31-57 peers at 10 MB/s on the *same host* within minutes. Same-host, same-network, only-the-magnet-changed test isolated the variable to webtorrent's peer-connection behavior — patten matches well-documented webtorrent-cli weakness ([webtorrent/webtorrent-cli #175](https://github.com/webtorrent/webtorrent-cli/issues/175), [#241](https://github.com/webtorrent/webtorrent-cli/issues/241)).
+Apr 29 evening: three Torrentio results (`The Boys S05E05` 1080p NTb / 480p mSD / 720p NTb) reporting 419 / 79 / 39 seeds attached to **zero reachable peers** under webtorrent-cli on the server. The fourth result, FLUX 720p with 30 reported seeds, attached to 31-57 peers at 10 MB/s on the *same host* within minutes. Same-host, same-network, only-the-magnet-changed test isolated the variable to webtorrent's peer-connection behavior — patten matches well-documented webtorrent-cli weakness ([webtorrent/webtorrent-cli #175](https://github.com/webtorrent/webtorrent-cli/issues/175), [#241](https://github.com/webtorrent/webtorrent-cli/issues/241)).
 
 Oracle deep-research confirmed and ranked remediation options. User chose the structural fix (single binary, no Node subprocess, native axum integration) over the diagnostic stopgap (transmission-cli for one-off downloads).
 
@@ -40,11 +40,11 @@ HLS chain + Chromecast DNAT hijack + Smart Resume + cast_health_monitor + Local 
 
 ### Empirical validation
 
-Live test against the previously-failing NTb 1080p magnet on the same Darwin host:
+Live test against the previously-failing NTb 1080p magnet on the same server:
 - **Apr 30 first librqbit play**: torrent FLUX 1080p attached **10 peers at 1.47 MB/s within 2 seconds**, 18.9 MB downloaded.
-- ffmpeg launched on `http://192.168.4.1:7890/torrent/0/stream/0` (the new endpoint).
+- ffmpeg launched on `http://192.168.1.10:7890/torrent/0/stream/0` (the new endpoint).
 - Cast went `<init> → Playing` at 9s post-Smart-Resume seek.
-- librqbit detected a piece-hash mismatch from peer `185.149.91.65` and disconnected it — proper data-integrity validation working.
+- librqbit detected a piece-hash mismatch from a peer and disconnected it — proper data-integrity validation working.
 - 52s total from spela start to TV playing.
 
 This is the migration's hypothesis validated: librqbit attaches peers where webtorrent-cli got zero, end-to-end through the new code path.
@@ -63,8 +63,8 @@ Two-agent audit (oracle for security/bugs, general-purpose for test gaps) surfac
 
 | Commit | Finding | Fix |
 |---|---|---|
-| `7445530` | **H1 SSRF magnet validator** | `validate_magnet_uri()` rejects non-magnet URIs at HTTP boundary. librqbit's `AddTorrent::Url` accepts http(s):// and fetches them — would have turned POST /play into an SSRF pivot against Darwin's internal services (Postgres :5433, Redis :6379, FalkorDB :6380, Temporal :7233, llama.cpp :8080, restic-rest :8001, AdGuard :3000, kamal-proxy admin). Defense in depth: applied in `do_play`, `handle_queue_add`, AND inside `TorrentEngine::start`. 8 tests. |
-| `14671d4` | **H2 Host-header allowlist + tightened CORS** | `require_host_header` middleware + `compute_host_allowlist` (loopback + darwin.home + stream_host + user additions). DNS-rebinding defense. CORS narrowed to LAN origins (no wildcard). Bearer-token auth deliberately deferred (would need CLI/Ruby plumbing). 9 tests. |
+| `7445530` | **H1 SSRF magnet validator** | `validate_magnet_uri()` rejects non-magnet URIs at HTTP boundary. librqbit's `AddTorrent::Url` accepts http(s):// and fetches them — would have turned POST /play into an SSRF pivot against the server's internal services (Postgres :5433, Redis :6379, FalkorDB :6380, Temporal :7233, llama.cpp :8080, restic-rest :8001, AdGuard :3000, kamal-proxy admin). Defense in depth: applied in `do_play`, `handle_queue_add`, AND inside `TorrentEngine::start`. 8 tests. |
+| `14671d4` | **H2 Host-header allowlist + tightened CORS** | `require_host_header` middleware + `compute_host_allowlist` (loopback + media-server.lan + stream_host + user additions). DNS-rebinding defense. CORS narrowed to LAN origins (no wildcard). Bearer-token auth deliberately deferred (would need CLI/Ruby plumbing). 9 tests. |
 | `61d18e2` | **H3 Mutex panic-cascade recovery** | `lock_recover<T>` helper using `PoisonError::into_inner`. Sweep replaced 18 `.lock().unwrap()` sites in server.rs. 2 tests including actual mutex-poisoning via thread+panic. |
 | `edc4e90` + `610f7a8` | **H4 /torrent/* loopback-only** | `require_loopback_source` middleware via sub-router. URL builder uses `127.0.0.1` so ffmpeg's source IP is loopback (otherwise the LAN-bind IP would 403 itself — caught during deploy). Chromecast still hits `/hls/*` via `stream_host`, no impact. |
 
@@ -117,7 +117,7 @@ migration + audit and follow the same focused-doc-with-references pattern.
 
 **Symptom**: with `intro.mp4` enabled, Chromecast (CrKey 1.56) buffered indefinitely
 at ~segment 5 (30-36s into playback). Workaround was `--no-intro` and renaming
-`intro.mp4 → intro.mp4.disabled` on Darwin.
+`intro.mp4 → intro.mp4.disabled` on the server.
 
 **Hypothesis** (Apr 19 session, recorded in TODO.md): NVENC's scene-change detection
 fires an unscheduled IDR at the intro→main concat seam (a hard visual transition
@@ -143,11 +143,11 @@ not the seam directly.
 Belt-and-suspenders. The `-force_key_frames` alone would suffice; the others
 constrain encoder choice for predictability.
 
-**Validation pending live test**: `ssh darwin 'mv ~/.config/spela/intro.mp4.disabled ~/.config/spela/intro.mp4'`
+**Validation pending live test**: `ssh <server> 'mv ~/.config/spela/intro.mp4.disabled ~/.config/spela/intro.mp4'`
 then play any title; smooth playback past segment 5 = hypothesis confirmed.
 Hard-verification recipe (per Apr 19 TODO note):
 ```
-ssh darwin 'for i in 00000 00001 00004 00005 00006; do
+ssh <server> 'for i in 00000 00001 00004 00005 00006; do
   ffprobe -v error -select_streams v -show_frames -read_intervals "%+#1" \
     ~/media/transcoded_hls/seg_${i}.ts | grep -E "key_frame|pict_type"
 done'
@@ -232,7 +232,7 @@ into the existing decision helper.
 webtorrent because of a piece-verification bug: `_markUnverified` re-selected ALL pieces
 on certain workflows, downloading the entire torrent despite the `-s <fileIdx>` flag.
 Fix: `Selections.contains()` guard preventing re-selection of deselected pieces. Patched
-in-place on Darwin at `~/.local/share/mise/installs/node/24.14.0/lib/node_modules/webtorrent-cli/node_modules/webtorrent/lib/`.
+in-place on the server at `~/.local/share/mise/installs/node/24.14.0/lib/node_modules/webtorrent-cli/node_modules/webtorrent/lib/`.
 Verified: 27-file season pack → only target file + 1.7MB boundary pieces downloaded
 (sparse files, no actual disk waste). Smart ranking preferred single-file torrents
 as belt-and-suspenders. **No longer in the runtime path** since v3.3.0 — librqbit's

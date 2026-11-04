@@ -5,12 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=fredrik
-ExecStart=/home/fredrik/.local/bin/spela server
+User=user
+ExecStart=/home/user/.local/bin/spela server
 Restart=on-failure
 RestartSec=5
 Environment=TMDB_API_KEY=
-WorkingDirectory=/home/fredrik
+WorkingDirectory=/home/user
 
 [Install]
 WantedBy=multi-user.target

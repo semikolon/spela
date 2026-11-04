@@ -100,7 +100,7 @@ sketched is **contrary to a hard-won decision** and is **explicitly OUT of
 scope for v1** (see §13 Deferred). For Chromecast, the route is *uniformly* the
 server-NVENC bridge. This both respects Chesterton's Fence on `server.rs:1130`
 and *simplifies* the implementation — there is no codec→route fork for
-Chromecast; the only decision is the **source URL** (`file://` Darwin-local vs
+Chromecast; the only decision is the **source URL** (`file://` server-local vs
 `http://` workstation-origin), which `detect_codecs`/`transcode_hls` already
 handle identically.
 
@@ -120,7 +120,7 @@ plays too**. Its real meaning is **"complete non-torrent source"**, not
 source") must stay `file://`-gated. The known case is embedded-subtitle
 extraction at `server.rs:1004` (`server_url.starts_with("file://")`). For
 workstation-origin plays we skip embedded-sub extraction and fall back to
-OpenSubtitles (same as the torrent path). Darwin-local library files keep
+OpenSubtitles (same as the torrent path). server-local library files keep
 embedded extraction. This carve-out is enumerated as a test.
 
 ## 6. Component A — config (`src/config.rs`)

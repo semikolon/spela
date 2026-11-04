@@ -78,12 +78,12 @@ pub struct AppState {
     pub watched: Vec<WatchedEntry>,
     /// 2026-07-13 (slice 5): sessions DETECTED on a house Chromecast (incl.
     /// non-spela apps) that reached completion but are NOT yet confirmed as
-    /// Fredrik's — housemates watch these TVs too. Surfaced on his next web-UI
+    /// Fredrik's — other people in the household watch these TVs too. Surfaced on his next web-UI
     /// load; only a "Yes, I watched it" promotes one into `watched`. Deduped by
     /// key; newest-first; capped.
     #[serde(default)]
     pub pending_watched: Vec<PendingWatch>,
-    /// Keys Fredrik answered "No (someone else)" to — so a housemate's binge
+    /// Keys Fredrik answered "No (someone else)" to — so someone else's binge
     /// doesn't re-nag every poll. A genuinely new episode is a new key, so it
     /// still surfaces. Capped.
     #[serde(default)]
@@ -736,7 +736,7 @@ impl AppState {
 
     /// Resolve a pending Chromecast detection. `watched=true` → promote into the
     /// watched-ledger (it WAS Fredrik); `false` → drop it + remember the "no"
-    /// so a housemate's binge of the same episode doesn't re-nag. Returns true
+    /// so someone else's binge of the same episode doesn't re-nag. Returns true
     /// if the key was found pending.
     pub fn resolve_pending(&mut self, key: &str, watched: bool) -> bool {
         let Some(pos) = self.pending_watched.iter().position(|p| p.key == key) else {
@@ -1159,8 +1159,8 @@ mod tests {
             season: Some(5),
             episode: Some(1),
             imdb_id: Some("tt1190634".into()),
-            target: "chromecast:Fredriks TV".into(),
-            url: "http://darwin.home:7890/hls/master.m3u8".into(),
+            target: "chromecast:Bedroom TV".into(),
+            url: "http://media-server.lan:7890/hls/master.m3u8".into(),
             started_at: chrono::Utc::now(),
             pid: 0,
             has_subtitles: true,
@@ -1325,7 +1325,7 @@ mod tests {
 mod watched_threshold_tests {
     use super::*;
 
-    /// Ledger rows copied verbatim from the live Darwin ledger on 2026-08-25 —
+    /// Ledger rows copied verbatim from the live the server ledger on 2026-08-25 —
     /// title strings exactly as spela wrote them, so the test exercises the real
     /// shapes (`Show SxxExx` for a completion, a bare title for a whole-show mark).
     fn ledger(rows: &[(&str, bool)]) -> AppState {

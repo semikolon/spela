@@ -45,8 +45,8 @@ pub struct ServerState {
     pub torrent_engine: Arc<TorrentEngine>,
     /// Apr 30, 2026 (security audit H2): precomputed Host-header allowlist
     /// for the require_host_header middleware. Built once at startup from
-    /// `Config` via `compute_host_allowlist`. Loopback + `darwin.home` +
-    /// stream_host + config.allowed_hosts.
+    /// `Config` via `compute_host_allowlist`. Loopback + stream_host +
+    /// config.allowed_hosts; no hostname is built in.
     pub host_allowlist: std::collections::HashSet<String>,
     /// 2026-07-04: live warmup progress. While `do_play` blocks setting up a
     /// stream (torrent connect → download → transcode pre-buffer → cast LOAD),
@@ -137,7 +137,7 @@ pub struct ServerState {
     pub vlc_activity: Mutex<Option<(Instant, String, Option<String>)>>,
     /// 2026-08-04: pending VLC control commands (pause/resume/seek/stop) for the
     /// Mac-side `spela-vlc-bridge` to drain + apply to the local VLC HTTP
-    /// interface. spela runs on Darwin and CANNOT reach the Mac's loopback VLC,
+    /// interface. spela runs on the server and CANNOT reach the Mac's loopback VLC,
     /// so the already-running watcher (which polls spela) is the relay: the web
     /// remote POSTs `/vlc/control` here, the watcher GETs `/vlc/pending` (drains)
     /// and issues the matching `?command=` to VLC. Each item = `{"cmd":..,"val":..}`.
@@ -236,7 +236,7 @@ pub(crate) fn client_is_off_lan(addr: std::net::IpAddr) -> bool {
     match addr {
         std::net::IpAddr::V4(v4) => {
             let o = v4.octets();
-            // The fleet's WireGuard subnet. Home LAN is 192.168.4.x and loopback is
+            // The fleet's WireGuard subnet. Home LAN is 192.168.1.x and loopback is
             // spela talking to itself; both are unmetered by construction.
             o[0] == 10
         }
@@ -417,7 +417,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     }
 
     // Apr 15, 2026: Chromecast hardcodes Google DNS (8.8.8.8 / 8.8.4.4) and
-    // can NOT resolve LAN-only hostnames like `darwin.home` even when the
+    // can NOT resolve LAN-only hostnames like `media-server.lan` even when the
     // user's other devices reach them through the LAN's recursive resolver
     // (AdGuard Home, dnsmasq, mDNS). spela's cast LOAD URL is built from
     // `stream_host`, so a hostname here means the receiver fetches a name
@@ -645,7 +645,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     //   - Host-header allowlist (`require_host_header`) is the PRIMARY
     //     DNS-rebinding defense per H2's own design comment. A malicious
     //     LAN page using DNS rebinding sets `Host: malicious.com` — which
-    //     the allowlist (localhost / 127.0.0.1 / darwin.home / stream_host)
+    //     the allowlist (localhost / 127.0.0.1 / media-server.lan / stream_host)
     //     does NOT match → 403 BEFORE the request reaches any handler.
     //     CORS never enters the picture for this attack class.
     //   - Spela has no browser UI, no cookies, no auth, no per-user state.
@@ -842,7 +842,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     );
 
     // May 1, 2026: dual-bind when `host` is a specific non-loopback address
-    // (e.g. `192.168.4.1` per Darwin's systemd unit). See
+    // (e.g. `192.168.1.10` per the server's systemd unit). See
     // `compute_bind_addresses` doc-comment for the full rationale. Without
     // this, ffmpeg's hardcoded `http://127.0.0.1:7890/torrent/...` URL gets
     // connection-refused when admin pins the listener to a LAN IP only,
@@ -957,7 +957,7 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Apr 30, 2026 (security audit H2): compute the effective Host-header
 /// allowlist for the server. Always includes loopback (`localhost`,
-/// `127.0.0.1`) and the canonical fleet hostname (`darwin.home`); adds
+/// `127.0.0.1`) and the canonical fleet hostname (`media-server.lan`); adds
 /// `stream_host` if non-empty (Chromecast LAN endpoint); appends
 /// `config.allowed_hosts` for custom deployments. Returned as a HashSet
 /// for O(1) lookup in the per-request middleware. Pure function so the
@@ -1000,8 +1000,8 @@ pub(crate) fn is_idle_in_cold_start_window(
 /// configured. Skips the loopback bind when `host` is itself loopback or the
 /// wildcard (already covers loopback).
 ///
-/// Why this design: when admin runs `spela server --host 192.168.4.1` to
-/// keep the LAN-only bind explicit (Darwin is the router; `0.0.0.0` would
+/// Why this design: when admin runs `spela server --host 192.168.1.10` to
+/// keep the LAN-only bind explicit (the server is the router; `0.0.0.0` would
 /// bind WAN too and rely solely on iptables to drop it), a single-bind
 /// listener leaves `/torrent/*` unreachable from spela's own ffmpeg
 /// subprocess — which calls `http://127.0.0.1:7890/torrent/...` per
@@ -1034,7 +1034,6 @@ pub(crate) fn compute_host_allowlist(config: &Config) -> std::collections::HashS
     let mut set = std::collections::HashSet::new();
     set.insert("localhost".into());
     set.insert("127.0.0.1".into());
-    set.insert("darwin.home".into());
     if !config.stream_host.is_empty() {
         set.insert(config.stream_host.clone());
     }
@@ -1913,7 +1912,7 @@ async fn handle_search(
     {
         Ok(mut result) => {
             // 2026-07-28: the ranker prefers H.264 because NVENC-transcoding targets
-            // (chromecast + shannon, which pull Darwin NVENC H.264) insta-play it. For
+            // (chromecast + renderer, which pull server NVENC H.264) insta-play it. For
             // native-HEVC-decode targets (vlc + phone/browser) re-rank WITHOUT that
             // preference, so a well-seeded HEVC isn't demoted below a starved H.264.
             // (Re-ranking reassigns result ids, so it must precede the partial-download
@@ -2002,7 +2001,7 @@ async fn handle_search(
             // results from a different query.
             //
             // Anchoring incident: 2026-05-24 evening — Fredrik pressed A
-            // on "Ex Machina" in the Shannon kiosk WatchSubmenu. Kiosk
+            // on "Ex Machina" in the kiosk WatchSubmenu. Kiosk
             // dispatched the title to spela-local, which called /search
             // then /play 1. The /search hit a transient error (network
             // blip / TMDB / Torrentio timeout) and returned 4xx without
@@ -2315,7 +2314,7 @@ async fn play_request(
     if let Some(why) = refusal_for_marked(req, search.as_ref()) {
         return Json(json!({"error": why, "no_release_yet": true}));
     }
-    if req.target.as_deref() == Some("shannon") {
+    if is_renderer_target(req.target.as_deref()) {
         return do_play(
             state,
             req,
@@ -2505,6 +2504,12 @@ pub(crate) const fn magnet_required_error(has_title: bool) -> &'static str {
     }
 }
 
+/// `target=renderer` (or its older name `shannon`): hand the play to the
+/// configured renderer instead of casting or streaming it here.
+pub(crate) fn is_renderer_target(target: Option<&str>) -> bool {
+    matches!(target, Some("renderer") | Some("shannon"))
+}
+
 /// Rebuild a `PlayRequest` that re-plays the CURRENT stream from
 /// absolute episode position `seek_to` (seconds). Used by
 /// `/seek-retranscode` so a scrubber seek PAST the transcoded frontier
@@ -2522,8 +2527,8 @@ pub(crate) const fn magnet_required_error(has_title: bool) -> &'static str {
 /// multi-file torrent re-play re-selects librqbit's default file —
 /// acceptable: seek-retranscode's primary use is single-file library
 /// plays; documented limitation, not a regression of normal play.
-/// 2026-06-09: Build the JSON body forwarded to Shannon's
-/// `shannon-kiosk-actions.service /watch` when `target=shannon` is
+/// 2026-06-09: Build the JSON body forwarded to the renderer's
+/// `kiosk daemon.service /watch` when `target=renderer` is
 /// dispatched. Pure helper extracted from `do_play` so the body shape
 /// can be unit-tested without standing up a TCP listener.
 ///
@@ -2533,7 +2538,7 @@ pub(crate) const fn magnet_required_error(has_title: bool) -> &'static str {
 ///     branch (no /search, no library lookup).
 ///   - **no magnet, has title** (kiosk library tile, web-remote My-Library):
 ///     `{title, library:true}` — spela-local takes the library-bypass
-///     branch (no /search, no TMDB, no Torrentio; Darwin do_play routes
+///     branch (no /search, no TMDB, no Torrentio; the server's do_play routes
 ///     via Local Bypass + remote-origin /library/match).
 ///   - **empty-string magnet** (defensive — should never happen in
 ///     practice, but a caller that passes `Some("")` instead of `None`
@@ -2545,7 +2550,7 @@ pub(crate) const fn magnet_required_error(has_title: bool) -> &'static str {
 /// definition LAN-local (the 2026-06-09 `Spring` → `Send Help (2024)`
 /// incident; `fbf56c1` fixed the TMDB-side surface symptom, this helper
 /// closes the architectural gap that lets the symptom matter at all).
-pub(crate) fn build_shannon_dispatch_body(
+pub(crate) fn build_renderer_dispatch_body(
     title: &str,
     magnet: Option<&str>,
     file_index: Option<u32>,
@@ -2751,19 +2756,19 @@ async fn do_play(
         }
     }
 
-    // 2026-05-23: target="shannon" dispatch — Shannon's bedroom kiosk
+    // 2026-05-23: target="renderer" dispatch — the renderer's kiosk
     // is a peer playback target alongside Chromecasts ("This phone" /
     // chromecast: are the existing pair). Architecturally distinct
-    // from chromecast/vlc paths: Darwin spela does NOT transcode here.
-    // Instead, we just notify Shannon's shannon-kiosk-actions daemon
-    // (`http://192.168.4.30:8080/watch` — LAN-bound since 2026-05-23
-    // dotfiles `ad65b709`) with the title; Shannon's `spela-local`
+    // from chromecast/vlc paths: the server's spela does NOT transcode here.
+    // Instead, we just notify the renderer's kiosk daemon at
+    // `renderer_watch_url` (e.g. `http://192.168.1.30:8080/watch`) with
+    // the title; the renderer's `spela-local`
     // shell client then does its own `/search` + `/play target=vlc`
     // round-trip, kicks off transcoding via the standard non-cast
     // HLS path, and decodes locally (HW via v4l2slh264dec when
     // available, SW playbin3+kmssink fallback). Avoids the
     // double-/play race that would occur if we transcoded here AND
-    // Shannon's spela-local also called /play.
+    // the renderer's spela-local also called /play.
     //
     // Config knob: spela.toml `shannon_watch_url` overrides the
     // default for fleet rebinding. Empty = disable shannon target.
@@ -2772,41 +2777,49 @@ async fn do_play(
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or("");
-    if req_target == "shannon" {
-        let shannon_url = state
+    if is_renderer_target(Some(req_target)) {
+        let renderer_url = match state
             .config
-            .shannon_watch_url
-            .clone()
-            .unwrap_or_else(|| "http://192.168.4.30:8080/watch".to_string());
-        let title_for_shannon = req
+            .renderer_watch_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+        {
+            Some(u) => u.to_string(),
+            None => {
+                return Json(json!({
+                    "error": "No renderer is configured (set renderer_watch_url in config.toml)"
+                }));
+            }
+        };
+        let title_for_renderer = req
             .title
             .clone()
             .or_else(|| req.show.clone())
             .unwrap_or_default();
-        if title_for_shannon.is_empty() {
+        if title_for_renderer.is_empty() {
             return Json(json!({
-                "error": "target=shannon requires a title (or a result_id from a previous search)"
+                "error": "target=renderer requires a title (or a result_id from a previous search)"
             }));
         }
-        // 2026-05-26 — pass magnet + file_index through to Shannon's
+        // 2026-05-26 — pass magnet + file_index through to the renderer's
         // spela-local. By this point in do_play, result_id resolution
         // (L936-990) has populated req.magnet/file_index from
         // last_search if the caller sent result_id. Forwarding them
         // lets spela-local SKIP its own /search round-trip and POST
         // /play with the EXACT magnet the user picked. Without this,
-        // Shannon's own /search + /play 1 races against the ranker
+        // the renderer's own /search + /play 1 races against the ranker
         // (Torrentio order non-deterministic; HEVC↔H.264 mid-tier swaps
         // observed). Title-only fallback preserved for My-Library taps
         // and any caller that doesn't have a magnet.
         //
         // 2026-06-09 — `library` signal for the no-magnet case. By the
-        // time `target=shannon` is checked, result_id resolution (above)
+        // time `target=renderer` is checked, result_id resolution (above)
         // has filled magnet/file_index from last_search if the caller
         // was a search-based play. So "no magnet at this point" reliably
         // means "the user tapped a library entry" (kiosk My-Library tile
         // or web-remote My-Library). Forwarding `library:true` lets
         // spela-local skip its `/search` round-trip ENTIRELY and POST
-        // `/play {title, target:"vlc"}` straight to Darwin, which routes
+        // `/play {title, target:"vlc"}` straight to the server, which routes
         // via Local Bypass + remote-origin `/library/match` — zero TMDB,
         // zero Torrentio, zero internet for a LAN-local play. Pre-fix,
         // every library-tile-tap hit TMDB+Torrentio through spela-local's
@@ -2815,11 +2828,14 @@ async fn do_play(
         // `Spring` → `Send Help (2024)` incident: search.rs `fbf56c1`
         // fixed the surface symptom; this signal closes the architectural
         // gap that lets the surface symptom matter at all).
-        let body =
-            build_shannon_dispatch_body(&title_for_shannon, req.magnet.as_deref(), req.file_index);
+        let body = build_renderer_dispatch_body(
+            &title_for_renderer,
+            req.magnet.as_deref(),
+            req.file_index,
+        );
         let client = reqwest::Client::new();
         let post_result = client
-            .post(&shannon_url)
+            .post(&renderer_url)
             .header("Content-Type", "application/json")
             .json(&body)
             .timeout(std::time::Duration::from_secs(8))
@@ -2829,31 +2845,31 @@ async fn do_play(
             Ok(resp) if resp.status().is_success() => {
                 let direct_play = req.magnet.as_deref().is_some_and(|s| !s.is_empty());
                 tracing::info!(
-                    "target=shannon: dispatched '{}' to {} (direct_play={}, file_index={:?})",
-                    title_for_shannon,
-                    shannon_url,
+                    "target=renderer: dispatched '{}' to {} (direct_play={}, file_index={:?})",
+                    title_for_renderer,
+                    renderer_url,
                     direct_play,
                     req.file_index
                 );
                 return Json(json!({
-                    "status": "dispatched_to_shannon",
-                    "target": "shannon",
-                    "title": title_for_shannon,
-                    "shannon_url": shannon_url,
+                    "status": "dispatched_to_renderer",
+                    "target": "renderer",
+                    "title": title_for_renderer,
+                    "renderer_url": renderer_url,
                     "direct_play": direct_play,
                 }));
             }
             Ok(resp) => {
                 let code = resp.status().as_u16();
                 return Json(json!({
-                    "error": format!("Shannon daemon returned HTTP {}", code),
-                    "shannon_url": shannon_url,
+                    "error": format!("Renderer returned HTTP {}", code),
+                    "renderer_url": renderer_url,
                 }));
             }
             Err(e) => {
                 return Json(json!({
-                    "error": format!("Shannon daemon unreachable: {}", e),
-                    "shannon_url": shannon_url,
+                    "error": format!("Renderer unreachable: {}", e),
+                    "renderer_url": renderer_url,
                 }));
             }
         }
@@ -3749,7 +3765,7 @@ async fn do_play(
 
                     // Cast URL is the HLS MASTER playlist (not the media
                     // playlist directly). Older Chromecast firmwares —
-                    // confirmed live on CrKey 1.56 / Fredriks TV — refuse
+                    // confirmed live on CrKey 1.56 / Bedroom TV — refuse
                     // to load a bare media playlist without CODECS /
                     // RESOLUTION / BANDWIDTH hints. /hls/master.m3u8 wraps
                     // ffmpeg's media playlist with those hints synthetically.
@@ -4533,7 +4549,7 @@ fn try_promote_to_hls_cache(
 /// `spela status` reports its local intent ("running: true, status: streaming")
 /// while the TV is back to its ambient wallpaper. Apr 15, 2026 incident:
 /// every cast attempt produced a healthy ffmpeg + a "streaming" status while
-/// Fredriks TV showed nothing but the blue cast icon, with no failure surface.
+/// Bedroom TV showed nothing but the blue cast icon, with no failure surface.
 ///
 /// Behavior:
 ///   - Sleeps `STARTUP_GRACE_SECS` so the receiver has time to actually load.
@@ -4650,7 +4666,7 @@ pub const MIN_STREAM_AGE_FOR_RECAST_SECS: u64 = 60;
 /// the original Apr 25 lifetime-cap-of-1 with a frequency-cap design.
 ///
 /// Why the change: the cap-of-1 was correct for the failure class it was
-/// built for (Apr 25 Vardagsrum CrKey 1.56 mid-stream IDLE — single random
+/// built for (Apr 25 Living Room TV CrKey 1.56 mid-stream IDLE — single random
 /// flake, one retry, give up if the retry doesn't work). It was wrong for
 /// a different class we hit Apr 28-29: receiver IDLEs every ~15-30 minutes
 /// of sustained playback, recovers with a recast for another 15-30 min,
@@ -4732,7 +4748,7 @@ pub const PREPARED_HLS_CHROMECAST_MAX_BUFFERING_DURATION_SECS: u64 = 15;
 
 /// Decision: should `cast_health_monitor` attempt auto-recast before cleanup?
 ///
-/// Apr 25, 2026 — added after the Vardagsrum CrKey 1.56 Chromecast repeatedly
+/// Apr 25, 2026 — added after the living-room CrKey 1.56 Chromecast repeatedly
 /// entered `player_state=IDLE` mid-stream during sustained high-bitrate
 /// BluRay H.264 playback (~7 Mbps). Pattern: healthy for ~11 minutes, then a
 /// sudden transition to IDLE with no error surface the cast protocol will
@@ -4796,7 +4812,7 @@ pub fn should_attempt_recast(
 /// `handle_play`'s existing auto-retry loop can fall back to the next
 /// search result. Empirically calibrated:
 ///   - Well-seeded torrents (MeGusta-class, 1000+ seeds) produce the first
-///     HLS segment within 5-10 s on Darwin's GTX 1650 NVENC (HEVC→H.264
+///     HLS segment within 5-10 s on the server's GTX 1650 NVENC (HEVC→H.264
 ///     transcode at ~3-6× realtime, first 6 s segment ready at ~1-2 s
 ///     wall once piece 0 lands).
 ///   - 20 s = 2-3× safety margin for slow-but-recoverable cases (HEVC
@@ -5625,7 +5641,7 @@ async fn cast_health_monitor(
             // Apr 25, 2026: auto-recast on first mid-stream IDLE batch.
             //
             // Old CrKey firmware occasionally drops its CAF session without
-            // error after sustained high-bitrate playback — classic Vardagsrum
+            // error after sustained high-bitrate playback — classic living-room TV
             // failure mode. Workers stay alive (ffmpeg keeps writing, webtorrent
             // keeps seeding); it's the receiver that needs a kick. One fresh
             // LOAD + seek to HWM recovers ~10-30 s later with no manual action.
@@ -5803,7 +5819,7 @@ async fn cast_health_monitor(
                         // tries to write to the same paths.
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         // Apr 29, 2026 PM bug fix: spela binds to
-                        // `config.host` (e.g. 192.168.4.1 on Darwin per its
+                        // `config.host` (e.g. 192.168.1.10 on the server per its
                         // systemd unit) — NOT 0.0.0.0. Self-calling 127.0.0.1
                         // failed because the server isn't listening on
                         // loopback. Use the actual bind host. Fall back to
@@ -5976,7 +5992,7 @@ async fn handle_status(State(state): State<SharedState>) -> Json<Value> {
             // torrent ID (small u32 like 4/5/6) against the OS PID
             // space and "worked" only by coincidence — May 6, 2026
             // it reported `process_dead` while S05E06 was actively
-            // streaming to Fredriks TV. Ruby's tool-loop saw the
+            // streaming to Bedroom TV. Ruby's tool-loop saw the
             // false-dead status, narrated failure, retried, narrated
             // success, retried, looped 6× in 97 seconds. The torrent
             // engine handle is checked too as belt-and-suspenders so
@@ -7472,8 +7488,8 @@ pub(crate) fn build_remote_stream_url(origin_base: &str, handle: &str) -> String
 /// library counterpart of `resolve_result_for_vlc`. Mirrors do_play's remote-origin
 /// Local Bypass (liveness ping → `/library/match` → `build_remote_stream_url`) so a
 /// library title opened in VLC streams the EXACT serve-library file the Chromecast
-/// path would, just decoded natively by VLC (no Darwin NVENC). Remote origins only
-/// for now — Fredrik's library lives on a remote serve-library origin; a Darwin-local
+/// path would, just decoded natively by VLC (no server NVENC). Remote origins only
+/// for now — Fredrik's library lives on a remote serve-library origin; a server-local
 /// curated dir would need a local raw-serve endpoint (TODO if one is ever added).
 async fn resolve_library_vlc_url(
     state: &SharedState,
@@ -7839,9 +7855,27 @@ async fn handle_targets(State(state): State<SharedState>) -> Json<Value> {
     })
     .await;
     match result {
-        Ok(Ok(devices)) => Json(json!({"targets": devices})),
-        Ok(Err(e)) => Json(json!({"error": e.to_string(), "targets": []})),
-        Err(e) => Json(json!({"error": e.to_string(), "targets": []})),
+        Ok(Ok(devices)) => {
+            Json(json!({"targets": devices, "renderer": renderer_target(&state.config)}))
+        }
+        Ok(Err(e)) => Json(
+            json!({"error": e.to_string(), "targets": [], "renderer": renderer_target(&state.config)}),
+        ),
+        Err(e) => Json(
+            json!({"error": e.to_string(), "targets": [], "renderer": renderer_target(&state.config)}),
+        ),
+    }
+}
+
+/// The renderer target the web remote may offer, or null when none is configured.
+fn renderer_target(config: &Config) -> Value {
+    match config
+        .renderer_watch_url
+        .as_deref()
+        .filter(|u| !u.is_empty())
+    {
+        Some(_) => json!({"name": config.renderer_name}),
+        None => Value::Null,
     }
 }
 
@@ -8182,7 +8216,7 @@ async fn handle_watched_remove(
 
 /// `GET /pending-watched` — sessions the Chromecast tracker (slice 5) detected
 /// as completed on a house TV but that AREN'T yet confirmed as Fredrik's
-/// (housemates use these TVs too). The web remote surfaces these on load with a
+/// (other people in the household use these TVs too). The web remote surfaces these on load with a
 /// Yes/No prompt; only a Yes promotes one into the watched-ledger.
 async fn handle_pending_watched(State(state): State<SharedState>) -> Json<Value> {
     let app = AppState::load(&state.state_dir);
@@ -8190,7 +8224,7 @@ async fn handle_pending_watched(State(state): State<SharedState>) -> Json<Value>
 }
 
 /// `POST /pending-watched/resolve` — `{key, watched:bool}`. Yes → mark_watched
-/// (it WAS Fredrik); No → drop it + remember the dismissal so a housemate's
+/// (it WAS Fredrik); No → drop it + remember the dismissal so someone else's
 /// binge of the same episode doesn't re-nag.
 async fn handle_pending_watched_resolve(
     State(state): State<SharedState>,
@@ -8219,7 +8253,7 @@ async fn handle_pending_watched_resolve(
 /// 2026-07-13 (slice 5): background watch tracker. A tokio task on a fixed
 /// cadence polls each house Chromecast's media status (READ-ONLY) across ALL
 /// apps and STAGES near-complete Movie/TvShow sessions for Fredrik to confirm.
-/// It never controls anything and never auto-marks (housemates watch these TVs)
+/// It never controls anything and never auto-marks (other people in the household watch these TVs)
 /// — spela's OWN casts are excluded here (already tracked via
 /// `save_position_smart`) by skipping content served from spela's own stream.
 fn spawn_chromecast_tracker(state: SharedState) {
@@ -8644,7 +8678,7 @@ async fn handle_library(State(state): State<SharedState>) -> Json<Value> {
         }
     }
 
-    // (2) Remote serve-library origins (the BOHR collection lives here).
+    // (2) Remote serve-library origins (the library collection lives here).
     let mut any_origin_listed = false;
     for origin in &state.config.remote_origins {
         let base = origin.trim_end_matches('/');
@@ -9617,7 +9651,7 @@ async fn handle_hls_playlist(
 /// Serve a synthetic HLS master playlist that declares CODECS / RESOLUTION /
 /// BANDWIDTH and points at the media playlist (`playlist.m3u8`) ffmpeg
 /// generates. CrKey 1.56 firmware on 1st-gen Chromecasts won't load a media
-/// playlist directly via LOAD — Apr 15, 2026 live test against Fredriks TV
+/// playlist directly via LOAD — Apr 15, 2026 live test against Bedroom TV
 /// proved the receiver fetches the bare media playlist 4 times in a row
 /// then bails to player_state=IDLE / idle_reason=ERROR without ever
 /// requesting a single segment, while Apple's bipbop reference HLS stream
@@ -11108,7 +11142,7 @@ async fn handle_vlc_ready(
 
 /// `GET /library/vlc.m3u?title=<raw_name>` — the library counterpart of
 /// `/vlc/{id}/open.m3u`. Resolves the library file to its serve-library URL and
-/// returns a one-entry .m3u VLC opens directly (native decode on the Mac, no Darwin
+/// returns a one-entry .m3u VLC opens directly (native decode on the Mac, no the server
 /// GPU). The SPA's library play routes here for the `vlc` target, sharing the same
 /// device-targeting dispatch as a torrent play.
 /// `GET /library/files?title=` — proxy to the serve-library origin's file list for
@@ -11242,7 +11276,7 @@ fn m3u_response(body: String) -> axum::response::Response {
 }
 
 /// The address a player on the LAN uses to reach this server: `stream_host` when it is
-/// configured (Darwin), else the Host the request arrived on, which the Host allowlist
+/// configured (the server), else the Host the request arrived on, which the Host allowlist
 /// has already approved.
 fn lan_base(state: &ServerState, headers: &HeaderMap) -> String {
     if !state.config.stream_host.is_empty() {
@@ -13633,13 +13667,13 @@ mod tests {
     fn boot_resume_recent_chromecast_returns_device() {
         let now = Utc::now();
         let prev = cs_cast(
-            "chromecast:Fredriks TV",
+            "chromecast:Bedroom TV",
             "magnet:?xt=1",
             now - chrono::Duration::minutes(5),
         );
         assert_eq!(
             boot_resume_device(&prev, now, false),
-            Some("Fredriks TV".to_string())
+            Some("Bedroom TV".to_string())
         );
     }
 
@@ -13873,7 +13907,7 @@ mod tests {
 
     #[test]
     fn replay_request_library_play_drops_empty_magnet_to_none() {
-        let r = replay_request_from_current(&_cs_fixture("", "chromecast:Fredriks TV"), 2240.0);
+        let r = replay_request_from_current(&_cs_fixture("", "chromecast:Bedroom TV"), 2240.0);
         assert_eq!(
             r.magnet, None,
             "empty magnet (library/bypass) must become None so do_play takes the title-bridge path"
@@ -13881,7 +13915,7 @@ mod tests {
         assert_eq!(r.title.as_deref(), Some("Grosse.Pointe.Blank.1997.1080p"));
         assert_eq!(r.seek_to, Some(2240.0));
         assert_eq!(r.target.as_deref(), Some("chromecast"));
-        assert_eq!(r.cast_name.as_deref(), Some("Fredriks TV"));
+        assert_eq!(r.cast_name.as_deref(), Some("Bedroom TV"));
         assert_eq!(r.imdb_id.as_deref(), Some("tt0119229"));
         assert_eq!(
             r.poster_url.as_deref(),
@@ -13907,16 +13941,35 @@ mod tests {
         assert_eq!(r.cast_name, None);
     }
 
-    // --- 2026-06-09: target=shannon dispatch body shape ---
+    #[test]
+    fn the_renderer_target_is_offered_only_when_configured() {
+        let mut config = Config::default();
+        assert!(renderer_target(&config).is_null());
+        config.renderer_watch_url = Some(String::new());
+        assert!(renderer_target(&config).is_null());
+        config.renderer_watch_url = Some("http://192.168.1.30:8080/watch".into());
+        config.renderer_name = "Kitchen TV".into();
+        assert_eq!(renderer_target(&config)["name"], "Kitchen TV");
+    }
+
+    #[test]
+    fn the_renderer_target_answers_to_both_names() {
+        assert!(is_renderer_target(Some("renderer")));
+        assert!(is_renderer_target(Some("shannon")));
+        assert!(!is_renderer_target(Some("vlc")));
+        assert!(!is_renderer_target(None));
+    }
+
+    // --- 2026-06-09: target=renderer dispatch body shape ---
     // Pins the contract that spela-local sees, so the library-bypass
     // signal can never regress to "always falls through to /search".
 
     #[test]
-    fn shannon_dispatch_no_magnet_signals_library_bypass() {
+    fn renderer_dispatch_no_magnet_signals_library_bypass() {
         // The canonical kiosk-library-tile-tap shape: title only, no magnet.
         // Must carry `library:true` so spela-local takes the library branch
         // and skips its /search round-trip.
-        let body = build_shannon_dispatch_body("Spring (2014).mkv", None, None);
+        let body = build_renderer_dispatch_body("Spring (2014).mkv", None, None);
         assert_eq!(body["title"], "Spring (2014).mkv");
         assert_eq!(body["library"], true);
         assert!(body.get("magnet").is_none(), "no magnet on library tap");
@@ -13924,12 +13977,12 @@ mod tests {
     }
 
     #[test]
-    fn shannon_dispatch_with_magnet_omits_library_signal() {
-        // Web-remote search-based play: magnet supplied by Darwin
+    fn renderer_dispatch_with_magnet_omits_library_signal() {
+        // Web-remote search-based play: magnet supplied by the server
         // last_search resolution. Must NOT carry `library:true` —
         // spela-local must take the direct-play branch, not library.
         let body =
-            build_shannon_dispatch_body("The Boys S05E07", Some("magnet:?xt=urn:btih:abc"), None);
+            build_renderer_dispatch_body("The Boys S05E07", Some("magnet:?xt=urn:btih:abc"), None);
         assert_eq!(body["title"], "The Boys S05E07");
         assert_eq!(body["magnet"], "magnet:?xt=urn:btih:abc");
         assert!(
@@ -13939,10 +13992,10 @@ mod tests {
     }
 
     #[test]
-    fn shannon_dispatch_with_magnet_and_file_index() {
+    fn renderer_dispatch_with_magnet_and_file_index() {
         // Multi-file torrent: magnet + file_index passthrough.
         let body =
-            build_shannon_dispatch_body("Pack Release", Some("magnet:?xt=urn:btih:def"), Some(3));
+            build_renderer_dispatch_body("Pack Release", Some("magnet:?xt=urn:btih:def"), Some(3));
         assert_eq!(body["title"], "Pack Release");
         assert_eq!(body["magnet"], "magnet:?xt=urn:btih:def");
         assert_eq!(body["file_index"], 3);
@@ -13950,13 +14003,13 @@ mod tests {
     }
 
     #[test]
-    fn shannon_dispatch_empty_string_magnet_treated_as_no_magnet() {
+    fn renderer_dispatch_empty_string_magnet_treated_as_no_magnet() {
         // Defensive: a caller that passes `Some("")` (e.g. a JSON
         // payload with `magnet: ""`) gets the same library-bypass
         // treatment as `None`. Prevents an empty-magnet from sneaking
         // through as "supplied" and triggering spela-local's direct-play
         // branch with a useless empty magnet.
-        let body = build_shannon_dispatch_body("Some Title", Some(""), None);
+        let body = build_renderer_dispatch_body("Some Title", Some(""), None);
         assert_eq!(body["library"], true);
         assert!(body.get("magnet").is_none());
     }
@@ -14108,8 +14161,8 @@ mod tests {
             season: None,
             episode: None,
             imdb_id: None,
-            target: "chromecast:Fredriks TV".into(),
-            url: "http://192.168.4.1:7890/hls/master.m3u8".into(),
+            target: "chromecast:Bedroom TV".into(),
+            url: "http://192.168.1.10:7890/hls/master.m3u8".into(),
             started_at: chrono::Utc::now(),
             pid: 0,
             has_subtitles: false,
@@ -14138,8 +14191,8 @@ mod tests {
             season: None,
             episode: None,
             imdb_id: None,
-            target: "chromecast:Fredriks TV".into(),
-            url: "http://192.168.4.1:7890/hls/master.m3u8".into(),
+            target: "chromecast:Bedroom TV".into(),
+            url: "http://192.168.1.10:7890/hls/master.m3u8".into(),
             started_at: chrono::Utc::now(),
             pid: 0,
             has_subtitles: false,
@@ -14526,7 +14579,7 @@ mod tests {
 
     #[test]
     fn find_local_bypass_dir_no_marker_no_size_matches_curated_library() {
-        // BOHR-shaped: `<root>/Inception (2010) [1080p]/<dense .mkv>`,
+        // Library-shaped: `<root>/Inception (2010) [1080p]/<dense .mkv>`,
         // NO .spela_done, expected_bytes=0. Must match (tier 3).
         let root = tempfile::tempdir().unwrap();
         let film = root.path().join("Inception (2010) [1080p]");
@@ -14955,7 +15008,7 @@ mod tests {
 
     /// 2026-09-14 anchor. Both names, both sizes and the `quality` string are
     /// copied VERBATIM from the live `last_search.json` and `/mnt/hdd/spela-media`
-    /// on Darwin, mid-incident.
+    /// on the server, mid-incident.
     ///
     /// The 4K HDR release carries a title with NO resolution, codec or group token,
     /// so normalized it is a strict PREFIX of the fully-downloaded 1080p REMUX
@@ -15196,7 +15249,7 @@ mod tests {
     fn is_valid_poster_url_rejects_internal_targets() {
         // L7: defends against attacker-controlled poster_url that the
         // Chromecast would fetch directly, leaking IP reachability info.
-        assert!(!is_valid_poster_url("http://192.168.4.1:6379/"));
+        assert!(!is_valid_poster_url("http://192.168.1.10:6379/"));
         assert!(!is_valid_poster_url("http://localhost:80/"));
         assert!(!is_valid_poster_url("file:///etc/passwd"));
     }
@@ -15253,14 +15306,17 @@ mod tests {
 
     #[test]
     fn parse_host_header_strips_port() {
-        assert_eq!(parse_host_header("darwin.home:7890"), "darwin.home");
-        assert_eq!(parse_host_header("192.168.4.1:7890"), "192.168.4.1");
+        assert_eq!(
+            parse_host_header("media-server.lan:7890"),
+            "media-server.lan"
+        );
+        assert_eq!(parse_host_header("192.168.1.10:7890"), "192.168.1.10");
         assert_eq!(parse_host_header("localhost:7890"), "localhost");
     }
 
     #[test]
     fn parse_host_header_no_port() {
-        assert_eq!(parse_host_header("darwin.home"), "darwin.home");
+        assert_eq!(parse_host_header("media-server.lan"), "media-server.lan");
         assert_eq!(parse_host_header("localhost"), "localhost");
     }
 
@@ -15278,13 +15334,13 @@ mod tests {
 
     #[test]
     fn compute_bind_addresses_dual_binds_on_specific_lan_ip() {
-        // The Wilderpeople movie-night regression: --host 192.168.4.1 alone
+        // The Wilderpeople movie-night regression: --host 192.168.1.10 alone
         // left ffmpeg's loopback URL connection-refused. We MUST also bind
         // 127.0.0.1 in this case.
-        let addrs = compute_bind_addresses("192.168.4.1", 7890);
+        let addrs = compute_bind_addresses("192.168.1.10", 7890);
         assert_eq!(addrs.len(), 2, "expected dual bind, got {:?}", addrs);
         assert!(addrs.contains(&"127.0.0.1:7890".to_string()));
-        assert!(addrs.contains(&"192.168.4.1:7890".to_string()));
+        assert!(addrs.contains(&"192.168.1.10:7890".to_string()));
     }
 
     #[test]
@@ -15325,7 +15381,7 @@ mod tests {
         // Bind order matters: a panic during the LAN bind should still
         // leave loopback up so that internal subprocesses can reach the
         // server while the operator investigates the LAN failure.
-        let addrs = compute_bind_addresses("192.168.4.1", 7890);
+        let addrs = compute_bind_addresses("192.168.1.10", 7890);
         assert_eq!(addrs[0], "127.0.0.1:7890");
     }
 
@@ -15407,10 +15463,10 @@ mod tests {
         // The whole point of dual-bind: --host stays specific to LAN, so
         // WAN is never bound. This test is the canonical pin against a
         // future "convenient" change to bind 0.0.0.0 silently.
-        let addrs = compute_bind_addresses("192.168.4.1", 7890);
+        let addrs = compute_bind_addresses("192.168.1.10", 7890);
         assert!(!addrs.iter().any(|a| a.starts_with("0.0.0.0:")));
         assert!(
-            !addrs.iter().any(|a| a.contains("94.254.")), // Darwin's WAN /24
+            !addrs.iter().any(|a| a.contains("203.0.113.")), // the server's WAN /24
             "WAN IP must never appear in bind addresses, got {:?}",
             addrs
         );
@@ -15423,15 +15479,17 @@ mod tests {
         let allow = compute_host_allowlist(&config);
         assert!(allow.contains("localhost"));
         assert!(allow.contains("127.0.0.1"));
-        assert!(allow.contains("darwin.home"));
+        // No deployment's hostname is built in: only loopback is allowed
+        // until stream_host or allowed_hosts names more.
+        assert_eq!(allow.len(), 2, "{allow:?}");
     }
 
     #[test]
     fn compute_host_allowlist_includes_stream_host_when_set() {
         let mut config = Config::default();
-        config.stream_host = "192.168.4.1".into();
+        config.stream_host = "192.168.1.10".into();
         let allow = compute_host_allowlist(&config);
-        assert!(allow.contains("192.168.4.1"));
+        assert!(allow.contains("192.168.1.10"));
     }
 
     #[test]
@@ -15457,13 +15515,13 @@ mod tests {
 
     #[test]
     fn compute_host_allowlist_rejects_unknown_wan_ip() {
-        // Defense-in-depth pin: Darwin's public WAN IP must NOT be in the
+        // Defense-in-depth pin: the server's public WAN IP must NOT be in the
         // default allowlist. iptables is the first line; the host-header
         // middleware is the second. Verify the second doesn't spontaneously
         // accept the public IP if iptables ever lets it through.
         let config = Config::default();
         let allow = compute_host_allowlist(&config);
-        assert!(!allow.contains("94.254.88.116"));
+        assert!(!allow.contains("203.0.113.7"));
     }
 
     // --- Reaper grace period math (Apr 15, 2026 regression guards) ---
@@ -15866,7 +15924,7 @@ mod tests {
 
     #[test]
     fn test_recast_normal_mid_stream_death() {
-        // Vardagsrum-style failure: ~12 min in, we have an HWM, no prior recast.
+        // Living-room-TV-style failure: ~12 min in, we have an HWM, no prior recast.
         // This is the primary recovery case — must attempt.
         assert!(should_attempt_recast(None, 720, true, false));
     }
@@ -16161,7 +16219,7 @@ mod tests {
     #[test]
     fn test_fail_fast_deadline_is_stable() {
         // Pinned: 20 s. Calibrated against MeGusta-class swarms (1000+
-        // seeds) producing first segment within 5-10 s on Darwin's GTX
+        // seeds) producing first segment within 5-10 s on the server's GTX
         // 1650. Loosening risks burning user patience; tightening risks
         // false-positives on healthy-but-slow startup. If this assertion
         // needs to change, also update the FAIL_FAST_STREAM_START_SECS
@@ -17184,7 +17242,7 @@ mod client_location_tests {
     }
 
     /// spela is LAN-only, so WireGuard is the only way in from mobile data or a
-    /// hotspot. MERIAN's tunnel address is the real one.
+    /// hotspot. The laptop's tunnel address is the real one.
     #[test]
     fn the_wireguard_subnet_is_off_lan() {
         assert!(client_is_off_lan(ip("10.0.0.3")));
@@ -17193,8 +17251,8 @@ mod client_location_tests {
 
     #[test]
     fn the_home_lan_and_loopback_are_not() {
-        assert!(!client_is_off_lan(ip("192.168.4.1")));
-        assert!(!client_is_off_lan(ip("192.168.4.126")));
+        assert!(!client_is_off_lan(ip("192.168.1.10")));
+        assert!(!client_is_off_lan(ip("192.168.1.51")));
         assert!(!client_is_off_lan(ip("127.0.0.1")));
     }
 
@@ -17216,7 +17274,7 @@ mod client_location_tests {
             ip("10.0.0.3")
         );
         assert_eq!(
-            effective_client_ip(ip("192.168.4.1"), Some("10.0.0.3, 172.16.0.1")),
+            effective_client_ip(ip("192.168.1.10"), Some("10.0.0.3, 172.16.0.1")),
             ip("10.0.0.3"),
             "the first entry is the originating client"
         );
@@ -17226,7 +17284,7 @@ mod client_location_tests {
     #[test]
     fn the_forwarded_header_is_ignored_from_a_non_local_peer() {
         assert_eq!(
-            effective_client_ip(ip("10.0.0.3"), Some("192.168.4.50")),
+            effective_client_ip(ip("10.0.0.3"), Some("192.168.1.60")),
             ip("10.0.0.3"),
             "a remote client cannot claim to be on the LAN"
         );

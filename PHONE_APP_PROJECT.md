@@ -14,9 +14,9 @@ Date: Apr 28, 2026.
 - Dev effort:
   > "My dev velocity these days is insane so dev effort should not be a factor here basically"
 - Remote access via existing WireGuard:
-  > "I've got WireGuard set up on Darwin (home router and server) so we should use that instead of Tailscale I guess?"
+  > "I've got WireGuard set up on the server (home router and server) so we should use that instead of Tailscale I guess?"
 - WG split-tunnel preference:
-  > "ideally (minor issue tho) I'd like it if ONLY the spela app traffic was tunneled through WG through the Sarpetorp network. But I guess it doesn't matter that much."
+  > "ideally (minor issue tho) I'd like it if ONLY the spela app traffic was tunneled through WG through the house network. But I guess it doesn't matter that much."
 - On running spela on the phone itself:
   > "Could/should the phone app run spela on the phone itself to stream directly from the torrent? Or is that a bad idea?" — confirmed bad idea (battery, cellular caps, mobile-IP exposure, iOS background-kill).
 - On reusing the Custom Receiver on the phone:
@@ -27,9 +27,9 @@ Date: Apr 28, 2026.
 ## Decisions made
 
 1. **Native iOS app** (SwiftUI). No Android v1.
-2. **Centralized spela on Darwin**, phone is a thin client. No torrent/transcode on phone.
-3. **WireGuard for remote access** (not Tailscale). Existing WG terminates on Darwin.
-4. **Use the official WireGuard iOS app**, not bake WG into the spela app. Set `AllowedIPs` to Darwin's LAN subnet only (e.g. `192.168.4.0/24`) so only spela traffic tunnels.
+2. **Centralized spela on the server**, phone is a thin client. No torrent/transcode on phone.
+3. **WireGuard for remote access** (not Tailscale). Existing WG terminates on the server.
+4. **Use the official WireGuard iOS app**, not bake WG into the spela app. Set `AllowedIPs` to the server's LAN subnet only (e.g. `192.168.1.0/24`) so only spela traffic tunnels.
 5. **Custom Cast Receiver remains TV-side only.** Reuse Shaka logic at most as library/pattern, not as artifact.
 
 ## Open questions (in dependency order)
@@ -104,7 +104,7 @@ Date: Apr 28, 2026.
 - Multi-device handoff ("continue on TV").
 
 **Infra**
-- WG `AllowedIPs` scoping (decided: Darwin LAN subnet only).
+- WG `AllowedIPs` scoping (decided: the server LAN subnet only).
 - WG always-on vs on-demand by SSID.
 - Cast SDK $5 gate (defer or pay).
 - App Store / sideload / PWA distribution path (decided: TestFlight via paid Apple Dev, pending Tier 1 confirmation).

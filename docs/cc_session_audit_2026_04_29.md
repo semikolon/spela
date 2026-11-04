@@ -2,7 +2,7 @@
 
 **Status**: TENTATIVE — needs human review before any action.
 **Scope**: Sessions in `~/.claude/projects/-Users-fredrikbranstrom-Projects-spela/` modified between 2026-01-29 and 2026-04-29. Only 3 sessions matched the filter; all 3 inspected.
-**Cross-references**: `~/dotfiles/docs/2026-04-29-audit-master.md` (cross-project synthesis).
+**Cross-references**: `docs/2026-04-29-audit-master.md` in the owner's dotfiles (cross-project synthesis).
 
 ## Hanging sessions
 
@@ -16,11 +16,11 @@
 
 2. **`experimental_endlist_hack` cleanup pass** (`a9a4030b` adjacent) — flag noted as "functionally redundant subset of `vod_manifest_padded`, should be removed in a future cleanup pass" inside the v3.2.1 changelog item, but **no standalone task**. Easy to lose when next refactoring touches HLS.
 
-3. **Loose docs sweep** (`a9a4030b` Apr 29 final turns) — `~/graphiti-falkordblite-vs-falkordb.md` (8.9KB, Mar 14) and 3 files in `~/Documents/` (disk-cleanup, ghostty postmortem, sleepfm feasibility) flagged as "possibly worth migrating to `~/dotfiles/docs/` for nit-tracking". **Not tracked anywhere**; sweep abandoned mid-thought.
+3. **Loose docs sweep** (`a9a4030b` Apr 29 final turns) — `~/graphiti-falkordblite-vs-falkordb.md` (8.9KB, Mar 14) and 3 files in `~/Documents/` (disk-cleanup, ghostty postmortem, sleepfm feasibility) flagged as "possibly worth migrating to `docs/` in the owner's dotfiles for nit-tracking". **Not tracked anywhere**; sweep abandoned mid-thought.
 
-4. **Argon DA1/Anti-standby continuous tone — implementation path decision** (`a9a4030b`) — Open Question #4 in `bedroom_audio_station_2026_04_26.md` (Chromecast Spotify Connect vs Shannon vs Apple TV). Persisted as open question but **no decision trigger** beyond "decide once Shannon Phase 9 lands". Vulnerable to indefinite drift.
+4. **Argon DA1/Anti-standby continuous tone — implementation path decision** (`a9a4030b`) — Open Question #4 in `bedroom_audio_station_2026_04_26.md` (Chromecast Spotify Connect vs the renderer vs Apple TV). Persisted as open question but **no decision trigger** beyond "decide once the renderer Phase 9 lands". Vulnerable to indefinite drift.
 
-5. **Universal Import "verify model is DA2 vs DA2 V2"** (`a9a4030b`) — persisted as Open Question #1 but requires physical nameplate inspection at Sarpetorp; **no reminder mechanism**, will only surface on next visit if user thinks of it.
+5. **Universal Import "verify model is DA2 vs DA2 V2"** (`a9a4030b`) — persisted as Open Question #1 but requires physical nameplate inspection at the house; **no reminder mechanism**, will only surface on next visit if user thinks of it.
 
 6. **Ruby identity narration in Tier 0** (`93af8f46`, line 1420 nudge) — flagged as `/capture` candidate when next session starts. Identity-boundary fix shipped to code, but the meta-pattern observation ("3 prompts have separate identity rules; cross-reference comments are sufficient") **not captured to Graphiti** as a reusable pattern.
 

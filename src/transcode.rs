@@ -4,7 +4,7 @@ use tokio::process::Command;
 
 /// The H.264 encoder this machine's ffmpeg actually has, best first.
 ///
-/// 2026-11-03: every re-encode path was written for Darwin's GTX 1650 and
+/// 2026-11-03: every re-encode path was written for the server's GTX 1650 and
 /// hard-codes `h264_nvenc`. A spela on a Mac has no NVENC, so any play that
 /// needed a re-encode (subtitle burn-in, intro clip, a seek, any Chromecast
 /// play) produced zero segments and fell through to the next source — which
@@ -35,7 +35,7 @@ pub fn pick_h264_encoder(encoders_listing: &str) -> H264Encoder {
 }
 
 /// Probed once per process. A failed probe keeps NVENC, the historical
-/// behaviour, so a broken `ffmpeg -encoders` cannot change Darwin's output.
+/// behaviour, so a broken `ffmpeg -encoders` cannot change the server's output.
 pub fn h264_encoder() -> H264Encoder {
     static ENCODER: std::sync::OnceLock<H264Encoder> = std::sync::OnceLock::new();
     *ENCODER.get_or_init(|| {
@@ -1527,12 +1527,12 @@ mod encoder_tests {
 
     #[test]
     fn nvenc_wins_when_listed() {
-        // Darwin's listing was not reachable when this was written; only the
+        // The server's listing was not reachable when this was written; only the
         // name column matters, and FFmpeg names the encoder `h264_nvenc`.
-        let darwin = format!(
+        let server_listing = format!(
             "{MAC_LISTING} V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)\n"
         );
-        assert_eq!(pick_h264_encoder(&darwin), H264Encoder::Nvenc);
+        assert_eq!(pick_h264_encoder(&server_listing), H264Encoder::Nvenc);
     }
 
     #[test]

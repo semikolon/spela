@@ -549,7 +549,7 @@ mod tests {
     // bytes + EOF → EBML parse failure → ffmpeg crashed → 0 HLS segments
     // → 75 s blue-cast icon). These tests pin the pure decision helpers;
     // the actual probe read against a real FileStream is integration-
-    // tested by the May 13 incident replay live on Darwin.
+    // tested by the May 13 incident replay live on the server.
 
     #[test]
     fn test_probe_target_clamps_to_max_for_large_range() {

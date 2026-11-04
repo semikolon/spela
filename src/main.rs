@@ -83,9 +83,9 @@ enum Commands {
         /// Stream to VLC instead of Chromecast
         #[arg(long)]
         vlc: bool,
-        /// Phase 7 thin-client: no Chromecast — the server (Darwin, NVENC)
+        /// Phase 7 thin-client: no Chromecast — the server (the server, NVENC)
         /// builds the HLS as usual; THIS host plays it locally via mpv.
-        /// Run on the bedroom box (Shannon). Heavy transcode stays on the
+        /// Run on the renderer box. Heavy transcode stays on the
         /// server; this machine is a thin player. Blocks until mpv exits,
         /// then tells the server to stop. Display/GPU specifics live in
         /// the host's own ~/.config/mpv/mpv.conf (kiosk: vo=gpu/drm).
@@ -175,7 +175,7 @@ enum Commands {
     },
     /// Queue management — auto-fire next item on natural EOF.
     /// Examples:
-    ///   spela queue add 1 --cast "Fredriks TV"   (queue search result #1)
+    ///   spela queue add 1 --cast "Bedroom TV"   (queue search result #1)
     ///   spela queue list
     ///   spela queue clear
     Queue {
@@ -301,7 +301,7 @@ enum QueueAction {
     Add {
         /// Result number from last `spela search`.
         result_id: usize,
-        /// Override the default cast device (e.g. "Fredriks TV").
+        /// Override the default cast device (e.g. "Bedroom TV").
         #[arg(long)]
         cast: Option<String>,
         /// Slower startup, fewer buffering stalls on Chromecast
@@ -615,7 +615,7 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             }
 
             // Thin-client render: wait for the server's HLS to be ready
-            // (Darwin transcode cold-start), then play it locally with
+            // (the server transcode cold-start), then play it locally with
             // mpv. Heavy transcode stays on the server's NVENC GPU; this
             // host is a dumb player. Blocks until mpv exits, then stops
             // the server-side stream. Display/GPU specifics belong in the
@@ -956,7 +956,7 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
             } => {
                 // Server resolves result_id against ITS last_search.json.
                 // Required because the CLI runs on a different host than
-                // the server in typical setups (Mac CLI → Darwin spela).
+                // the server in typical setups (Mac CLI → the server's spela).
                 let body = serde_json::json!({
                     "result_id": result_id,
                     "cast_name": cast,

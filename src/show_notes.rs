@@ -12,7 +12,7 @@
 //! is old, so stale intel reads AS stale rather than as current fact. A note nobody has
 //! refreshed in six months is worse than no note if it looks fresh.
 //!
-//! User-local on Darwin (`~/.config/spela/show_notes.json`), never the public repo — it
+//! User-local on the server (`~/.config/spela/show_notes.json`), never the public repo — it
 //! carries opinions about what Fredrik is watching.
 
 use anyhow::Result;

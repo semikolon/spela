@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // spela server — HTTP API for media streaming control
-// Runs on Darwin. Clients (CLI, voice agents) connect via HTTP from any machine.
+// Runs on the server. Clients (CLI, voice agents) connect via HTTP from any machine.
 //
 // Search: TMDB (metadata) + Torrentio (magnet links). Zero scraping.
 // Stream: webtorrent-cli to Chromecast/VLC/mpv.
@@ -274,7 +274,7 @@ async function startStream(magnet, opts = {}) {
   stopStream(true)
 
   const target = opts.target || state.preferences.default_target || 'chromecast'
-  const castName = opts.cast_name || state.preferences.chromecast_name || 'Fredriks TV'
+  const castName = opts.cast_name || state.preferences.chromecast_name || 'Bedroom TV'
   const noSubs = opts.no_subs === true
   const subLang = opts.subtitle_lang || 'eng'
 
@@ -298,7 +298,7 @@ async function startStream(magnet, opts = {}) {
       const log = readFileSync(logFile, 'utf8')
       const match = log.match(/Server running at: (http:\/\/localhost:\d+\/[^\n]+)/)
       if (match) {
-        serverUrl = match[1].replace('localhost', 'darwin.home').trim()
+        serverUrl = match[1].replace('localhost', 'media-server.lan').trim()
         break
       }
     } catch {}
@@ -326,7 +326,7 @@ async function startStream(magnet, opts = {}) {
       // Serve transcoded file via python HTTP server
       const httpProc = spawn('python3', ['-m', 'http.server', '8889', '--directory', MEDIA_DIR], { detached: true, stdio: 'ignore' })
       httpProc.unref()
-      finalUrl = `http://darwin.home:8889/transcoded_aac.mp4`
+      finalUrl = `http://media-server.lan:8889/transcoded_aac.mp4`
       await new Promise(r => setTimeout(r, 2000))
     }
   } catch (err) {
@@ -472,31 +472,31 @@ const server = createServer(async (req, res) => {
       case '/status':  json(200, getStatus()); break
       case '/pause': {
         const s = loadState()
-        const device = s.current?.target?.split(':')?.[1] || 'Fredriks TV'
+        const device = s.current?.target?.split(':')?.[1] || 'Bedroom TV'
         json(200, castCommand('pause', [device])); break
       }
       case '/resume': {
         const s = loadState()
-        const device = s.current?.target?.split(':')?.[1] || 'Fredriks TV'
+        const device = s.current?.target?.split(':')?.[1] || 'Bedroom TV'
         json(200, castCommand('resume', [device])); break
       }
       case '/seek': {
         const s = loadState()
-        const device = s.current?.target?.split(':')?.[1] || 'Fredriks TV'
+        const device = s.current?.target?.split(':')?.[1] || 'Bedroom TV'
         const secs = url.searchParams.get('t') || body.t || body.seconds
         if (!secs) { json(400, { error: 'Missing t (seconds) parameter' }); break }
         json(200, castCommand('seek', [device, String(secs)])); break
       }
       case '/volume': {
         const s = loadState()
-        const device = s.current?.target?.split(':')?.[1] || 'Fredriks TV'
+        const device = s.current?.target?.split(':')?.[1] || 'Bedroom TV'
         const vol = url.searchParams.get('level') || body.level
         if (!vol) { json(400, { error: 'Missing level (0-100) parameter' }); break }
         json(200, castCommand('volume', [device, String(vol)])); break
       }
       case '/cast-info': {
         const s = loadState()
-        const device = body.device || s.current?.target?.split(':')?.[1] || 'Fredriks TV'
+        const device = body.device || s.current?.target?.split(':')?.[1] || 'Bedroom TV'
         json(200, castCommand('info', [device])); break
       }
       case '/targets': json(200, { targets: discoverChromecasts() }); break
