@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+	xmlns:content="http://purl.org/rss/1.0/modules/content/"
+	xmlns:wfw="http://wellformedweb.org/CommentAPI/"
+	xmlns:dc="http://purl.org/dc/elements/1.1/"
+	xmlns:atom="http://www.w3.org/2005/Atom"
+	xmlns:sy="http://purl.org/rss/1.0/modules/syndication/"
+	xmlns:slash="http://purl.org/rss/1.0/modules/slash/"
+	xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+xmlns:podcast="https://podcastindex.org/namespace/1.0"
+xmlns:rawvoice="https://blubrry.com/developer/rawvoice-rss/"
+>
+<channel>
+	<title>Lex Fridman Podcast</title>
+	<atom:link href="https://lexfridman.com/feed/podcast/" rel="self" type="application/rss+xml" />
+	<link>https://lexfridman.com/</link>
+	<description>Conversations that explore technology, history, philosophy, physics, mathematics, biology, chemistry, engineering, AI, robotics, programming, music, film, art, sports, psychology, neuroscience, geopolitics, business, economics, religion, astronomy, and the human condition with people from all walks of life.</description>
+	<lastBuildDate>Mon, 26 Oct 2026 22:52:28 +0000</lastBuildDate>
+	<language>en-US</language>
+	<sy:updatePeriod>hourly</sy:updatePeriod>
+	<sy:updateFrequency>1</sy:updateFrequency>
+	<generator>Blubrry PowerPress/11.18.2</generator>
+		<atom:link rel="hub" href="https://pubsubhubbub.appspot.com/" />
+	<itunes:new-feed-url>https://lexfridman.com/feed/podcast/</itunes:new-feed-url>
+	<itunes:author>Lex Fridman</itunes:author>
+	<itunes:explicit>false</itunes:explicit>
+	<itunes:image href="https://lexfridman.com/wordpress/wp-content/uploads/powerpress/lex_fridman_podcast_cover_3000.jpg" />
+	<itunes:owner>
+		<itunes:name>Lex Fridman</itunes:name>
+		<itunes:email>lexfridman@gmail.com</itunes:email>
+	</itunes:owner>
+	<podcast:medium>podcast</podcast:medium>
+	<image>
+		<title>Lex Fridman Podcast</title>
+		<url>https://lexfridman.com/wordpress/wp-content/uploads/powerpress/lex_fridman_podcast_cover_3000.jpg</url>
+		<link>https://lexfridman.com/podcast</link>
+	</image>
+	<itunes:category text="Technology" />
+	<itunes:category text="Science" />
+	<itunes:category text="Society &amp; Culture">
+		<itunes:category text="Philosophy" />
+	</itunes:category>
+	<podcast:podping usesPodping="true" />
+	<podcast:guid>7eeae9d1-141e-5133-9e8f-6c1da695e40c</podcast:guid>
+	<rawvoice:subscribe feed="https://lexfridman.com/feed/podcast/" itunes="https://podcasts.apple.com/us/podcast/lex-fridman-podcast/id1434243584" tunein="https://tunein.com/podcasts/Technology-Podcasts/Artificial-Intelligence-p1153019/" spotify="https://open.spotify.com/show/2MAi0BvDc6GTFvKFPXnkCL" youtube="https://youtube.com/@lexfridman"></rawvoice:subscribe>
+	<item>
+		<title>#503 – AI Crisis in Math: Navier-Stokes, Riemann Hypothesis &#038; Complexity Theory</title>
+		<link>https://lexfridman.com/math-ai-crisis/?utm_source=rss&#038;utm_medium=rss&#038;utm_campaign=math-ai-crisis</link>
+		<pubDate>Mon, 26 Oct 2026 22:52:28 +0000</pubDate>
+		<guid isPermaLink="false">https://lexfridman.com/?p=7807</guid>
+		<comments>https://lexfridman.com/math-ai-crisis/#respond</comments>
+		<wfw:commentRss>https://lexfridman.com/math-ai-crisis/feed/</wfw:commentRss>
+		<slash:comments>0</slash:comments>
+		<category><![CDATA[Podcast]]></category>
+		<description><![CDATA[<p>Ankur Moitra, Steven Brunton and Alex Kontorovich are three mathematicians who can speak to this incredible moment in the history of mathematics, when AI solved some of its hardest problems: Navier-Stokes, the quasi-Riemann hypothesis, the unique games conjecture and hundreds of other problems. Ankur Moitra is a mathematician at MIT (visiting the Institute for Advanced Study in Princeton) working in theoretical computer science, who can speak to the unique games conjecture, complexity theory and the mathematics of how AI learns. Steven Brunton is a mathematician and fluid dynamics expert at UW, who can speak to Navier-Stokes, turbulence and machine learning for fluid dynamics. Alex Kontorovich is a mathematician at Rutgers specializing in number theory, who can speak to the Riemann hypothesis, Lean and machine-checked proofs.<br />
+Thank you for listening ❤ Check out our sponsors: <a href="https://lexfridman.com/sponsors/ep503-sc">https://lexfridman.com/sponsors/ep503-sc</a><br />
+See below for timestamps, transcript, and to give feedback, submit questions, contact Lex, etc.</p>
+<p><b>Transcript:</b><br />
+<a href="https://lexfridman.com/math-ai-crisis-transcript">https://lexfridman.com/math-ai-crisis-transcript</a></p>
+<p><b>CONTACT LEX:</b><br />
+<b>Feedback</b> &#8211; give feedback to Lex: <a href="https://lexfridman.com/survey">https://lexfridman.com/survey</a><br />
+<b>AMA</b> &#8211; submit questions, videos or call-in: <a href="https://lexfridman.com/ama">https://lexfridman.com/ama</a><br />
+<b>Hiring</b> &#8211; join our team: <a href="https://lexfridman.com/hiring">https://lexfridman.com/hiring</a><br />
+<b>Other</b> &#8211; other ways to get in touch: <a href="https://lexfridman.com/contact">https://lexfridman.com/contact</a></p>
+<p><b>EPISODE LINKS:</b><br />
+Ankur&#8217;s Website: <a href="https://people.csail.mit.edu/moitra/">https://people.csail.mit.edu/moitra/</a><br />
+Alex&#8217;s X: <a href="https://x.com/AlexKontorovich">https://x.com/AlexKontorovich</a><br />
+Alex&#8217;s Website: <a href="https://sites.math.rutgers.edu/~alexk/">https://sites.math.rutgers.edu/~alexk/</a><br />
+Steven&#8217;s X: <a href="https://x.com/eigensteve">https://x.com/eigensteve</a><br />
+Steven&#8217;s YouTube: <a href="https://youtube.com/@Eigensteve">https://youtube.com/@Eigensteve</a><br />
+Steven&#8217;s Website: <a href="https://eigensteve.com">https://eigensteve.com</a><br />
+Lean: <a href="https://lean-lang.org/">https://lean-lang.org/</a></p>
+<p><b>SPONSORS:</b><br />
+To support this podcast, check out our sponsors &#038; get discounts:<br />
+<b>Wispr Flow:</b> AI-powered voice dictation app.<br />
+Go to <a href="https://lexfridman.com/s/wispr_flow-ep503-sc">https://wisprflow.ai/lex</a><br />
+<b>Fin:</b> AI agent for customer service.<br />
+Go to <a href="https://lexfridman.com/s/fin-ep503-sc">https://fin.ai/lex</a><br />
+<b>LMNT:</b> Zero-sugar electrolyte drink mix.<br />
+Go to <a href="https://lexfridman.com/s/lmnt-ep503-sc">https://drinkLMNT.com/lex</a><br />
+<b>Blitzy:</b> AI agent for large enterprise codebases.<br />
+Go to <a href="https://lexfridman.com/s/blitzy-ep503-sc">https://blitzy.com/lex</a><br />
+<b>Shopify:</b> Sell stuff online.<br />
+Go to <a href="https://lexfridman.com/s/shopify-ep503-sc">https://shopify.com/lex</a><br />
+<b>NetSuite:</b> Business management software.<br />
+Go to <a href="https://lexfridman.com/s/netsuite-ep503-sc">https://netsuite.ai/lex</a><br />
+<b>Perplexity:</b> AI-powered answer engine.<br />
+Go to <a href="https://lexfridman.com/s/perplexity-ep503-sc">https://perplexity.ai/</a></p>
+<p><b>OUTLINE:</b><br />
+(00:00) &#8211; Introduction<br />
+(01:58) &#8211; Sponsors, Comments, and Reflections<br />
+(09:53) &#8211; Crisis moment in mathematics<br />
+(18:10) &#8211; Will AI &#8220;solve&#8221; mathematics?<br />
+(34:21) &#8211; Can AI create new math?<br />
+(1:13:53) &#8211; Riemann hypothesis<br />
+(1:37:45) &#8211; Navier-Stokes<br />
+(2:03:42) &#8211; How nature computes<br />
+(2:12:35) &#8211; Unique Games Conjecture and complexity theory<br />
+(2:27:28) &#8211; How mathematicians think<br />
+(2:41:05) &#8211; Is math invented or discovered?<br />
+(2:47:13) &#8211; Can AI solve P vs NP?<br />
+(2:57:28) &#8211; Why LLMs work so well<br />
+(3:11:54) &#8211; Problems AI can&#8217;t solve yet<br />
+(3:16:23) &#8211; Grigori Perelman<br />
+(3:25:41) &#8211; Advice for young people</p>]]></description>
+		<enclosure url="https://media.blubrry.com/takeituneasy/ins.blubrry.com/takeituneasy/lex_ai_math_ai_crisis.mp3" length="160582933" type="audio/mpeg" />
+		<itunes:episodeType>full</itunes:episodeType>
+		<itunes:duration>3:42:40</itunes:duration>
+		<rawvoice:pid>155864055</rawvoice:pid>
+	</item>
+	<item>
+		<title>#502 – Psychiatry, Insane Asylums, Mental Illness, ECT, Lobotomies, Freud &#038; Jung</title>
+		<link>https://lexfridman.com/andrew-scull/?utm_source=rss&#038;utm_medium=rss&#038;utm_campaign=andrew-scull</link>
+		<pubDate>Thu, 17 Sep 2026 00:40:49 +0000</pubDate>
+		<guid isPermaLink="false">https://lexfridman.com/?p=6554</guid>
+		<comments>https://lexfridman.com/andrew-scull/#respond</comments>
+		<wfw:commentRss>https://lexfridman.com/andrew-scull/feed/</wfw:commentRss>
+		<slash:comments>0</slash:comments>
+		<category><![CDATA[Podcast]]></category>
+		<description><![CDATA[<p>Andrew Scull is a historian of psychiatry.<br />
+Thank you for listening ❤ Check out our sponsors: <a href="https://lexfridman.com/sponsors/ep502-sc">https://lexfridman.com/sponsors/ep502-sc</a><br />
+See below for timestamps, transcript, and to give feedback, submit questions, contact Lex, etc.</p>
+<p><b>Transcript:</b><br />
+<a href="https://lexfridman.com/andrew-scull-transcript">https://lexfridman.com/andrew-scull-transcript</a></p>
+<p><b>CONTACT LEX:</b><br />
+<b>Feedback</b> &#8211; give feedback to Lex: <a href="https://lexfridman.com/survey">https://lexfridman.com/survey</a><br />
+<b>AMA</b> &#8211; submit questions, videos or call-in: <a href="https://lexfridman.com/ama">https://lexfridman.com/ama</a><br />
+<b>Hiring</b> &#8211; join our team: <a href="https://lexfridman.com/hiring">https://lexfridman.com/hiring</a><br />
+<b>Other</b> &#8211; other ways to get in touch: <a href="https://lexfridman.com/contact">https://lexfridman.com/contact</a></p>
+<p><b>EPISODE LINKS:</b><br />
+Andrew&#8217;s Website (UCSD faculty page): <a href="https://sociology.ucsd.edu/people/faculty/emeritus/andrew-scull.html">https://sociology.ucsd.edu/people/faculty/emeritus/andrew-scull.html</a><br />
+Desperate Remedies (book): <a href="https://amzn.to/4vmBquI">https://amzn.to/4vmBquI</a><br />
+Madness in Civilization (book): <a href="https://amzn.to/3SZhd0I">https://amzn.to/3SZhd0I</a></p>
+<p><b>SPONSORS:</b><br />
+To support this podcast, check out our sponsors &#38; get discounts:<br />
+<b>Wispr Flow:</b> AI-powered voice dictation app.<br />
+Go to <a href="https://lexfridman.com/s/wispr_flow-ep502-sc">https://wisprflow.ai/lex</a><br />
+<b>Fin:</b> AI agent for customer service.<br />
+Go to <a href="https://lexfridman.com/s/fin-ep502-sc">https://fin.ai/lex</a><br />
+<b>LMNT:</b> Zero-sugar electrolyte drink mix.<br />
+Go to <a href="https://lexfridman.com/s/lmnt-ep502-sc">https://drinkLMNT.com/lex</a><br />
+<b>Shopify:</b> Sell stuff online.<br />
+Go to <a href="https://lexfridman.com/s/shopify-ep502-sc">https://shopify.com/lex</a><br />
+<b>BetterHelp:</b> Online therapy and counseling.<br />
+Go to <a href="https://lexfridman.com/s/betterhelp-ep502-sc">https://betterhelp.com/lex</a><br />
+<b>Perplexity:</b> AI-powered answer engine.<br />
+Go to <a href="https://lexfridman.com/s/perplexity-ep502-sc">https://perplexity.ai/</a></p>
+<p><b>OUTLINE:</b><br />
+(00:00) &#8211; Introduction<br />
+(01:07) &#8211; Sponsors, Comments, and Reflections<br />
+(08:10) &#8211; Crisis in Psychiatry<br />
+(37:48) &#8211; Categories of Mental Illness<br />
+(45:07) &#8211; Asylums, Eugenics, and the Nazis<br />
+(57:13) &#8211; The Ice Pick Lobotomy<br />
+(1:03:26) &#8211; Malaria &#8220;Cure&#8221; for Syphilis<br />
+(1:21:42) &#8211; Insulin Coma Therapy<br />
+(1:29:34) &#8211; Electroconvulsive Therapy (ECT)<br />
+(1:49:03) &#8211; One Flew Over the Cuckoo&#8217;s Nest<br />
+(2:06:35) &#8211; Freud and Psychoanalysis<br />
+(2:36:30) &#8211; WWII and Cognitive behavioral therapy (CBT)<br />
+(2:57:04) &#8211; Antipsychotics<br />
+(3:20:24) &#8211; Antidepressants<br />
+(3:33:18) &#8211; Future of Psychiatry</p>
+<p><b>PODCAST LINKS:</b><br />
+&#8211; Podcast Website: <a href="https://lexfridman.com/podcast">https://lexfridman.com/podcast</a><br />
+&#8211; Apple Podcasts: <a href="https://apple.co/2lwqZIr">https://apple.co/2lwqZIr</a><br />
+&#8211; Spotify: <a href="https://open.spotify.com/episode/082a1V6nazH9ZZqskV1vfz">https://open.spotify.com/episode/082a1V6nazH9ZZqskV1vfz</a><br />
+&#8211; RSS: <a href="https://lexfridman.com/feed/podcast/">https://lexfridman.com/feed/podcast/</a><br />
+&#8211; Podcast Playlist: <a href="https://www.youtube.com/playlist?list=PLrAXtmErZgOdP_8GztsuKi9nrraNbKKp4">https://www.youtube.com/playlist?list=PLrAXtmErZgOdP_8GztsuKi9nrraNbKKp4</a><br />
+&#8211; Clips Channel: <a href="https://www.youtube.com/lexclips">https://www.youtube.com/lexclips</a></p>]]></description>
+		<enclosure url="https://media.blubrry.com/takeituneasy/ins.blubrry.com/takeituneasy/lex_ai_andrew_scull.mp3" length="161169050" type="audio/mpeg" />
+		<itunes:episodeType>full</itunes:episodeType>
+		<itunes:duration>3:43:51</itunes:duration>
+		<rawvoice:pid>155427270</rawvoice:pid>
+	</item>
+</channel>
+</rss>

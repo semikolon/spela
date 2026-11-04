@@ -1,9 +1,11 @@
+mod audiobook;
 mod cast;
 mod config;
 mod disk;
 mod following;
 mod hls_cache;
 mod library_origin;
+mod podcast;
 mod recommendations;
 mod search;
 mod server;
@@ -14,6 +16,7 @@ mod torrent;
 mod torrent_engine;
 mod torrent_stream;
 mod transcode;
+mod uplink;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -178,6 +181,97 @@ enum Commands {
         #[command(subcommand)]
         action: QueueAction,
     },
+    /// Podcasts: find a show, list its episodes, play one (in VLC here, or --cast).
+    /// Examples:
+    ///   spela podcast search lex fridman
+    ///   spela podcast episodes 1434243584
+    ///   spela podcast play 1434243584                 (newest episode)
+    ///   spela podcast play 1434243584 --episode 3 --cast "Living Room"
+    Podcast {
+        #[command(subcommand)]
+        action: PodcastAction,
+    },
+    /// Audiobooks: search torrent indexes by title, play a book (in VLC here, or --cast).
+    /// Examples:
+    ///   spela audiobook search the body keeps the score
+    ///   spela audiobook play <hash> --name "The Body Keeps the Score"
+    Audiobook {
+        #[command(subcommand)]
+        action: AudiobookAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PodcastAction {
+    /// Search Apple's podcast directory.
+    Search {
+        query: Vec<String>,
+        /// Two-letter store code (default: the server's `podcast_country`).
+        #[arg(long)]
+        country: Option<String>,
+    },
+    /// A show's episodes, newest first.
+    Episodes {
+        /// Show id from `spela podcast search`.
+        id: u64,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Play an episode. Default: the newest, in VLC on this machine.
+    Play {
+        id: u64,
+        /// 1 = newest, 2 = the one before, and so on.
+        #[arg(long, default_value_t = 1)]
+        episode: usize,
+        /// Chromecast device name instead of VLC.
+        #[arg(long)]
+        cast: Option<String>,
+        /// Start at this many seconds in (VLC only).
+        #[arg(long)]
+        start: Option<u64>,
+        /// Print the playlist URL instead of opening VLC.
+        #[arg(long)]
+        print: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AudiobookAction {
+    /// Search the Pirate Bay, Knaben and AudioBook Bay by title.
+    Search { query: Vec<String> },
+    /// Fetch a book's torrent and play it chapter by chapter.
+    Play {
+        /// Info hash from `spela audiobook search`.
+        hash: String,
+        #[arg(long, default_value = "Audiobook")]
+        name: String,
+        /// Chromecast device name instead of VLC (plays the first chapter).
+        #[arg(long)]
+        cast: Option<String>,
+        /// Print the playlist URL instead of opening VLC.
+        #[arg(long)]
+        print: bool,
+    },
+}
+
+/// Open a URL in VLC on the machine the CLI runs on.
+fn open_in_local_vlc(url: &str) -> anyhow::Result<()> {
+    let status = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+            .args(["-a", "VLC", url])
+            .status()?
+    } else {
+        std::process::Command::new("vlc")
+            .arg(url)
+            .spawn()
+            .map(|_| std::process::ExitStatus::default())?
+    };
+    if !status.success() {
+        anyhow::bail!("could not open VLC");
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -668,6 +762,145 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
                 .json()
                 .await?)
         }
+        Commands::Podcast { action } => match action {
+            PodcastAction::Search { query, country } => {
+                let mut url = format!("{}/podcast/search?q={}", base, urlencoded(&query.join(" ")));
+                if let Some(c) = country {
+                    url.push_str(&format!("&country={}", urlencoded(&c)));
+                }
+                Ok(client.get(&url).send().await?.json().await?)
+            }
+            PodcastAction::Episodes { id, limit, offset } => Ok(client
+                .get(format!(
+                    "{}/podcast/episodes?id={}&limit={}&offset={}",
+                    base, id, limit, offset
+                ))
+                .send()
+                .await?
+                .json()
+                .await?),
+            PodcastAction::Play {
+                id,
+                episode,
+                cast,
+                start,
+                print,
+            } => {
+                let n = episode.max(1) - 1;
+                let page: Value = client
+                    .get(format!(
+                        "{}/podcast/episodes?id={}&limit=1&offset={}",
+                        base, id, n
+                    ))
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                if let Some(e) = page.get("error") {
+                    anyhow::bail!("{}", e);
+                }
+                let ep = page["episodes"][0].clone();
+                let Some(guid) = ep["guid"].as_str() else {
+                    anyhow::bail!("no episode {} in that show", episode);
+                };
+                if let Some(device) = cast {
+                    let r: Value = client
+                        .post(format!("{}/podcast/cast", base))
+                        .json(&serde_json::json!({"id": id, "ep": guid, "cast_name": device}))
+                        .send()
+                        .await?
+                        .json()
+                        .await?;
+                    return Ok(
+                        serde_json::json!({"show": page["title"], "episode": ep["title"], "cast": r}),
+                    );
+                }
+                let mut url = format!("{}/podcast/vlc.m3u?id={}&ep={}", base, id, urlencoded(guid));
+                if let Some(t) = start {
+                    url.push_str(&format!("&t={}", t));
+                }
+                if !print {
+                    open_in_local_vlc(&url)?;
+                }
+                Ok(
+                    serde_json::json!({"show": page["title"], "episode": ep["title"],
+                    "published": ep["published"], "playlist": url, "opened_in_vlc": !print}),
+                )
+            }
+        },
+        Commands::Audiobook { action } => match action {
+            AudiobookAction::Search { query } => Ok(client
+                .get(format!(
+                    "{}/audiobook/search?q={}",
+                    base,
+                    urlencoded(&query.join(" "))
+                ))
+                .send()
+                .await?
+                .json()
+                .await?),
+            AudiobookAction::Play {
+                hash,
+                name,
+                cast,
+                print,
+            } => {
+                let started: Value = client
+                    .post(format!("{}/audiobook/start", base))
+                    .json(&serde_json::json!({"hash": hash, "name": name}))
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                if let Some(e) = started.get("error") {
+                    anyhow::bail!("{}", e);
+                }
+                let id = started["id"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("no torrent id"))?;
+                // The chapter list exists once the torrent's metadata has arrived.
+                let mut files = Value::Null;
+                for _ in 0..60 {
+                    let f: Value = client
+                        .get(format!("{}/audiobook/{}/files", base, id))
+                        .send()
+                        .await?
+                        .json()
+                        .await?;
+                    if f["ready"].as_bool() == Some(true) {
+                        files = f;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                let first = files["files"][0]["idx"].as_u64();
+                let Some(first) = first else {
+                    anyhow::bail!(
+                        "the torrent's chapter list did not arrive within a minute (no peers?)"
+                    );
+                };
+                if let Some(device) = cast {
+                    let r: Value = client
+                        .post(format!("{}/audiobook/{}/cast", base, id))
+                        .json(&serde_json::json!({"file": first, "cast_name": device}))
+                        .send()
+                        .await?
+                        .json()
+                        .await?;
+                    return Ok(
+                        serde_json::json!({"book": name, "id": id, "chapters": files["files"].as_array().map(|a| a.len()), "cast": r}),
+                    );
+                }
+                let url = format!("{}/audiobook/{}/open.m3u", base, id);
+                if !print {
+                    open_in_local_vlc(&url)?;
+                }
+                Ok(
+                    serde_json::json!({"book": name, "id": id, "chapters": files["files"].as_array().map(|a| a.len()),
+                    "playlist": url, "opened_in_vlc": !print}),
+                )
+            }
+        },
         Commands::Queue { action } => match action {
             QueueAction::List => Ok(client
                 .get(format!("{}/queue", base))

@@ -447,6 +447,11 @@ impl CastController {
                     content_type
                 );
                 StreamType::Buffered
+            } else if content_type.starts_with("audio/") {
+                // 2026-11-04: a podcast episode or an audiobook chapter is a whole
+                // file of known length, not a growing transcode. Buffered lets the
+                // receiver seek in it and show its length.
+                StreamType::Buffered
             } else {
                 StreamType::Live
             };

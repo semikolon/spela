@@ -1,5 +1,24 @@
 # Spela TODOs 🎬🍿
 
+### 🔓 OPEN — 4 November 2026: podcasts and audiobooks (built, tested on a test instance, not deployed)
+
+His words: *"it should be able to stream podcasts, make it happen"*, and *"If spela COULD find the
+audiobooks through torrents etc then we can leave them"*. Design, sources, what is verified and what
+is not: [`docs/podcasts_and_audiobooks.md`](docs/podcasts_and_audiobooks.md). Owed, in order:
+- [ ] Deploy to the server with `bin/deploy-server.sh` once it is reachable again, then one real
+  play each: a podcast in VLC through the remote's `vlc://` hand-off, a book in VLC, both on a
+  Chromecast (`/audio/control` pause and stop included).
+- [ ] Run `spela podcast play` and `spela audiobook play` once each (the endpoints are tested, the
+  commands are not).
+- [ ] Watch the uplink governor's log lines under a real busy line (`uplink: upload ceiling …`).
+- [ ] Save a book to the Books app on macOS as one M4B with chapters (his ask: *"The audiobooks
+  could be downloaded to the Audiobooks app on MacOS I guess, if feasible?"*; feasible, plan in the
+  design doc § Next).
+- [ ] Offer to remove books he has finished, read from the Books library database (his ask: *"spela
+  could also automatically offer to remove books/pods after I've listened to them, if that's
+  tracked in the mac Books app etc"*; the fields are listed in the design doc § Next).
+- [ ] Resume position for podcast episodes.
+
 ### 🔓 OPEN — 4 October 2026: the "good enough" bitrate levels are starting values
 
 **Live.** Size stops counting in the ranker once a release carries enough bitrate for its

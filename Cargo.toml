@@ -60,6 +60,8 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 # `is_running_state` regex helpers. Already pulled in transitively (librqbit,
 # tracing-subscriber etc.), so adding it direct doesn't grow the tree.
 regex = "1"
+# 2026-11-04: podcast RSS feeds (src/podcast.rs). Read-only DOM parser, no dependencies.
+roxmltree = "0.20"
 once_cell = "1"
 libc = "0.2.189"
 

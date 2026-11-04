@@ -910,6 +910,37 @@
 button:disabled{opacity:.45;cursor:default}
 @media(max-width:560px){#upnextPanel{padding:22px 18px;max-height:72vh}#upnextPanel h2{font-size:25px}.handoff-actions .srcbtn{flex:1 1 auto}#nowbar{flex-wrap:wrap}#nowbar .nt{min-width:120px}#nowbar #nbNext{font-size:14px;padding:10px}.transport{flex-wrap:wrap}}
 </style>
+<style>
+  /* Podcasts and audiobooks (2026-11-04): result lists and the persistent audio bar. */
+  .alist{display:flex;flex-direction:column;gap:.5rem;margin-top:.6rem}
+  .arow{display:flex;gap:.7rem;align-items:center;text-align:left;width:100%;background:var(--bg3);
+    border:1px solid var(--line);border-radius:var(--r);padding:.6rem .7rem;color:var(--fg)}
+  .arow.ep{align-items:flex-start}
+  .aart{width:56px;height:56px;border-radius:10px;object-fit:cover;flex:0 0 auto;background:var(--bg2)}
+  .aart.big{width:96px;height:96px}
+  .atxt{display:flex;flex-direction:column;min-width:0;flex:1 1 auto}
+  .at{font-weight:700;overflow-wrap:anywhere}
+  .as{color:var(--dim);font-size:.85rem}
+  .as .dead{color:var(--bad)} .as .slow{color:var(--warn)}
+  .asum{color:var(--dim2);font-size:.82rem;margin-top:.2rem}
+  .ahead{display:flex;gap:.9rem;align-items:center;margin:.6rem 0}
+  .anote{color:var(--warn);font-size:.85rem;margin:.4rem 0}
+  .abtns{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.6rem}
+  #audiobar{position:fixed;left:0;right:0;bottom:0;z-index:26;display:none;gap:.6rem;align-items:center;
+    background:rgba(21,21,28,.97);backdrop-filter:blur(10px);border-top:1px solid var(--line);
+    padding:.55rem .7rem calc(.55rem + var(--safe-b))}
+  #audiobar.on{display:flex}
+  #audiobar audio{flex:1 1 auto;min-width:0;max-width:460px}
+  #audiobar .atxt{flex:0 1 auto;max-width:45%}
+  body.audio-on main{padding-bottom:96px}
+  /* Four modes do not fit a phone's width with labels: icons only, the chosen one named. */
+  @media (max-width:560px){
+    #modeSeg button{padding-left:.6rem;padding-right:.6rem}
+    #modeSeg button .lbl{display:none}
+    #modeSeg button.on .lbl{display:inline}
+    #modeSeg button:not(.on) .lu{margin-right:0}
+  }
+</style>
 </head>
 <body>
 <div class="banner" id="banner"><span id="bannerMsg">spela unreachable</span><button id="bannerRetry">Retry</button></div>
@@ -942,8 +973,10 @@ button:disabled{opacity:.45;cursor:default}
       <input id="q" type="search" inputmode="search" autocomplete="off"
         placeholder="Search a movie or show…" aria-label="Search">
       <div class="seg" id="modeSeg">
-        <button data-m="movie" class="on" data-ic="film">Movies</button>
-        <button data-m="tv" data-ic="tv">TV</button>
+        <button data-m="movie" class="on" data-ic="film" aria-label="Movies"><span class="lbl">Movies</span></button>
+        <button data-m="tv" data-ic="tv" aria-label="TV"><span class="lbl">TV</span></button>
+        <button data-m="podcast" data-ic="mic" aria-label="Podcasts"><span class="lbl">Podcasts</span></button>
+        <button data-m="book" data-ic="headphones" aria-label="Books"><span class="lbl">Books</span></button>
       </div>
       <!-- QUALITY. Deliberately NOT in the top nav (Fredrik, 2026-09-06): that row
            is already six tabs plus brand, badge and target chip, and wraps under
@@ -2095,6 +2128,7 @@ const seg=$("#modeSeg");
 seg.onclick=e=>{ const b=e.target.closest("button"); if(!b)return;
   S.mode=b.dataset.m; sessionStorage.setItem(MKEY,S.mode);
   [...seg.children].forEach(x=>x.classList.toggle("on",x===b));
+  syncModeUi();
   if(S.search.q) runSearch(S.search.q); };
 // Quality control. Same delegation shape as the mode segment beside it.
 $("#qualSeg")?.addEventListener("click", e=>{
@@ -2113,7 +2147,7 @@ function setPref(p){
   if(S.search.q) runSearch(S.search.q);
 }
 function setMode(m){ S.mode=m; sessionStorage.setItem(MKEY,S.mode);
-  [...seg.children].forEach(x=>x.classList.toggle("on",x.dataset.m===m)); }
+  [...seg.children].forEach(x=>x.classList.toggle("on",x.dataset.m===m)); syncModeUi(); }
 
 // "Continue watching" row — spela-native tracker, slice 1. Shows the distinct
 // titles played in spela over the last 14 days (from /recent); tap a chip to
@@ -2618,6 +2652,155 @@ async function fillDetailLine(card, title, isTV){
   }
 }
 
+/* ---------- podcasts and audiobooks (2026-11-04) ----------
+   Podcasts: Apple's directory → the show's feed → the publisher's own audio file.
+   Books: a title search over three torrent indexes → spela's torrent engine, chapter by
+   chapter. VLC gets a playlist; a Chromecast is cast one file (controls via
+   /audio/control); "This device" plays in the audio bar, which deliberately stays open
+   across navigation like any music player and stops only on its own ✕. */
+// A function, not a const: setMode can run during startup before this line does.
+function audioModePrompt(m){ return {podcast:"Search a podcast…", book:"Search an audiobook…"}[m]; }
+function syncModeUi(){
+  const q=$("#q"); if(q) q.placeholder=audioModePrompt(S.mode)||"Search a movie or show…";
+  const qs=$("#qualSeg"); if(qs) qs.style.display=audioModePrompt(S.mode)?"none":"";
+}
+function fmtDur(s){ if(!s) return ""; const h=Math.floor(s/3600), m=Math.round((s%3600)/60);
+  return h?`${h} h ${m} min`:`${m} min`; }
+function fmtBytes(b){ if(!b) return ""; return b>=1e9?(b/1e9).toFixed(1)+" GB":Math.max(1,Math.round(b/1e6))+" MB"; }
+async function runAudioSearch(q,out,ac){
+  out.innerHTML=`<div class="state">Searching…</div>`;
+  const path=(S.mode==="podcast"?"/podcast/search?q=":"/audiobook/search?q=")+encodeURIComponent(q);
+  let d; try{ d=await api(path,{signal:ac.signal}); }
+  catch(e){ if(e.name==="AbortError")return;
+    out.innerHTML=`<div class="state"><div class="big">spela unreachable</div>Check the connection and retry.</div>`; return; }
+  if(d.failed||d.error){ out.innerHTML=`<div class="state"><div class="big">Search failed</div>${esc(d.error||"")}</div>`; return; }
+  if(S.mode==="podcast") renderShows(d.shows||[],out); else renderBooks(d.books||[],d.failed_sources||[],out);
+}
+function renderShows(shows,out){
+  if(!shows.length){ out.innerHTML=`<div class="state"><div class="big">No podcasts found</div></div>`; return; }
+  const list=el("div",{className:"alist"});
+  shows.forEach(s=>{
+    const b=el("button",{className:"arow"});
+    b.innerHTML=`<img class="aart" loading="lazy" alt="" src="${esc(s.artwork||"")}"><span class="atxt"><span class="at">${esc(s.title)}</span><span class="as">${esc([s.author, s.episode_count?s.episode_count+" episodes":""].filter(Boolean).join(" · "))}</span></span>`;
+    b.onclick=()=>openShow(s,0);
+    list.appendChild(b);
+  });
+  out.innerHTML=""; out.appendChild(list);
+}
+async function openShow(show,offset){
+  const out=$("#searchOut"); out.innerHTML=`<div class="state">Reading the feed…</div>`;
+  let d; try{ d=await api(`/podcast/episodes?id=${show.id}&limit=50&offset=${offset}`); }
+  catch(e){ d={failed:true,error:"spela unreachable"}; }
+  if(d.failed||d.error){ out.innerHTML=`<div class="state"><div class="big">Couldn’t read the feed</div>${esc(d.error||"")}</div>`; return; }
+  // Apple's 600 px artwork first: a feed's own image is often a 3000 px original.
+  const sh={id:show.id, title:d.title||show.title, artwork:show.artwork||d.artwork||""};
+  const back=el("button",{className:"srcbtn",textContent:"← All shows"}); back.onclick=()=>runSearch(S.search.q);
+  const head=el("div",{className:"ahead"});
+  head.innerHTML=`<img class="aart big" alt="" src="${esc(sh.artwork)}"><span class="atxt"><span class="at">${esc(sh.title)}</span><span class="as">${esc([d.author||show.author, d.total+" episodes"].filter(Boolean).join(" · "))}</span></span>`;
+  const list=el("div",{className:"alist"});
+  (d.episodes||[]).forEach(e=>{
+    const row=el("div",{className:"arow ep"});
+    row.innerHTML=`<span class="atxt"><span class="at">${esc(e.title)}</span><span class="as">${esc([e.published, fmtDur(e.duration_s)].filter(Boolean).join(" · "))}</span>${e.summary?`<span class="asum">${esc(e.summary)}</span>`:""}</span>`;
+    const p=el("button",{className:"playicon",title:"Play",innerHTML:ic("play")});
+    p.onclick=()=>playAudio({kind:"podcast",show:sh,ep:e});
+    row.prepend(p); list.appendChild(row);
+  });
+  out.innerHTML=""; out.append(back,head,list);
+  const nav=el("div",{className:"abtns"});
+  if(offset>0){ const n=el("button",{className:"srcbtn",textContent:"Newer"}); n.onclick=()=>openShow(show,Math.max(0,offset-50)); nav.appendChild(n); }
+  if(offset+50<d.total){ const o=el("button",{className:"srcbtn",textContent:"Older episodes"}); o.onclick=()=>openShow(show,offset+50); nav.appendChild(o); }
+  if(nav.children.length) out.appendChild(nav);
+}
+function renderBooks(books,failed,out){
+  const note=failed.length?`<div class="anote">Not reached this time: ${esc(failed.join(", "))}</div>`:"";
+  if(!books.length){ out.innerHTML=`<div class="state"><div class="big">No audiobooks found</div>${note}</div>`; return; }
+  const list=el("div",{className:"alist"});
+  books.forEach(b=>{
+    const row=el("div",{className:"arow ep"});
+    const seeds=b.seeders==null?"seeders not reported":b.seeders+(b.seeders===1?" seeder":" seeders");
+    const cls=b.seeders==null?"":b.seeders<1?"dead":b.seeders<5?"slow":"";
+    const rest=[fmtBytes(b.bytes), b.files?b.files+" files":"", (b.sources||[]).join(", ")].filter(Boolean).map(x=>" · "+esc(x)).join("");
+    row.innerHTML=`<span class="atxt"><span class="at">${esc(b.name)}</span><span class="as"><span class="${cls}">${esc(seeds)}</span>${rest}</span></span>`;
+    const p=el("button",{className:"playicon",title:"Play",innerHTML:ic("play")});
+    p.onclick=()=>startBook(b);
+    row.prepend(p); list.appendChild(row);
+  });
+  out.innerHTML=note; out.appendChild(list);
+}
+async function startBook(b){
+  if(!S.target){ S.pending=()=>startBook(b); toast("Pick where to play — it starts right after"); openSheet(); return; }
+  toast("Fetching the book…");
+  let r; try{ r=await api("/audiobook/start",{method:"POST",body:{hash:b.hash,name:b.name}}); }
+  catch(e){ r={failed:true,error:"spela unreachable"}; }
+  if(r.failed||r.error){ toast(r.error||"Couldn’t start that book"); return; }
+  let files=null;
+  for(let i=0;i<60;i++){
+    let f=null; try{ f=await api(`/audiobook/${r.id}/files`); }catch(e){}
+    if(f&&f.ready){ files=f.files||[]; break; }
+    const peers=f&&f.progress&&f.progress.peers;
+    toast(peers?`Connecting… ${peers} peers`:"Connecting to peers…");
+    await new Promise(res=>setTimeout(res,1500));
+  }
+  if(!files){ toast("No peers sent that book’s file list. Try another copy."); return; }
+  if(!files.length){ toast("That torrent holds no audio files."); return; }
+  playAudio({kind:"book",id:r.id,name:b.name,files});
+}
+async function playAudio(spec){
+  if(!S.target){ S.pending=()=>playAudio(spec); toast("Pick where to play — it starts right after"); openSheet(); return; }
+  const isPod=spec.kind==="podcast";
+  const title=isPod?spec.ep.title:spec.name, sub=isPod?spec.show.title:"Audiobook", art=isPod?spec.show.artwork:"";
+  const k=S.target.kind;
+  if(k==="shannon"){ toast("Shannon doesn’t play podcasts or books yet. Pick another target."); openSheet(); return; }
+  if(k==="vlc"){
+    const path=isPod?`/podcast/vlc.m3u?id=${spec.show.id}&ep=${encodeURIComponent(spec.ep.guid)}`:`/audiobook/${spec.id}/open.m3u`;
+    toast("Opening in VLC…");
+    fireVlcUrl(location.origin+path);
+    return;
+  }
+  if(k==="chromecast"){
+    let r; try{ r=isPod
+      ? await api("/podcast/cast",{method:"POST",body:{id:spec.show.id,ep:spec.ep.guid,cast_name:S.target.name}})
+      : await api(`/audiobook/${spec.id}/cast`,{method:"POST",body:{file:spec.files[0].idx,cast_name:S.target.name}}); }
+    catch(e){ r={failed:true,error:"spela unreachable"}; }
+    if(r.failed||r.error){ toast(r.error||"Cast failed"); return; }
+    showAudioBar({title,sub,art,cast:true});
+    toast("Playing on "+S.target.name);
+    return;
+  }
+  const urls=isPod?[spec.ep.audio_url]:spec.files.map(f=>`/audiobook/${spec.id}/file/${f.idx}`);
+  showAudioBar({title,sub,art,urls,labels:isPod?null:spec.files.map(f=>f.label)});
+}
+function showAudioBar(o){
+  let bar=$("#audiobar"); if(!bar){ bar=el("div",{id:"audiobar"}); document.body.appendChild(bar); }
+  const old=bar.querySelector("audio"); if(old){ old.pause(); old.removeAttribute("src"); old.load(); }
+  bar.innerHTML=""; bar.classList.add("on"); document.body.classList.add("audio-on");
+  if(o.art){ bar.appendChild(el("img",{className:"aart",alt:"",src:o.art})); }
+  const txt=el("div",{className:"atxt"});
+  txt.innerHTML=`<span class="at">${esc(o.title)}</span><span class="as">${esc(o.sub||"")}</span>`;
+  bar.appendChild(txt);
+  const close=el("button",{className:"srcbtn",textContent:"✕",title:"Stop"});
+  const hide=()=>{ bar.classList.remove("on"); bar.innerHTML=""; document.body.classList.remove("audio-on"); };
+  if(o.cast){
+    let playing=true;
+    const pp=el("button",{className:"playicon",title:"Pause",innerHTML:ic("pause")});
+    pp.onclick=async()=>{ let r; try{ r=await api("/audio/control",{method:"POST",body:{cmd:playing?"pause":"resume"}}); }catch(e){ r={error:"spela unreachable"}; }
+      if(r.error||r.failed){ toast(r.error||"Couldn’t reach the Chromecast"); return; }
+      playing=!playing; pp.innerHTML=ic(playing?"pause":"play"); pp.title=playing?"Pause":"Play"; };
+    close.onclick=async()=>{ try{ await api("/audio/control",{method:"POST",body:{cmd:"stop"}}); }catch(e){} hide(); };
+    bar.append(pp,close);
+    return;
+  }
+  const a=el("audio",{controls:true,preload:"auto"}); let i=0;
+  const sub=txt.querySelector(".as");
+  const load=()=>{ a.src=o.urls[i];
+    if(o.labels) sub.textContent=`${o.sub} · ${o.labels[i]} (${i+1} of ${o.urls.length})`;
+    a.play().catch(()=>toast("Tap play to start")); };
+  a.onended=()=>{ if(i+1<o.urls.length){ i++; load(); } };
+  close.onclick=()=>{ a.pause(); a.removeAttribute("src"); a.load(); hide(); };
+  bar.append(a,close); load();
+}
+syncModeUi();
+
 async function runSearch(q){
   stopTrailers();                 // a new query replaces the card the trailer sits in
   if(S.search.abort) S.search.abort.abort();
@@ -2626,6 +2809,7 @@ async function runSearch(q){
   // pending-confirm); they return when the search box is cleared.
   $("#recentRow")?.classList.remove("on"); $("#pendingRow")?.classList.remove("on"); $("#followingRow")?.classList.remove("on");
   const out=$("#searchOut");
+  if(audioModePrompt(S.mode)) return runAudioSearch(q, out, ac);
   // Instant interpretation: mirror the server's SxxExx parse client-side so the
   // "Season N Episode M" tag shows in the loading skeleton BEFORE the /search
   // round-trip returns (server d.searching stays authoritative for the final card).
@@ -2760,6 +2944,8 @@ const LU={
   phone:'<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>',
   refresh:'<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
   film:'<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18"/><path d="M3 7.5h4"/><path d="M3 12h18"/><path d="M3 16.5h4"/><path d="M17 3v18"/><path d="M17 7.5h4"/><path d="M17 16.5h4"/>',
+  mic:'<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/>',
+  headphones:'<path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3"/>',
   home:'<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   play:'<polygon points="6 3 20 12 6 21 6 3" fill="currentColor" stroke="none"/>'
 };
@@ -3304,7 +3490,7 @@ function openSheet(){
       o.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
         S.target={kind:"chromecast",name:d2.name};
         sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
-      if(!resume && S.search && S.search.q) runSearch(S.search.q);  // re-rank for the new target
+      if(!resume && S.search && S.search.q && !audioModePrompt(S.mode)) runSearch(S.search.q);  // re-rank for the new target (a podcast or book list has nothing to re-rank)
         if(resume) resume();   // the play the user originally tapped now fires (to this target)
         else if(moving) toast("Single stream — your next play moves it to "+d2.name); };
       list.appendChild(o);
@@ -3316,7 +3502,7 @@ function openSheet(){
     ph.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
       S.target={kind:"phone",name:"This device"};
       sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
-      if(!resume && S.search && S.search.q) runSearch(S.search.q);  // re-rank for the new target
+      if(!resume && S.search && S.search.q && !audioModePrompt(S.mode)) runSearch(S.search.q);  // re-rank for the new target (a podcast or book list has nothing to re-rank)
       if(resume) resume();   // the play the user originally tapped now fires (to this phone)
       else if(moving) toast("Single stream — your next play moves it here, off the TV"); };
     list.appendChild(ph);
@@ -3334,7 +3520,7 @@ function openSheet(){
     vl.onclick=()=>{ const resume=S.pending; S.pending=null;
       S.target={kind:"vlc",name:"VLC"};
       sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
-      if(!resume && S.search && S.search.q) runSearch(S.search.q);  // re-rank for the new target
+      if(!resume && S.search && S.search.q && !audioModePrompt(S.mode)) runSearch(S.search.q);  // re-rank for the new target (a podcast or book list has nothing to re-rank)
       if(resume) resume();
       else toast("Tap a source (or Play best) to open it in VLC"); };
     list.appendChild(vl);
@@ -3350,7 +3536,7 @@ function openSheet(){
     sh.onclick=()=>{ const moving=!!S.now.data, resume=S.pending; S.pending=null;
       S.target={kind:"shannon",name:"Shannon TV"};
       sessionStorage.setItem(TKEY,JSON.stringify(S.target)); tgtLabel(); closeSheet();
-      if(!resume && S.search && S.search.q) runSearch(S.search.q);  // re-rank for the new target
+      if(!resume && S.search && S.search.q && !audioModePrompt(S.mode)) runSearch(S.search.q);  // re-rank for the new target (a podcast or book list has nothing to re-rank)
       if(resume) resume();
       else if(moving) toast("Single stream — your next play moves it to Shannon"); };
     list.appendChild(sh);

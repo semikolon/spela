@@ -145,7 +145,7 @@ pub enum TorrentState {
 /// ⚠ librqbit's field is named `upload_bps` but the quota is spent in BYTES: the caller
 /// is `prepare_for_upload(NonZeroU32::new(ci.size))` and `ci.size` is a chunk length in
 /// bytes. Hence bits over eight.
-const MAX_UPLOAD_BYTES_PER_SEC: u32 = 100_000_000 / 8;
+pub(crate) const MAX_UPLOAD_BYTES_PER_SEC: u32 = 100_000_000 / 8;
 
 impl TorrentEngine {
     /// Construct an engine with a freshly-created `Session` rooted at `media_dir`.
@@ -435,6 +435,33 @@ impl TorrentEngine {
             })
             .collect()
         })
+    }
+
+    /// The torrent's info hash as lowercase hex.
+    pub fn info_hash_hex(&self, id: u32) -> Option<String> {
+        Some(
+            self.handle(id)?
+                .info_hash()
+                .as_string()
+                .to_ascii_lowercase(),
+        )
+    }
+
+    /// Bytes uploaded over the torrent's size, or `None` if it is gone or its size is
+    /// not known yet. Read by the audiobook seeding rule (2026-11-04).
+    pub fn upload_ratio(&self, id: u32) -> Option<f64> {
+        let s = self.handle(id)?.stats();
+        (s.total_bytes > 0).then(|| s.uploaded_bytes as f64 / s.total_bytes as f64)
+    }
+
+    /// The session-wide upload ceiling, in bytes per second. Set by the uplink governor
+    /// (`src/uplink.rs`) and never above `MAX_UPLOAD_BYTES_PER_SEC`. A ceiling below one
+    /// 16 KiB chunk per second would make every upload wait forever, so it is floored.
+    pub fn set_upload_limit(&self, bytes_per_sec: u32) {
+        let v = bytes_per_sec.clamp(crate::uplink::FLOOR_BYTES_PER_SEC, MAX_UPLOAD_BYTES_PER_SEC);
+        self.session
+            .ratelimits
+            .set_upload_bps(std::num::NonZeroU32::new(v));
     }
 
     /// Stop a torrent uploading, keeping it and its files exactly where they are.
@@ -757,6 +784,28 @@ impl TorrentEngine {
     /// rather than a piece bitmap — librqbit's `TorrentStats` exposes no bitmap, and the
     /// file is the ground truth anyway.
     /// Relative to the media root, including the torrent-specific output directory.
+    /// Every file in a torrent as `(index, path inside the torrent, length)`, or `None`
+    /// while the metadata is still being fetched from the swarm. Used by the audiobook
+    /// player (2026-11-04), whose torrents hold one file per chapter.
+    pub fn file_list(&self, id: u32) -> Option<Vec<(usize, String, u64)>> {
+        let handle = self.handle(id)?;
+        handle
+            .with_metadata(|m| {
+                m.file_infos
+                    .iter()
+                    .enumerate()
+                    .map(|(i, fi)| {
+                        (
+                            i,
+                            fi.relative_filename.to_string_lossy().into_owned(),
+                            fi.len,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .ok()
+    }
+
     /// The public librqbit API supplies that directory; metadata alone omits it.
     pub fn file_relative_path(&self, id: u32, file_idx: usize) -> Option<PathBuf> {
         let handle = self.handle(id)?;

@@ -2408,6 +2408,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxmltree"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
 name = "rust_cast"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2800,6 +2806,7 @@ dependencies = [
  "once_cell",
  "regex",
  "reqwest",
+ "roxmltree",
  "rust_cast",
  "rustls",
  "serde",

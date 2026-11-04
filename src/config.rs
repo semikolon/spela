@@ -30,6 +30,19 @@ pub struct Config {
     /// Google Cast app ID for custom receiver. Leave empty to use Default Media Receiver.
     #[serde(default)]
     pub cast_app_id: String,
+    /// Two-letter store code for the podcast directory (2026-11-04). It decides which
+    /// national shows rank in a search, so a Swedish listener sets "se".
+    #[serde(default = "default_podcast_country")]
+    pub podcast_country: String,
+    /// 2026-11-04: let seeding yield to other traffic on the connection, by the round
+    /// trip to the outside (`src/uplink.rs`). Off = the fixed upload maximum only.
+    #[serde(default = "default_true")]
+    pub uplink_governor: bool,
+    /// 2026-11-04: an audiobook's torrent stops seeding once it has uploaded this many
+    /// times its own size (the owner's ruling: one to two times, so the swarm is not
+    /// leeched from). The uplink governor decides how fast, this decides how long.
+    #[serde(default = "default_book_seed_ratio")]
+    pub book_seed_ratio: f64,
     /// Apr 28, 2026: Whether to send rich `Metadata::TvShow`/`Movie` in the
     /// LOAD message.  Default `false`.  When true, DMR shows a poster+title
     /// splash on top of the playback view.
@@ -206,6 +219,14 @@ fn default_quality() -> String {
 fn default_media_dir() -> String {
     "~/media".into()
 }
+fn default_book_seed_ratio() -> f64 {
+    2.0
+}
+
+fn default_podcast_country() -> String {
+    "us".to_string()
+}
+
 fn default_port() -> u16 {
     7890
 }
@@ -265,6 +286,9 @@ impl Default for Config {
             host: default_host(),
             known_devices: HashMap::new(),
             cast_app_id: String::new(),
+            podcast_country: default_podcast_country(),
+            uplink_governor: true,
+            book_seed_ratio: default_book_seed_ratio(),
             rich_metadata_in_load: false,
             experimental_endlist_hack: false,
             // Default `true` since 2026-06-29: with it `false`, non-Bypass plays

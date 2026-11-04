@@ -575,6 +575,13 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
     //
     // Lifetime: permanent by design, like the disk sweep above — it ends with the
     // process, and its purpose is stated here.
+    // 2026-11-04: which torrents are audiobooks, saved across restarts.
+    crate::audiobook::load(&state.state_dir);
+    // 2026-11-04: seeding yields to other traffic on the line (src/uplink.rs).
+    // Lifetime: permanent by design, off with `uplink_governor = false`.
+    if state.config.uplink_governor {
+        crate::uplink::spawn(state.torrent_engine.clone());
+    }
     {
         let seed_guard_state = state.clone();
         tokio::spawn(async move {
@@ -711,6 +718,20 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/library", get(handle_library))
         .route("/library/files", get(handle_library_files))
         .route("/library/vlc.m3u", get(handle_vlc_library_playlist))
+        // 2026-11-04: podcasts (Apple's directory + the show's own RSS feed) and
+        // audiobooks (title search over three torrent indexes). src/podcast.rs,
+        // src/audiobook.rs; the handlers sit after handle_vlc_library_playlist.
+        .route("/podcast/search", get(handle_podcast_search))
+        .route("/podcast/episodes", get(handle_podcast_episodes))
+        .route("/podcast/vlc.m3u", get(handle_podcast_playlist))
+        .route("/podcast/cast", post(handle_podcast_cast))
+        .route("/audiobook/search", get(handle_audiobook_search))
+        .route("/audiobook/start", post(handle_audiobook_start))
+        .route("/audiobook/{id}/files", get(handle_audiobook_files))
+        .route("/audiobook/{id}/open.m3u", get(handle_audiobook_playlist))
+        .route("/audiobook/{id}/file/{idx}", get(handle_audiobook_file))
+        .route("/audiobook/{id}/cast", post(handle_audiobook_cast))
+        .route("/audio/control", post(handle_audio_control))
         .route(
             "/queue",
             get(handle_queue_list)
@@ -10528,15 +10549,36 @@ async fn stop_seeding_what_has_been_watched(state: &SharedState) {
     }
     let app = AppState::load(&state.state_dir);
     for (id, name) in seeding {
-        let title = ledger_title_for_release(&name);
-        if title.is_empty() || !app.has_seen(None, &title) {
-            continue;
+        // An audiobook is never marked watched, so the ledger test below would let it
+        // seed for as long as the server runs. It stops once it is fully downloaded;
+        // the files stay for the next listen.
+        //
+        // It seeds to `book_seed_ratio` times its size first (the owner's ruling,
+        // 2026-11-04: one to two times, so the swarm is not leeched from). How FAST it
+        // seeds meanwhile is the uplink governor's call, which yields to other traffic.
+        let is_book = crate::audiobook::name_of(&state.torrent_engine, id).is_some();
+        if is_book {
+            let ratio = state.torrent_engine.upload_ratio(id).unwrap_or(0.0);
+            if ratio < state.config.book_seed_ratio {
+                continue;
+            }
+        } else {
+            let title = ledger_title_for_release(&name);
+            if title.is_empty() || !app.has_seen(None, &title) {
+                continue;
+            }
         }
+        let why = if is_book {
+            "audiobook seeded to its ratio"
+        } else {
+            "already watched"
+        };
         match state.torrent_engine.pause_seeding(id).await {
             Ok(()) => tracing::info!(
-                "librqbit: stopped seeding torrent {} ({}) — already watched",
+                "librqbit: stopped seeding torrent {} ({}) — {}",
                 id,
-                title
+                name,
+                why
             ),
             Err(e) => tracing::debug!("librqbit: could not stop seeding torrent {}: {}", id, e),
         }
@@ -11163,6 +11205,444 @@ async fn handle_vlc_library_playlist(
         None => (
             axum::http::StatusCode::NOT_FOUND,
             Json(json!({"error": "Library file not found, or its origin is offline."})),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Podcasts and audiobooks (2026-11-04). See src/podcast.rs and src/audiobook.rs.
+// ---------------------------------------------------------------------------
+
+// Upstream failures answer 424, not 502/503: the web remote reads those two as "spela
+// itself is down" and would replace the reason with a generic message.
+fn bad_request(msg: &str) -> axum::response::Response {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg })),
+    )
+        .into_response()
+}
+
+fn not_found(msg: &str) -> axum::response::Response {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(json!({ "error": msg })),
+    )
+        .into_response()
+}
+
+fn m3u_response(body: String) -> axum::response::Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "audio/x-mpegurl")],
+        body,
+    )
+        .into_response()
+}
+
+/// The address a player on the LAN uses to reach this server: `stream_host` when it is
+/// configured (Darwin), else the Host the request arrived on, which the Host allowlist
+/// has already approved.
+fn lan_base(state: &ServerState, headers: &HeaderMap) -> String {
+    if !state.config.stream_host.is_empty() {
+        return format!("http://{}:{}", state.config.stream_host, state.config.port);
+    }
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("127.0.0.1");
+    format!("http://{host}")
+}
+
+/// The Chromecast that the last podcast or audiobook was cast to, for `/audio/control`.
+/// Audio casts create no `CurrentStream`, so the video controls cannot find it.
+static AUDIO_CAST_DEVICE: once_cell::sync::Lazy<Mutex<Option<String>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+fn chromecast_audio_type(t: &str, url: &str) -> String {
+    let t = t.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "audio/x-m4a" | "audio/m4a" | "audio/x-m4b" | "audio/m4b" => "audio/mp4".into(),
+        "audio/mp3" | "audio/x-mp3" | "audio/x-mpeg" => "audio/mpeg".into(),
+        "" => crate::podcast::audio_type_from_url(url).into(),
+        _ => t,
+    }
+}
+
+async fn cast_audio(
+    state: &SharedState,
+    device: String,
+    url: String,
+    content_type: String,
+    duration: Option<f64>,
+    meta: cast::CastMetadata,
+) -> axum::response::Response {
+    if device.is_empty() {
+        return bad_request("cast_name required (no default Chromecast is set)");
+    }
+    let st = state.clone();
+    let dev = device.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cast = lock_recover(&st.cast);
+        cast.cast_url(&dev, &url, &content_type, duration, None, &meta)
+    })
+    .await;
+    match out {
+        Ok(Ok(r)) => {
+            *lock_recover(&AUDIO_CAST_DEVICE) = Some(device);
+            Json(json!({ "status": r.status, "device": r.device })).into_response()
+        }
+        Ok(Err(e)) => (
+            axum::http::StatusCode::FAILED_DEPENDENCY,
+            Json(json!({ "error": format!("Cast failed: {e}") })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Cast task failed: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /podcast/search?q=` — shows from Apple's podcast directory.
+async fn handle_podcast_search(
+    State(state): State<SharedState>,
+    axum::extract::Query(p): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let q = p.get("q").map(|s| s.trim()).unwrap_or("");
+    if q.is_empty() {
+        return bad_request("q required");
+    }
+    let country = p
+        .get("country")
+        .filter(|c| c.len() == 2 && c.chars().all(|ch| ch.is_ascii_alphabetic()))
+        .cloned()
+        .unwrap_or_else(|| state.config.podcast_country.clone());
+    match crate::podcast::search(q, &country).await {
+        Ok(shows) => Json(json!({ "query": q, "shows": shows })).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::FAILED_DEPENDENCY,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /podcast/episodes?id=&offset=&limit=` — a show's episodes, newest first.
+async fn handle_podcast_episodes(
+    axum::extract::Query(p): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let Some(id) = p.get("id").and_then(|s| s.parse::<u64>().ok()) else {
+        return bad_request("id required");
+    };
+    let offset = p
+        .get("offset")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = p
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(50)
+        .min(500);
+    match crate::podcast::feed(id).await {
+        Ok(f) => {
+            let total = f.episodes.len();
+            let page: Vec<_> = f.episodes.into_iter().skip(offset).take(limit).collect();
+            Json(json!({
+                "id": id, "title": f.title, "author": f.author, "artwork": f.artwork,
+                "total": total, "offset": offset, "episodes": page,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::FAILED_DEPENDENCY,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /podcast/vlc.m3u?id=&ep=&t=` — a one-episode VLC playlist; `t` resumes.
+async fn handle_podcast_playlist(
+    axum::extract::Query(p): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let (Some(id), Some(guid)) = (p.get("id").and_then(|s| s.parse::<u64>().ok()), p.get("ep"))
+    else {
+        return bad_request("id and ep required");
+    };
+    let start = p
+        .get("t")
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|t| t as u64);
+    match crate::podcast::episode(id, guid).await {
+        Ok((f, ep)) => m3u_response(crate::podcast::vlc_playlist(&f.title, &ep, start)),
+        Err(e) => not_found(&format!("{e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct PodcastCastReq {
+    id: u64,
+    ep: String,
+    cast_name: Option<String>,
+}
+
+/// `POST /podcast/cast {id, ep, cast_name}` — the episode's audio on a Chromecast. The
+/// URL is taken from the feed here, never from the client.
+async fn handle_podcast_cast(
+    State(state): State<SharedState>,
+    Json(req): Json<PodcastCastReq>,
+) -> axum::response::Response {
+    let (f, ep) = match crate::podcast::episode(req.id, &req.ep).await {
+        Ok(x) => x,
+        Err(e) => return not_found(&format!("{e:#}")),
+    };
+    let device = req
+        .cast_name
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| state.config.default_device.clone());
+    let meta = cast::CastMetadata {
+        title: Some(ep.title.clone()),
+        series_title: Some(f.title.clone()),
+        poster_url: f.artwork.clone(),
+        ..Default::default()
+    };
+    let ctype = chromecast_audio_type(&ep.audio_type, &ep.audio_url);
+    cast_audio(
+        &state,
+        device,
+        ep.audio_url,
+        ctype,
+        ep.duration_s.map(|d| d as f64),
+        meta,
+    )
+    .await
+}
+
+/// `GET /audiobook/search?q=` — books from the Pirate Bay, Knaben and AudioBook Bay.
+async fn handle_audiobook_search(
+    axum::extract::Query(p): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let q = p.get("q").map(|s| s.trim()).unwrap_or("");
+    if q.is_empty() {
+        return bad_request("q required");
+    }
+    let r = crate::audiobook::search(q).await;
+    Json(json!({ "query": q, "books": r.books, "failed_sources": r.failed })).into_response()
+}
+
+#[derive(Deserialize)]
+struct AudiobookStartReq {
+    hash: String,
+    name: String,
+}
+
+/// `POST /audiobook/start {hash, name}` — add the book's torrent (every file) and answer
+/// with the torrent id. Goes through `start_torrent_for_play`, so the media cap applies.
+async fn handle_audiobook_start(
+    State(state): State<SharedState>,
+    Json(req): Json<AudiobookStartReq>,
+) -> axum::response::Response {
+    let Some(hash) = crate::audiobook::valid_hash(&req.hash) else {
+        return bad_request("hash must be a 40-character hex info hash");
+    };
+    let name = crate::podcast::one_line(req.name.trim());
+    let magnet = crate::audiobook::magnet(&hash, &name);
+    match start_torrent_for_play(&state, &magnet, None).await {
+        Ok((id, _)) => {
+            crate::audiobook::register(&hash, &name);
+            Json(json!({ "id": id, "name": name })).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::FAILED_DEPENDENCY,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /audiobook/{id}/files` — chapters in listening order once the torrent's metadata
+/// has arrived (`ready: false` until then), plus download progress.
+async fn handle_audiobook_files(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<u32>,
+) -> axum::response::Response {
+    let Some(name) = crate::audiobook::name_of(&state.torrent_engine, id) else {
+        return not_found("No audiobook with that id on this server");
+    };
+    let progress = state.torrent_engine.progress(id).map(|p| {
+        json!({ "downloaded": p.bytes_downloaded, "total": p.bytes_total,
+                "peers": p.peers_connected, "speed_bps": p.speed_bps, "finished": p.finished })
+    });
+    match state.torrent_engine.file_list(id) {
+        None => Json(json!({ "id": id, "name": name, "ready": false, "progress": progress }))
+            .into_response(),
+        Some(all) => {
+            let files: Vec<_> = crate::audiobook::listening_order(all)
+                .into_iter()
+                .map(|(idx, path, len)| json!({ "idx": idx, "label": crate::audiobook::chapter_label(&path), "bytes": len }))
+                .collect();
+            Json(json!({ "id": id, "name": name, "ready": true, "files": files, "progress": progress })).into_response()
+        }
+    }
+}
+
+/// `GET /audiobook/{id}/open.m3u` — every chapter, in order, for VLC.
+async fn handle_audiobook_playlist(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<u32>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let Some(name) = crate::audiobook::name_of(&state.torrent_engine, id) else {
+        return not_found("No audiobook with that id on this server");
+    };
+    let Some(all) = state.torrent_engine.file_list(id) else {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({ "error": "Still fetching the torrent's file list" })),
+        )
+            .into_response();
+    };
+    let files = crate::audiobook::listening_order(all);
+    match crate::audiobook::vlc_playlist(&lan_base(&state, &headers), id, &name, &files) {
+        Ok(m) => m3u_response(m),
+        Err(e) => not_found(&format!("{e:#}")),
+    }
+}
+
+/// `GET /audiobook/{id}/file/{idx}` — one chapter, Range-served from the torrent as it
+/// downloads. Open to the LAN (VLC, a Chromecast, a phone), unlike `/torrent/*`, but only
+/// for torrents started as audiobooks and only for their audio files.
+async fn handle_audiobook_file(
+    State(state): State<SharedState>,
+    axum::extract::Path((id, idx)): axum::extract::Path<(u32, usize)>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if crate::audiobook::name_of(&state.torrent_engine, id).is_none() {
+        return not_found("No audiobook with that id on this server");
+    }
+    let is_audio = state
+        .torrent_engine
+        .file_list(id)
+        .and_then(|f| f.into_iter().find(|(i, _, _)| *i == idx))
+        .is_some_and(|(_, p, _)| crate::audiobook::is_audio(&p));
+    if !is_audio {
+        return not_found("No audio file with that index in this book");
+    }
+    if let Err(e) = state.torrent_engine.resume_for(id, idx).await {
+        tracing::debug!("audiobook: resume_for({id}, {idx}) failed: {e}");
+    }
+    let path = state
+        .torrent_engine
+        .file_list(id)
+        .and_then(|f| f.into_iter().find(|(i, _, _)| *i == idx))
+        .map(|(_, p, _)| p)
+        .unwrap_or_default();
+    match crate::torrent_stream::serve_torrent_stream(&state.torrent_engine, id, idx, &headers)
+        .await
+    {
+        Ok(mut r) => {
+            // The shared stream handler labels everything as Matroska video; a phone's
+            // <audio> element refuses that, so say what the chapter is.
+            if let Ok(v) =
+                axum::http::HeaderValue::from_str(crate::podcast::audio_type_from_url(&path))
+            {
+                r.headers_mut().insert(axum::http::header::CONTENT_TYPE, v);
+            }
+            r
+        }
+        Err(code) => (code, "stream unavailable").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AudiobookCastReq {
+    file: usize,
+    cast_name: Option<String>,
+}
+
+/// `POST /audiobook/{id}/cast {file, cast_name}` — one chapter on a Chromecast.
+async fn handle_audiobook_cast(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<u32>,
+    headers: HeaderMap,
+    Json(req): Json<AudiobookCastReq>,
+) -> axum::response::Response {
+    let Some(name) = crate::audiobook::name_of(&state.torrent_engine, id) else {
+        return not_found("No audiobook with that id on this server");
+    };
+    let Some(path) = state
+        .torrent_engine
+        .file_list(id)
+        .and_then(|f| f.into_iter().find(|(i, _, _)| *i == req.file))
+        .map(|(_, p, _)| p)
+        .filter(|p| crate::audiobook::is_audio(p))
+    else {
+        return not_found("No audio file with that index in this book");
+    };
+    let url = format!(
+        "{}/audiobook/{id}/file/{}",
+        lan_base(&state, &headers),
+        req.file
+    );
+    let device = req
+        .cast_name
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| state.config.default_device.clone());
+    let meta = cast::CastMetadata {
+        title: Some(crate::audiobook::chapter_label(&path)),
+        series_title: Some(name),
+        ..Default::default()
+    };
+    let ctype = chromecast_audio_type("", &path);
+    cast_audio(&state, device, url, ctype, None, meta).await
+}
+
+#[derive(Deserialize)]
+struct AudioControlReq {
+    cmd: String,
+    seconds: Option<f64>,
+}
+
+/// `POST /audio/control {cmd: pause|resume|stop|seek, seconds}` — the Chromecast that the
+/// last podcast or audiobook went to.
+async fn handle_audio_control(
+    State(state): State<SharedState>,
+    Json(req): Json<AudioControlReq>,
+) -> axum::response::Response {
+    let Some(device) = lock_recover(&AUDIO_CAST_DEVICE).clone() else {
+        return not_found("Nothing has been cast as audio yet");
+    };
+    let st = state.clone();
+    let dev = device.clone();
+    let cmd = req.cmd.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cast = lock_recover(&st.cast);
+        match cmd.as_str() {
+            "pause" => cast.pause(&dev),
+            "resume" => cast.resume(&dev),
+            "stop" => cast.stop_cast(&dev),
+            "seek" => cast.seek(&dev, req.seconds.unwrap_or(0.0).max(0.0)),
+            other => Err(anyhow::anyhow!("unknown command {other}")),
+        }
+    })
+    .await;
+    match out {
+        Ok(Ok(r)) => {
+            if req.cmd == "stop" {
+                *lock_recover(&AUDIO_CAST_DEVICE) = None;
+            }
+            Json(json!({ "status": r.status, "device": device })).into_response()
+        }
+        Ok(Err(e)) => (
+            axum::http::StatusCode::FAILED_DEPENDENCY,
+            Json(json!({ "error": format!("{e}") })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{e}") })),
         )
             .into_response(),
     }
