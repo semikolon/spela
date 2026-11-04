@@ -437,6 +437,15 @@ impl TorrentEngine {
         })
     }
 
+    /// The spela id of the torrent with this info hash (40 hex characters), if held.
+    pub fn id_for_hash(&self, hex: &str) -> Option<u32> {
+        let id20 = Magnet::parse(&format!("magnet:?xt=urn:btih:{hex}"))
+            .ok()?
+            .as_id20()?;
+        let handle = self.session.get(TorrentIdOrHash::Hash(id20))?;
+        shift_librqbit_id(handle.id()).ok()
+    }
+
     /// The torrent's info hash as lowercase hex.
     pub fn info_hash_hex(&self, id: u32) -> Option<String> {
         Some(

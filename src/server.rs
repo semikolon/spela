@@ -731,6 +731,7 @@ pub async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .route("/audiobook/{id}/open.m3u", get(handle_audiobook_playlist))
         .route("/audiobook/{id}/file/{idx}", get(handle_audiobook_file))
         .route("/audiobook/{id}/cast", post(handle_audiobook_cast))
+        .route("/audiobook/remove", post(handle_audiobook_remove))
         .route("/audio/control", post(handle_audio_control))
         .route(
             "/queue",
@@ -11481,7 +11482,10 @@ async fn handle_audiobook_files(
         Some(all) => {
             let files: Vec<_> = crate::audiobook::listening_order(all)
                 .into_iter()
-                .map(|(idx, path, len)| json!({ "idx": idx, "label": crate::audiobook::chapter_label(&path), "bytes": len }))
+                .map(|(idx, path, len)| {
+                    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+                    json!({ "idx": idx, "label": crate::audiobook::chapter_label(&path), "ext": ext, "bytes": len })
+                })
                 .collect();
             Json(json!({ "id": id, "name": name, "ready": true, "files": files, "progress": progress })).into_response()
         }
@@ -11597,6 +11601,37 @@ async fn handle_audiobook_cast(
     };
     let ctype = chromecast_audio_type("", &path);
     cast_audio(&state, device, url, ctype, None, meta).await
+}
+
+#[derive(Deserialize)]
+struct AudiobookRemoveReq {
+    hash: String,
+}
+
+/// `POST /audiobook/remove {hash}` — stop a book's torrent and delete its files on this
+/// server. Only books started as audiobooks; any other torrent is refused. Used when the
+/// listener has finished the book (`spela audiobook finished --remove`).
+async fn handle_audiobook_remove(
+    State(state): State<SharedState>,
+    Json(req): Json<AudiobookRemoveReq>,
+) -> axum::response::Response {
+    let Some(hash) = crate::audiobook::valid_hash(&req.hash) else {
+        return bad_request("hash must be a 40-character hex info hash");
+    };
+    let Some(name) = crate::audiobook::name_for_hash(&hash) else {
+        return not_found("That torrent was not started as an audiobook here");
+    };
+    if let Some(id) = state.torrent_engine.id_for_hash(&hash) {
+        if let Err(e) = state.torrent_engine.stop(id, true).await {
+            return (
+                axum::http::StatusCode::FAILED_DEPENDENCY,
+                Json(json!({ "error": format!("Could not remove the torrent: {e}") })),
+            )
+                .into_response();
+        }
+    }
+    crate::audiobook::forget(&hash);
+    Json(json!({ "removed": name, "hash": hash })).into_response()
 }
 
 #[derive(Deserialize)]

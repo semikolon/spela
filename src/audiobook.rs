@@ -399,6 +399,18 @@ pub fn register(hash: &str, name: &str) {
     }
 }
 
+/// Drop a book from the list (its torrent and files are removed by the caller).
+pub fn forget(hash: &str) {
+    let Ok(mut m) = STARTED.lock() else { return };
+    m.remove(&hash.to_ascii_lowercase());
+    let Some(path) = STATE_FILE.lock().ok().and_then(|f| f.clone()) else {
+        return;
+    };
+    if let Ok(t) = serde_json::to_string_pretty(&*m) {
+        let _ = std::fs::write(&path, t);
+    }
+}
+
 pub fn name_for_hash(hash: &str) -> Option<String> {
     STARTED
         .lock()

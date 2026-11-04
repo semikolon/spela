@@ -1,4 +1,5 @@
 mod audiobook;
+mod books_app;
 mod cast;
 mod config;
 mod disk;
@@ -241,6 +242,26 @@ enum PodcastAction {
 enum AudiobookAction {
     /// Search the Pirate Bay, Knaben and AudioBook Bay by title.
     Search { query: Vec<String> },
+    /// Fetch a whole book, join its chapters into one .m4b and open it in the Books app
+    /// (macOS). Books keeps its own copy; the .m4b is left in ~/Library/Caches/spela/books.
+    Save {
+        /// Info hash from `spela audiobook search`.
+        hash: String,
+        #[arg(long, default_value = "Audiobook")]
+        name: String,
+        /// Write the .m4b but do not open it in Books.
+        #[arg(long)]
+        no_import: bool,
+        /// Where to write the .m4b (default ~/Library/Caches/spela/books).
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Books saved to the Books app, with how far through each one is; --remove deletes
+    /// the torrent and files of every finished one on the server.
+    Finished {
+        #[arg(long)]
+        remove: bool,
+    },
     /// Fetch a book's torrent and play it chapter by chapter.
     Play {
         /// Info hash from `spela audiobook search`.
@@ -839,6 +860,20 @@ async fn run_client_command(command: Commands, server: &str) -> anyhow::Result<V
                 .await?
                 .json()
                 .await?),
+            AudiobookAction::Finished { remove } => books_app::finished(&base, remove).await,
+            AudiobookAction::Save {
+                hash,
+                name,
+                no_import,
+                dir,
+            } => {
+                let out_dir = dir.unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .unwrap_or_default()
+                        .join("Library/Caches/spela/books")
+                });
+                books_app::save(&base, &hash, &name, !no_import, &out_dir).await
+            }
             AudiobookAction::Play {
                 hash,
                 name,

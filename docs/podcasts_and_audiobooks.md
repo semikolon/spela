@@ -114,10 +114,32 @@ spela podcast episodes <show id>
 spela podcast play <show id> [--episode N] [--cast NAME] [--start SECONDS] [--print]
 spela audiobook search the body keeps the score
 spela audiobook play <hash> --name "<title>" [--cast NAME] [--print]
+spela audiobook save <hash> --name "<title>" [--no-import] [--dir PATH]
+spela audiobook finished [--remove]
 ```
 
 Without `--cast`, `play` opens VLC on the machine the command runs on (`open -a VLC` on macOS, `vlc`
 elsewhere); `--print` only prints the playlist URL.
+
+## The Books app on macOS (`src/books_app.rs`, runs on the listener's Mac)
+
+**`save`** waits for the whole book to download on the server (it gives up only after five minutes
+with no progress), fetches every chapter, and joins them into ONE `.m4b`: ffmpeg's concat demuxer,
+a metadata file with a `[CHAPTER]` per input laid end to end, Apple's `aac_at` encoder (ffmpeg's
+`aac` if absent) at 64 kbit/s mono or 96 kbit/s stereo, and the audiobook tag (`media_type=2`). A
+book that already is one `.m4b`/`.m4a` is copied, not re-encoded. Chapter names drop what every
+file name shares ("heart_of_darkness_1a_conrad_64kb" becomes "Part 1a"). The file is opened with
+Books, which copies it into its own storage; once Books' library lists the title, spela deletes its
+own copy, so the Mac's disk gets the space back. One file with chapters is the form Books handles
+best; separate MP3s are reported to import as many titles or merge without chapter marks.
+
+**`finished`** reads Books' library database (`~/Library/Containers/com.apple.iBooksX/Data/
+Documents/BKLibrary/BKLibrary-*.sqlite`, table `ZBKLIBRARYASSET`: `ZCONTENTTYPE = 6` is an
+audiobook, `ZISFINISHED` and `ZREADINGPROGRESS` say how far the listener is) for every book `save`
+recorded in `~/.config/spela/books_saved.json`. A book counts as finished when Books marks it so or
+progress reaches 99%. With `--remove`, `POST /audiobook/remove {hash}` stops the book's torrent and
+deletes its files on the server (books only; any other torrent is refused). Books keeps its own
+copy; removing it there is the listener's step, since Books offers no scripting for it.
 
 ## Seeding: how long, and how fast
 
@@ -158,6 +180,11 @@ Verified on 2026-11-04 against a separate test instance (own port, state and med
 - A public-domain LibriVox book with seven files: started, its six audio chapters listed in order,
   a Range request answered 206, a non-audio file and an unknown book refused with 404, VLC decoded a
   chapter, and the book was still known after a server restart.
+- `spela podcast search|episodes|play --print` and `spela audiobook search|play --print`.
+- `spela audiobook save`: the LibriVox book became one 4 h 10 min `.m4b` (123 MB, AAC mono 64 kbit/s,
+  six named chapters, audiobook tag) in 52 seconds; opened with Books, it was listed in Books'
+  library as an audiobook with its duration, in Books' own storage. `spela audiobook finished` read
+  its progress (0%); `POST /audiobook/remove` deleted the torrent's files and forgot the book.
 - The web remote in a browser, desktop and phone widths: both modes search and render, a podcast
   episode and a book played in the audio bar (muted for the test), and a book moved to its next
   chapter by itself.
@@ -168,7 +195,6 @@ Not verified yet:
   `/audio/control` have only been compiled, not run against a receiver.
 - The `vlc://` hand-off from the remote with a real VLC window (the playlists were checked with a
   headless VLC instead).
-- The `spela podcast` and `spela audiobook` commands themselves (the endpoints they call were).
 - The uplink governor against a real busy line (its control law has unit tests; its probing has run
   only in the test instance).
 - Deployment: none. The server normally runs on another machine; nothing here has been built or
@@ -176,17 +202,8 @@ Not verified yet:
 
 ## Next
 
-- **Save a book to the Books app on macOS.** Books imports MP3 and M4B (File > Import, or
-  `open -a Books <file>`) and keeps chapters best from one M4B. Plan: a Mac-side command fetches the
-  chapters, joins them into one M4B with chapter marks (ffmpeg's `aac_at` encoder is Apple's own and
-  present on the Mac), and hands it to Books. Reports of Books merging separate MP3s into one long
-  title are the reason for building the M4B first.
-- **Offer to remove what has been listened to.** Books records it: its library database
-  (`~/Library/Containers/com.apple.iBooksX/Data/Documents/BKLibrary/BKLibrary-*.sqlite`, table
-  `ZBKLIBRARYASSET`) has `ZISFINISHED`, `ZDATEFINISHED`, `ZREADINGPROGRESS`, `ZDURATION` and `ZKIND`,
-  readable without opening Books. A listener-side check can list finished books spela fetched and
-  offer to delete their torrent and files on the server. Podcasts stream and store nothing, so for
-  them "remove" only means dropping them from a list.
+- **Offer removal by itself.** `spela audiobook finished` is the offer when asked; running it on a
+  timer and telling the listener (a notification, or the voice assistant) is not built.
 - **Resume for podcasts.** VLC's playlist already takes `t=`; nothing records where a listener
   stopped.
 - **A Chromecast plays one chapter at a time.** A cast queue of all chapters would need the

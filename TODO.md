@@ -8,15 +8,15 @@ is not: [`docs/podcasts_and_audiobooks.md`](docs/podcasts_and_audiobooks.md). Ow
 - [ ] Deploy to the server with `bin/deploy-server.sh` once it is reachable again, then one real
   play each: a podcast in VLC through the remote's `vlc://` hand-off, a book in VLC, both on a
   Chromecast (`/audio/control` pause and stop included).
-- [ ] Run `spela podcast play` and `spela audiobook play` once each (the endpoints are tested, the
-  commands are not).
 - [ ] Watch the uplink governor's log lines under a real busy line (`uplink: upload ceiling …`).
-- [ ] Save a book to the Books app on macOS as one M4B with chapters (his ask: *"The audiobooks
-  could be downloaded to the Audiobooks app on MacOS I guess, if feasible?"*; feasible, plan in the
-  design doc § Next).
-- [ ] Offer to remove books he has finished, read from the Books library database (his ask: *"spela
-  could also automatically offer to remove books/pods after I've listened to them, if that's
-  tracked in the mac Books app etc"*; the fields are listed in the design doc § Next).
+- [x] Save a book to the Books app on macOS as one M4B with chapters: `spela audiobook save` (his ask:
+  *"The audiobooks could be downloaded to the Audiobooks app on MacOS I guess, if feasible?"*). Built
+  and run once with a public-domain book, 4 November.
+- [x] List finished books and remove them from the server: `spela audiobook finished [--remove]`
+  (his ask: *"spela could also automatically offer to remove books/pods after I've listened to
+  them, if that's tracked in the mac Books app etc"*).
+- [ ] Make that offer by itself: run `finished` on a timer and tell him (a notification or Ruby),
+  rather than only when asked.
 - [ ] Resume position for podcast episodes.
 
 ### 🔓 OPEN — 4 October 2026: the "good enough" bitrate levels are starting values
