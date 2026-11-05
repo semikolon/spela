@@ -13,7 +13,7 @@ as readiness or permit sparse holes in a static file. See
 [readiness and identity](docs/PLAYBACK_READINESS.md).
 
 Deploy with `bin/deploy-server.sh <ssh-host> --restart` from a clean committed checkout;
-it checks `/status` and `/progress` before restarting. Preserve active playback.
+it checks `/status` (idle, and no `vlc_active`) and `/progress` before restarting. Preserve active playback.
 Documentation/frontend-only changes can be staged without a binary restart; frontend
 changes become visible on page reload. Do not call a staged binary deployed/running.
 
