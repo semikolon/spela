@@ -46,7 +46,7 @@ if [[ "$mode" == --restart ]]; then
     # Never interrupt a live stream or a pending play. A wedged HTTP endpoint
     # needs operator diagnosis; --restart is for an already-confirmed idle host.
     curl --fail --silent --max-time 5 http://127.0.0.1:7890/status |
-        python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("status")=="idle" else "Playback active; binary staged only")'
+        python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("status")=="idle" and not s.get("vlc_active") else "Playback active; binary staged only")'
     curl --fail --silent --max-time 5 http://127.0.0.1:7890/progress |
         python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(1 if s.get("active") else 0)'
     sudo systemctl restart spela
