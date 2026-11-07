@@ -6,6 +6,14 @@
 in VLC"*; a trial of server conversion was judged not worth it. The name rule below is live
 (`dolby_vision_without_fallback`, mechanics in `CLAUDE.md`, tier 1). Not built: the byte check and
 the conversion. Delete this section once a few weeks of VLC plays have shown no green picture.
+
+**Same evening, the ranking alone was not enough:** Local Bypass matches the episode on disk, not
+the release, and the profile 5 copy played earlier was complete and bigger, so ▶ would have served
+it again over the ranked hybrid (verified on the live server: `/vlc/1/ready` answered "on disk" with
+the RAWR file). `bypass_crosses_dolby_vision_wall` (server.rs) now refuses a copy behind the wall
+for the target: profile 5 for VLC unless that release was the one chosen, any Dolby Vision for a
+Chromecast. Still owed: one line in `CLAUDE.md` § Local Bypass (held back to keep that file to one
+write per sitting).
 The question as it was put:
 
 VisionQuest S01E02 opened green in VLC. The pick was `...2160p DSNP WEB-DL DDP5 1 Atmos DV H

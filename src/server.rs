@@ -2985,8 +2985,21 @@ async fn do_play(
             expected_bytes,
             &corrupt_files,
         ) {
-            server_url = format!("file://{}", local_path.to_string_lossy());
-            is_local = true;
+            // A transcoding target cannot use any Dolby Vision copy (NVENC cannot read
+            // the RPU), a native one not a profile 5 copy. The request carries no
+            // release name, so any copy behind the wall is refused here.
+            let transcoding = matches!(target.as_str(), "chromecast" | "renderer");
+            if bypass_crosses_dolby_vision_wall(&local_path, None, transcoding) {
+                tracing::info!(
+                    "Local Bypass: on-disk {:?} sits behind the Dolby Vision wall for \
+                     target {} — not substituting",
+                    local_path,
+                    target
+                );
+            } else {
+                server_url = format!("file://{}", local_path.to_string_lossy());
+                is_local = true;
+            }
         }
     }
 
@@ -9729,6 +9742,35 @@ const MIN_BYPASS_SIZE_FRACTION: f64 = 0.75;
 /// materially smaller is refused. `have == 0` means the size could not be read,
 /// which is not evidence of a downgrade, so it passes and the other health checks
 /// decide.
+/// 2026-11-07: Local Bypass matches the EPISODE on disk (title, year, resolution), not
+/// the release, so it could swap in a copy the ranker had pushed below the Dolby Vision
+/// wall. VisionQuest S01E02: the ranker picked a `DV HDR` hybrid, but the profile 5
+/// release played (green) earlier that evening was complete on disk, bigger, and so
+/// passed the size floor; pressing play would have served it again.
+///
+/// True when the on-disk copy sits behind the wall for this target and the chosen
+/// release does not. A chosen release that is behind the same wall was picked by hand,
+/// so its copy on disk is the one wanted. `chosen` is None when the caller holds no
+/// release name; then any copy behind the wall is refused.
+pub(crate) fn bypass_crosses_dolby_vision_wall(
+    on_disk: &std::path::Path,
+    chosen: Option<&str>,
+    transcoding: bool,
+) -> bool {
+    // The release name usually sits on the folder as well as the file.
+    let name = [
+        on_disk.parent().and_then(|p| p.file_name()),
+        on_disk.file_name(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|s| s.to_string_lossy().into_owned())
+    .collect::<Vec<_>>()
+    .join(" ");
+    crate::search::behind_dolby_vision_wall(&name, transcoding)
+        && !chosen.is_some_and(|c| crate::search::behind_dolby_vision_wall(c, transcoding))
+}
+
 pub(crate) fn bypass_size_is_acceptable(have: u64, want: u64) -> bool {
     if want == 0 || have == 0 {
         return true;
@@ -9822,6 +9864,16 @@ fn resolve_local_file_impl(
             );
             return None;
         }
+    }
+    // The VLC path is a native target, so the wall here is Dolby Vision profile 5.
+    let chosen = format!("{} {}", r.title, r.torrent_title);
+    if bypass_crosses_dolby_vision_wall(&path, Some(chosen.as_str()), false) {
+        tracing::info!(
+            "Local Bypass: on-disk {:?} is Dolby Vision profile 5 and the chosen release \
+             is not — not substituting, using the ranked one",
+            path
+        );
+        return None;
     }
     let name = title.replace(['/', '\\'], "-");
     Some((path, name))
@@ -14810,6 +14862,50 @@ mod tests {
             result.is_none(),
             "E06 request must not match the E05 folder"
         );
+    }
+
+    /// 2026-11-07, real paths from the server's media dir that evening: the ranker
+    /// chose the FLUX `DV HDR` hybrid, and the profile 5 RAWR copy (played green an hour
+    /// earlier) was complete on disk. The bypass must not swap it back in.
+    #[test]
+    fn bypass_does_not_swap_in_a_copy_behind_the_dolby_vision_wall() {
+        let dir = "www.UIndex.org    -    VisionQuest S01E02 Theseus 2160p DSNP WEB-DL DDP5 1 Atmos DV H 265-RAWR";
+        let rawr = std::path::PathBuf::from(format!(
+            "/mnt/media/{dir}/VisionQuest S01E02 Theseus 2160p DSNP WEB-DL DDP5 1 Atmos DV H 265-RAWR.mkv"
+        ));
+        let flux_name =
+            "VisionQuest S01E02 Theseus 2160p DSNP WEB-DL DDP5 1 Atmos DV HDR H 265-FLUX.mkv";
+        let flux = std::path::PathBuf::from(format!("/mnt/media/x/{flux_name}"));
+        let rawr_name = rawr.file_name().unwrap().to_string_lossy().into_owned();
+
+        // VLC (native): profile 5 on disk, hybrid chosen -> refused.
+        assert!(bypass_crosses_dolby_vision_wall(
+            &rawr,
+            Some(flux_name),
+            false
+        ));
+        // The profile 5 release itself, tapped deliberately -> its copy is fine.
+        assert!(!bypass_crosses_dolby_vision_wall(
+            &rawr,
+            Some(&rawr_name),
+            false
+        ));
+        // A hybrid on disk is not behind the wall for VLC.
+        assert!(!bypass_crosses_dolby_vision_wall(
+            &flux,
+            Some(flux_name),
+            false
+        ));
+        assert!(!bypass_crosses_dolby_vision_wall(&flux, None, false));
+        // Chromecast (transcoding): any Dolby Vision copy is refused.
+        assert!(bypass_crosses_dolby_vision_wall(&flux, None, true));
+        assert!(bypass_crosses_dolby_vision_wall(&rawr, None, true));
+        // Not Dolby Vision at all: never refused.
+        let plain = std::path::PathBuf::from(
+            "/mnt/media/Star.City.S01E08.HDR.2160p.WEB.h265.HeBits-GRACE.mkv",
+        );
+        assert!(!bypass_crosses_dolby_vision_wall(&plain, None, true));
+        assert!(!bypass_crosses_dolby_vision_wall(&plain, None, false));
     }
 
     #[test]

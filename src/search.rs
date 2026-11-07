@@ -3786,10 +3786,24 @@ fn has_dolby_vision_in_title(title: &str) -> bool {
 /// A name is a claim: a hybrid labelled only `DV` is demoted wrongly, and costs a
 /// 1080p where a 4K would have played. That is the cheaper error of the two.
 fn dolby_vision_without_fallback(r: &TorrentResult) -> bool {
-    if !has_dolby_vision_in_title(&r.title) {
+    dolby_vision_without_fallback_in(&r.title, &r.torrent_title)
+}
+
+/// Whether a release NAME sits behind the Dolby Vision wall for a target: every DV
+/// release for a transcoding target (the GTX 1650's NVENC cannot read the RPU), and
+/// profile 5 for a native one (VLC shows it green). The same wall the ranker's
+/// `dv_gate` puts up, for callers that hold a name rather than a result: Local
+/// Bypass, which matches an episode on disk by title and must not swap in a copy
+/// the ranker had pushed down (2026-11-07).
+pub(crate) fn behind_dolby_vision_wall(name: &str, transcoding: bool) -> bool {
+    has_dolby_vision_in_title(name) && (transcoding || dolby_vision_without_fallback_in(name, ""))
+}
+
+fn dolby_vision_without_fallback_in(title: &str, torrent_title: &str) -> bool {
+    if !has_dolby_vision_in_title(title) {
         return false;
     }
-    let names = format!("{} {}", r.title, r.torrent_title).to_lowercase();
+    let names = format!("{} {}", title, torrent_title).to_lowercase();
     let toks: Vec<&str> = names
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| !t.is_empty())
