@@ -16,6 +16,11 @@ release still beats every 1080p one. Options, recommended first:
 - **Name rule only.** Cheaper; a release that says only `DV` but is profile 8 is demoted wrongly.
 - **Play profile 5 properly** in a player that converts it (mpv or IINA through libplacebo; VLC 4
   is still beta). Keeps 4K, but replaces VLC under the bridge, the handler and the remote's control.
+- **Convert on the server before VLC gets it.** Profile 5's base picture is not standard, so this is a
+  full re-encode (libplacebo reshaping with the Dolby metadata, then NVENC), never a remux. The
+  server's ffmpeg 6.1.1 has `libplacebo` with `apply_dolbyvision` (checked 7 November); unknown is
+  whether the GTX 1650 keeps up at 4K beside the embedder (1.2 GB of 4 GB VRAM free). A one-minute
+  run on the VisionQuest file still in the media dir settles it.
 
 ### 🔓 OPEN — 4 November 2026: podcasts and audiobooks (built, tested on a test instance, not deployed)
 
