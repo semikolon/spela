@@ -451,6 +451,13 @@ eq(nearEnd(3480,3600),true,"offer during the last two minutes");
 eq(nearEnd(3400,3600),false,"do not cover the main episode");
 eq(nearEnd(0,0),false,"unknown duration cannot trigger an offer");
 eq(nearEnd(100,120),false,"short clips do not trigger episode offers");
+// The "Playback ended" offer after VLC closes follows the server's watched rule.
+const watched = new Function(extract("countsAsWatched")+";return countsAsWatched;")();
+eq(watched(15,2706),false,"a VLC closed fifteen seconds in was a quit, not an ending");
+eq(watched(2600,2706),true,"closed during the credits counts as watched");
+eq(watched(2350,2706),false,"six minutes left is not the end");
+eq(watched(2598,2706),true,"96% counts as watched");
+eq(watched(0,0),false,"unknown duration offers nothing");
 const shortcut = new Function(extract("handoffShortcut")+";return handoffShortcut;")();
 const key={ctrlKey:true,altKey:true,code:"KeyN"};
 eq(shortcut(key),"next","next key supports VLC's native binding");

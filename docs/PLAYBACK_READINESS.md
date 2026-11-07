@@ -58,11 +58,14 @@ Measured delivery governs readiness; ranking seed counts cannot replace it.
 
 ## Handoff and controls
 
-Near the end, offer the next episode and recently watched followed series, with an easy
-Home action. Metadata can be prepared early; torrent downloads wait for a deliberate
-play choice. Stop/next must await the VLC bridge's closure acknowledgement before
-launching replacement playback; a failed stop preserves controls and shows a persistent
-error. Natural completion should retain the end panel rather than leave a dead player.
+Near the end, offer the next episode, with an easy Home action. (Recently watched
+followed series were offered too until 2026-11-07; the server still returns them, the
+remote no longer shows them.) Metadata can be prepared early; torrent downloads wait for
+a deliberate play choice. Stop/next must await the VLC bridge's closure acknowledgement
+before launching replacement playback; a failed stop preserves controls and shows a
+persistent error. Natural completion should retain the end panel rather than leave a dead
+player, and only completion: a VLC closed before the play counts as watched (the server's
+rule, 96% or within five minutes of the end) returns to where the play started.
 
 Single-key N/H overrides belong only in the end window, not throughout viewing. VLC
 keeps its normal controls earlier; arrow keys remain untouched. The window is the final

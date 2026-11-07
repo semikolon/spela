@@ -1,5 +1,22 @@
 # Spela TODOs 🎬🍿
 
+### 🔓 OPEN — 7 November 2026: should VLC stop picking Dolby Vision profile 5? (his ruling)
+
+VisionQuest S01E02 opened green in VLC. The pick was `...2160p DSNP WEB-DL DDP5 1 Atmos DV H
+265-RAWR`, and ffprobe on the server read it as **DV profile 5, `dv_bl_signal_compatibility_id=0`**:
+no HDR10 or SDR picture underneath, which VLC 3.0.24 cannot convert, so the colours come out
+green and purple. Since 2026-09-05 Dolby Vision is only a last preference for VLC (`dv_preference`,
+after resolution and size), lifted because nearly every 4K web release carries DV and because DV
+had played fine; that evidence fits profile 8, which has an HDR10 picture underneath. So a 4K DV
+release still beats every 1080p one. Options, recommended first:
+- **Read the name, then check the bytes.** For VLC, rank a release that names DV and no HDR10 (the
+  usual profile 5 shape; `DV HDR` hybrids are profile 8) below every release without DV, as the
+  Chromecast gate does; and when the served file's ffprobe says profile 5 with compatibility id 0,
+  move to the next source with a note. Cost: such a title drops to 1080p when no other 4K exists.
+- **Name rule only.** Cheaper; a release that says only `DV` but is profile 8 is demoted wrongly.
+- **Play profile 5 properly** in a player that converts it (mpv or IINA through libplacebo; VLC 4
+  is still beta). Keeps 4K, but replaces VLC under the bridge, the handler and the remote's control.
+
 ### 🔓 OPEN — 4 November 2026: podcasts and audiobooks (built, tested on a test instance, not deployed)
 
 His words: *"it should be able to stream podcasts, make it happen"*, and *"If spela COULD find the

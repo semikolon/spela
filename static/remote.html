@@ -901,14 +901,17 @@
 #upnextPanel{position:fixed;z-index:34;bottom:0;left:0;right:0;margin:0 auto;max-width:1100px;max-height:70vh;overflow:auto;padding:28px 36px;background:#171922;border:1px solid #353a50;border-radius:24px 24px 0 0;box-shadow:0 -16px 80px #0009}
 #upnextPanel h2{margin:8px 0;font-size:32px}
 #upnextPanel p{margin:10px 0 18px}
+/* Show title and episode line share a row on desktop; stacked on phones (media query below). */
+#upnextPanel .handoff-title{display:flex;flex-wrap:wrap;align-items:baseline;column-gap:18px}
+#upnextPanel .handoff-title p{margin:8px 0 18px}
 #upnextPanel .eyebrow{color:#a9b9ff;text-transform:uppercase;letter-spacing:.12em;font-weight:750;font-size:14px}
-.handoff-actions,.handoff-alternatives{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}
+.handoff-actions{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}
 .handoff-actions .srcbtn{min-height:58px;padding:14px 22px;font-size:18px}
 .handoff-actions .primary{background:#3963dc;color:white}
 .handoff-error{color:#ffca85}
 #nowbar .srcbtn{min-height:48px;white-space:nowrap}
 button:disabled{opacity:.45;cursor:default}
-@media(max-width:560px){#upnextPanel{padding:22px 18px;max-height:72vh}#upnextPanel h2{font-size:25px}.handoff-actions .srcbtn{flex:1 1 auto}#nowbar{flex-wrap:wrap}#nowbar .nt{min-width:120px}#nowbar #nbNext{font-size:14px;padding:10px}.transport{flex-wrap:wrap}}
+@media(max-width:560px){#upnextPanel{padding:22px 18px;max-height:72vh}#upnextPanel h2{font-size:25px}#upnextPanel .handoff-title{display:block}.handoff-actions .srcbtn{flex:1 1 auto}#nowbar{flex-wrap:wrap}#nowbar .nt{min-width:120px}#nowbar #nbNext{font-size:14px;padding:10px}.transport{flex-wrap:wrap}}
 </style>
 <style>
   /* Podcasts and audiobooks (2026-11-04): result lists and the persistent audio bar. */
@@ -3569,6 +3572,14 @@ function activeEndWindow(now){
 function nearPlaybackEnd(position,duration){
   return duration>=300 && position>=duration-Math.min(120,duration*.04);
 }
+/* Whether the server counts this play as watched: the same rule as HWM_CLEAR_FRACTION
+   (0.96) and HWM_CLEAR_TAIL_SECS (300) in src/state.rs. A VLC that closes past this
+   point gets the "Playback ended" offer; one closed earlier was a quit, not an ending
+   (2026-11-07: a release opened, looked wrong and was closed seconds in, and the remote
+   offered the next episode as though it had been watched). */
+function countsAsWatched(position,duration){
+  return duration>0 && position>0 && (position>=duration*.96 || duration-position<=300);
+}
 function handoffTitle(){
   const title=S.now.vlcTitle || S.now.data?.title || "";
   return /(?:s\d+e\d+|\d+x\d+)/i.test(title) ? title : title+(S.now.epShort?" "+S.now.epShort:"");
@@ -3616,8 +3627,10 @@ function renderHandoff(){
   if(root.dataset.rendered===signature) return;
   root.dataset.rendered=signature; root.replaceChildren();
   root.appendChild(el("div",{className:"eyebrow",textContent:handoff.busy?"Stopping current playback…":handoff.ended?"Playback ended":"Up next"}));
-  root.appendChild(el("h2",{textContent:next?.title || "What would you like to watch?"}));
-  root.appendChild(el("p",{textContent:next ? [next.episode_label,next.name].filter(Boolean).join(" · ") : (handoff.pending?"Finding your next episode…":"No next episode available yet.")}));
+  const titleRow=el("div",{className:"handoff-title"});
+  titleRow.appendChild(el("h2",{textContent:next?.title || "What would you like to watch?"}));
+  titleRow.appendChild(el("p",{textContent:next ? [next.episode_label,next.name].filter(Boolean).join(" · ") : (handoff.pending?"Finding your next episode…":"No next episode available yet.")}));
+  root.appendChild(titleRow);
   const actions=el("div",{className:"handoff-actions"});
   if(next) actions.appendChild(handoffButton(handoff.busy?"Switching…":"Play next episode",()=>advancePlayback(next),true));
   actions.appendChild(handoffButton(handoff.ended?"Home":"Stop & go home",stopAndHome));
@@ -3627,12 +3640,6 @@ function renderHandoff(){
   if(handoff.error){
     root.appendChild(el("p",{className:"handoff-error",textContent:handoff.error}));
     actions.appendChild(handoffButton("Retry",()=>{handoff.error=""; if(handoff.retry) handoff.retry(); else prepareHandoff();}));
-  }
-  if(handoff.data?.alternatives?.length){
-    root.appendChild(el("p",{className:"sub",textContent:"Or return to a series you’ve been watching"}));
-    const others=el("div",{className:"handoff-alternatives"});
-    for(const item of handoff.data.alternatives) others.appendChild(handoffButton(item.title+" · "+item.episode_label,()=>advancePlayback(item)));
-    root.appendChild(others);
   }
   root.appendChild(el("div",{className:"sub",textContent:plainKeys ? (next?"N · Next episode   ·   ":"")+(handoff.ended?"H · Home":"H · Stop & home") : "Ctrl+Alt+N · Next episode   ·   Ctrl+Alt+H · Stop & home"}));
 }
@@ -3647,7 +3654,7 @@ async function advancePlayback(choice){
     owner.requested=false;
     choice=handoff.data?.next;
   }
-  if(!choice){ handoff.dismissed=false; handoff.error=handoff.error||"No next episode available. You can choose another series or go home."; renderHandoff(); return; }
+  if(!choice){ handoff.dismissed=false; handoff.error=handoff.error||"No next episode available."; renderHandoff(); return; }
   handoff.busy=true; handoff.error=""; handoff.retry=()=>advancePlayback(choice); renderHandoff();
   if(S.now.data && !await stopPlayback({stay:true})){handoff.busy=false;renderHandoff();return;}
   resetHandoff();
@@ -3705,12 +3712,17 @@ function stopVlcPoll(){ clearInterval(S.vlcTimer); S.vlcTimer=null; }
    left to tell. The brief toast matches the "Stopped" one, so a screen that
    changes by itself still says why. */
 function vlcEnded(title){
+  // Decided before the teardown: an episode that reached its end gets the "Playback
+  // ended" offer; one quit part-way goes back to where the play was started from,
+  // as a manual Stop does.
+  const finished=countsAsWatched(S.now.posAbs,S.now.dur);
   stopVlcPoll();
   S.now.vlc=false; S.now.data=null; S.now.playing=false; S.now.stopping=false;
   S.now.vlcTitle=null; S.now.stalled=false; S.now.runway=null;
-  markHandoffEnded();
   $("#nowbar").classList.remove("on");
-  renderNowFull(); renderHandoff();
+  if(finished){ markHandoffEnded(); renderNowFull(); renderHandoff(); return; }
+  resetHandoff(); renderNowFull(); renderHandoff();
+  leaveNowViewAfterStop(); toast("VLC closed");
 }
 
 async function pollVlc(){
