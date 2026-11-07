@@ -10,10 +10,20 @@ the conversion. Delete this section once a few weeks of VLC plays have shown no 
 **Same evening, the ranking alone was not enough:** Local Bypass matches the episode on disk, not
 the release, and the profile 5 copy played earlier was complete and bigger, so ▶ would have served
 it again over the ranked hybrid (verified on the live server: `/vlc/1/ready` answered "on disk" with
-the RAWR file). `bypass_crosses_dolby_vision_wall` (server.rs) now refuses a copy behind the wall
-for the target: profile 5 for VLC unless that release was the one chosen, any Dolby Vision for a
-Chromecast. Still owed: one line in `CLAUDE.md` § Local Bypass (held back to keep that file to one
-write per sitting).
+the RAWR file).
+
+**Built the same evening, on his yes ("Sure. Sounds great."): one judge for the list and the disk.**
+The bypass had checked only part of the ranker's rules (episode, year, resolution, complete, not
+corrupt, at least 75% of the chosen size), so a cam or dub copy on disk could also replace a ranked
+original. Now `on_disk_copy_judged_worse` (server.rs) ranks the copy on disk like a listed release
+(as itself when it is listed, so Torrentio's flags count; else by file and folder name) and refuses
+it when it is worse than the chosen release on any part of the ranker's class (`RankBucket`: another
+film, Dolby Vision, cam, dub, resolution, language); the 75% size floor stays. Both bypass paths use
+it: the VLC one, and the Chromecast/browser play, which finds the chosen release by its magnet; a
+play with no listed release behind it (a library tap) is not judged. Rejected: comparing the full
+rank key, since size bands would refuse a copy only slightly smaller and download it again, which
+the floor exists to prevent. Still owed: the `CLAUDE.md` § Local Bypass line, held back to keep that
+file to one write per sitting.
 The question as it was put:
 
 VisionQuest S01E02 opened green in VLC. The pick was `...2160p DSNP WEB-DL DDP5 1 Atmos DV H

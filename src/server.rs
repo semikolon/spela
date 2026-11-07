@@ -2985,16 +2985,32 @@ async fn do_play(
             expected_bytes,
             &corrupt_files,
         ) {
-            // A transcoding target cannot use any Dolby Vision copy (NVENC cannot read
-            // the RPU), a native one not a profile 5 copy. The request carries no
-            // release name, so any copy behind the wall is refused here.
+            // The ranker judges the copy against the release this play was chosen as
+            // (`on_disk_copy_judged_worse`). The chosen release is found in the last
+            // search by its magnet; a play with no listed release behind it (a library
+            // tap, a bare magnet) has nothing to compare and plays the copy as before.
             let transcoding = matches!(target.as_str(), "chromecast" | "renderer");
-            if bypass_crosses_dolby_vision_wall(&local_path, None, transcoding) {
+            let worse = req
+                .magnet
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .and_then(|m| {
+                    let search = AppState::load_last_search(&state.state_dir)?;
+                    let chosen = search.results.iter().find(|r| r.magnet == m)?.clone();
+                    Some(on_disk_copy_judged_worse(
+                        &search,
+                        &chosen,
+                        &local_path,
+                        transcoding,
+                    ))
+                })
+                .unwrap_or_default();
+            if !worse.is_empty() {
                 tracing::info!(
-                    "Local Bypass: on-disk {:?} sits behind the Dolby Vision wall for \
-                     target {} — not substituting",
+                    "Local Bypass: on-disk {:?} is worse than the chosen release on {} — \
+                     not substituting",
                     local_path,
-                    target
+                    worse.join(", ")
                 );
             } else {
                 server_url = format!("file://{}", local_path.to_string_lossy());
@@ -9742,33 +9758,63 @@ const MIN_BYPASS_SIZE_FRACTION: f64 = 0.75;
 /// materially smaller is refused. `have == 0` means the size could not be read,
 /// which is not evidence of a downgrade, so it passes and the other health checks
 /// decide.
-/// 2026-11-07: Local Bypass matches the EPISODE on disk (title, year, resolution), not
-/// the release, so it could swap in a copy the ranker had pushed below the Dolby Vision
-/// wall. VisionQuest S01E02: the ranker picked a `DV HDR` hybrid, but the profile 5
-/// release played (green) earlier that evening was complete on disk, bigger, and so
-/// passed the size floor; pressing play would have served it again.
+/// 2026-11-07: the ranker's judgement applied to a copy Local Bypass found on disk
+/// (`search::on_disk_copy_worse_on`): the parts on which it is worse than the chosen
+/// release; empty means it may be used. Local Bypass matches the EPISODE, not the
+/// release, so without this it served the profile 5 VisionQuest copy (green in VLC)
+/// over the hybrid the ranker had put first, and could as well serve a dub or a cam.
 ///
-/// True when the on-disk copy sits behind the wall for this target and the chosen
-/// release does not. A chosen release that is behind the same wall was picked by hand,
-/// so its copy on disk is the one wanted. `chosen` is None when the caller holds no
-/// release name; then any copy behind the wall is refused.
-pub(crate) fn bypass_crosses_dolby_vision_wall(
-    on_disk: &std::path::Path,
-    chosen: Option<&str>,
+/// The copy is judged as itself when it is one of the listed releases, so Torrentio's
+/// language flags count too; otherwise by its file and folder names.
+fn on_disk_copy_judged_worse(
+    search: &crate::search::SearchResult,
+    chosen: &crate::search::TorrentResult,
+    path: &std::path::Path,
     transcoding: bool,
-) -> bool {
-    // The release name usually sits on the folder as well as the file.
-    let name = [
-        on_disk.parent().and_then(|p| p.file_name()),
-        on_disk.file_name(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|s| s.to_string_lossy().into_owned())
-    .collect::<Vec<_>>()
-    .join(" ");
-    crate::search::behind_dolby_vision_wall(&name, transcoding)
-        && !chosen.is_some_and(|c| crate::search::behind_dolby_vision_wall(c, transcoding))
+) -> Vec<&'static str> {
+    let name = |p: Option<&std::ffi::OsStr>| {
+        p.map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let file = name(path.file_name());
+    let dir = name(path.parent().and_then(|p| p.file_name()));
+    let listed = search
+        .results
+        .iter()
+        .find(|r| same_release_name(&r.title, &file))
+        .cloned();
+    let on_disk = listed.unwrap_or_else(|| {
+        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        crate::search::result_for_file_on_disk(&file, &dir, bytes, &chosen.quality)
+    });
+    let show = search.show.as_ref();
+    crate::search::on_disk_copy_worse_on(
+        &search.results,
+        chosen,
+        &on_disk,
+        crate::search::RankOpts {
+            transcoding,
+            original_language: show.and_then(|s| s.original_language.as_deref()),
+            pref: crate::search::QualityPref::Auto,
+            runtime_min: show.and_then(|s| s.runtime_min),
+        },
+    )
+}
+
+/// Whether a listed release's name and a file name on disk are the same release:
+/// equal once case and a video extension are set aside (Torrentio sometimes lists
+/// the name without the extension the file carries).
+fn same_release_name(listed: &str, file: &str) -> bool {
+    let stem = |s: &str| {
+        let s = s.trim().to_lowercase();
+        for ext in [".mkv", ".mp4", ".m4v", ".avi", ".ts"] {
+            if let Some(b) = s.strip_suffix(ext) {
+                return b.to_string();
+            }
+        }
+        s
+    };
+    !file.is_empty() && stem(listed) == stem(file)
 }
 
 pub(crate) fn bypass_size_is_acceptable(have: u64, want: u64) -> bool {
@@ -9865,13 +9911,15 @@ fn resolve_local_file_impl(
             return None;
         }
     }
-    // The VLC path is a native target, so the wall here is Dolby Vision profile 5.
-    let chosen = format!("{} {}", r.title, r.torrent_title);
-    if bypass_crosses_dolby_vision_wall(&path, Some(chosen.as_str()), false) {
+    // One judge for the list and the disk: the copy may not be worse than the chosen
+    // release in any part of the ranker's class. The VLC path is a native target.
+    let worse = on_disk_copy_judged_worse(&search, r, &path, false);
+    if !worse.is_empty() {
         tracing::info!(
-            "Local Bypass: on-disk {:?} is Dolby Vision profile 5 and the chosen release \
-             is not — not substituting, using the ranked one",
-            path
+            "Local Bypass: on-disk {:?} is worse than the chosen release on {} — not \
+             substituting, using the ranked one",
+            path,
+            worse.join(", ")
         );
         return None;
     }
@@ -14864,48 +14912,73 @@ mod tests {
         );
     }
 
-    /// 2026-11-07, real paths from the server's media dir that evening: the ranker
-    /// chose the FLUX `DV HDR` hybrid, and the profile 5 RAWR copy (played green an hour
-    /// earlier) was complete on disk. The bypass must not swap it back in.
+    /// 2026-11-07, real names from the server's media dir and the live list that
+    /// evening: the ranker chose the FLUX `DV HDR` hybrid, and the profile 5 RAWR copy
+    /// (played green an hour earlier) was complete on disk. One judge: the copy on disk
+    /// is ranked like a listed release and may not be worse than the chosen one.
     #[test]
-    fn bypass_does_not_swap_in_a_copy_behind_the_dolby_vision_wall() {
-        let dir = "www.UIndex.org    -    VisionQuest S01E02 Theseus 2160p DSNP WEB-DL DDP5 1 Atmos DV H 265-RAWR";
-        let rawr = std::path::PathBuf::from(format!(
-            "/mnt/media/{dir}/VisionQuest S01E02 Theseus 2160p DSNP WEB-DL DDP5 1 Atmos DV H 265-RAWR.mkv"
-        ));
+    fn on_disk_copy_is_judged_by_the_ranker_against_the_chosen_release() {
         let flux_name =
             "VisionQuest S01E02 Theseus 2160p DSNP WEB-DL DDP5 1 Atmos DV HDR H 265-FLUX.mkv";
-        let flux = std::path::PathBuf::from(format!("/mnt/media/x/{flux_name}"));
-        let rawr_name = rawr.file_name().unwrap().to_string_lossy().into_owned();
+        let rawr_name = "VisionQuest S01E02 Theseus 2160p DSNP WEB-DL DDP5 1 Atmos DV H 265-RAWR";
+        let mut flux = ranked_source(1, "magnet:?xt=urn:btih:flux");
+        flux.title = flux_name.into();
+        flux.quality = "4k DV | HDR".into();
+        flux.size = "4.03 GB".into();
+        flux.file_index = Some(0);
+        let mut rawr = ranked_source(2, "magnet:?xt=urn:btih:rawr");
+        // Torrentio lists this one without the extension the file on disk carries.
+        rawr.title = rawr_name.into();
+        rawr.quality = "4k DV".into();
+        rawr.size = "5.24 GB".into();
+        rawr.file_index = Some(0);
+        let search = crate::search::SearchResult {
+            query: "VisionQuest S01E02".into(),
+            show: None,
+            searching: None,
+            error: None,
+            torrent_available: true,
+            results: vec![flux.clone(), rawr.clone()],
+        };
+        let rawr_path = std::path::PathBuf::from(format!(
+            "/mnt/media/www.UIndex.org    -    {rawr_name}/{rawr_name}.mkv"
+        ));
+        let flux_path = std::path::PathBuf::from(format!("/mnt/media/x/{flux_name}"));
 
-        // VLC (native): profile 5 on disk, hybrid chosen -> refused.
-        assert!(bypass_crosses_dolby_vision_wall(
-            &rawr,
-            Some(flux_name),
-            false
-        ));
-        // The profile 5 release itself, tapped deliberately -> its copy is fine.
-        assert!(!bypass_crosses_dolby_vision_wall(
-            &rawr,
-            Some(&rawr_name),
-            false
-        ));
-        // A hybrid on disk is not behind the wall for VLC.
-        assert!(!bypass_crosses_dolby_vision_wall(
-            &flux,
-            Some(flux_name),
-            false
-        ));
-        assert!(!bypass_crosses_dolby_vision_wall(&flux, None, false));
-        // Chromecast (transcoding): any Dolby Vision copy is refused.
-        assert!(bypass_crosses_dolby_vision_wall(&flux, None, true));
-        assert!(bypass_crosses_dolby_vision_wall(&rawr, None, true));
-        // Not Dolby Vision at all: never refused.
-        let plain = std::path::PathBuf::from(
-            "/mnt/media/Star.City.S01E08.HDR.2160p.WEB.h265.HeBits-GRACE.mkv",
+        // VLC: the profile 5 copy may not replace the ranked hybrid.
+        assert_eq!(
+            on_disk_copy_judged_worse(&search, &flux, &rawr_path, false),
+            vec!["Dolby Vision"]
         );
-        assert!(!bypass_crosses_dolby_vision_wall(&plain, None, true));
-        assert!(!bypass_crosses_dolby_vision_wall(&plain, None, false));
+        // The hybrid's own copy is the chosen release: used.
+        assert!(on_disk_copy_judged_worse(&search, &flux, &flux_path, false).is_empty());
+        // Profile 5 tapped by hand: its own copy is used.
+        assert!(on_disk_copy_judged_worse(&search, &rawr, &rawr_path, false).is_empty());
+        // A copy that is not listed is judged by its names.
+        let unlisted = std::path::PathBuf::from(format!(
+            "/mnt/media/{rawr_name} REPACK/{rawr_name} REPACK.mkv"
+        ));
+        assert_eq!(
+            on_disk_copy_judged_worse(&search, &flux, &unlisted, false),
+            vec!["Dolby Vision"]
+        );
+    }
+
+    #[test]
+    fn same_release_name_sets_aside_case_and_the_extension() {
+        assert!(same_release_name(
+            "Show.S01E01.1080p-GRP",
+            "show.s01e01.1080p-grp.mkv"
+        ));
+        assert!(same_release_name(
+            "Show.S01E01.1080p-GRP.mp4",
+            "Show.S01E01.1080p-GRP.mp4"
+        ));
+        assert!(!same_release_name(
+            "Show.S01E01.1080p-GRP",
+            "Show.S01E01.1080p-OTHER.mkv"
+        ));
+        assert!(!same_release_name("Show.S01E01.1080p-GRP", ""));
     }
 
     #[test]

@@ -3789,14 +3789,82 @@ fn dolby_vision_without_fallback(r: &TorrentResult) -> bool {
     dolby_vision_without_fallback_in(&r.title, &r.torrent_title)
 }
 
-/// Whether a release NAME sits behind the Dolby Vision wall for a target: every DV
-/// release for a transcoding target (the GTX 1650's NVENC cannot read the RPU), and
-/// profile 5 for a native one (VLC shows it green). The same wall the ranker's
-/// `dv_gate` puts up, for callers that hold a name rather than a result: Local
-/// Bypass, which matches an episode on disk by title and must not swap in a copy
-/// the ranker had pushed down (2026-11-07).
-pub(crate) fn behind_dolby_vision_wall(name: &str, transcoding: bool) -> bool {
-    has_dolby_vision_in_title(name) && (transcoding || dolby_vision_without_fallback_in(name, ""))
+/// 2026-11-07: may a copy already on disk stand in for the release the ranker chose?
+/// One judge for the list and the disk. Local Bypass matches the EPISODE on disk
+/// (title, year, resolution), not the release, so before this it could swap a copy
+/// the ranker had pushed down back in: the profile 5 VisionQuest copy over the hybrid
+/// that was ranked first, and just as well a dub over the original, or a cam copy.
+///
+/// The copy is judged by the ranker itself, on the class part of the key
+/// (`RankBucket`): another film, Dolby Vision behind the wall, cam, dub, resolution,
+/// language. Returns the parts on which it is WORSE than the chosen release; empty
+/// means it may be used. Field by field rather than as one ordering, so being better
+/// on one part (a hybrid on disk where a profile 5 was chosen by hand) cannot excuse
+/// being worse on another (that hybrid being a dub). Size stays the caller's floor:
+/// the size tier's bands would refuse a copy only slightly smaller and download it
+/// again, which the floor exists to prevent.
+pub(crate) fn on_disk_copy_worse_on(
+    results: &[TorrentResult],
+    chosen: &TorrentResult,
+    on_disk: &TorrentResult,
+    opts: RankOpts<'_>,
+) -> Vec<&'static str> {
+    let ctx = RankCtx::for_set(results, opts);
+    let (d, c) = (rank_bucket(on_disk, &ctx), rank_bucket(chosen, &ctx));
+    let mut worse = Vec::new();
+    if d.other_film && !c.other_film {
+        worse.push("another film");
+    }
+    if d.unaddressable && !c.unaddressable {
+        worse.push("whole torrent");
+    }
+    if d.dv_gate && !c.dv_gate {
+        worse.push("Dolby Vision");
+    }
+    if d.cam && !c.cam {
+        worse.push("cam copy");
+    }
+    if d.dub && !c.dub {
+        worse.push("dub");
+    }
+    if d.res > c.res {
+        worse.push("resolution");
+    }
+    if d.lang > c.lang {
+        worse.push("language");
+    }
+    worse
+}
+
+/// A result standing for a file already on disk, so the ranker can judge it
+/// (`on_disk_copy_worse_on`). The file name is read as the release name and the
+/// folder name as the torrent's title, as Torrentio gives them. The resolution is
+/// the chosen release's, since Local Bypass only matches that resolution.
+pub(crate) fn result_for_file_on_disk(
+    file_name: &str,
+    dir_name: &str,
+    bytes: u64,
+    quality: &str,
+) -> TorrentResult {
+    TorrentResult {
+        id: 0,
+        quality: quality.into(),
+        title: file_name.into(),
+        seeds: 0,
+        // GiB, as `parse_size_to_bytes` reads it back.
+        size: format!("{:.2} GB", bytes as f64 / 1024f64.powi(3)),
+        source: "on disk".into(),
+        magnet: String::new(),
+        info_hash: String::new(),
+        file_index: Some(0),
+        partial_pct: None,
+        cam: false,
+        other_year: None,
+        torrent_title: dir_name.into(),
+        languages: Vec::new(),
+        dub: None,
+        dolby_vision_p5: false,
+    }
 }
 
 fn dolby_vision_without_fallback_in(title: &str, torrent_title: &str) -> bool {
@@ -5100,6 +5168,53 @@ mod tests {
         r.torrent_title =
             "Укрытие / Silo / Сезон: 3 [2026 HDR10 HDR10+ Dolby Vision WEB-DL 2160p 4k]".into();
         assert!(!dolby_vision_without_fallback(&r));
+    }
+
+    /// 2026-11-07: a copy on disk is judged by the ranker's own class against the
+    /// chosen release. Real names: the Babylon Berlin pair is from the recorded list
+    /// (a Russian dub and the German original), the telesync and the BluRay are from
+    /// the Project Hail Mary list.
+    #[test]
+    fn test_on_disk_copy_worse_on_uses_the_rankers_class() {
+        let original = make_result(1, "Babylon.Berlin.S05E01.1080p.ARD.WEB-DL.mp4", 17, Some(0));
+        let dub = make_result(
+            2,
+            "Babylon.Berlin.S05E01.1080p.Ru.Ultradox.mkv",
+            17,
+            Some(0),
+        );
+        let set = vec![original.clone(), dub.clone()];
+        // A dub is also tagged for another language, so it is worse on both.
+        assert_eq!(
+            on_disk_copy_worse_on(&set, &original, &dub, opts_for(false, "de")),
+            vec!["dub", "language"]
+        );
+        assert!(
+            on_disk_copy_worse_on(&set, &dub, &original, opts_for(false, "de")).is_empty(),
+            "the original may stand in for a dub chosen by hand"
+        );
+
+        let bluray = make_result(
+            3,
+            "Project Hail Mary 2026 1080p BluRay DoVi HDR10P TrueHD Atmos 7 1 x265-GeneM",
+            39,
+            Some(0),
+        );
+        let cam = make_result(
+            4,
+            "Project.Hail.Mary.2026.1080p.TELESYNC.HC.x264-SyncUP",
+            271,
+            Some(0),
+        );
+        let set = vec![bluray.clone(), cam.clone()];
+        for transcoding in [false, true] {
+            let worse = on_disk_copy_worse_on(&set, &bluray, &cam, opts_for(transcoding, "en"));
+            assert!(
+                worse.contains(&"cam copy"),
+                "transcoding={transcoding}: {worse:?}"
+            );
+        }
+        assert!(on_disk_copy_worse_on(&set, &bluray, &bluray, opts_for(false, "en")).is_empty());
     }
 
     /// The ruling itself (2026-11-07): for VLC, a profile 5 4K ranks below a 1080p
