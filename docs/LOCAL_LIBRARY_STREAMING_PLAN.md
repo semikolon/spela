@@ -17,6 +17,9 @@ spela already has a **Local Bypass** mechanism (`server.rs:find_local_bypass_mat
 (`~/media`) for a healthy on-disk file matching the requested title/year/quality
 and, on a hit, feeds that `file://` path into the *same* transcode→HLS→cast
 pipeline a torrent would use (`pid = 0`, `is_local = true`).
+(2026-11-07: the ranker now also judges the copy it finds, so a dub, a cam copy or a Dolby
+Vision profile 5 copy is not swapped in for a better chosen release; see `CLAUDE.md` § Local
+Bypass.)
 
 Two limitations:
 

@@ -22,8 +22,7 @@ film, Dolby Vision, cam, dub, resolution, language); the 75% size floor stays. B
 it: the VLC one, and the Chromecast/browser play, which finds the chosen release by its magnet; a
 play with no listed release behind it (a library tap) is not judged. Rejected: comparing the full
 rank key, since size bands would refuse a copy only slightly smaller and download it again, which
-the floor exists to prevent. Still owed: the `CLAUDE.md` § Local Bypass line, held back to keep that
-file to one write per sitting.
+the floor exists to prevent. Recorded in `CLAUDE.md` § Local Bypass.
 The question as it was put:
 
 VisionQuest S01E02 opened green in VLC. The pick was `...2160p DSNP WEB-DL DDP5 1 Atmos DV H
@@ -46,13 +45,13 @@ release still beats every 1080p one. Options, recommended first:
   whether the GTX 1650 keeps up at 4K beside the embedder (1.2 GB of 4 GB VRAM free). A one-minute
   run on the VisionQuest file still in the media dir settles it.
 
-### 🔓 OPEN — 4 November 2026: podcasts and audiobooks (built, tested on a test instance, not deployed)
+### 🔓 OPEN — 4 November 2026: podcasts and audiobooks (built, live on the server, not yet played for real)
 
 His words: *"it should be able to stream podcasts, make it happen"*, and *"If spela COULD find the
 audiobooks through torrents etc then we can leave them"*. Design, sources, what is verified and what
 is not: [`docs/podcasts_and_audiobooks.md`](docs/podcasts_and_audiobooks.md). Owed, in order:
-- [ ] Deploy to the server with `bin/deploy-server.sh` once it is reachable again, then one real
-  play each: a podcast in VLC through the remote's `vlc://` hand-off, a book in VLC, both on a
+- [ ] Deployed (the server answered `/podcast/search` on 7 November; its journal shows no podcast
+  or audiobook use since the 5 November restart). Owed: one real play each: a podcast in VLC through the remote's `vlc://` hand-off, a book in VLC, both on a
   Chromecast (`/audio/control` pause and stop included).
 - [ ] Watch the uplink governor's log lines under a real busy line (`uplink: upload ceiling …`).
 - [x] Save a book to the Books app on macOS as one M4B with chapters: `spela audiobook save` (his ask:

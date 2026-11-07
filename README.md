@@ -51,7 +51,9 @@ assistant should be able to play something when you ask nicely.
   Danish film plays Danish and a Korean one Korean, even when the release labels the dub
   as default. A release that is itself a dub is marked, ranked below every real source
   and never played by itself.
-- **Local files first.** If a complete, healthy copy is already on disk it is served straight from there,
+- **Local files first.** If a complete, healthy copy is already on disk, and the ranking would
+  class it no worse than the release it chose (not a dub, a cam copy or Dolby Vision
+  profile 5 where the choice was none of those), it is served straight from there,
   fully seekable, with no torrent involved — including files a separate library daemon
   serves from an external drive, and a season pack opens an episode chooser rather than
   guessing. Incomplete owned files use piece-aware streaming to fill missing gaps;
@@ -131,7 +133,10 @@ function, so a rule that looks at the other candidate cannot be written.
    disappearing from it.
 2. **Non-Dolby-Vision first**, and this one is a hard gate for the Chromecast: consumer
    NVENC cannot parse a DV profile 5/7 RPU, so those releases produce no output at all.
-   For native decoding it is a preference rather than a gate. Plain HDR10 is unaffected.
+   For native decoding (VLC) the gate holds for profile 5 alone, Dolby Vision with no
+   ordinary HDR picture underneath, which VLC shows green; it is read from the release
+   name. Hybrid releases (`DV HDR`, profile 8) are only a preference. Plain HDR10 is
+   unaffected.
 3. **A real source before a cam copy.** A release filmed in a cinema still says 1080p
    and still has a size, so everything below would rank it as picture. It is read from
    the release name after the year, not from the tracker's quality label, which calls
