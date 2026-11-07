@@ -12978,6 +12978,7 @@ mod tests {
             torrent_title: String::new(),
             languages: Vec::new(),
             dub: None,
+            dolby_vision_p5: false,
         }
     }
 
@@ -15055,6 +15056,7 @@ mod tests {
             torrent_title: String::new(),
             languages: Vec::new(),
             dub: None,
+            dolby_vision_p5: false,
         };
 
         let pct = result_partial_pct(dir.path(), &four_k)
@@ -15110,6 +15112,7 @@ mod tests {
             torrent_title: String::new(),
             languages: Vec::new(),
             dub: None,
+            dolby_vision_p5: false,
         };
         assert_eq!(
             result_partial_pct(dir.path(), &four_k),
@@ -15137,6 +15140,7 @@ mod tests {
             torrent_title: String::new(),
             languages: Vec::new(),
             dub: None,
+            dolby_vision_p5: false,
         };
         let dir = tempfile::tempdir().unwrap();
         // ~32%-downloaded sparse partial named like a real release (the Pantheon

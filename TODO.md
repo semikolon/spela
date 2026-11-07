@@ -1,6 +1,12 @@
 # Spela TODOs 🎬🍿
 
-### 🔓 OPEN — 7 November 2026: should VLC stop picking Dolby Vision profile 5? (his ruling)
+### ✅ RULED — 7 November 2026: VLC demotes Dolby Vision profile 5
+
+**Ruled and built the same evening:** *"Just maybe demote profile 5 as it seems to display wonkily
+in VLC"*; a trial of server conversion was judged not worth it. The name rule below is live
+(`dolby_vision_without_fallback`, mechanics in `CLAUDE.md`, tier 1). Not built: the byte check and
+the conversion. Delete this section once a few weeks of VLC plays have shown no green picture.
+The question as it was put:
 
 VisionQuest S01E02 opened green in VLC. The pick was `...2160p DSNP WEB-DL DDP5 1 Atmos DV H
 265-RAWR`, and ffprobe on the server read it as **DV profile 5, `dv_bl_signal_compatibility_id=0`**:

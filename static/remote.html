@@ -2093,6 +2093,11 @@ function posterCard({poster,title,year,cta,onPlay,sources,onMarkWatched,rtTitle,
       if(r.dub) row.appendChild(el("span",{className:"disc",
         title:"tagged for another language, and the original audio is not named, so most likely a dub",
         textContent:"⚠ "+(r.dub.length?r.dub.join("+")+" ":"")+"dub"}));
+      // Dolby Vision with no HDR picture underneath (`dolby_vision_without_fallback`
+      // in search.rs): VLC shows it green, so it ranks below every release without DV.
+      if(r.dolby_vision_p5) row.appendChild(el("span",{className:"disc",
+        title:"Dolby Vision profile 5: no ordinary HDR picture underneath, so VLC shows it green and purple",
+        textContent:"⚠ DV profile 5"}));
       row.appendChild(el("span",{className:"s "+health,
         title:fresh?"just aired — seed counts unreliable for a day or so; tap to try (spela verifies real delivery)":"",
         textContent:fresh?"🌱 new":(health==="dead"?"⚠ ":"")+sc+"🌱"}));

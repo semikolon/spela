@@ -217,6 +217,11 @@ pub struct TorrentResult {
     /// only when the title's original language is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dub: Option<Vec<String>>,
+    /// 2026-11-07: Dolby Vision with no ordinary HDR picture underneath (profile 5), as
+    /// read from the name by `dolby_vision_without_fallback`. Written by the ranker for
+    /// every result it ranks, so the remote can say why such a release sits low.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dolby_vision_p5: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -2007,6 +2012,7 @@ fn torrent_results_from_streams(resp: &Value) -> Vec<TorrentResult> {
                 torrent_title,
                 languages,
                 dub: None, // written by the ranker
+                dolby_vision_p5: false,
             }
         })
         .collect()
@@ -2348,7 +2354,17 @@ fn rank_bucket(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankBucket {
     // the lift — he has played DV before without noticing wrong colour — and
     // the failure mode if that is ever wrong is washed-out picture, visible in
     // the first second and revertible by moving this tier back up.
-    let dv_gate = ctx.prefer_h264 && has_dolby_vision_in_title(&r.title);
+    //
+    // 2026-11-07, that failure arrived, for one kind of DV only. VisionQuest
+    // S01E02 (`...2160p DSNP WEB-DL DDP5 1 Atmos DV H 265-RAWR`) ffprobed as
+    // profile 5 with `dv_bl_signal_compatibility_id=0`: no HDR10 or SDR picture
+    // underneath, which VLC 3 cannot convert, so it played green. The DV that
+    // played fine was the hybrid kind (`DV HDR`, profile 8), which carries an
+    // HDR10 picture. The owner's ruling the same evening: demote profile 5 for VLC.
+    // So for native targets the gate applies again, to profile 5 alone, as read
+    // from the name (`dolby_vision_without_fallback`).
+    let dv_gate = has_dolby_vision_in_title(&r.title)
+        && (ctx.prefer_h264 || dolby_vision_without_fallback(r));
 
     // Tier 2 (2026-10-04): a real source beats a cam copy. A release filmed in a
     // cinema or taken off a projector feed still says 1080p and still has a
@@ -2685,6 +2701,7 @@ pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) 
     for r in results.iter_mut() {
         r.cam = is_cam_source(&r.title);
         r.dub = language_fit(r, opts.original_language).dub;
+        r.dolby_vision_p5 = dolby_vision_without_fallback(r);
     }
     // Pre-pass: the 1080p yardstick a 2160p release is judged against. Computed
     // once, outside the comparator, so every tier stays a per-result value.
@@ -3754,6 +3771,44 @@ fn has_dolby_vision_in_title(title: &str) -> bool {
     lower
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|tok| tok == "dv" || tok == "dovi")
+}
+
+/// 2026-11-07: a Dolby Vision release with no ordinary HDR picture underneath, i.e.
+/// profile 5, which VLC 3 shows green and purple. Read from the names (file and
+/// torrent), since the profile is only in the bytes:
+/// - an explicit profile decides (`P5`, `Profile 8`, `Dolby Vision P7`);
+/// - otherwise a release that names HDR10, HDR10+, HDR or HLG beside DV is the
+///   hybrid kind (profile 8, an HDR10 or HLG picture plus the Dolby layer);
+/// - a release that names DV and nothing else is taken to be profile 5. Streaming
+///   services ship DV that way (VisionQuest's `DSNP WEB-DL ... DV H 265` measured
+///   profile 5), while release groups label their hybrids `DV HDR`.
+///
+/// A name is a claim: a hybrid labelled only `DV` is demoted wrongly, and costs a
+/// 1080p where a 4K would have played. That is the cheaper error of the two.
+fn dolby_vision_without_fallback(r: &TorrentResult) -> bool {
+    if !has_dolby_vision_in_title(&r.title) {
+        return false;
+    }
+    let names = format!("{} {}", r.title, r.torrent_title).to_lowercase();
+    let toks: Vec<&str> = names
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    for (i, t) in toks.iter().enumerate() {
+        let profile = match *t {
+            "p5" => Some(5),
+            "p7" => Some(7),
+            "p8" => Some(8),
+            "profile" => toks.get(i + 1).and_then(|n| n.parse::<u8>().ok()),
+            _ => None,
+        };
+        if let Some(p) = profile {
+            return p == 5;
+        }
+    }
+    !toks
+        .iter()
+        .any(|t| matches!(*t, "hdr" | "hdr10" | "hdr10p" | "hdr10plus" | "hlg"))
 }
 
 fn extract_episode(val: &Value) -> Option<EpisodeRef> {
@@ -5000,6 +5055,83 @@ mod tests {
         assert!(has_dolby_vision_in_title("Movie.2160p.DV.HDR.HEVC.mkv"));
     }
 
+    /// 2026-11-07: profile 5 (DV with no HDR picture underneath) is told from the
+    /// hybrid kind by name. Every name here is a real release: the VisionQuest one
+    /// was ffprobed as profile 5 on the server, the rest come from the recorded
+    /// Torrentio lists in tests/fixtures/torrentio/.
+    #[test]
+    fn test_dolby_vision_without_fallback_reads_the_name() {
+        let p5 = |title: &str| dolby_vision_without_fallback(&make_result(1, title, 10, Some(0)));
+        // Measured profile 5, compatibility id 0.
+        assert!(p5(
+            "VisionQuest S01E02 Theseus 2160p DSNP WEB-DL DDP5 1 Atmos DV H 265-RAWR"
+        ));
+        // Hybrids name an HDR picture beside DV.
+        assert!(!p5(
+            "East of Eden 2026 S01E05 Departure 2160p NF WEB-DL DDP5 1 Atmos DV HDR H 265-FLUX.mkv"
+        ));
+        assert!(!p5(
+            "Blade Runner 2049 2017 UHD BluRay 1080p DD Atmos 5 1 DoVi HDR10 x265-SM737"
+        ));
+        assert!(!p5(
+            "Project Hail Mary 2026 1080p BluRay DoVi HDR10P TrueHD Atmos 7 1 x265-GeneM"
+        ));
+        // An explicit profile decides, whatever else is named.
+        assert!(!p5("Проект «Конец света» / Project Hail Mary (2026) UHD BDRemux | 2160p | 4K | HDR10+ | Dolby Vision P7 | D | MovieDalen | IMAX"));
+        assert!(!p5("Проект «Конец света» / Project Hail Mary (2026) WEB-DL-HEVC 2160p | 4K | HDR10+ | Dolby Vision Profile 8 | D P L A | IMAX"));
+        // Not Dolby Vision at all.
+        assert!(!p5("Star.City.S01E08.HDR.2160p.WEB.h265.HeBits-GRACE"));
+        // The torrent's own title counts too: a pack that names HDR10 is a hybrid.
+        let mut r = make_result(1, "Silo.S03E01.WEB-DL.2160p.DV.mkv", 10, Some(0));
+        r.torrent_title =
+            "Укрытие / Silo / Сезон: 3 [2026 HDR10 HDR10+ Dolby Vision WEB-DL 2160p 4k]".into();
+        assert!(!dolby_vision_without_fallback(&r));
+    }
+
+    /// The ruling itself (2026-11-07): for VLC, a profile 5 4K ranks below a 1080p
+    /// without DV, while a hybrid 4K still beats it, as since 2026-09-05.
+    #[test]
+    fn test_vlc_demotes_dolby_vision_profile_5_but_not_hybrids() {
+        let mut p5 = make_result(
+            1,
+            "VisionQuest S01E02 Theseus 2160p DSNP WEB-DL DDP5 1 Atmos DV H 265-RAWR",
+            40,
+            Some(0),
+        );
+        p5.quality = "2160p".into();
+        p5.size = "9.8 GB".into();
+        let mut hd = make_result(2, "VisionQuest.S01E02.1080p.WEB.h264-ETHEL", 40, Some(0));
+        hd.size = "3.1 GB".into();
+        let mut results = vec![p5.clone(), hd.clone()];
+        rank_results_mut_prefer(&mut results, false, Some("en"));
+        // The ranker renumbers ids after sorting, so the titles are compared.
+        assert_eq!(
+            results[0].title, hd.title,
+            "profile 5 must not lead for VLC"
+        );
+        assert!(
+            results[1].dolby_vision_p5,
+            "the demoted row carries its mark"
+        );
+        assert!(!results[0].dolby_vision_p5);
+
+        let mut hybrid = make_result(
+            3,
+            "East of Eden 2026 S01E05 Departure 2160p NF WEB-DL DDP5 1 Atmos DV HDR H 265-FLUX.mkv",
+            40,
+            Some(0),
+        );
+        hybrid.quality = "2160p".into();
+        hybrid.size = "9.8 GB".into();
+        let mut results = vec![hd, hybrid.clone()];
+        rank_results_mut_prefer(&mut results, false, Some("en"));
+        assert_eq!(
+            results[0].title, hybrid.title,
+            "a hybrid 4K still wins for VLC"
+        );
+        assert!(!results[0].dolby_vision_p5);
+    }
+
     #[test]
     fn test_has_dolby_vision_in_title() {
         // Real problematic filename from the failed Boys S05E01 play
@@ -5074,6 +5206,7 @@ mod tests {
             torrent_title: String::new(),
             languages: Vec::new(),
             dub: None,
+            dolby_vision_p5: false,
         }
     }
 
@@ -7593,12 +7726,14 @@ mod tests {
                 "the ranker writes the flag the remote reads"
             );
             // A real source that can actually play: addressable, and not behind
-            // the Dolby Vision wall on the transcoding target.
+            // the Dolby Vision wall: all DV on the transcoding target, and since
+            // 2026-11-07 profile 5 on the native one too (VLC shows it green).
             let last_playable_real = (0..r.len())
                 .filter(|&i| {
                     !is_cam_source(&r[i].title)
                         && r[i].file_index.is_some()
                         && !(transcoding && has_dolby_vision_in_title(&r[i].title))
+                        && !r[i].dolby_vision_p5
                 })
                 .max()
                 .unwrap();

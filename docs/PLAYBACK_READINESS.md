@@ -58,7 +58,10 @@ Measured delivery governs readiness; ranking seed counts cannot replace it.
 
 ## Handoff and controls
 
-Near the end, offer the next episode, with an easy Home action. (Recently watched
+Origin: his request to a Codex session on 9 October 2026 (rollout `01a121e2`, built
+13 October): a large panel offering the next episode "while the credits are rolling", a
+smaller row of other followed series, and keys to go next or home. Near the end, offer
+the next episode, with an easy Home action. (Recently watched
 followed series were offered too until 2026-11-07; the server still returns them, the
 remote no longer shows them.) Metadata can be prepared early; torrent downloads wait for
 a deliberate play choice. Stop/next must await the VLC bridge's closure acknowledgement
