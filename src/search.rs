@@ -2363,8 +2363,12 @@ fn rank_bucket(r: &TorrentResult, ctx: &RankCtx<'_>) -> RankBucket {
     // HDR10 picture. The owner's ruling the same evening: demote profile 5 for VLC.
     // So for native targets the gate applies again, to profile 5 alone, as read
     // from the name (`dolby_vision_without_fallback`).
-    let dv_gate = has_dolby_vision_in_title(&r.title)
-        && (ctx.prefer_h264 || dolby_vision_without_fallback(r));
+    // 2026-11-09: the name cannot tell profile 5 from 8 (VisionQuest S01E06 by
+    // MeM.GP, named `DV.HDR` like its profile-8 siblings, was profile 5), so a mark
+    // the BYTES set (`dolby_vision_p5`, from a probe of the served file) gates too.
+    let dv_gate = (ctx.prefer_h264 && has_dolby_vision_in_title(&r.title))
+        || r.dolby_vision_p5
+        || dolby_vision_without_fallback(r);
 
     // Tier 2 (2026-10-04): a real source beats a cam copy. A release filmed in a
     // cinema or taken off a projector feed still says 1080p and still has a
@@ -5218,6 +5222,41 @@ mod tests {
             );
         }
         assert!(on_disk_copy_worse_on(&set, &bluray, &bluray, opts_for(false, "en")).is_empty());
+    }
+
+    /// 2026-11-09: a release the BYTES proved profile 5 (`dolby_vision_p5` set by the
+    /// server from a probe of the served file) ranks below a non-DV 1080p for VLC
+    /// however hybrid its NAME looks. Names and sizes from the live S01E06 list.
+    #[test]
+    fn test_vlc_demotes_a_byte_proved_profile_5_whatever_its_name_says() {
+        let mut p5 = make_result(
+            1,
+            "VisionQuest.S01E06.Stallo.ITA.ENG.2160p.DSNP.WEB-DL.DDP5.1.DV.HDR.H.265-MeM.GP.mkv",
+            40,
+            Some(0),
+        );
+        p5.quality = "2160p".into();
+        p5.size = "6.48 GB".into();
+        p5.dolby_vision_p5 = true;
+        let mut hd = make_result(
+            2,
+            "VisionQuest S01E06 Deadlock 1080p DSNP WEB-DL DDP5 1 Atmos H 264-RAWR[EZTVx.to].mkv",
+            2690,
+            Some(0),
+        );
+        hd.size = "2.28 GB".into();
+        // Unmarked, the same name is a hybrid and the 4K leads (the 2026-11-07 rule).
+        let mut unmarked = p5.clone();
+        unmarked.dolby_vision_p5 = false;
+        let mut results = vec![unmarked, hd.clone()];
+        rank_results_mut_prefer(&mut results, false, Some("en"));
+        assert_eq!(results[0].title, p5.title, "by its name it is a hybrid");
+        assert!(!results[0].dolby_vision_p5);
+        // Marked by the bytes, it ranks behind the 1080p and keeps its mark.
+        let mut results = vec![p5.clone(), hd.clone()];
+        rank_results_mut_prefer(&mut results, false, Some("en"));
+        assert_eq!(results[0].title, hd.title, "the bytes outrank the name");
+        assert!(results[1].dolby_vision_p5, "the mark survives ranking");
     }
 
     /// The ruling itself (2026-11-07): for VLC, a profile 5 4K ranks below a 1080p
