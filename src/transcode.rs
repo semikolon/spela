@@ -476,6 +476,28 @@ pub struct MediaQuality {
     pub codec: String,
     pub duration_secs: f64,
     pub bitrate_bps: u64,
+    /// Dolby Vision profile from the stream's DOVI configuration record, when the
+    /// file carries one (2026-11-09). Read from the bytes because the NAME cannot
+    /// tell: VisionQuest S01E03, S01E04 and S01E06 by the same group carry the
+    /// identical `DV.HDR` label, and two are profile 8 while the third is profile 5.
+    pub dv_profile: Option<u8>,
+    /// `dv_bl_signal_compatibility_id`: what the base layer is without the Dolby
+    /// metadata. 0 means nothing standard underneath (profile 5's shape); 1, 2 and
+    /// 4 mean HDR10, SDR and HLG, which any player shows right.
+    pub dv_bl_compat_id: Option<u8>,
+}
+
+impl MediaQuality {
+    /// Dolby Vision with no ordinary picture underneath: profile 5, or any profile
+    /// whose base-layer compatibility id is 0. VLC 3 cannot reshape it and shows
+    /// green and purple. The name rule in `search::dolby_vision_without_fallback`
+    /// is the cheap first pass; this is the verdict.
+    pub fn dolby_vision_without_fallback(&self) -> bool {
+        matches!(
+            (self.dv_profile, self.dv_bl_compat_id),
+            (Some(5), _) | (Some(_), Some(0))
+        )
+    }
 }
 
 /// Probe one file with ffprobe. ~100-300 ms, so callers cache by path — the
@@ -488,7 +510,9 @@ pub async fn probe_media_quality(path: &std::path::Path) -> Option<MediaQuality>
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=codec_name,width,height",
+            // `stream_side_data` carries the Dolby Vision configuration record; a
+            // file without one simply has no `side_data_list`.
+            "stream=codec_name,width,height:stream_side_data=dv_profile,dv_bl_signal_compatibility_id",
             "-show_entries",
             "format=duration,size",
             "-of",
@@ -502,6 +526,12 @@ pub async fn probe_media_quality(path: &std::path::Path) -> Option<MediaQuality>
         return None;
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    media_quality_from_ffprobe_json(&v)
+}
+
+/// The pure half of `probe_media_quality`, so the parse can be tested against
+/// ffprobe output copied from real files.
+pub fn media_quality_from_ffprobe_json(v: &serde_json::Value) -> Option<MediaQuality> {
     let st = v["streams"].as_array()?.first()?;
     let width = st["width"].as_u64().unwrap_or(0) as u32;
     let height = st["height"].as_u64().unwrap_or(0) as u32;
@@ -525,13 +555,62 @@ pub async fn probe_media_quality(path: &std::path::Path) -> Option<MediaQuality>
     } else {
         0
     };
+    let dovi = st["side_data_list"]
+        .as_array()
+        .and_then(|l| l.iter().find(|d| d.get("dv_profile").is_some()));
+    let dv_field = |k: &str| dovi.and_then(|d| d[k].as_u64()).map(|n| n.min(255) as u8);
     Some(MediaQuality {
         width,
         height,
         codec,
         duration_secs: duration,
         bitrate_bps,
+        dv_profile: dv_field("dv_profile"),
+        dv_bl_compat_id: dv_field("dv_bl_signal_compatibility_id"),
     })
+}
+
+#[cfg(test)]
+mod dolby_vision_probe_tests {
+    use super::*;
+
+    // Both blobs are ffprobe's own output for files in the media dir on 2026-11-09:
+    // VisionQuest S01E06 and S01E03 by MeM.GP, named identically `DV.HDR`.
+    const PROFILE_5: &str = r#"{"programs":[],"streams":[{"codec_name":"hevc","width":3840,"height":2160,
+        "side_data_list":[{"dv_profile":5,"dv_bl_signal_compatibility_id":0}]}],
+        "format":{"duration":"3248.256000","size":"6953664423"}}"#;
+    const PROFILE_8: &str = r#"{"programs":[],"streams":[{"codec_name":"hevc","width":3840,"height":2160,
+        "side_data_list":[{"dv_profile":8,"dv_bl_signal_compatibility_id":1}]}],
+        "format":{"duration":"3119.104000","size":"4649254842"}}"#;
+    const NO_DV: &str = r#"{"programs":[],"streams":[{"codec_name":"h264","width":1920,"height":1080}],
+        "format":{"duration":"3119.104000","size":"2449254842"}}"#;
+
+    fn parse(s: &str) -> MediaQuality {
+        media_quality_from_ffprobe_json(&serde_json::from_str(s).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn profile_5_is_read_from_the_bytes_whatever_the_name_said() {
+        let q = parse(PROFILE_5);
+        assert_eq!((q.dv_profile, q.dv_bl_compat_id), (Some(5), Some(0)));
+        assert!(q.dolby_vision_without_fallback());
+        assert_eq!(q.width, 3840);
+        assert_eq!(q.codec, "hevc");
+    }
+
+    #[test]
+    fn profile_8_with_an_hdr10_base_plays_right() {
+        let q = parse(PROFILE_8);
+        assert_eq!((q.dv_profile, q.dv_bl_compat_id), (Some(8), Some(1)));
+        assert!(!q.dolby_vision_without_fallback());
+    }
+
+    #[test]
+    fn a_file_without_dolby_vision_has_no_record_and_is_not_flagged() {
+        let q = parse(NO_DV);
+        assert_eq!((q.dv_profile, q.dv_bl_compat_id), (None, None));
+        assert!(!q.dolby_vision_without_fallback());
+    }
 }
 
 pub async fn detect_codecs(url: &str, preferred_lang: Option<&str>) -> Result<CodecInfo> {

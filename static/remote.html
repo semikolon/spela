@@ -1378,6 +1378,9 @@ async function vlcWaitReady(id, gen, pin){
     // auto-retry loop does on the Chromecast path — the VLC path never had an
     // equivalent, and since the play button always takes result #1, one dead top pick
     // was an unresolvable spinner (The Diplomat S03E01, 2026-08-27).
+    // The bytes said Dolby Vision profile 5 (readiness ffprobes the file; the name
+    // cannot tell profile 5 from 8, 2026-11-09): mark the row, move on, say why.
+    if(d && d.dv_profile5){ markDvProfile5(id); return {rotate:true, dv5:true}; }
     if(d && d.dead) return {rotate:true};
     // The server raced the top candidates and a different one is actually delivering.
     // Switch to it rather than keep waiting on a source that is losing.
@@ -1440,7 +1443,9 @@ async function openInVlc(id,title,poster){
     }else{
       const next = nextVlcSource(shot, id, startedOnMarked);
       if(next == null) break;
-      S.now.vlcNote = "Source " + id + " stopped delivering — trying source " + next + "…";
+      S.now.vlcNote = rdy.dv5
+        ? "Source " + id + " is Dolby Vision profile 5, which VLC shows green — trying source " + next + "…"
+        : "Source " + id + " stopped delivering — trying source " + next + "…";
       id = next;
     }
     skipped += 1;
@@ -3154,12 +3159,24 @@ function unreleasedNote(show, nowMs){
 // The next source the VLC rotation may try after `id` went dead, or null. It never moves
 // onto a marked result by itself; a rotation that STARTED on one was asked for one. Mirrors
 // `next_fallback_source` on the server, which does the same for the Chromecast walk.
+// A Dolby Vision profile 5 row counts as marked HERE: the rotation reaches it only
+// once every release without that mark has failed, and a green picture is not a rescue.
 function nextVlcSource(shot, id, startedOnMarked){
-  const marked = rid => { const r=(shot||[]).find(x=>x.id===rid); return !!(r && (r.cam || r.other_year!=null || r.dub)); };
+  const marked = rid => { const r=(shot||[]).find(x=>x.id===rid); return !!(r && (r.cam || r.other_year!=null || r.dub || r.dolby_vision_p5)); };
   for(let next=id+1; next<=(shot||[]).length; next++){
     if(startedOnMarked || !marked(next)) return next;
   }
   return null;
+}
+// The bytes proved a row profile 5 (`dv_profile5` on the readiness answer). Mark it in
+// the live result list (the rotation's snapshot holds the same objects, so it is skipped
+// from here on) and, when the search card is on screen, search again so the server's
+// ranking, which now knows the hash, puts the row where it belongs with its ⚠ label.
+function markDvProfile5(rid){
+  const rs=(S.search.data&&S.search.data.results)||[];
+  const r=rs.find(x=>x.id===rid); if(!r) return;
+  r.dolby_vision_p5=true;
+  if(location.hash.indexOf("#/search")===0 && S.search.q) runSearch(S.search.q);
 }
 async function fastPlay(query, isTV, poster){
   if(!S.target){ S.pending=()=>fastPlay(query,isTV,poster); toast("Pick where to play — it starts right after"); openSheet(); return; }

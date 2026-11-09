@@ -70,6 +70,12 @@ pub struct AppState {
     /// free and lookup is O(1).
     #[serde(default)]
     pub corrupt_files: std::collections::HashSet<String>,
+    /// 2026-11-09: info hashes whose served file ffprobed as Dolby Vision with no
+    /// ordinary picture underneath (profile 5). The release NAME cannot tell
+    /// (`search::dolby_vision_without_fallback`'s doc), so once the bytes have said
+    /// it, every later search marks that release before ranking. Lower-case hex.
+    #[serde(default)]
+    pub dolby_vision_p5_infohashes: std::collections::HashSet<String>,
     /// 2026-07-13: spela-native watch tracker (roadmap slice 2). Episodes/movies
     /// auto-marked "watched" when a play reaches completion (~HWM_CLEAR_FRACTION),
     /// keyed like `resume_positions`. Newest-first, deduped by key, capped. Feeds
@@ -621,6 +627,27 @@ impl AppState {
             (imdb_id.is_some() && w.imdb_id.as_deref() == imdb_id)
                 || w.show.as_deref().map(str::to_lowercase) == Some(clean.clone())
                 || crate::search::clean_title_for_tmdb(&w.title).to_lowercase() == clean
+        })
+    }
+
+    /// Has THIS title been watched: the episode named, or the film. `has_seen`
+    /// answers a different question (is this show a discovery?) and says yes to
+    /// any episode of a show with one watched episode, which is right for the
+    /// recommender and wrong for anything per-episode: the seeding stop read
+    /// VisionQuest S01E06 as watched one minute into it, five earlier episodes
+    /// being in the ledger (2026-11-09).
+    pub fn has_watched_exactly(&self, title: &str) -> bool {
+        let (_, season, episode) = crate::search::parse_episode_markers(title);
+        let (Some(s), Some(e)) = (season, episode) else {
+            return self.has_seen(None, title);
+        };
+        let show = crate::search::clean_title_for_tmdb(title).to_lowercase();
+        self.watched.iter().any(|w| {
+            let (_, ws, we) = crate::search::parse_episode_markers(&w.title);
+            ws == Some(s)
+                && we == Some(e)
+                && (w.show.as_deref().map(str::to_lowercase) == Some(show.clone())
+                    || crate::search::clean_title_for_tmdb(&w.title).to_lowercase() == show)
         })
     }
 
@@ -1241,6 +1268,26 @@ mod tests {
         // Not in the ledger → not seen (a fresh recommendation stays).
         assert!(!app.has_seen(Some("tt9999999"), "Andor"));
         assert!(!app.has_seen(None, "Dune Part Two"));
+    }
+
+    #[test]
+    fn has_watched_exactly_is_per_episode_where_has_seen_is_per_show() {
+        let mut app = AppState::default();
+        for ep in 1..=5 {
+            app.mark_watched_auto(
+                Some("tt23112594".into()),
+                format!("VisionQuest S01E{ep:02}"),
+            );
+        }
+        app.mark_watched_auto(None, "Poor Things".into());
+        // The show is seen (five episodes), the sixth episode is not watched.
+        assert!(app.has_seen(None, "VisionQuest S01E06"));
+        assert!(!app.has_watched_exactly("VisionQuest S01E06"));
+        assert!(app.has_watched_exactly("VisionQuest S01E05"));
+        assert!(app.has_watched_exactly("visionquest s01e03"));
+        // A film has no episode, so the two agree.
+        assert!(app.has_watched_exactly("Poor Things"));
+        assert!(!app.has_watched_exactly("Dune Part Two"));
     }
 
     #[test]

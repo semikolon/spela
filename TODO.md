@@ -17,13 +17,18 @@ names, different profiles: no reading of the name separates them. Every one of t
 releases in the S01E06 list is named `DV HDR`/`DoVi HDR`. The deployed binary was `bfcfbd1`, so
 the rule was live and did what it says.
 
-Proposed (his call, ranking policy): **check the bytes at readiness.** `probe_media_quality`
-already ffprobes the served file on `/vlc/{id}/ready`; add `dv_profile` and
-`dv_bl_signal_compatibility_id` to that probe (same command, two more fields). On a native target,
-profile 5 with id 0 → the readiness answer says so, the remote rotates to the next source with a
-note (as it does for a dead source), and the row is marked `⚠ DV profile 5`. The name rule stays as
-the cheap first pass. Cost: the probe needs the file's head, so a profile-5 release is found out
-after its first megabytes, not before the download starts; the walk then costs one more source.
+**Built the same morning, on his yes ("Yes, build it"): the bytes decide at readiness.**
+`probe_media_quality` reads the Dolby Vision record; `/vlc/{id}/ready` refuses a profile-5 file
+(`dead` + `dv_profile5`), the remote rotates on with a note and marks the row, and the info hash is
+remembered in `state.json` so every later search ranks it behind the non-DV releases. The name rule
+stays as the first pass. Mechanics in `CLAUDE.md` (Hard-Won, "The name cannot tell Dolby Vision
+profile 5 from 8"). Not covered: the phone's in-browser pass-through has no readiness poll.
+The FLUX S01E06 was probed profile 8 and is what he plays instead.
+
+Also fixed on his word ("follow what I've said in the past about seeding"): the seeding stop
+judged the SHOW watched (five episodes in the ledger) and stopped seeding S01E06 one minute in;
+it now asks about that episode (`has_watched_exactly`). The rule stands as ruled 2026-09-09:
+seed until watched, then stop; books to their ratio.
 
 **Same evening, the ranking alone was not enough:** Local Bypass matches the episode on disk, not
 the release, and the profile 5 copy played earlier was complete and bigger, so ▶ would have served

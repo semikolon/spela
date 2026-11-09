@@ -256,7 +256,8 @@ over verbatim to ffmpeg workers and any future torrent backend.
   saturated uplink costs every device on the LAN its latency, not just the download.
   librqbit's field is named `upload_bps` but the quota is spent in BYTES — the caller
   passes a chunk length — so the constant is bits over eight.
-- **A finished download keeps seeding until it has been watched**, then stops; the
+- **A finished download keeps seeding until it has been watched** (that episode or film, not
+  the show: five watched episodes do not make the sixth watched, 2026-11-09), then stops; the
   pruner ends the rest by taking the files. Sharing back is the default; sharing
   forever, for things nobody will watch, is not. The join from a release name to a
   ledger entry is deliberately fuzzy, because both ways of getting it wrong are cheap:

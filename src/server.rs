@@ -312,6 +312,92 @@ fn spawn_media_probe_at(state: &SharedState, path: std::path::PathBuf) {
     });
 }
 
+/// The probe for a known path, run NOW when the cache has none. The readiness
+/// handler otherwise never probes inline, but the one place it says `ready:true`
+/// needs the verdict first: a complete Dolby Vision profile 5 file on disk read
+/// as ready on the first poll, before the background probe had landed, and VLC
+/// opened it green (2026-11-09). ~100-300 ms, once per file.
+async fn media_quality_now(
+    state: &SharedState,
+    path: &std::path::Path,
+) -> Option<crate::transcode::MediaQuality> {
+    let key = path.to_string_lossy().to_string();
+    if let Some(q) = lock_recover(&state.media_probe).get(&key).cloned() {
+        return Some(q);
+    }
+    let q = crate::transcode::probe_media_quality(path).await?;
+    lock_recover(&state.media_probe).insert(key, q.clone());
+    Some(q)
+}
+
+/// The bytes said Dolby Vision profile 5 (`MediaQuality::dolby_vision_without_fallback`):
+/// write it everywhere the name rule's verdict lives, so the release ranks and
+/// shows as profile 5 from now on. Three homes: the pinned copy this play reads,
+/// `last_search` (the search view's rows), and the persisted set every later
+/// search consults before ranking. The readiness answer that follows is `dead`,
+/// which the remote turns into a rotation to the next source with a note.
+fn record_dolby_vision_p5(
+    state: &SharedState,
+    rid: usize,
+    pin: VlcPin<'_>,
+    path: &std::path::Path,
+) {
+    let mut hash = None;
+    if let Some(key) = pin.key() {
+        let mut pins = lock_recover(&state.vlc_intents);
+        if let Some((_, search)) = pins.get_mut(&key) {
+            for r in search.results.iter_mut().filter(|r| r.id == rid) {
+                r.dolby_vision_p5 = true;
+                hash = Some(r.info_hash.to_ascii_lowercase());
+            }
+        }
+    }
+    if let Some(mut search) = AppState::load_last_search(&state.state_dir) {
+        let mut touched = false;
+        for r in search.results.iter_mut() {
+            let same = r.id == rid && pin.ih.is_none_or(|ih| r.info_hash.eq_ignore_ascii_case(ih));
+            if same {
+                r.dolby_vision_p5 = true;
+                hash.get_or_insert_with(|| r.info_hash.to_ascii_lowercase());
+                touched = true;
+            }
+        }
+        if touched {
+            AppState::save_last_search(&state.state_dir, &search);
+        }
+    }
+    let hash = hash
+        .or_else(|| pin.ih.map(|h| h.to_ascii_lowercase()))
+        .filter(|h| !h.is_empty());
+    if let Some(h) = hash {
+        let mut app = AppState::load(&state.state_dir);
+        if app.dolby_vision_p5_infohashes.insert(h.clone()) {
+            let _ = app.save(&state.state_dir);
+        }
+        tracing::warn!(
+            "VLC: result #{} ({}) is Dolby Vision profile 5 in the bytes — marked, not served ({:?})",
+            rid,
+            &h[..8.min(h.len())],
+            path
+        );
+    } else {
+        tracing::warn!(
+            "VLC: result #{} is Dolby Vision profile 5 in the bytes — not served ({:?}); no info hash to remember it by",
+            rid,
+            path
+        );
+    }
+}
+
+/// The readiness answer for a file whose bytes say profile 5: `dead`, so the
+/// remote's rotation moves on, plus the reason, so it can say so and mark the row.
+fn dolby_vision_p5_refusal() -> Json<Value> {
+    Json(json!({
+        "ready": false, "pct": 0, "dead": true, "dv_profile5": true,
+        "phase": "Dolby Vision profile 5",
+    }))
+}
+
 /// Probe the file a result resolves to, once. Lifetime: one bounded ffprobe that
 /// completes on its own; the cache entry is what stops the ~1.5s readiness poll
 /// from spawning another every tick.
@@ -1935,6 +2021,19 @@ async fn handle_search(
                 None if off_lan => crate::search::QualityPref::Saver,
                 None => crate::search::QualityPref::Auto,
             };
+            // Releases whose served bytes once read as Dolby Vision profile 5 are
+            // marked before the ranking below: the name cannot tell profile 5 from 8
+            // (2026-11-09, `record_dolby_vision_p5`), and the ranker ORs the mark in.
+            {
+                let known = AppState::load(&state.state_dir).dolby_vision_p5_infohashes;
+                if !known.is_empty() {
+                    for r in result.results.iter_mut() {
+                        if known.contains(&r.info_hash.to_ascii_lowercase()) {
+                            r.dolby_vision_p5 = true;
+                        }
+                    }
+                }
+            }
             // A non-Auto preference re-ranks whatever the target is: a Chromecast on
             // a hotspot costs exactly as much per gigabyte as a phone does.
             if pref != crate::search::QualityPref::Auto
@@ -10698,8 +10797,11 @@ async fn stop_seeding_what_has_been_watched(state: &SharedState) {
                 continue;
             }
         } else {
+            // THIS episode, not the show: `has_seen` is per show (right for the
+            // recommender) and stopped S01E06 seeding one minute in, because five
+            // earlier episodes were in the ledger (2026-11-09).
             let title = ledger_title_for_release(&name);
-            if title.is_empty() || !app.has_seen(None, &title) {
+            if title.is_empty() || !app.has_watched_exactly(&title) {
                 continue;
             }
         }
@@ -10951,13 +11053,23 @@ async fn handle_vlc_ready(
         ))
         .find(|(path, _)| is_physically_full(path, 0));
     let probed = cached_media_quality(&state, id, VlcPin::from_query(&pin));
-    if complete.is_some() {
+    if let Some((path, _)) = &complete {
+        // The bytes, before "ready": a complete file on disk is the one case where
+        // this poll says yes at once, so the probe runs inline here (once, cached).
+        // VisionQuest S01E06 was complete, named `DV.HDR`, and profile 5 (2026-11-09).
+        let probed = media_quality_now(&state, path).await;
+        if probed
+            .as_ref()
+            .is_some_and(|q| q.dolby_vision_without_fallback())
+        {
+            record_dolby_vision_p5(&state, id, VlcPin::from_query(&pin), path);
+            return dolby_vision_p5_refusal();
+        }
         // Warm the external English subtitle before VLC asks for it. On a complete
         // file this is the SLOW case (alass aligns over the whole file, 38.9s measured
         // on Star City S01E06) and VLC blocks on its `--input-slave`, so doing it here
         // — during the poll the SPA already runs — is what keeps the open instant.
         spawn_vlc_subtitle_warm(&state, id, VlcPin::from_query(&pin));
-        spawn_media_probe(&state, id, VlcPin::from_query(&pin));
         return Json(json!({
             "ready": true, "pct": 100, "phase": "on disk", "quality": probed,
         }));
@@ -11215,6 +11327,23 @@ async fn handle_vlc_ready(
             disk::runway_secs(p.as_path(), 0, file_size, d)
         })
     });
+    // The bytes decide what the name could not: the container header is on disk
+    // once the file is openable (and often long before), and it carries the Dolby
+    // Vision record. Inline only at the moment of saying "ready", so a poll never
+    // waits on ffprobe before that; until then the background probe fills the cache.
+    let quality = match &file_path {
+        Some(p) if ready => media_quality_now(&state, p).await,
+        p => cached_media_quality_at(&state, p.as_deref()),
+    };
+    if let (Some(p), true) = (
+        &file_path,
+        quality
+            .as_ref()
+            .is_some_and(|q| q.dolby_vision_without_fallback()),
+    ) {
+        record_dolby_vision_p5(&state, id, VlcPin::from_query(&pin), p);
+        return dolby_vision_p5_refusal();
+    }
     Json(json!({
         "ready": ready,
         "wait_reason": wait_reason,
@@ -11235,7 +11364,7 @@ async fn handle_vlc_ready(
         // nobody asked, while "how many minutes can I watch" is the actual one.
         "runway_secs": runway,
         "dur_secs": dur,
-        "quality": cached_media_quality_at(&state, file_path.as_deref()),
+        "quality": quality,
         "phase": if finished { "complete" } else if ready { "buffered" } else { "buffering" },
     }))
 }

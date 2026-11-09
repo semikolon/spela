@@ -2701,7 +2701,10 @@ pub fn rank_results_mut_opts(results: &mut [TorrentResult], opts: RankOpts<'_>) 
     for r in results.iter_mut() {
         r.cam = is_cam_source(&r.title);
         r.dub = language_fit(r, opts.original_language).dub;
-        r.dolby_vision_p5 = dolby_vision_without_fallback(r);
+        // OR, never assignment: a mark already carried in (the bytes of a served
+        // file said profile 5, `server::record_dolby_vision_p5`) outranks the name,
+        // which cannot tell profile 5 from 8 (2026-11-09).
+        r.dolby_vision_p5 = r.dolby_vision_p5 || dolby_vision_without_fallback(r);
     }
     // Pre-pass: the 1080p yardstick a 2160p release is judged against. Computed
     // once, outside the comparator, so every tier stays a per-result value.
