@@ -7,6 +7,24 @@ in VLC"*; a trial of server conversion was judged not worth it. The name rule be
 (`dolby_vision_without_fallback`, mechanics in `CLAUDE.md`, tier 1). Not built: the byte check and
 the conversion. Delete this section once a few weeks of VLC plays have shown no green picture.
 
+**9 November: the name rule failed on its second episode, and the name cannot be made to work.**
+VisionQuest S01E06 opened green. ▶ played `VisionQuest.S01E06.Stallo.ITA.ENG.2160p.DSNP.WEB-DL.DDP5.1.DV.HDR.H.265-MeM.GP`
+(rank 1 of 40, 40 seeds, 6.48 GB): named `DV.HDR`, so the rule read it as a hybrid and ranked it
+first; ffprobe on the server reads **profile 5, `dv_bl_signal_compatibility_id=0`**. The same
+group's S01E03 and S01E04, named identically (`...DV.HDR.H.265-MeM.GP`), are **profile 8,
+compatibility id 1**, and played fine; so did the FLUX S01E05 (`DV HDR`, profile 8). Identical
+names, different profiles: no reading of the name separates them. Every one of the nine 4K
+releases in the S01E06 list is named `DV HDR`/`DoVi HDR`. The deployed binary was `bfcfbd1`, so
+the rule was live and did what it says.
+
+Proposed (his call, ranking policy): **check the bytes at readiness.** `probe_media_quality`
+already ffprobes the served file on `/vlc/{id}/ready`; add `dv_profile` and
+`dv_bl_signal_compatibility_id` to that probe (same command, two more fields). On a native target,
+profile 5 with id 0 → the readiness answer says so, the remote rotates to the next source with a
+note (as it does for a dead source), and the row is marked `⚠ DV profile 5`. The name rule stays as
+the cheap first pass. Cost: the probe needs the file's head, so a profile-5 release is found out
+after its first megabytes, not before the download starts; the walk then costs one more source.
+
 **Same evening, the ranking alone was not enough:** Local Bypass matches the episode on disk, not
 the release, and the profile 5 copy played earlier was complete and bigger, so ▶ would have served
 it again over the ranked hybrid (verified on the live server: `/vlc/1/ready` answered "on disk" with
