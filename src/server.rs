@@ -84,7 +84,7 @@ pub struct ServerState {
     /// readiness path reads the show's title, original language and imdb id for
     /// the audio-language preference, the bypass match and the subtitle key, so
     /// a lone row would leave those resolving against the new search.
-    pub vlc_intents: Mutex<HashMap<String, (Instant, crate::search::SearchResult)>>,
+    pub vlc_intents: Mutex<HashMap<String, (Instant, u64, crate::search::SearchResult)>>,
     /// Result ids whose source race has already been run, so a ~1.5s poll cannot start a
     /// fresh race on every tick.
     pub vlc_raced: Mutex<HashSet<usize>>,
@@ -343,9 +343,9 @@ fn record_dolby_vision_p5(
     path: &std::path::Path,
 ) {
     let mut hash = None;
-    if let Some(key) = pin.key() {
+    if let Some(key) = pin.identity() {
         let mut pins = lock_recover(&state.vlc_intents);
-        if let Some((_, search)) = pins.get_mut(&key) {
+        if let Some((_, _, search)) = pins.get_mut(&key) {
             for r in search.results.iter_mut().filter(|r| r.id == rid) {
                 r.dolby_vision_p5 = true;
                 hash = Some(r.info_hash.to_ascii_lowercase());
@@ -10068,7 +10068,7 @@ impl<'a> VlcPin<'a> {
             fi: q.fi,
         }
     }
-    fn key(&self) -> Option<String> {
+    fn identity(&self) -> Option<String> {
         self.ih.map(|h| vlc_pin_key(h, self.fi))
     }
 }
@@ -10102,12 +10102,19 @@ fn vlc_pin_key(ih: &str, fi: Option<u32>) -> String {
 /// in-flight play keeps naming the release it was started for no matter how many
 /// searches run underneath it, and every other caller is unaffected.
 fn vlc_search(state: &SharedState, pin: VlcPin<'_>) -> Option<crate::search::SearchResult> {
-    if let Some(key) = pin.key() {
+    if let Some(key) = pin.identity() {
         let mut pins = lock_recover(&state.vlc_intents);
-        pins.retain(|_, (seen, _)| seen.elapsed() < VLC_INTENT_TTL);
-        if let Some((seen, search)) = pins.get_mut(&key) {
-            *seen = Instant::now(); // in use — do not expire under an active wait
-            return Some(search.clone());
+        pins.retain(|_, (seen, _, _)| seen.elapsed() < VLC_INTENT_TTL);
+        if let Some((_, group, search)) = pins.get(&key) {
+            let (group, search) = (*group, search.clone());
+            // In use: keep the WHOLE group alive, since a rotation walks its siblings.
+            let now = Instant::now();
+            for (seen, g, _) in pins.values_mut() {
+                if *g == group {
+                    *seen = now;
+                }
+            }
+            return Some(search);
         }
     }
     AppState::load_last_search(&state.state_dir)
@@ -10121,7 +10128,7 @@ fn vlc_search(state: &SharedState, pin: VlcPin<'_>) -> Option<crate::search::Sea
 /// current search is NOT pinned: there is nothing trustworthy to copy, and the
 /// positional fallback is then no worse than it has always been.
 fn pin_vlc_search(state: &SharedState, pin: VlcPin<'_>) {
-    let (Some(raw), Some(key)) = (pin.ih, pin.key()) else {
+    let (Some(raw), Some(key)) = (pin.ih, pin.identity()) else {
         return;
     };
     {
@@ -10144,19 +10151,57 @@ fn pin_vlc_search(state: &SharedState, pin: VlcPin<'_>) {
         return;
     }
     let mut pins = lock_recover(&state.vlc_intents);
-    pins.retain(|_, (seen, _)| seen.elapsed() < VLC_INTENT_TTL);
-    let ages: Vec<(String, std::time::Duration)> = pins
-        .iter()
-        .map(|(k, (seen, _))| (k.clone(), seen.elapsed()))
-        .collect();
-    for key in pins_to_evict(&ages, VLC_INTENT_MAX) {
-        pins.remove(&key);
+    pins.retain(|_, (seen, _, _)| seen.elapsed() < VLC_INTENT_TTL);
+    // The bound counts SEARCHES (groups), not releases: one group holds a key per
+    // release of the list it was taken from.
+    let mut group_ages: HashMap<u64, std::time::Duration> = HashMap::new();
+    for (seen, g, _) in pins.values() {
+        let age = seen.elapsed();
+        let e = group_ages.entry(*g).or_insert(age);
+        *e = (*e).min(age);
     }
+    let ages: Vec<(String, std::time::Duration)> = group_ages
+        .into_iter()
+        .map(|(g, a)| (g.to_string(), a))
+        .collect();
+    for victim in pins_to_evict(&ages, VLC_INTENT_MAX) {
+        if let Ok(g) = victim.parse::<u64>() {
+            pins.retain(|_, (_, pg, _)| *pg != g);
+        }
+    }
+    static NEXT_GROUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let group = NEXT_GROUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Pin EVERY release of this list, not only the one asked for. The remote walks
+    // to the next-ranked source when one is dead, and that source is first asked
+    // for minutes later, by when another search may have replaced `last_search`
+    // (2026-11-16: Search Party's second source met a Furious search, was found
+    // absent, fell back to its position, and VLC opened Furious).
+    let added = pin_every_release(&mut pins, group, &search);
     tracing::info!(
-        "VLC: pinned the result list for {} — later searches cannot repoint this play",
-        key
+        "VLC: pinned the result list for {} ({} releases) — later searches cannot repoint this play",
+        key,
+        added
     );
-    pins.insert(key, (Instant::now(), search));
+}
+
+/// Store one copy of `search` under the key of every release in it that has no
+/// pin yet; returns how many keys were added. A release already pinned keeps the
+/// copy it has. Pure, so the rotation case is testable without a live server.
+fn pin_every_release(
+    pins: &mut HashMap<String, (Instant, u64, crate::search::SearchResult)>,
+    group: u64,
+    search: &crate::search::SearchResult,
+) -> usize {
+    let now = Instant::now();
+    let mut added = 0usize;
+    for r in &search.results {
+        let k = vlc_pin_key(&r.info_hash, r.file_index);
+        if let std::collections::hash_map::Entry::Vacant(v) = pins.entry(k) {
+            v.insert((now, group, search.clone()));
+            added += 1;
+        }
+    }
+    added
 }
 
 /// Which pins must go so that one more fits under `max`, oldest-used first.
@@ -13653,6 +13698,46 @@ mod tests {
         assert!(!pins_to_evict(&ages, 2).contains(&"waiting".to_string()));
     }
 
+    #[test]
+    fn a_rotation_target_keeps_the_list_it_was_ranked_in_after_another_search() {
+        // 2026-11-16: Search Party's first source was pinned, a Furious search then
+        // replaced last_search, and the rotation's SECOND Search Party source met
+        // the Furious list and VLC opened Furious. Pinning every release of the
+        // list at the first poll is what keeps the second source's list its own.
+        let mk = |q: &str, ids: &[(&str, u32)]| {
+            let mut results = Vec::new();
+            for (n, (ih, _)) in ids.iter().enumerate() {
+                let mut r = ranked_source(n + 1, "magnet:?xt=urn:btih:a");
+                r.info_hash = (*ih).to_string();
+                r.file_index = Some(0);
+                results.push(r);
+            }
+            crate::search::SearchResult {
+                query: q.into(),
+                show: None,
+                searching: None,
+                error: None,
+                torrent_available: true,
+                results,
+            }
+        };
+        let party = mk("search party s05e02", &[("5f8deb5c", 0), ("594b7a8e", 0)]);
+        let furious = mk(
+            "furious",
+            &[("aaaaaaaa", 0), ("bbbbbbbb", 0), ("cccccccc", 0)],
+        );
+        let mut pins = HashMap::new();
+        assert_eq!(pin_every_release(&mut pins, 1, &party), 2);
+        // The Furious search comes later and pins its own, without touching Party's.
+        assert_eq!(pin_every_release(&mut pins, 2, &furious), 3);
+        let second = vlc_pin_key("594b7a8e", Some(0));
+        let (_, group, list) = pins.get(&second).expect("the second source is pinned");
+        assert_eq!(*group, 1);
+        assert_eq!(list.query, "search party s05e02");
+        // A release already pinned keeps the copy it has.
+        assert_eq!(pin_every_release(&mut pins, 3, &party), 0);
+    }
+
     // These five were written against `pick_id_for_infohash`, which matched on
     // the TORRENT. Superseded in place 2026-09-28 rather than deleted: the cases
     // are still right, and what changed is that identity now includes the FILE.
@@ -13670,7 +13755,7 @@ mod tests {
     }
 
     #[test]
-    fn a_season_pack_resolves_to_the_EPISODE_asked_for_not_the_first_one() {
+    fn a_season_pack_resolves_to_the_episode_asked_for_not_the_first_one() {
         // The 2026-09-28 case, and the whole reason identity gained a file half.
         // Search Party S01E05 and S01E06 are files 4 and 5 of ONE pack torrent,
         // so both results carry infohash 37800d0e…; asking for file 5 must never
